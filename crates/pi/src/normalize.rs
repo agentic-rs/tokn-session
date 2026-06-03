@@ -174,7 +174,10 @@ fn normalize_assistant_message(
           message_id: meta.id.clone(),
           parent_id: meta.parent_id.clone(),
           phase: Phase::Finished,
-          text: thinking,
+          text: present_text(thinking),
+          summary: None,
+          encrypted_content: None,
+          signature: thinking_signature,
           timestamp: timestamp.clone(),
         }));
       }
@@ -282,6 +285,10 @@ fn unknown_event(session_id: Option<String>, native_type: Option<String>, timest
     native_type,
     timestamp,
   })
+}
+
+fn present_text(text: String) -> Option<String> {
+  (!text.is_empty()).then_some(text)
 }
 
 fn unknown_content_type(prefix: &str, value: &Value) -> Option<String> {

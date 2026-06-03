@@ -71,16 +71,24 @@ fn normalize_response_item(
       content,
       phase: _,
     } => normalize_message(session_id, id, role, content, timestamp),
-    CodexResponseItem::Reasoning { id, summary, content } => {
+    CodexResponseItem::Reasoning {
+      id,
+      summary,
+      content,
+      encrypted_content,
+    } => {
       let text = content
         .unwrap_or_default()
         .into_iter()
         .filter_map(reasoning_content_text)
-        .chain(summary.into_iter().filter_map(|summary| summary.text))
         .collect::<Vec<_>>()
         .join("\n");
-      if text.is_empty() {
-        let _ = (session_id, timestamp);
+      let summary = summary
+        .into_iter()
+        .filter_map(|summary| summary.text)
+        .collect::<Vec<_>>()
+        .join("\n");
+      if text.is_empty() && summary.is_empty() && encrypted_content.is_none() {
         Vec::new()
       } else {
         vec![AgentEvent::Reasoning(ReasoningEvent {
@@ -89,7 +97,10 @@ fn normalize_response_item(
           message_id: id,
           parent_id: None,
           phase: Phase::Finished,
-          text,
+          text: present_text(text),
+          summary: present_text(summary),
+          encrypted_content,
+          signature: None,
           timestamp,
         })]
       }
@@ -285,7 +296,10 @@ fn normalize_event_msg(session_id: Option<String>, event: CodexEventMsg, timesta
           message_id: None,
           parent_id: None,
           phase: Phase::Finished,
-          text,
+          text: present_text(text),
+          summary: None,
+          encrypted_content: None,
+          signature: None,
           timestamp,
         })]
       }
@@ -394,6 +408,7 @@ fn normalize_event_msg(session_id: Option<String>, event: CodexEventMsg, timesta
       timestamp,
     })],
     CodexEventMsg::TokenCount {} => Vec::new(),
+    CodexEventMsg::ThreadGoalUpdated { .. } => Vec::new(),
     CodexEventMsg::TurnComplete {} => Vec::new(),
     CodexEventMsg::TurnAborted { reason } => vec![AgentEvent::Error(ErrorEvent {
       provider: Provider::Codex,
@@ -485,6 +500,10 @@ fn tool_output_event(
 
 fn parse_json_string_or_text(value: String) -> Value {
   serde_json::from_str(&value).unwrap_or(Value::String(value))
+}
+
+fn present_text(text: String) -> Option<String> {
+  (!text.is_empty()).then_some(text)
 }
 
 fn unknown_event(session_id: Option<String>, native_type: Option<String>, timestamp: Option<String>) -> AgentEvent {

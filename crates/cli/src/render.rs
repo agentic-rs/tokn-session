@@ -53,9 +53,16 @@ pub fn render_pretty(session: &LoadedSession) -> String {
         output.push('\n');
       }
       AgentEvent::Reasoning(event) => {
-        output.push_str("reasoning\n");
-        write_indented(&mut output, &event.text);
-        output.push('\n');
+        if let Some(summary) = &event.summary {
+          output.push_str("reasoning summary\n");
+          write_indented(&mut output, summary);
+          output.push('\n');
+        }
+        if let Some(text) = &event.text {
+          output.push_str("reasoning\n");
+          write_indented(&mut output, text);
+          output.push('\n');
+        }
       }
       AgentEvent::ToolCall(event) => {
         output.push_str("tool");

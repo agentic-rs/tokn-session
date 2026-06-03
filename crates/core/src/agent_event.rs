@@ -52,7 +52,10 @@ pub struct ReasoningEvent {
   pub message_id: Option<String>,
   pub parent_id: Option<String>,
   pub phase: Phase,
-  pub text: String,
+  pub text: Option<String>,
+  pub summary: Option<String>,
+  pub encrypted_content: Option<String>,
+  pub signature: Option<String>,
   pub timestamp: Option<String>,
 }
 

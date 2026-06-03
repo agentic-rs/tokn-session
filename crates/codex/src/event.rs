@@ -39,6 +39,7 @@ pub enum CodexResponseItem {
     id: Option<String>,
     summary: Vec<CodexReasoningSummary>,
     content: Option<Vec<CodexReasoningContent>>,
+    encrypted_content: Option<String>,
   },
   FunctionCall {
     id: Option<String>,
@@ -185,6 +186,13 @@ pub enum CodexEventMsg {
     status: String,
   },
   TokenCount {},
+  ThreadGoalUpdated {
+    #[serde(rename = "threadId")]
+    thread_id: Option<String>,
+    #[serde(rename = "turnId")]
+    turn_id: Option<String>,
+    goal: Option<Value>,
+  },
   TurnStarted {
     turn_id: Option<String>,
   },
