@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use tokn_agent_codex::CodexSessionSource;
 use tokn_agent_core::{LoadedSession, SessionRef};
+use tokn_agent_opencode::OpenCodeSessionSource;
 use tokn_agent_pi::PiSessionSource;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,6 +26,7 @@ impl AgentClient {
 
 enum SessionSourceClient {
   Codex(CodexSessionSource),
+  OpenCode(OpenCodeSessionSource),
   Pi(PiSessionSource),
 }
 
@@ -32,6 +34,7 @@ impl SessionSourceClient {
   fn list_sessions(&self) -> Result<Vec<SessionRef>, String> {
     match self {
       Self::Codex(source) => source.list_sessions(),
+      Self::OpenCode(source) => source.list_sessions(),
       Self::Pi(source) => source.list_sessions(),
     }
   }
@@ -39,6 +42,7 @@ impl SessionSourceClient {
   fn load_session(&self, session: &str) -> Result<LoadedSession, String> {
     match self {
       Self::Codex(source) => source.load_session(session),
+      Self::OpenCode(source) => source.load_session(session),
       Self::Pi(source) => source.load_session(session),
     }
   }
@@ -48,6 +52,6 @@ fn session_source(source: Source, session_dir: Option<PathBuf>) -> Result<Sessio
   match source {
     Source::Pi => Ok(SessionSourceClient::Pi(PiSessionSource::new(session_dir))),
     Source::Codex => Ok(SessionSourceClient::Codex(CodexSessionSource::new(session_dir))),
-    Source::OpenCode => Err("opencode sessions are not implemented yet".to_string()),
+    Source::OpenCode => Ok(SessionSourceClient::OpenCode(OpenCodeSessionSource::new(session_dir))),
   }
 }

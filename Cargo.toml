@@ -3,6 +3,7 @@ members = [
   "crates/core",
   "crates/codex",
   "crates/pi",
+  "crates/opencode",
   "crates/client",
   "crates/cli",
 ]
@@ -18,4 +19,5 @@ serde_json = "1"
 tokn-agent-client = { path = "crates/client" }
 tokn-agent-codex = { path = "crates/codex" }
 tokn-agent-core = { path = "crates/core" }
+tokn-agent-opencode = { path = "crates/opencode" }
 tokn-agent-pi = { path = "crates/pi" }

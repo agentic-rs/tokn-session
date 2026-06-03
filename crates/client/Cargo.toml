@@ -6,4 +6,5 @@ edition.workspace = true
 [dependencies]
 tokn-agent-codex.workspace = true
 tokn-agent-core.workspace = true
+tokn-agent-opencode.workspace = true
 tokn-agent-pi.workspace = true

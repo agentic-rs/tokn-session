@@ -172,16 +172,16 @@ fn parse_format(value: &str) -> Result<Format, String> {
 
 fn help() -> String {
   "usage:
-  tokn-agent sessions list [--source pi] [--session-dir <dir>]
-  tokn-agent sessions list [--source pi] [--limit <n>]
-  tokn-agent sessions show [--source pi] [--format pretty|jsonl] [--session-dir <dir>] <session-id-or-path>"
+  tokn-agent sessions list [--source pi|codex|opencode] [--session-dir <dir>]
+  tokn-agent sessions list [--source pi|codex|opencode] [--limit <n>]
+  tokn-agent sessions show [--source pi|codex|opencode] [--format pretty|jsonl] [--session-dir <dir>] <session-id-or-path>"
     .to_string()
 }
 
 fn sessions_help() -> String {
   "usage:
-  tokn-agent sessions list [--source pi] [--session-dir <dir>]
-  tokn-agent sessions list [--source pi] [--limit <n>]
-  tokn-agent sessions show [--source pi] [--format pretty|jsonl] [--session-dir <dir>] <session-id-or-path>"
+  tokn-agent sessions list [--source pi|codex|opencode] [--session-dir <dir>]
+  tokn-agent sessions list [--source pi|codex|opencode] [--limit <n>]
+  tokn-agent sessions show [--source pi|codex|opencode] [--format pretty|jsonl] [--session-dir <dir>] <session-id-or-path>"
     .to_string()
 }

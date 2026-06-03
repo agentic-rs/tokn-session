@@ -105,6 +105,8 @@ pub struct UnknownEvent {
 pub enum Provider {
   Pi,
   Codex,
+  #[serde(rename = "opencode")]
+  OpenCode,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]

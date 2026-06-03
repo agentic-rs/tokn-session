@@ -1,0 +1,10 @@
+[package]
+name = "tokn-agent-opencode"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokn-agent-core.workspace = true
