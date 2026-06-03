@@ -80,11 +80,8 @@ fn normalize_response_item(
         .collect::<Vec<_>>()
         .join("\n");
       if text.is_empty() {
-        vec![unknown_event(
-          session_id,
-          Some("response_item.reasoning".to_string()),
-          timestamp,
-        )]
+        let _ = (session_id, timestamp);
+        Vec::new()
       } else {
         vec![AgentEvent::Reasoning(ReasoningEvent {
           provider: Provider::Codex,
@@ -436,7 +433,7 @@ fn content_item_text(item: CodexContentItem) -> Option<String> {
 
 fn reasoning_content_text(item: CodexReasoningContent) -> Option<String> {
   match item {
-    CodexReasoningContent::Text { text } => Some(text),
+    CodexReasoningContent::ReasoningText { text } | CodexReasoningContent::Text { text } => Some(text),
     CodexReasoningContent::Unknown(_) => None,
   }
 }

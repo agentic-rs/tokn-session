@@ -116,6 +116,9 @@ pub struct CodexReasoningSummary {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CodexReasoningContent {
+  ReasoningText {
+    text: String,
+  },
   Text {
     text: String,
   },
