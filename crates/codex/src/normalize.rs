@@ -5,8 +5,8 @@ use crate::event::{
   CodexSessionMeta,
 };
 use tokn_agent_core::{
-  AgentEvent, ErrorEvent, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role, SessionStarted,
-  ToolCallEvent, UnknownEvent,
+  AgentEvent, ErrorEvent, GoalUpdated, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role,
+  SessionStarted, ToolCallEvent, UnknownEvent,
 };
 
 pub struct CodexNormalizer {
@@ -408,7 +408,17 @@ fn normalize_event_msg(session_id: Option<String>, event: CodexEventMsg, timesta
       timestamp,
     })],
     CodexEventMsg::TokenCount {} => Vec::new(),
-    CodexEventMsg::ThreadGoalUpdated { .. } => Vec::new(),
+    CodexEventMsg::ThreadGoalUpdated {
+      thread_id,
+      turn_id,
+      goal,
+    } => vec![AgentEvent::GoalUpdated(GoalUpdated {
+      provider: Provider::Codex,
+      session_id: thread_id.or(session_id),
+      turn_id,
+      goal,
+      timestamp,
+    })],
     CodexEventMsg::TurnComplete {} => Vec::new(),
     CodexEventMsg::TurnAborted { reason } => vec![AgentEvent::Error(ErrorEvent {
       provider: Provider::Codex,

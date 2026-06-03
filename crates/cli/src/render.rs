@@ -1,3 +1,4 @@
+use serde_json::Value;
 use tokn_agent_core::{AgentEvent, LoadedSession, Role, SessionRef};
 
 pub fn render_session_list(sessions: &[SessionRef]) -> String {
@@ -64,6 +65,29 @@ pub fn render_pretty(session: &LoadedSession) -> String {
           output.push('\n');
         }
       }
+      AgentEvent::GoalUpdated(event) => {
+        output.push_str("goal updated");
+        if let Some(status) = event.goal.as_ref().and_then(|goal| goal_string(goal, "status")) {
+          output.push_str(&format!(" [{status}]"));
+        }
+        if let Some(tokens_used) = event.goal.as_ref().and_then(|goal| goal_number(goal, "tokensUsed")) {
+          output.push_str(&format!(" tokens={tokens_used}"));
+        }
+        if let Some(time_used_seconds) = event
+          .goal
+          .as_ref()
+          .and_then(|goal| goal_number(goal, "timeUsedSeconds"))
+        {
+          output.push_str(&format!(" time={time_used_seconds}s"));
+        }
+        output.push('\n');
+        if let Some(objective) = event.goal.as_ref().and_then(|goal| goal_string(goal, "objective")) {
+          write_indented(&mut output, objective);
+        } else if let Some(goal) = &event.goal {
+          write_indented(&mut output, &goal.to_string());
+        }
+        output.push('\n');
+      }
       AgentEvent::ToolCall(event) => {
         output.push_str("tool");
         if let Some(name) = &event.tool_name {
@@ -101,6 +125,14 @@ pub fn render_pretty(session: &LoadedSession) -> String {
   }
 
   output
+}
+
+fn goal_string<'a>(goal: &'a Value, field: &str) -> Option<&'a str> {
+  goal.get(field).and_then(Value::as_str)
+}
+
+fn goal_number(goal: &Value, field: &str) -> Option<u64> {
+  goal.get(field).and_then(Value::as_u64)
 }
 
 fn role_label(role: Role) -> &'static str {

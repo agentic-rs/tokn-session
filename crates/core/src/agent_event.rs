@@ -8,6 +8,7 @@ pub enum AgentEvent {
   ProviderChanged(ProviderChanged),
   Message(MessageEvent),
   Reasoning(ReasoningEvent),
+  GoalUpdated(GoalUpdated),
   ToolCall(ToolCallEvent),
   Error(ErrorEvent),
   Unknown(UnknownEvent),
@@ -56,6 +57,15 @@ pub struct ReasoningEvent {
   pub summary: Option<String>,
   pub encrypted_content: Option<String>,
   pub signature: Option<String>,
+  pub timestamp: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GoalUpdated {
+  pub provider: Provider,
+  pub session_id: Option<String>,
+  pub turn_id: Option<String>,
+  pub goal: Option<Value>,
   pub timestamp: Option<String>,
 }
 
