@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use tokn_agent_codex::CodexSessionSource;
 use tokn_agent_core::{LoadedSession, SessionRef};
 use tokn_agent_pi::PiSessionSource;
 
@@ -23,18 +24,21 @@ impl AgentClient {
 }
 
 enum SessionSourceClient {
+  Codex(CodexSessionSource),
   Pi(PiSessionSource),
 }
 
 impl SessionSourceClient {
   fn list_sessions(&self) -> Result<Vec<SessionRef>, String> {
     match self {
+      Self::Codex(source) => source.list_sessions(),
       Self::Pi(source) => source.list_sessions(),
     }
   }
 
   fn load_session(&self, session: &str) -> Result<LoadedSession, String> {
     match self {
+      Self::Codex(source) => source.load_session(session),
       Self::Pi(source) => source.load_session(session),
     }
   }
@@ -43,7 +47,7 @@ impl SessionSourceClient {
 fn session_source(source: Source, session_dir: Option<PathBuf>) -> Result<SessionSourceClient, String> {
   match source {
     Source::Pi => Ok(SessionSourceClient::Pi(PiSessionSource::new(session_dir))),
-    Source::Codex => Err("codex sessions are not implemented yet".to_string()),
+    Source::Codex => Ok(SessionSourceClient::Codex(CodexSessionSource::new(session_dir))),
     Source::OpenCode => Err("opencode sessions are not implemented yet".to_string()),
   }
 }

@@ -99,8 +99,18 @@ dependencies = [
 name = "tokn-agent-client"
 version = "0.1.0"
 dependencies = [
+ "tokn-agent-codex",
  "tokn-agent-core",
  "tokn-agent-pi",
+]
+
+[[package]]
+name = "tokn-agent-codex"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokn-agent-core",
 ]
 
 [[package]]

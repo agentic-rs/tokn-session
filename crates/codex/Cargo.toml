@@ -1,9 +1,9 @@
 [package]
-name = "tokn-agent-client"
+name = "tokn-agent-codex"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-tokn-agent-codex.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 tokn-agent-core.workspace = true
-tokn-agent-pi.workspace = true

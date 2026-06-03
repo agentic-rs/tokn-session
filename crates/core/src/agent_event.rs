@@ -91,6 +91,7 @@ pub struct UnknownEvent {
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
   Pi,
+  Codex,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
