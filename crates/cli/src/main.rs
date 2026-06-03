@@ -1,13 +1,9 @@
-mod agent_event;
-mod cli;
-mod pi;
+mod args;
 mod render;
 
-use std::path::PathBuf;
-
-use cli::{Command, Format, SessionsCommand, Source};
-use pi::session_source::PiSessionSource;
+use args::{Command, Format, SessionsCommand};
 use render::{render_agent_jsonl, render_pretty, render_session_list};
+use tokn_agent_client::AgentClient;
 
 fn main() {
   if let Err(err) = run() {
@@ -17,7 +13,7 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-  let cli = cli::parse(std::env::args().skip(1).collect())?;
+  let cli = args::parse(std::env::args().skip(1).collect())?;
 
   match cli.command {
     Command::Sessions(SessionsCommand::List {
@@ -25,7 +21,7 @@ fn run() -> Result<(), String> {
       session_dir,
       limit,
     }) => {
-      let mut sessions = session_source(source, session_dir)?.list_sessions()?;
+      let mut sessions = AgentClient::list_sessions(source, session_dir)?;
       if limit > 0 {
         sessions.truncate(limit);
       }
@@ -38,21 +34,12 @@ fn run() -> Result<(), String> {
       format,
       session_dir,
     }) => {
-      let source = session_source(source, session_dir)?;
-      let loaded = source.load_session(&session)?;
+      let loaded = AgentClient::load_session(source, session_dir, &session)?;
       match format {
         Format::Pretty => print!("{}", render_pretty(&loaded)),
         Format::Jsonl => print!("{}", render_agent_jsonl(&loaded.events)?),
       }
       Ok(())
     }
-  }
-}
-
-fn session_source(source: Source, session_dir: Option<PathBuf>) -> Result<PiSessionSource, String> {
-  match source {
-    Source::Pi => Ok(PiSessionSource::new(session_dir)),
-    Source::Codex => Err("codex sessions are not implemented yet".to_string()),
-    Source::OpenCode => Err("opencode sessions are not implemented yet".to_string()),
   }
 }

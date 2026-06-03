@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use tokn_agent_client::Source;
+
 #[derive(Debug)]
 pub struct Cli {
   pub command: Command,
@@ -23,13 +25,6 @@ pub enum SessionsCommand {
     format: Format,
     session_dir: Option<PathBuf>,
   },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Source {
-  Pi,
-  Codex,
-  OpenCode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

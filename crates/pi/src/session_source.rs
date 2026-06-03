@@ -2,24 +2,9 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use crate::agent_event::AgentEvent;
-use crate::pi::event::PiEvent;
-use crate::pi::normalize::PiNormalizer;
-
-#[derive(Debug)]
-pub struct SessionRef {
-  pub id: String,
-  pub path: PathBuf,
-  pub cwd: Option<String>,
-  pub timestamp: Option<String>,
-  pub message_count: usize,
-}
-
-#[derive(Debug)]
-pub struct LoadedSession {
-  pub reference: SessionRef,
-  pub events: Vec<AgentEvent>,
-}
+use crate::event::PiEvent;
+use crate::normalize::PiNormalizer;
+use tokn_agent_core::{LoadedSession, SessionRef};
 
 pub struct PiSessionSource {
   session_dir: Option<PathBuf>,

@@ -1,5 +1,4 @@
-use crate::agent_event::{AgentEvent, Role};
-use crate::pi::session_source::{LoadedSession, SessionRef};
+use tokn_agent_core::{AgentEvent, LoadedSession, Role, SessionRef};
 
 pub fn render_session_list(sessions: &[SessionRef]) -> String {
   let mut output = String::new();

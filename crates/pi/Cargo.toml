@@ -1,0 +1,10 @@
+[package]
+name = "tokn-agent-pi"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokn-agent-core.workspace = true
+

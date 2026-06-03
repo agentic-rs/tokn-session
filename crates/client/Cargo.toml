@@ -1,0 +1,9 @@
+[package]
+name = "tokn-agent-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokn-agent-core.workspace = true
+tokn-agent-pi.workspace = true
+

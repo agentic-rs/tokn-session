@@ -1,12 +1,12 @@
 use serde_json::Value;
 
-use crate::agent_event::{
-  AgentEvent, ErrorEvent, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role, SessionStarted,
-  ToolCallEvent, UnknownEvent,
-};
-use crate::pi::event::{
+use crate::event::{
   PiAssistantContentBlock, PiEvent, PiMessage, PiMessageEvent, PiToolResultContentBlock, PiUserContent,
   PiUserContentBlock,
+};
+use tokn_agent_core::{
+  AgentEvent, ErrorEvent, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role, SessionStarted,
+  ToolCallEvent, UnknownEvent,
 };
 
 pub struct PiNormalizer {
@@ -95,7 +95,7 @@ struct PiMessageMeta {
 fn normalize_user_message(
   session_id: Option<String>,
   meta: &PiMessageMeta,
-  message: crate::pi::event::PiUserMessage,
+  message: crate::event::PiUserMessage,
 ) -> Vec<AgentEvent> {
   let timestamp = meta
     .timestamp
@@ -145,7 +145,7 @@ fn normalize_user_message(
 fn normalize_assistant_message(
   session_id: Option<String>,
   meta: &PiMessageMeta,
-  message: crate::pi::event::PiAssistantMessage,
+  message: crate::event::PiAssistantMessage,
 ) -> Vec<AgentEvent> {
   let timestamp = meta
     .timestamp
@@ -205,7 +205,7 @@ fn normalize_assistant_message(
 fn normalize_tool_result_message(
   session_id: Option<String>,
   meta: &PiMessageMeta,
-  message: crate::pi::event::PiToolResultMessage,
+  message: crate::event::PiToolResultMessage,
 ) -> Vec<AgentEvent> {
   let timestamp = meta
     .timestamp
