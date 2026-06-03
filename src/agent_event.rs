@@ -95,6 +95,7 @@ pub enum Provider {
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
 pub enum Role {
     User,
     Assistant,
