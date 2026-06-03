@@ -62,10 +62,12 @@ pub struct ToolCallEvent {
     pub session_id: Option<String>,
     pub message_id: Option<String>,
     pub parent_id: Option<String>,
+    pub tool_call_id: Option<String>,
     pub tool_name: Option<String>,
     pub phase: Phase,
     pub input: Option<Value>,
     pub output: Option<Value>,
+    pub is_error: Option<bool>,
     pub timestamp: Option<String>,
 }
 

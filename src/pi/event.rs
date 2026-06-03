@@ -59,6 +59,10 @@ pub struct PiMessageEvent {
 pub struct PiMessage {
     pub role: String,
     pub content: Value,
+    pub tool_call_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub details: Option<Value>,
+    pub is_error: Option<bool>,
     pub timestamp: Option<u64>,
 }
 

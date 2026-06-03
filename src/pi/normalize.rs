@@ -76,6 +76,23 @@ fn normalize_message(session_id: Option<String>, event: PiMessageEvent) -> Vec<A
         .timestamp
         .or_else(|| event.message.timestamp.map(|value| value.to_string()));
 
+    if event.message.role == "toolResult" {
+        events.push(AgentEvent::ToolCall(ToolCallEvent {
+            provider: Provider::Pi,
+            session_id,
+            message_id: event.id,
+            parent_id: event.parent_id,
+            tool_call_id: event.message.tool_call_id,
+            tool_name: event.message.tool_name,
+            phase: Phase::Finished,
+            input: None,
+            output: event.message.details.or(Some(event.message.content)),
+            is_error: event.message.is_error,
+            timestamp,
+        }));
+        return events;
+    }
+
     for content in content_items(&event.message.content) {
         let content_type = content
             .get("type")
@@ -114,12 +131,16 @@ fn normalize_message(session_id: Option<String>, event: PiMessageEvent) -> Vec<A
                     }));
                 }
             }
-            "tool_use" | "tool_call" => {
+            "toolCall" | "tool_use" | "tool_call" => {
                 events.push(AgentEvent::ToolCall(ToolCallEvent {
                     provider: Provider::Pi,
                     session_id: session_id.clone(),
                     message_id: event.id.clone(),
                     parent_id: event.parent_id.clone(),
+                    tool_call_id: content
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                     tool_name: content
                         .get("name")
                         .or_else(|| content.get("tool"))
@@ -127,23 +148,42 @@ fn normalize_message(session_id: Option<String>, event: PiMessageEvent) -> Vec<A
                         .map(str::to_string),
                     phase: Phase::Finished,
                     input: content
-                        .get("input")
+                        .get("arguments")
                         .cloned()
+                        .or_else(|| content.get("input").cloned())
                         .or_else(|| content.get("args").cloned()),
                     output: None,
+                    is_error: None,
                     timestamp: timestamp.clone(),
                 }));
             }
-            "tool_result" => {
+            "toolResult" | "tool_result" => {
                 events.push(AgentEvent::ToolCall(ToolCallEvent {
                     provider: Provider::Pi,
                     session_id: session_id.clone(),
                     message_id: event.id.clone(),
                     parent_id: event.parent_id.clone(),
-                    tool_name: None,
+                    tool_call_id: content
+                        .get("id")
+                        .or_else(|| content.get("toolCallId"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    tool_name: content
+                        .get("name")
+                        .or_else(|| content.get("toolName"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                     phase: Phase::Finished,
                     input: None,
-                    output: Some(content.clone()),
+                    output: content
+                        .get("details")
+                        .cloned()
+                        .or_else(|| content.get("output").cloned())
+                        .or_else(|| Some(content.clone())),
+                    is_error: content
+                        .get("isError")
+                        .or_else(|| content.get("is_error"))
+                        .and_then(Value::as_bool),
                     timestamp: timestamp.clone(),
                 }));
             }
@@ -182,7 +222,7 @@ fn role_from_pi(role: &str) -> Role {
         "user" => Role::User,
         "assistant" => Role::Assistant,
         "system" => Role::System,
-        "tool" => Role::Tool,
+        "tool" | "toolResult" => Role::Tool,
         _ => Role::Unknown,
     }
 }

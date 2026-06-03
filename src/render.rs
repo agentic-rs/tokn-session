@@ -70,6 +70,13 @@ pub fn render_pretty(session: &LoadedSession) -> String {
                     output.push(' ');
                     output.push_str(name);
                 }
+                if let Some(id) = &event.tool_call_id {
+                    output.push_str(" #");
+                    output.push_str(id);
+                }
+                if event.is_error == Some(true) {
+                    output.push_str(" error");
+                }
                 output.push('\n');
                 if let Some(input) = &event.input {
                     write_indented(&mut output, &format!("input: {input}"));
