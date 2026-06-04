@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::event::PiEvent;
 use crate::normalize::PiNormalizer;
-use tokn_agent_core::{LoadedSession, SessionRef};
+use tokn_session_core::{LoadedSession, SessionRef};
 
 pub struct PiSessionSource {
   session_dir: Option<PathBuf>,

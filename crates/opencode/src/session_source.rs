@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 
 use crate::event::{OpenCodeMessage, OpenCodeMessageRow, OpenCodePart, OpenCodePartRow, OpenCodeSessionRow};
 use crate::normalize::OpenCodeNormalizer;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::Value;
-use tokn_agent_core::{LoadedSession, SessionRef};
+use tokn_session_core::{LoadedSession, SessionRef};
 
 pub struct OpenCodeSessionSource {
   session_dir: Option<PathBuf>,
@@ -119,7 +119,23 @@ impl OpenCodeSessionSource {
 }
 
 fn connect_database(path: &Path) -> Result<Connection, String> {
-  Connection::open(path).map_err(|err| format!("failed to open opencode database {}: {err}", path.display()))
+  let uri = format!("file:{}?mode=ro&immutable=1", sqlite_uri_path(path));
+  Connection::open_with_flags(&uri, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI)
+    .map_err(|err| format!("failed to open opencode database {}: {err}", path.display()))
+}
+
+fn sqlite_uri_path(path: &Path) -> String {
+  path
+    .to_string_lossy()
+    .chars()
+    .flat_map(|value| match value {
+      ' ' => "%20".chars().collect::<Vec<_>>(),
+      '#' => "%23".chars().collect::<Vec<_>>(),
+      '?' => "%3f".chars().collect::<Vec<_>>(),
+      '%' => "%25".chars().collect::<Vec<_>>(),
+      value => vec![value],
+    })
+    .collect()
 }
 
 fn load_session_row(connection: &Connection, session_id: &str) -> Result<Option<OpenCodeSessionRow>, String> {

@@ -1,5 +1,5 @@
 [package]
-name = "tokn-agent-opencode"
+name = "tokn-session-opencode"
 version.workspace = true
 edition.workspace = true
 
@@ -7,4 +7,4 @@ edition.workspace = true
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-tokn-agent-core.workspace = true
+tokn-session-core.workspace = true

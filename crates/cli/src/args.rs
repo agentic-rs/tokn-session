@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use tokn_agent_client::Source;
+use tokn_session_client::Source;
 
 #[derive(Debug)]
 pub struct Cli {
@@ -172,16 +172,16 @@ fn parse_format(value: &str) -> Result<Format, String> {
 
 fn help() -> String {
   "usage:
-  tokn-agent sessions list [--source pi|codex|opencode] [--session-dir <dir>]
-  tokn-agent sessions list [--source pi|codex|opencode] [--limit <n>]
-  tokn-agent sessions show [--source pi|codex|opencode] [--format pretty|jsonl] [--session-dir <dir>] <session-id-or-path>"
+  tokn-session sessions list [--source pi|codex|opencode] [--session-dir <dir>]
+  tokn-session sessions list [--source pi|codex|opencode] [--limit <n>]
+  tokn-session sessions show [--source pi|codex|opencode] [--format pretty|jsonl] [--session-dir <dir>] <session-id-or-path>"
     .to_string()
 }
 
 fn sessions_help() -> String {
   "usage:
-  tokn-agent sessions list [--source pi|codex|opencode] [--session-dir <dir>]
-  tokn-agent sessions list [--source pi|codex|opencode] [--limit <n>]
-  tokn-agent sessions show [--source pi|codex|opencode] [--format pretty|jsonl] [--session-dir <dir>] <session-id-or-path>"
+  tokn-session sessions list [--source pi|codex|opencode] [--session-dir <dir>]
+  tokn-session sessions list [--source pi|codex|opencode] [--limit <n>]
+  tokn-session sessions show [--source pi|codex|opencode] [--format pretty|jsonl] [--session-dir <dir>] <session-id-or-path>"
     .to_string()
 }

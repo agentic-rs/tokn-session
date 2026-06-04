@@ -266,35 +266,35 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokn-agent-cli"
+name = "tokn-session-cli"
 version = "0.1.0"
 dependencies = [
  "serde_json",
- "tokn-agent-client",
- "tokn-agent-core",
+ "tokn-session-client",
+ "tokn-session-core",
 ]
 
 [[package]]
-name = "tokn-agent-client"
+name = "tokn-session-client"
 version = "0.1.0"
 dependencies = [
- "tokn-agent-codex",
- "tokn-agent-core",
- "tokn-agent-opencode",
- "tokn-agent-pi",
+ "tokn-session-codex",
+ "tokn-session-core",
+ "tokn-session-opencode",
+ "tokn-session-pi",
 ]
 
 [[package]]
-name = "tokn-agent-codex"
+name = "tokn-session-codex"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "tokn-agent-core",
+ "tokn-session-core",
 ]
 
 [[package]]
-name = "tokn-agent-core"
+name = "tokn-session-core"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -302,22 +302,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokn-agent-opencode"
+name = "tokn-session-opencode"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "tokn-agent-core",
+ "tokn-session-core",
 ]
 
 [[package]]
-name = "tokn-agent-pi"
+name = "tokn-session-pi"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "tokn-agent-core",
+ "tokn-session-core",
 ]
 
 [[package]]

@@ -4,7 +4,7 @@ use crate::event::{
   CodexCompacted, CodexContentItem, CodexEvent, CodexEventMsg, CodexLine, CodexReasoningContent, CodexResponseItem,
   CodexSessionMeta,
 };
-use tokn_agent_core::{
+use tokn_session_core::{
   AgentEvent, ErrorEvent, GoalUpdated, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role,
   SessionStarted, ToolCallEvent, UnknownEvent,
 };

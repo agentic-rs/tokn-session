@@ -1,5 +1,5 @@
 [package]
-name = "tokn-agent-core"
+name = "tokn-session-core"
 version.workspace = true
 edition.workspace = true
 

@@ -4,7 +4,7 @@ use crate::event::{
   PiAssistantContentBlock, PiEvent, PiMessage, PiMessageEvent, PiToolResultContentBlock, PiUserContent,
   PiUserContentBlock,
 };
-use tokn_agent_core::{
+use tokn_session_core::{
   AgentEvent, ErrorEvent, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role, SessionStarted,
   ToolCallEvent, UnknownEvent,
 };

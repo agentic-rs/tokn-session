@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
-use tokn_agent_codex::CodexSessionSource;
-use tokn_agent_core::{LoadedSession, SessionRef};
-use tokn_agent_opencode::OpenCodeSessionSource;
-use tokn_agent_pi::PiSessionSource;
+use tokn_session_codex::CodexSessionSource;
+use tokn_session_core::{LoadedSession, SessionRef};
+use tokn_session_opencode::OpenCodeSessionSource;
+use tokn_session_pi::PiSessionSource;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Source {

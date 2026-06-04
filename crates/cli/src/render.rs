@@ -1,5 +1,5 @@
 use serde_json::Value;
-use tokn_agent_core::{AgentEvent, LoadedSession, Role, SessionRef};
+use tokn_session_core::{AgentEvent, LoadedSession, Role, SessionRef};
 
 pub fn render_session_list(sessions: &[SessionRef]) -> String {
   let mut output = String::new();

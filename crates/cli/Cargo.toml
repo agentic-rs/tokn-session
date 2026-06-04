@@ -1,14 +1,14 @@
 [package]
-name = "tokn-agent-cli"
+name = "tokn-session-cli"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "tokn-agent"
+name = "tokn-session"
 path = "src/main.rs"
 
 [dependencies]
 serde_json.workspace = true
-tokn-agent-client.workspace = true
-tokn-agent-core.workspace = true
+tokn-session-client.workspace = true
+tokn-session-core.workspace = true
 

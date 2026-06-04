@@ -3,7 +3,7 @@ use crate::event::{
   OpenCodeToolState,
 };
 use serde_json::{Value, json};
-use tokn_agent_core::{
+use tokn_session_core::{
   AgentEvent, ErrorEvent, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role, SessionStarted,
   ToolCallEvent, UnknownEvent,
 };
