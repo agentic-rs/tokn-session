@@ -1,7 +1,9 @@
 mod args;
+mod browser;
 mod render;
 
 use args::{Command, Format};
+use browser::browse_session;
 use render::{render_agent_jsonl, render_pretty, render_session_list};
 use tokn_session_client::AgentClient;
 
@@ -40,6 +42,14 @@ fn run() -> Result<(), String> {
         Format::Jsonl => print!("{}", render_agent_jsonl(&loaded.events)?),
       }
       Ok(())
+    }
+    Command::Browse {
+      source,
+      session,
+      session_dir,
+    } => {
+      let loaded = AgentClient::load_session(source, session_dir, &session)?;
+      browse_session(&loaded)
     }
   }
 }

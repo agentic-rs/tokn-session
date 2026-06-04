@@ -12,6 +12,7 @@ Implemented CLI:
 tokn-session list --source codex --limit 5
 tokn-session show --source opencode <session-id> --format pretty
 tokn-session show --source pi <session-id> --format jsonl
+tokn-session browse --source codex <session-id>
 ```
 
 The old `tokn-session sessions list/show` shape is intentionally unsupported.
@@ -63,6 +64,19 @@ read crates/cli/src/render.rs #call_abc
 ```
 
 Unknown tools still render their raw input/output so new provider shapes remain discoverable.
+
+`browse` is the first interactive historical-session view. It opens an alternate-screen item browser with one row per normalized event. Rows are collapsed by default; expanded rows reuse the same per-event pretty rendering as linear output.
+
+Current browser keys:
+
+- `j`/Down and `k`/Up move the selected event row.
+- `h` collapses the selected row; `l` expands it.
+- Enter/Space toggles expansion.
+- `z` expands only the selected row.
+- `C` collapses all rows.
+- `g`/Home and `G`/End jump to the first/last event.
+- Ctrl-D/Ctrl-U move by a coarse page.
+- `q`/Esc quits.
 
 ## Current Decisions And Edges
 

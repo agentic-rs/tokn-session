@@ -20,6 +20,11 @@ pub enum Command {
     format: Format,
     session_dir: Option<PathBuf>,
   },
+  Browse {
+    source: Source,
+    session: String,
+    session_dir: Option<PathBuf>,
+  },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,6 +74,25 @@ pub fn parse(args: Vec<String>) -> Result<Cli, String> {
           source,
           session: positionals.remove(0),
           format,
+          session_dir,
+        },
+      })
+    }
+    "browse" => {
+      let Options {
+        source,
+        format: _,
+        session_dir,
+        limit: _,
+        mut positionals,
+      } = parse_options(&args[1..])?;
+      if positionals.len() != 1 {
+        return Err("browse requires exactly one session id or path".to_string());
+      }
+      Ok(Cli {
+        command: Command::Browse {
+          source,
+          session: positionals.remove(0),
           session_dir,
         },
       })
@@ -157,6 +181,7 @@ fn help() -> String {
   "usage:
   tokn-session list [--source pi|codex|opencode] [--session-dir <dir>]
   tokn-session list [--source pi|codex|opencode] [--limit <n>]
-  tokn-session show [--source pi|codex|opencode] [--format pretty|jsonl] [--session-dir <dir>] <session-id-or-path>"
+  tokn-session show [--source pi|codex|opencode] [--format pretty|jsonl] [--session-dir <dir>] <session-id-or-path>
+  tokn-session browse [--source pi|codex|opencode] [--session-dir <dir>] <session-id-or-path>"
     .to_string()
 }

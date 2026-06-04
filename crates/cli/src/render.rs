@@ -36,76 +36,143 @@ pub fn render_pretty(session: &LoadedSession) -> String {
   ));
 
   for event in &session.events {
-    match event {
-      AgentEvent::SessionStarted(_) => {}
-      AgentEvent::ProviderChanged(event) => {
-        if let Some(model_id) = &event.model_id {
-          let provider = event.model_provider.as_deref().unwrap_or("model");
-          output.push_str(&format!("[model] {provider}/{model_id}\n\n"));
-        }
-        if let Some(level) = &event.thinking_level {
-          output.push_str(&format!("[thinking] {level}\n\n"));
-        }
-      }
-      AgentEvent::Message(event) => {
-        output.push_str(role_label(event.role));
-        output.push('\n');
-        write_indented(&mut output, &event.text);
-        output.push('\n');
-      }
-      AgentEvent::Reasoning(event) => {
-        if let Some(summary) = &event.summary {
-          output.push_str("reasoning summary\n");
-          write_indented(&mut output, summary);
-          output.push('\n');
-        }
-        if let Some(text) = &event.text {
-          output.push_str("reasoning\n");
-          write_indented(&mut output, text);
-          output.push('\n');
-        }
-      }
-      AgentEvent::GoalUpdated(event) => {
-        output.push_str("goal updated");
-        if let Some(status) = event.goal.as_ref().and_then(|goal| goal_string(goal, "status")) {
-          output.push_str(&format!(" [{status}]"));
-        }
-        if let Some(tokens_used) = event.goal.as_ref().and_then(|goal| goal_number(goal, "tokensUsed")) {
-          output.push_str(&format!(" tokens={tokens_used}"));
-        }
-        if let Some(time_used_seconds) = event
-          .goal
-          .as_ref()
-          .and_then(|goal| goal_number(goal, "timeUsedSeconds"))
-        {
-          output.push_str(&format!(" time={time_used_seconds}s"));
-        }
-        output.push('\n');
-        if let Some(objective) = event.goal.as_ref().and_then(|goal| goal_string(goal, "objective")) {
-          write_indented(&mut output, objective);
-        } else if let Some(goal) = &event.goal {
-          write_indented(&mut output, &goal.to_string());
-        }
-        output.push('\n');
-      }
-      AgentEvent::ToolCall(event) => {
-        render_tool(&mut output, event);
-      }
-      AgentEvent::Error(event) => {
-        output.push_str("error\n");
-        write_indented(&mut output, &event.message);
-        output.push('\n');
-      }
-      AgentEvent::Unknown(event) => {
-        output.push_str(&format!(
-          "unknown {}\n\n",
-          event.native_type.as_deref().unwrap_or("event")
-        ));
-      }
-    }
+    output.push_str(&render_event_pretty(event));
   }
 
   output
+}
+
+pub fn render_event_pretty(event: &AgentEvent) -> String {
+  let mut output = String::new();
+  match event {
+    AgentEvent::SessionStarted(_) => {}
+    AgentEvent::ProviderChanged(event) => {
+      if let Some(model_id) = &event.model_id {
+        let provider = event.model_provider.as_deref().unwrap_or("model");
+        output.push_str(&format!("[model] {provider}/{model_id}\n\n"));
+      }
+      if let Some(level) = &event.thinking_level {
+        output.push_str(&format!("[thinking] {level}\n\n"));
+      }
+    }
+    AgentEvent::Message(event) => {
+      output.push_str(role_label(event.role));
+      output.push('\n');
+      write_indented(&mut output, &event.text);
+      output.push('\n');
+    }
+    AgentEvent::Reasoning(event) => {
+      if let Some(summary) = &event.summary {
+        output.push_str("reasoning summary\n");
+        write_indented(&mut output, summary);
+        output.push('\n');
+      }
+      if let Some(text) = &event.text {
+        output.push_str("reasoning\n");
+        write_indented(&mut output, text);
+        output.push('\n');
+      }
+    }
+    AgentEvent::GoalUpdated(event) => {
+      output.push_str("goal updated");
+      if let Some(status) = event.goal.as_ref().and_then(|goal| goal_string(goal, "status")) {
+        output.push_str(&format!(" [{status}]"));
+      }
+      if let Some(tokens_used) = event.goal.as_ref().and_then(|goal| goal_number(goal, "tokensUsed")) {
+        output.push_str(&format!(" tokens={tokens_used}"));
+      }
+      if let Some(time_used_seconds) = event
+        .goal
+        .as_ref()
+        .and_then(|goal| goal_number(goal, "timeUsedSeconds"))
+      {
+        output.push_str(&format!(" time={time_used_seconds}s"));
+      }
+      output.push('\n');
+      if let Some(objective) = event.goal.as_ref().and_then(|goal| goal_string(goal, "objective")) {
+        write_indented(&mut output, objective);
+      } else if let Some(goal) = &event.goal {
+        write_indented(&mut output, &goal.to_string());
+      }
+      output.push('\n');
+    }
+    AgentEvent::ToolCall(event) => {
+      render_tool(&mut output, event);
+    }
+    AgentEvent::Error(event) => {
+      output.push_str("error\n");
+      write_indented(&mut output, &event.message);
+      output.push('\n');
+    }
+    AgentEvent::Unknown(event) => {
+      output.push_str(&format!(
+        "unknown {}\n\n",
+        event.native_type.as_deref().unwrap_or("event")
+      ));
+    }
+  }
+  output
+}
+
+pub fn render_event_summary(event: &AgentEvent) -> String {
+  match event {
+    AgentEvent::SessionStarted(event) => format!("session started {}", event.session_id),
+    AgentEvent::ProviderChanged(event) => {
+      if let Some(model_id) = &event.model_id {
+        let provider = event.model_provider.as_deref().unwrap_or("model");
+        format!("model {provider}/{model_id}")
+      } else if let Some(level) = &event.thinking_level {
+        format!("thinking {level}")
+      } else {
+        "provider changed".to_string()
+      }
+    }
+    AgentEvent::Message(event) => format!("{} {}", role_label(event.role), first_line(&event.text)),
+    AgentEvent::Reasoning(event) => {
+      if let Some(summary) = &event.summary {
+        format!("reasoning summary {}", first_line(summary))
+      } else if let Some(text) = &event.text {
+        format!("reasoning {}", first_line(text))
+      } else {
+        "reasoning encrypted".to_string()
+      }
+    }
+    AgentEvent::GoalUpdated(event) => {
+      let mut summary = "goal updated".to_string();
+      if let Some(status) = event.goal.as_ref().and_then(|goal| goal_string(goal, "status")) {
+        summary.push_str(&format!(" [{status}]"));
+      }
+      if let Some(objective) = event.goal.as_ref().and_then(|goal| goal_string(goal, "objective")) {
+        summary.push(' ');
+        summary.push_str(first_line(objective));
+      }
+      summary
+    }
+    AgentEvent::ToolCall(event) => render_tool_summary(event).unwrap_or_else(|| {
+      let mut summary = "tool".to_string();
+      if let Some(name) = &event.tool_name {
+        summary.push(' ');
+        summary.push_str(name);
+      }
+      append_tool_id(&mut summary, event);
+      summary
+    }),
+    AgentEvent::Error(event) => format!("error {}", first_line(&event.message)),
+    AgentEvent::Unknown(event) => format!("unknown {}", event.native_type.as_deref().unwrap_or("event")),
+  }
+}
+
+pub fn event_type(event: &AgentEvent) -> &'static str {
+  match event {
+    AgentEvent::SessionStarted(_) => "session",
+    AgentEvent::ProviderChanged(_) => "provider",
+    AgentEvent::Message(_) => "message",
+    AgentEvent::Reasoning(_) => "reasoning",
+    AgentEvent::GoalUpdated(_) => "goal",
+    AgentEvent::ToolCall(_) => "tool",
+    AgentEvent::Error(_) => "error",
+    AgentEvent::Unknown(_) => "unknown",
+  }
 }
 
 fn render_tool(output: &mut String, event: &ToolCallEvent) {
@@ -247,6 +314,10 @@ fn write_indented(output: &mut String, text: &str) {
   }
 }
 
+fn first_line(text: &str) -> &str {
+  text.trim().lines().next().unwrap_or("")
+}
+
 #[cfg(test)]
 mod tests {
   use std::path::PathBuf;
@@ -282,6 +353,31 @@ mod tests {
 
     assert!(output.contains("shell started cargo test #call\n"));
     assert!(!output.contains("input:"));
+  }
+
+  #[test]
+  fn render_event_summary_keeps_tool_ids() {
+    let event = AgentEvent::ToolCall(ToolCallEvent {
+      provider: Provider::Codex,
+      session_id: Some("session".to_string()),
+      message_id: None,
+      parent_id: None,
+      tool_call_id: Some("call".to_string()),
+      tool_name: Some("exec_command".to_string()),
+      tool_kind: ToolKind::Shell,
+      summary: Some(ToolSummary::Shell {
+        command: Some("cargo check".to_string()),
+        cwd: None,
+        exit_code: None,
+      }),
+      phase: Phase::Finished,
+      input: None,
+      output: None,
+      is_error: None,
+      timestamp: None,
+    });
+
+    assert_eq!(render_event_summary(&event), "shell cargo check #call");
   }
 
   #[test]

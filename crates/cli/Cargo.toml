@@ -8,7 +8,8 @@ name = "tokn-session"
 path = "src/main.rs"
 
 [dependencies]
+crossterm.workspace = true
+ratatui.workspace = true
 serde_json.workspace = true
 tokn-session-client.workspace = true
 tokn-session-core.workspace = true
-
