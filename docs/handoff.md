@@ -65,18 +65,20 @@ read crates/cli/src/render.rs #call_abc
 
 Unknown tools still render their raw input/output so new provider shapes remain discoverable.
 
-`browse` is the first interactive historical-session view. It opens an alternate-screen item browser with one row per normalized event. Rows are collapsed by default; expanded rows reuse the same per-event pretty rendering as linear output.
+`browse` is the first interactive historical-session view. Without a session id, it opens an alternate-screen session list; Enter opens the selected session. With a session id, it opens the event browser directly. The event browser uses one row per normalized event. Rows are collapsed by default; expanded rows reuse the same per-event pretty rendering as linear output.
 
 Current browser keys:
 
 - `j`/Down and `k`/Up move the selected event row.
 - `h` collapses the selected row; `l` expands it.
 - Enter/Space toggles expansion.
+- In the session list, Enter opens the selected session.
 - `z` expands only the selected row.
 - `C` collapses all rows.
 - `g`/Home and `G`/End jump to the first/last event.
 - Ctrl-D/Ctrl-U move by a coarse page.
-- `q`/Esc quits.
+- In the event browser opened from the session list, `q`/Esc returns to the session list.
+- In direct event browsing and the session list, `q`/Esc quits.
 
 ## Current Decisions And Edges
 

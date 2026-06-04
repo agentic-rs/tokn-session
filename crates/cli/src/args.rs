@@ -22,7 +22,7 @@ pub enum Command {
   },
   Browse {
     source: Source,
-    session: String,
+    session: Option<String>,
     session_dir: Option<PathBuf>,
   },
 }
@@ -86,13 +86,13 @@ pub fn parse(args: Vec<String>) -> Result<Cli, String> {
         limit: _,
         mut positionals,
       } = parse_options(&args[1..])?;
-      if positionals.len() != 1 {
-        return Err("browse requires exactly one session id or path".to_string());
+      if positionals.len() > 1 {
+        return Err("browse accepts at most one session id or path".to_string());
       }
       Ok(Cli {
         command: Command::Browse {
           source,
-          session: positionals.remove(0),
+          session: positionals.pop(),
           session_dir,
         },
       })
@@ -182,6 +182,6 @@ fn help() -> String {
   tokn-session list [--source pi|codex|opencode] [--session-dir <dir>]
   tokn-session list [--source pi|codex|opencode] [--limit <n>]
   tokn-session show [--source pi|codex|opencode] [--format pretty|jsonl] [--session-dir <dir>] <session-id-or-path>
-  tokn-session browse [--source pi|codex|opencode] [--session-dir <dir>] <session-id-or-path>"
+  tokn-session browse [--source pi|codex|opencode] [--session-dir <dir>] [session-id-or-path]"
     .to_string()
 }

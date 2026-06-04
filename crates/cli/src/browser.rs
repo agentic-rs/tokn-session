@@ -11,13 +11,23 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use tokn_session_core::{AgentEvent, LoadedSession};
+use tokn_session_core::{AgentEvent, LoadedSession, SessionRef};
 
 use crate::render::{event_type, render_event_pretty, render_event_summary};
 
 pub fn browse_session(session: &LoadedSession) -> Result<(), String> {
   let mut terminal = BrowserTerminal::enter()?;
   let result = EventBrowser::new(session).run(&mut terminal.terminal);
+  terminal.leave()?;
+  result
+}
+
+pub fn browse_sessions<F>(sessions: Vec<SessionRef>, mut load_session: F) -> Result<(), String>
+where
+  F: FnMut(&str) -> Result<LoadedSession, String>,
+{
+  let mut terminal = BrowserTerminal::enter()?;
+  let result = SessionBrowser::new(sessions).run(&mut terminal.terminal, &mut load_session);
   terminal.leave()?;
   result
 }
@@ -64,6 +74,177 @@ struct EventBrowser {
   selected: usize,
   scroll: usize,
   expanded: BTreeSet<usize>,
+}
+
+struct SessionBrowser {
+  sessions: Vec<SessionRef>,
+  selected: usize,
+  scroll: usize,
+}
+
+enum SessionBrowserAction {
+  Continue,
+  Quit,
+  Open(String),
+}
+
+impl SessionBrowser {
+  fn new(sessions: Vec<SessionRef>) -> Self {
+    Self {
+      sessions,
+      selected: 0,
+      scroll: 0,
+    }
+  }
+
+  fn run<F>(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>, load_session: &mut F) -> Result<(), String>
+  where
+    F: FnMut(&str) -> Result<LoadedSession, String>,
+  {
+    loop {
+      terminal
+        .draw(|frame| self.draw(frame))
+        .map_err(|err| format!("failed to draw session browser: {err}"))?;
+
+      if !event::poll(Duration::from_millis(200)).map_err(|err| format!("failed to poll events: {err}"))? {
+        continue;
+      }
+
+      let Event::Key(key) = event::read().map_err(|err| format!("failed to read event: {err}"))? else {
+        continue;
+      };
+      match self.handle_key(key) {
+        SessionBrowserAction::Continue => {}
+        SessionBrowserAction::Quit => return Ok(()),
+        SessionBrowserAction::Open(id) => {
+          let loaded = load_session(&id)?;
+          EventBrowser::new(&loaded).run(terminal)?;
+        }
+      }
+    }
+  }
+
+  fn draw(&mut self, frame: &mut ratatui::Frame<'_>) {
+    let area = frame.area();
+    let chunks = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(area);
+    let help = format!(
+      "Sessions  {}/{}  j/k move  Enter open  q quit",
+      self.selected.saturating_add(1),
+      self.sessions.len()
+    );
+    frame.render_widget(
+      Paragraph::new(help).block(Block::default().borders(Borders::BOTTOM)),
+      chunks[0],
+    );
+
+    let height = chunks[1].height as usize;
+    self.keep_selected_visible(height);
+    frame.render_widget(Paragraph::new(self.visible_lines(height)), chunks[1]);
+  }
+
+  fn handle_key(&mut self, key: KeyEvent) -> SessionBrowserAction {
+    match key.code {
+      KeyCode::Char('q') | KeyCode::Esc => SessionBrowserAction::Quit,
+      KeyCode::Enter => self
+        .sessions
+        .get(self.selected)
+        .map(|session| SessionBrowserAction::Open(session.id.clone()))
+        .unwrap_or(SessionBrowserAction::Continue),
+      KeyCode::Char('j') | KeyCode::Down => {
+        self.select_next();
+        SessionBrowserAction::Continue
+      }
+      KeyCode::Char('k') | KeyCode::Up => {
+        self.select_previous();
+        SessionBrowserAction::Continue
+      }
+      KeyCode::Char('g') | KeyCode::Home => {
+        self.select_first();
+        SessionBrowserAction::Continue
+      }
+      KeyCode::Char('G') | KeyCode::End => {
+        self.select_last();
+        SessionBrowserAction::Continue
+      }
+      KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        self.page_down();
+        SessionBrowserAction::Continue
+      }
+      KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        self.page_up();
+        SessionBrowserAction::Continue
+      }
+      _ => SessionBrowserAction::Continue,
+    }
+  }
+
+  fn select_next(&mut self) {
+    if self.selected + 1 < self.sessions.len() {
+      self.selected += 1;
+    }
+  }
+
+  fn select_previous(&mut self) {
+    self.selected = self.selected.saturating_sub(1);
+  }
+
+  fn select_first(&mut self) {
+    self.selected = 0;
+  }
+
+  fn select_last(&mut self) {
+    if !self.sessions.is_empty() {
+      self.selected = self.sessions.len() - 1;
+    }
+  }
+
+  fn page_down(&mut self) {
+    self.selected = (self.selected + 10).min(self.sessions.len().saturating_sub(1));
+  }
+
+  fn page_up(&mut self) {
+    self.selected = self.selected.saturating_sub(10);
+  }
+
+  fn keep_selected_visible(&mut self, height: usize) {
+    if height == 0 {
+      return;
+    }
+    if self.selected < self.scroll {
+      self.scroll = self.selected;
+    }
+    if self.selected >= self.scroll + height {
+      self.scroll = self.selected.saturating_sub(height - 1);
+    }
+  }
+
+  fn visible_lines(&self, height: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for index in self.scroll..self.sessions.len() {
+      if lines.len() >= height {
+        break;
+      }
+      let session = &self.sessions[index];
+      let cursor = if index == self.selected { ">" } else { " " };
+      let text = format!(
+        "{cursor} {:04} {:<36} {:<25} {:>6}  {}",
+        index + 1,
+        truncate(&session.id, 36),
+        truncate(session.timestamp.as_deref().unwrap_or("-"), 25),
+        session.message_count,
+        session.cwd.as_deref().unwrap_or("-"),
+      );
+      if index == self.selected {
+        lines.push(Line::from(Span::styled(
+          text,
+          Style::default().add_modifier(Modifier::REVERSED),
+        )));
+      } else {
+        lines.push(Line::from(text));
+      }
+    }
+    lines
+  }
 }
 
 impl EventBrowser {
@@ -251,4 +432,12 @@ impl EventRow {
       .map(|line| Line::from(format!("      {line}")))
       .collect()
   }
+}
+
+fn truncate(value: &str, max: usize) -> String {
+  let mut output = String::new();
+  for character in value.chars().take(max) {
+    output.push(character);
+  }
+  output
 }

@@ -3,7 +3,7 @@ mod browser;
 mod render;
 
 use args::{Command, Format};
-use browser::browse_session;
+use browser::{browse_session, browse_sessions};
 use render::{render_agent_jsonl, render_pretty, render_session_list};
 use tokn_session_client::AgentClient;
 
@@ -48,8 +48,15 @@ fn run() -> Result<(), String> {
       session,
       session_dir,
     } => {
-      let loaded = AgentClient::load_session(source, session_dir, &session)?;
-      browse_session(&loaded)
+      if let Some(session) = session {
+        let loaded = AgentClient::load_session(source, session_dir, &session)?;
+        return browse_session(&loaded);
+      }
+
+      let sessions = AgentClient::list_sessions(source, session_dir.clone())?;
+      browse_sessions(sessions, |session| {
+        AgentClient::load_session(source, session_dir.clone(), session)
+      })
     }
   }
 }
