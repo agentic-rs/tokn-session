@@ -1,6 +1,20 @@
 use serde_json::Value;
 use tokn_session_core::{AgentEvent, LoadedSession, Phase, Role, SessionRef, ToolCallEvent, ToolKind, ToolSummary};
 
+pub struct EventDisplay {
+  pub kind: &'static str,
+  pub summary: String,
+  pub detail: String,
+}
+
+pub fn display_event(event: &AgentEvent) -> EventDisplay {
+  EventDisplay {
+    kind: event_type(event),
+    summary: render_event_summary(event),
+    detail: render_event_pretty(event),
+  }
+}
+
 pub fn render_session_list(sessions: &[SessionRef]) -> String {
   let mut output = String::new();
   output.push_str("id                                    updated_at                 messages  cwd\n");
@@ -326,6 +340,35 @@ mod tests {
   use tokn_session_core::{AgentEvent, LoadedSession, Provider, SessionRef};
 
   use super::*;
+
+  #[test]
+  fn display_event_exposes_summary_and_detail() {
+    let event = AgentEvent::ToolCall(ToolCallEvent {
+      provider: Provider::Codex,
+      session_id: Some("session".to_string()),
+      message_id: None,
+      parent_id: None,
+      tool_call_id: Some("call".to_string()),
+      tool_name: Some("exec_command".to_string()),
+      tool_kind: ToolKind::Shell,
+      summary: Some(ToolSummary::Shell {
+        command: Some("cargo check".to_string()),
+        cwd: None,
+        exit_code: None,
+      }),
+      phase: Phase::Finished,
+      input: None,
+      output: None,
+      is_error: None,
+      timestamp: None,
+    });
+
+    let display = display_event(&event);
+
+    assert_eq!(display.kind, "tool");
+    assert_eq!(display.summary, "shell cargo check #call");
+    assert_eq!(display.detail, "shell cargo check #call\n\n");
+  }
 
   #[test]
   fn render_pretty_summarizes_shell_tools() {

@@ -12,8 +12,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use tokn_session_core::{AgentEvent, LoadedSession, SessionRef};
-
-use crate::render::{event_type, render_event_pretty, render_event_summary};
+use tokn_session_render::{EventDisplay, display_event};
 
 pub fn browse_session(session: &LoadedSession) -> Result<(), String> {
   let mut terminal = BrowserTerminal::enter()?;
@@ -419,11 +418,7 @@ struct EventRow {
 impl EventRow {
   fn new((index, event): (usize, &AgentEvent)) -> Self {
     let _ = index;
-    Self {
-      kind: event_type(event),
-      summary: render_event_summary(event),
-      detail: render_event_pretty(event),
-    }
+    Self::from(display_event(event))
   }
 
   fn header_line(&self, index: usize, selected: bool, expanded: bool) -> Line<'static> {
@@ -448,6 +443,16 @@ impl EventRow {
 
   fn detail_line_count(&self) -> usize {
     self.detail.trim_matches('\n').lines().count()
+  }
+}
+
+impl From<EventDisplay> for EventRow {
+  fn from(display: EventDisplay) -> Self {
+    Self {
+      kind: display.kind,
+      summary: display.summary,
+      detail: display.detail,
+    }
   }
 }
 

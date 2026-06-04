@@ -5,6 +5,7 @@ members = [
   "crates/pi",
   "crates/opencode",
   "crates/client",
+  "crates/render",
   "crates/cli",
 ]
 resolver = "2"
@@ -23,3 +24,4 @@ tokn-session-codex = { path = "crates/codex" }
 tokn-session-core = { path = "crates/core" }
 tokn-session-opencode = { path = "crates/opencode" }
 tokn-session-pi = { path = "crates/pi" }
+tokn-session-render = { path = "crates/render" }

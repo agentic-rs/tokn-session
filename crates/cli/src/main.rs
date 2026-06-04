@@ -1,11 +1,10 @@
 mod args;
 mod browser;
-mod render;
 
 use args::{Command, Format};
 use browser::{browse_session, browse_sessions};
-use render::{render_agent_jsonl, render_pretty, render_session_list};
 use tokn_session_client::AgentClient;
+use tokn_session_render::{render_agent_jsonl, render_pretty, render_session_list};
 
 fn main() {
   if let Err(err) = run() {

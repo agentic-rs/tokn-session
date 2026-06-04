@@ -647,6 +647,7 @@ dependencies = [
  "serde_json",
  "tokn-session-client",
  "tokn-session-core",
+ "tokn-session-render",
 ]
 
 [[package]]
@@ -691,6 +692,14 @@ name = "tokn-session-pi"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
+ "tokn-session-core",
+]
+
+[[package]]
+name = "tokn-session-render"
+version = "0.1.0"
+dependencies = [
  "serde_json",
  "tokn-session-core",
 ]

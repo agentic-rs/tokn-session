@@ -55,6 +55,8 @@ Reasoning is intentionally flat:
 
 Pretty rendering shows visible reasoning text and summaries, but does not display encrypted reasoning payloads. JSONL preserves encrypted reasoning in the IR.
 
+Reusable display formatting lives in `crates/render`. It depends on `core`, not on terminal libraries. The CLI uses it for linear output and the interactive browser uses its `EventDisplay` rows for collapsed summaries and expanded detail.
+
 Pretty rendering also prefers compact semantic tool lines, such as:
 
 ```text

@@ -1,0 +1,8 @@
+[package]
+name = "tokn-session-render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+tokn-session-core.workspace = true
