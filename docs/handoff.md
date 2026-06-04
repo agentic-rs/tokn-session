@@ -100,6 +100,8 @@ Current browser keys:
 
 ## Useful Smokes
 
+GitHub Actions CI runs format check, workspace check/test, and CLI build on pushes to `main` and pull requests.
+
 ```sh
 cargo run -p tokn-session-cli -- list --source codex --limit 1
 cargo run -p tokn-session-cli -- list --source opencode --limit 1
