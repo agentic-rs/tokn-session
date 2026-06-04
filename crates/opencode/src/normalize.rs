@@ -5,7 +5,7 @@ use crate::event::{
 use serde_json::{Value, json};
 use tokn_session_core::{
   AgentEvent, ErrorEvent, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role, SessionStarted,
-  ToolCallEvent, UnknownEvent,
+  ToolCallEvent, UnknownEvent, tool_kind_for_optional_name, tool_summary_for_io,
 };
 
 pub struct OpenCodeNormalizer {
@@ -242,6 +242,8 @@ fn tool_event(
     message_id: Some(message_id),
     parent_id,
     tool_call_id: call_id,
+    tool_kind: tool_kind_for_optional_name(tool.as_deref()),
+    summary: tool_summary_for_io(tool.as_deref(), input.as_ref(), output.as_ref()),
     tool_name: tool,
     phase,
     input,

@@ -38,6 +38,13 @@ Current event families include:
 - `error`
 - `unknown`
 
+Tool calls now carry semantic display metadata:
+
+- `tool_kind`: `shell`, `file_read`, `file_write`, `file_edit`, `search`, `web`, `task`, or `unknown`
+- `summary`: compact facts for known tool families, such as shell command/exit code or file edit path and rough line counts
+
+Raw `input` and `output` remain in the IR for debugging and provider-native detail.
+
 Reasoning is intentionally flat:
 
 - `text`
@@ -47,9 +54,20 @@ Reasoning is intentionally flat:
 
 Pretty rendering shows visible reasoning text and summaries, but does not display encrypted reasoning payloads. JSONL preserves encrypted reasoning in the IR.
 
+Pretty rendering also prefers compact semantic tool lines, such as:
+
+```text
+shell cargo test
+edit crates/core/src/agent_event.rs +4 -1
+read crates/cli/src/render.rs
+```
+
+Unknown tools still render their raw input/output so new provider shapes remain discoverable.
+
 ## Current Decisions And Edges
 
 - OpenCode shell tools with nonzero `metadata.exit` are marked as errors even when OpenCode records the tool state as completed.
+- Tool kind classification and summary extraction live in `crates/core`; provider normalizers should use the shared helpers where possible.
 - OpenCode support currently uses the legacy-compatible `message` and `part` tables seen in local data, not the newer `session_message` projection.
 - Codex `event_msg.thread_goal_updated` maps to the visible `goal_updated` IR event.
 - Timestamps are provider-native strings/numbers today; there is no unified timestamp type yet.

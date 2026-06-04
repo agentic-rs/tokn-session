@@ -183,6 +183,7 @@ pub enum CodexEventMsg {
     stdout: String,
     stderr: String,
     success: bool,
+    changes: Option<Value>,
     status: String,
   },
   TokenCount {},

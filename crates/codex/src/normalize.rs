@@ -6,7 +6,8 @@ use crate::event::{
 };
 use tokn_session_core::{
   AgentEvent, ErrorEvent, GoalUpdated, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role,
-  SessionStarted, ToolCallEvent, UnknownEvent,
+  SessionStarted, ToolCallEvent, ToolKind, ToolSummary, UnknownEvent, patch_summary, tool_kind_for_name,
+  tool_kind_for_optional_name, tool_summary_for_input, tool_summary_for_io,
 };
 
 pub struct CodexNormalizer {
@@ -111,19 +112,25 @@ fn normalize_response_item(
       namespace,
       arguments,
       call_id,
-    } => vec![AgentEvent::ToolCall(ToolCallEvent {
-      provider: Provider::Codex,
-      session_id,
-      message_id: id,
-      parent_id: None,
-      tool_call_id: Some(call_id),
-      tool_name: Some(namespace.map_or(name.clone(), |namespace| format!("{namespace}.{name}"))),
-      phase: Phase::Finished,
-      input: Some(parse_json_string_or_text(arguments)),
-      output: None,
-      is_error: None,
-      timestamp,
-    })],
+    } => {
+      let tool_name = namespace.map_or(name.clone(), |namespace| format!("{namespace}.{name}"));
+      let input = parse_json_string_or_text(arguments);
+      vec![AgentEvent::ToolCall(ToolCallEvent {
+        provider: Provider::Codex,
+        session_id,
+        message_id: id,
+        parent_id: None,
+        tool_call_id: Some(call_id),
+        tool_name: Some(tool_name.clone()),
+        tool_kind: tool_kind_for_name(&tool_name),
+        summary: tool_summary_for_input(&tool_name, &input),
+        phase: Phase::Finished,
+        input: Some(input),
+        output: None,
+        is_error: None,
+        timestamp,
+      })]
+    }
     CodexResponseItem::FunctionCallOutput { call_id, output } => {
       vec![tool_output_event(session_id, call_id, None, output, timestamp)]
     }
@@ -139,6 +146,8 @@ fn normalize_response_item(
       parent_id: None,
       tool_call_id: call_id,
       tool_name: Some("local_shell".to_string()),
+      tool_kind: ToolKind::Shell,
+      summary: tool_summary_for_input("local_shell", &action),
       phase: Phase::Finished,
       input: Some(action),
       output: status.map(Value::String),
@@ -151,19 +160,24 @@ fn normalize_response_item(
       call_id,
       name,
       input,
-    } => vec![AgentEvent::ToolCall(ToolCallEvent {
-      provider: Provider::Codex,
-      session_id,
-      message_id: id,
-      parent_id: None,
-      tool_call_id: Some(call_id),
-      tool_name: Some(name),
-      phase: Phase::Finished,
-      input: Some(parse_json_string_or_text(input)),
-      output: status.map(Value::String),
-      is_error: None,
-      timestamp,
-    })],
+    } => {
+      let input = parse_json_string_or_text(input);
+      vec![AgentEvent::ToolCall(ToolCallEvent {
+        provider: Provider::Codex,
+        session_id,
+        message_id: id,
+        parent_id: None,
+        tool_call_id: Some(call_id),
+        tool_name: Some(name.clone()),
+        tool_kind: tool_kind_for_name(&name),
+        summary: tool_summary_for_input(&name, &input),
+        phase: Phase::Finished,
+        input: Some(input),
+        output: status.map(Value::String),
+        is_error: None,
+        timestamp,
+      })]
+    }
     CodexResponseItem::CustomToolCallOutput { call_id, name, output } => {
       vec![tool_output_event(session_id, call_id, name, output, timestamp)]
     }
@@ -179,6 +193,8 @@ fn normalize_response_item(
       parent_id: None,
       tool_call_id: call_id,
       tool_name: Some("web_search".to_string()),
+      tool_kind: tool_kind_for_name("web_search"),
+      summary: tool_summary_for_input("web_search", &action),
       phase: Phase::Finished,
       input: Some(action),
       output: status.map(Value::String),
@@ -198,6 +214,8 @@ fn normalize_response_item(
       parent_id: None,
       tool_call_id: call_id,
       tool_name: Some(format!("tool_search.{execution}")),
+      tool_kind: ToolKind::Search,
+      summary: tool_summary_for_input("search", &arguments),
       phase: Phase::Finished,
       input: Some(arguments),
       output: status.map(Value::String),
@@ -216,6 +234,8 @@ fn normalize_response_item(
       parent_id: None,
       tool_call_id: call_id,
       tool_name: Some(format!("tool_search.{execution}")),
+      tool_kind: ToolKind::Search,
+      summary: None,
       phase: Phase::Finished,
       input: None,
       output: Some(serde_json::json!({ "status": status, "tools": tools })),
@@ -311,6 +331,12 @@ fn normalize_event_msg(session_id: Option<String>, event: CodexEventMsg, timesta
       parent_id: None,
       tool_call_id: call_id,
       tool_name: Some("exec_command".to_string()),
+      tool_kind: ToolKind::Shell,
+      summary: Some(ToolSummary::Shell {
+        command: Some(command.join(" ")),
+        cwd: None,
+        exit_code: None,
+      }),
       phase: Phase::Started,
       input: Some(Value::Array(command.into_iter().map(Value::String).collect())),
       output: None,
@@ -324,6 +350,12 @@ fn normalize_event_msg(session_id: Option<String>, event: CodexEventMsg, timesta
       parent_id: None,
       tool_call_id: call_id,
       tool_name: Some("exec_command".to_string()),
+      tool_kind: ToolKind::Shell,
+      summary: Some(ToolSummary::Shell {
+        command: None,
+        cwd: None,
+        exit_code: None,
+      }),
       phase: Phase::Finished,
       input: None,
       output: status.map(Value::String),
@@ -340,7 +372,9 @@ fn normalize_event_msg(session_id: Option<String>, event: CodexEventMsg, timesta
       message_id: None,
       parent_id: None,
       tool_call_id: call_id,
-      tool_name: name,
+      tool_name: name.clone(),
+      tool_kind: tool_kind_for_optional_name(name.as_deref()),
+      summary: tool_summary_for_io(name.as_deref(), arguments.as_ref(), None),
       phase: Phase::Started,
       input: arguments,
       output: None,
@@ -358,7 +392,9 @@ fn normalize_event_msg(session_id: Option<String>, event: CodexEventMsg, timesta
       message_id: None,
       parent_id: None,
       tool_call_id: call_id,
-      tool_name: name,
+      tool_name: name.clone(),
+      tool_kind: tool_kind_for_optional_name(name.as_deref()),
+      summary: None,
       phase: Phase::Finished,
       input: None,
       output: result.or_else(|| error.clone()),
@@ -378,6 +414,8 @@ fn normalize_event_msg(session_id: Option<String>, event: CodexEventMsg, timesta
       parent_id: None,
       tool_call_id: Some(call_id),
       tool_name: Some("apply_patch".to_string()),
+      tool_kind: ToolKind::FileEdit,
+      summary: Some(patch_summary(&changes)),
       phase: Phase::Started,
       input: Some(changes),
       output: None,
@@ -389,6 +427,7 @@ fn normalize_event_msg(session_id: Option<String>, event: CodexEventMsg, timesta
       stdout,
       stderr,
       success,
+      changes,
       status,
     } => vec![AgentEvent::ToolCall(ToolCallEvent {
       provider: Provider::Codex,
@@ -397,6 +436,8 @@ fn normalize_event_msg(session_id: Option<String>, event: CodexEventMsg, timesta
       parent_id: None,
       tool_call_id: Some(call_id),
       tool_name: Some("apply_patch".to_string()),
+      tool_kind: ToolKind::FileEdit,
+      summary: changes.as_ref().map(patch_summary),
       phase: Phase::Finished,
       input: None,
       output: Some(serde_json::json!({
@@ -499,7 +540,9 @@ fn tool_output_event(
     message_id: None,
     parent_id: None,
     tool_call_id: Some(call_id),
-    tool_name: name,
+    tool_name: name.clone(),
+    tool_kind: tool_kind_for_optional_name(name.as_deref()),
+    summary: None,
     phase: Phase::Finished,
     input: None,
     output: Some(output),

@@ -6,7 +6,7 @@ use crate::event::{
 };
 use tokn_session_core::{
   AgentEvent, ErrorEvent, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role, SessionStarted,
-  ToolCallEvent, UnknownEvent,
+  ToolCallEvent, UnknownEvent, tool_kind_for_name, tool_summary_for_input,
 };
 
 pub struct PiNormalizer {
@@ -187,7 +187,9 @@ fn normalize_assistant_message(
         message_id: meta.id.clone(),
         parent_id: meta.parent_id.clone(),
         tool_call_id: Some(id),
-        tool_name: Some(name),
+        tool_name: Some(name.clone()),
+        tool_kind: tool_kind_for_name(&name),
+        summary: tool_summary_for_input(&name, &arguments),
         phase: Phase::Finished,
         input: Some(arguments),
         output: None,
@@ -224,7 +226,9 @@ fn normalize_tool_result_message(
     message_id: meta.id.clone(),
     parent_id: meta.parent_id.clone(),
     tool_call_id: Some(message.tool_call_id),
-    tool_name: Some(message.tool_name),
+    tool_name: Some(message.tool_name.clone()),
+    tool_kind: tool_kind_for_name(&message.tool_name),
+    summary: tool_summary_for_input(&message.tool_name, &output),
     phase: Phase::Finished,
     input: None,
     output: Some(output),
