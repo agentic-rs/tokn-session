@@ -1,14 +1,39 @@
 # Agent Notes
 
-This repository is `tokn-session`, a Rust CLI and library workspace for viewing and eventually creating/attaching agent sessions across multiple providers.
+This file is the front door for AI agents working in this repo. Read it before editing. For current implementation status and next likely work, also read `docs/handoff.md` before non-trivial changes.
 
-## Current Shape
+## Goal
+
+`tokn-session` is a provider-agnostic session layer for agent tools.
+
+It should let users:
+
+- list existing sessions across providers
+- show sessions as a normalized event stream
+- create new provider sessions through one CLI
+- attach to or resume existing sessions
+- preserve enough provider-native detail to keep displays useful and debugging possible
+
+The long-term command shape is:
+
+```sh
+tokn-session list --source codex
+tokn-session show --source opencode <session-id>
+tokn-session create --source opencode "create a todo app"
+tokn-session attach <session-id>
+```
+
+The core abstraction is `AgentEvent`: provider-native historical sessions and live streams should normalize into this IR for display/export.
+
+## Stable Shape
 
 - The CLI binary is `tokn-session`.
-- Commands are top-level: `list` and `show`. Do not reintroduce a `sessions` namespace.
+- Commands are top-level. Do not reintroduce a `sessions` namespace.
 - Supported sources today are `pi`, `codex`, and `opencode`.
-- The current product focus is session interoperability: read provider-native session stores, normalize them into `AgentEvent`, and render/export them.
+- Current implemented commands are `list` and `show`.
 - Future likely commands are `create` and `attach`.
+- Provider-native events are normalized for display first; exact round-trip preservation is not a current goal.
+- Unknown events should stay visible enough to discover new provider shapes.
 
 ## Workspace
 
@@ -20,13 +45,11 @@ This repository is `tokn-session`, a Rust CLI and library workspace for viewing 
 - `crates/opencode`: OpenCode SQLite session source and normalization.
 - `vendor/`: source-of-truth checkouts for upstream projects. Do not edit vendored code unless explicitly asked.
 
-## Commands
+## Before Non-Trivial Work
 
-```sh
-cargo run -p tokn-session-cli -- list --source codex --limit 5
-cargo run -p tokn-session-cli -- show --source opencode <session-id> --format pretty
-cargo run -p tokn-session-cli -- show --source pi <session-id> --format jsonl
-```
+- Read `docs/handoff.md` for current status, known gaps, and next likely work.
+- If `docs/handoff.md` is stale after your change, update it.
+- Treat examples as representative; check similar provider code before changing only one source.
 
 ## Verification
 
@@ -51,5 +74,4 @@ When changes are verified, commit them with a conventional commit message such a
 - Prefer Rust.
 - Use 2 spaces for indentation.
 - Prefer code quality over minimizing diff size.
-- Treat examples as representative; check similar provider code before changing only one source.
-- Keep docs current but small. `docs/handoff.md` should describe the present state, not every historical step.
+- Keep docs current but small. `docs/handoff.md` should describe present state and useful next context, not every historical step.
