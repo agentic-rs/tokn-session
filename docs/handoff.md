@@ -95,7 +95,7 @@ Current browser keys:
 
 - No `create` command yet.
 - No `attach` command yet.
-- No provider fixture tests yet; verification currently leans on real local session stores and CLI smokes.
+- Codex has an initial normalization fixture test. Pi/OpenCode provider fixtures and CLI golden tests are still missing.
 - No live event stream abstraction yet.
 
 ## Useful Smokes
@@ -110,5 +110,6 @@ cargo run -p tokn-session-cli -- show --source opencode <session-id> --format pr
 
 - Add the first `create` path for invoking a provider and streaming normalized events.
 - Decide how to represent live event streams versus loaded historical sessions.
-- Add provider-specific tests or fixtures so real local session stores are not the only verification path.
+- Extend provider fixture coverage beyond Codex, especially Pi JSONL and OpenCode SQLite normalization.
+- Add CLI golden tests for tiny fixture-backed `list` and `show` outputs.
 - Consider splitting stable event IR notes into `docs/event-ir.md` once the IR changes again.

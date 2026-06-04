@@ -337,7 +337,9 @@ mod tests {
   use std::path::PathBuf;
 
   use serde_json::json;
-  use tokn_session_core::{AgentEvent, LoadedSession, Provider, SessionRef};
+  use tokn_session_core::{
+    AgentEvent, GoalUpdated, LoadedSession, MessageEvent, Provider, ProviderChanged, ReasoningEvent, SessionRef,
+  };
 
   use super::*;
 
@@ -396,6 +398,78 @@ mod tests {
 
     assert!(output.contains("shell started cargo test #call\n"));
     assert!(!output.contains("input:"));
+  }
+
+  #[test]
+  fn render_event_summary_handles_message_first_line() {
+    let event = AgentEvent::Message(MessageEvent {
+      provider: Provider::Codex,
+      session_id: Some("session".to_string()),
+      message_id: None,
+      parent_id: None,
+      role: Role::Assistant,
+      phase: Phase::Finished,
+      text: "first line\nsecond line".to_string(),
+      timestamp: None,
+    });
+
+    assert_eq!(render_event_summary(&event), "assistant first line");
+  }
+
+  #[test]
+  fn render_pretty_handles_reasoning_and_goal_updates() {
+    let session = loaded_session(vec![
+      AgentEvent::Reasoning(ReasoningEvent {
+        provider: Provider::Codex,
+        session_id: Some("session".to_string()),
+        message_id: None,
+        parent_id: None,
+        phase: Phase::Finished,
+        text: Some("thinking".to_string()),
+        summary: Some("summary".to_string()),
+        encrypted_content: Some("ciphertext".to_string()),
+        signature: None,
+        timestamp: None,
+      }),
+      AgentEvent::GoalUpdated(GoalUpdated {
+        provider: Provider::Codex,
+        session_id: Some("session".to_string()),
+        turn_id: Some("turn".to_string()),
+        goal: Some(json!({
+          "status": "complete",
+          "objective": "finish tests",
+          "tokensUsed": 12,
+          "timeUsedSeconds": 3
+        })),
+        timestamp: None,
+      }),
+    ]);
+
+    let output = render_pretty(&session);
+
+    assert!(output.contains("reasoning summary\n  summary\n"));
+    assert!(output.contains("reasoning\n  thinking\n"));
+    assert!(!output.contains("ciphertext"));
+    assert!(output.contains("goal updated [complete] tokens=12 time=3s\n  finish tests\n"));
+  }
+
+  #[test]
+  fn render_pretty_handles_provider_changes() {
+    let session = loaded_session(vec![AgentEvent::ProviderChanged(ProviderChanged {
+      provider: Provider::Codex,
+      session_id: Some("session".to_string()),
+      native_id: None,
+      native_parent_id: None,
+      model_provider: Some("openai".to_string()),
+      model_id: Some("gpt-5".to_string()),
+      thinking_level: Some("high".to_string()),
+      timestamp: None,
+    })]);
+
+    let output = render_pretty(&session);
+
+    assert!(output.contains("[model] openai/gpt-5\n\n"));
+    assert!(output.contains("[thinking] high\n\n"));
   }
 
   #[test]

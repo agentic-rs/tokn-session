@@ -572,3 +572,144 @@ fn unknown_type(prefix: &str, value: &Value) -> Option<String> {
   let suffix = value.get("type").and_then(Value::as_str).unwrap_or("unknown");
   Some(format!("{prefix}.{suffix}"))
 }
+
+#[cfg(test)]
+mod tests {
+  use serde_json::Value;
+  use tokn_session_core::{AgentEvent, Phase, Role, ToolKind, ToolSummary};
+
+  use super::*;
+  use crate::event::CodexLine;
+
+  #[test]
+  fn normalizes_basic_fixture_events() {
+    let events = normalize_fixture(include_str!("../fixtures/basic_session.jsonl"));
+
+    assert_eq!(events.len(), 9);
+    assert_session_started(&events[0]);
+    assert_provider_changed(&events[1]);
+    assert_user_message(&events[2]);
+    assert_assistant_message(&events[3]);
+    assert_reasoning(&events[4]);
+    assert_shell_tool_started(&events[5]);
+    assert_patch_tool_started(&events[6]);
+    assert_goal_updated(&events[7]);
+    assert_unknown_event(&events[8]);
+  }
+
+  fn normalize_fixture(input: &str) -> Vec<AgentEvent> {
+    let mut normalizer = CodexNormalizer::new();
+    input
+      .lines()
+      .filter(|line| !line.trim().is_empty())
+      .flat_map(|line| {
+        let line: CodexLine = serde_json::from_str(line).expect("fixture line should parse");
+        normalizer.normalize(line)
+      })
+      .collect()
+  }
+
+  fn assert_session_started(event: &AgentEvent) {
+    let AgentEvent::SessionStarted(event) = event else {
+      panic!("expected session started event");
+    };
+    assert_eq!(event.session_id, "session-fixture");
+    assert_eq!(event.cwd.as_deref(), Some("/tmp/project"));
+    assert_eq!(event.timestamp.as_deref(), Some("2026-06-04T00:00:00Z"));
+  }
+
+  fn assert_provider_changed(event: &AgentEvent) {
+    let AgentEvent::ProviderChanged(event) = event else {
+      panic!("expected provider changed event");
+    };
+    assert_eq!(event.session_id.as_deref(), Some("session-fixture"));
+    assert_eq!(event.model_provider.as_deref(), Some("openai"));
+  }
+
+  fn assert_user_message(event: &AgentEvent) {
+    let AgentEvent::Message(event) = event else {
+      panic!("expected user message event");
+    };
+    assert!(matches!(event.role, Role::User));
+    assert_eq!(event.text, "build a tiny test");
+    assert_eq!(event.session_id.as_deref(), Some("session-fixture"));
+  }
+
+  fn assert_assistant_message(event: &AgentEvent) {
+    let AgentEvent::Message(event) = event else {
+      panic!("expected assistant message event");
+    };
+    assert!(matches!(event.role, Role::Assistant));
+    assert_eq!(event.message_id.as_deref(), Some("msg-assistant"));
+    assert_eq!(event.text, "done");
+  }
+
+  fn assert_reasoning(event: &AgentEvent) {
+    let AgentEvent::Reasoning(event) = event else {
+      panic!("expected reasoning event");
+    };
+    assert_eq!(event.message_id.as_deref(), Some("rsn-1"));
+    assert_eq!(event.summary.as_deref(), Some("checked files"));
+    assert_eq!(event.text.as_deref(), Some("thinking out loud"));
+    assert_eq!(event.encrypted_content.as_deref(), Some("ciphertext"));
+  }
+
+  fn assert_shell_tool_started(event: &AgentEvent) {
+    let AgentEvent::ToolCall(event) = event else {
+      panic!("expected shell tool event");
+    };
+    assert_eq!(event.tool_call_id.as_deref(), Some("call-shell"));
+    assert_eq!(event.tool_name.as_deref(), Some("exec_command"));
+    assert!(matches!(event.tool_kind, ToolKind::Shell));
+    assert!(matches!(event.phase, Phase::Started));
+    match event.summary.as_ref() {
+      Some(ToolSummary::Shell {
+        command,
+        cwd,
+        exit_code,
+      }) => {
+        assert_eq!(command.as_deref(), Some("cargo test"));
+        assert_eq!(cwd, &None);
+        assert_eq!(exit_code, &None);
+      }
+      _ => panic!("expected shell summary"),
+    }
+  }
+
+  fn assert_patch_tool_started(event: &AgentEvent) {
+    let AgentEvent::ToolCall(event) = event else {
+      panic!("expected patch tool event");
+    };
+    assert_eq!(event.tool_call_id.as_deref(), Some("call-edit"));
+    assert_eq!(event.tool_name.as_deref(), Some("apply_patch"));
+    assert!(matches!(event.tool_kind, ToolKind::FileEdit));
+    match event.summary.as_ref() {
+      Some(ToolSummary::FileEdit { path, added, removed }) => {
+        assert_eq!(path.as_deref(), Some("crates/core/src/lib.rs"));
+        assert_eq!(added, &Some(2));
+        assert_eq!(removed, &Some(1));
+      }
+      _ => panic!("expected file edit summary"),
+    }
+  }
+
+  fn assert_goal_updated(event: &AgentEvent) {
+    let AgentEvent::GoalUpdated(event) = event else {
+      panic!("expected goal updated event");
+    };
+    assert_eq!(event.session_id.as_deref(), Some("session-fixture"));
+    assert_eq!(event.turn_id.as_deref(), Some("turn-1"));
+    assert_eq!(
+      event.goal.as_ref().and_then(|goal| goal.get("status")),
+      Some(&Value::String("complete".to_string()))
+    );
+  }
+
+  fn assert_unknown_event(event: &AgentEvent) {
+    let AgentEvent::Unknown(event) = event else {
+      panic!("expected unknown event");
+    };
+    assert_eq!(event.session_id.as_deref(), Some("session-fixture"));
+    assert_eq!(event.native_type.as_deref(), Some("event_msg.new_native_event"));
+  }
+}

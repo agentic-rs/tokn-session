@@ -1,0 +1,8 @@
+{"timestamp":"2026-06-04T00:00:00Z","type":"session_meta","payload":{"id":"session-fixture","timestamp":"2026-06-04T00:00:00Z","cwd":"/tmp/project","model_provider":"openai"}}
+{"timestamp":"2026-06-04T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"build a tiny test"}}
+{"timestamp":"2026-06-04T00:00:02Z","type":"response_item","payload":{"type":"message","id":"msg-assistant","role":"assistant","content":[{"type":"output_text","text":"done"}],"phase":"completed"}}
+{"timestamp":"2026-06-04T00:00:03Z","type":"response_item","payload":{"type":"reasoning","id":"rsn-1","summary":[{"text":"checked files"}],"content":[{"type":"reasoning_text","text":"thinking out loud"}],"encrypted_content":"ciphertext"}}
+{"timestamp":"2026-06-04T00:00:04Z","type":"event_msg","payload":{"type":"exec_command_begin","call_id":"call-shell","command":["cargo","test"]}}
+{"timestamp":"2026-06-04T00:00:05Z","type":"event_msg","payload":{"type":"patch_apply_begin","call_id":"call-edit","changes":{"crates/core/src/lib.rs":{"unified_diff":"@@\n-old\n+new\n+another\n"}}}}
+{"timestamp":"2026-06-04T00:00:06Z","type":"event_msg","payload":{"type":"thread_goal_updated","threadId":"session-fixture","turnId":"turn-1","goal":{"status":"complete","objective":"test fixture"}}}
+{"timestamp":"2026-06-04T00:00:07Z","type":"event_msg","payload":{"type":"new_native_event","value":123}}
