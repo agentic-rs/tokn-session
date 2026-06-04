@@ -9,11 +9,6 @@ pub struct Cli {
 
 #[derive(Debug)]
 pub enum Command {
-  Sessions(SessionsCommand),
-}
-
-#[derive(Debug)]
-pub enum SessionsCommand {
   List {
     source: Source,
     session_dir: Option<PathBuf>,
@@ -39,18 +34,6 @@ pub fn parse(args: Vec<String>) -> Result<Cli, String> {
   }
 
   match args[0].as_str() {
-    "sessions" => parse_sessions(&args[1..]),
-    "--help" | "-h" | "help" => Err(help()),
-    other => Err(format!("unknown command `{other}`\n\n{}", help())),
-  }
-}
-
-fn parse_sessions(args: &[String]) -> Result<Cli, String> {
-  if args.is_empty() {
-    return Err(sessions_help());
-  }
-
-  match args[0].as_str() {
     "list" => {
       let Options {
         source,
@@ -60,14 +43,14 @@ fn parse_sessions(args: &[String]) -> Result<Cli, String> {
         positionals,
       } = parse_options(&args[1..])?;
       if !positionals.is_empty() {
-        return Err("sessions list does not accept positional arguments".to_string());
+        return Err("list does not accept positional arguments".to_string());
       }
       Ok(Cli {
-        command: Command::Sessions(SessionsCommand::List {
+        command: Command::List {
           source,
           session_dir,
           limit,
-        }),
+        },
       })
     }
     "show" => {
@@ -79,19 +62,19 @@ fn parse_sessions(args: &[String]) -> Result<Cli, String> {
         mut positionals,
       } = parse_options(&args[1..])?;
       if positionals.len() != 1 {
-        return Err("sessions show requires exactly one session id or path".to_string());
+        return Err("show requires exactly one session id or path".to_string());
       }
       Ok(Cli {
-        command: Command::Sessions(SessionsCommand::Show {
+        command: Command::Show {
           source,
           session: positionals.remove(0),
           format,
           session_dir,
-        }),
+        },
       })
     }
-    "--help" | "-h" | "help" => Err(sessions_help()),
-    other => Err(format!("unknown sessions command `{other}`\n\n{}", sessions_help())),
+    "--help" | "-h" | "help" => Err(help()),
+    other => Err(format!("unknown command `{other}`\n\n{}", help())),
   }
 }
 
@@ -137,7 +120,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
           .parse::<usize>()
           .map_err(|_| format!("invalid --limit value `{value}`"))?;
       }
-      "--help" | "-h" => return Err(sessions_help()),
+      "--help" | "-h" => return Err(help()),
       value if value.starts_with('-') => return Err(format!("unknown option `{value}`")),
       value => positionals.push(value.to_string()),
     }
@@ -172,16 +155,8 @@ fn parse_format(value: &str) -> Result<Format, String> {
 
 fn help() -> String {
   "usage:
-  tokn-session sessions list [--source pi|codex|opencode] [--session-dir <dir>]
-  tokn-session sessions list [--source pi|codex|opencode] [--limit <n>]
-  tokn-session sessions show [--source pi|codex|opencode] [--format pretty|jsonl] [--session-dir <dir>] <session-id-or-path>"
-    .to_string()
-}
-
-fn sessions_help() -> String {
-  "usage:
-  tokn-session sessions list [--source pi|codex|opencode] [--session-dir <dir>]
-  tokn-session sessions list [--source pi|codex|opencode] [--limit <n>]
-  tokn-session sessions show [--source pi|codex|opencode] [--format pretty|jsonl] [--session-dir <dir>] <session-id-or-path>"
+  tokn-session list [--source pi|codex|opencode] [--session-dir <dir>]
+  tokn-session list [--source pi|codex|opencode] [--limit <n>]
+  tokn-session show [--source pi|codex|opencode] [--format pretty|jsonl] [--session-dir <dir>] <session-id-or-path>"
     .to_string()
 }
