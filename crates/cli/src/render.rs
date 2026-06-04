@@ -143,7 +143,7 @@ fn render_tool(output: &mut String, event: &ToolCallEvent) {
 
 fn render_tool_summary(event: &ToolCallEvent) -> Option<String> {
   let status = tool_status(event);
-  match &event.summary {
+  let mut line = match &event.summary {
     Some(ToolSummary::Shell {
       command,
       cwd: _,
@@ -157,26 +157,26 @@ fn render_tool_summary(event: &ToolCallEvent) -> Option<String> {
         line.push(' ');
         line.push_str(command);
       }
-      Some(line)
+      line
     }
-    Some(ToolSummary::FileRead { path }) => Some(format!("read{status} {}", path.as_deref().unwrap_or("-"))),
+    Some(ToolSummary::FileRead { path }) => format!("read{status} {}", path.as_deref().unwrap_or("-")),
     Some(ToolSummary::FileWrite { path, bytes }) => {
       let mut line = format!("write{status} {}", path.as_deref().unwrap_or("-"));
       if let Some(bytes) = bytes {
         line.push_str(&format!(" {bytes}b"));
       }
-      Some(line)
+      line
     }
     Some(ToolSummary::FileEdit { path, added, removed }) => {
       let mut line = format!("edit{status} {}", path.as_deref().unwrap_or("-"));
       if added.is_some() || removed.is_some() {
         line.push_str(&format!(" +{} -{}", added.unwrap_or(0), removed.unwrap_or(0)));
       }
-      Some(line)
+      line
     }
-    Some(ToolSummary::Search { query }) => Some(format!("search{status} {}", query.as_deref().unwrap_or("-"))),
-    Some(ToolSummary::Web { url }) => Some(format!("web{status} {}", url.as_deref().unwrap_or("-"))),
-    Some(ToolSummary::Task { title }) => Some(format!("task{status} {}", title.as_deref().unwrap_or("-"))),
+    Some(ToolSummary::Search { query }) => format!("search{status} {}", query.as_deref().unwrap_or("-")),
+    Some(ToolSummary::Web { url }) => format!("web{status} {}", url.as_deref().unwrap_or("-")),
+    Some(ToolSummary::Task { title }) => format!("task{status} {}", title.as_deref().unwrap_or("-")),
     None => match event.tool_kind {
       ToolKind::Shell => Some(format!("shell{status}")),
       ToolKind::FileRead => Some(format!("read{status}")),
@@ -186,7 +186,16 @@ fn render_tool_summary(event: &ToolCallEvent) -> Option<String> {
       ToolKind::Web => Some(format!("web{status}")),
       ToolKind::Task => Some(format!("task{status}")),
       ToolKind::Unknown => None,
-    },
+    }?,
+  };
+  append_tool_id(&mut line, event);
+  Some(line)
+}
+
+fn append_tool_id(line: &mut String, event: &ToolCallEvent) {
+  if let Some(id) = &event.tool_call_id {
+    line.push_str(" #");
+    line.push_str(id);
   }
 }
 
@@ -271,7 +280,7 @@ mod tests {
 
     let output = render_pretty(&session);
 
-    assert!(output.contains("shell started cargo test\n"));
+    assert!(output.contains("shell started cargo test #call\n"));
     assert!(!output.contains("input:"));
   }
 
@@ -299,7 +308,7 @@ mod tests {
 
     let output = render_pretty(&session);
 
-    assert!(output.contains("edit crates/core/src/agent_event.rs +4 -1\n"));
+    assert!(output.contains("edit crates/core/src/agent_event.rs +4 -1 #call\n"));
   }
 
   #[test]

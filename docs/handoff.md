@@ -57,9 +57,9 @@ Pretty rendering shows visible reasoning text and summaries, but does not displa
 Pretty rendering also prefers compact semantic tool lines, such as:
 
 ```text
-shell cargo test
-edit crates/core/src/agent_event.rs +4 -1
-read crates/cli/src/render.rs
+shell cargo test #call_abc
+edit crates/core/src/agent_event.rs +4 -1 #call_abc
+read crates/cli/src/render.rs #call_abc
 ```
 
 Unknown tools still render their raw input/output so new provider shapes remain discoverable.
