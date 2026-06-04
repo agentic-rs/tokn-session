@@ -369,9 +369,22 @@ impl EventBrowser {
     if self.selected < self.scroll {
       self.scroll = self.selected;
     }
-    if self.selected >= self.scroll + height {
-      self.scroll = self.selected.saturating_sub(height - 1);
+    while self.selected_header_offset() >= height && self.scroll < self.selected {
+      self.scroll += 1;
     }
+  }
+
+  fn selected_header_offset(&self) -> usize {
+    (self.scroll..self.selected).map(|index| self.row_height(index)).sum()
+  }
+
+  fn row_height(&self, index: usize) -> usize {
+    let detail_lines = if self.expanded.contains(&index) {
+      self.rows[index].detail_line_count()
+    } else {
+      0
+    };
+    1 + detail_lines
   }
 
   fn visible_lines(&self, height: usize) -> Vec<Line<'static>> {
@@ -432,6 +445,10 @@ impl EventRow {
       .map(|line| Line::from(format!("      {line}")))
       .collect()
   }
+
+  fn detail_line_count(&self) -> usize {
+    self.detail.trim_matches('\n').lines().count()
+  }
 }
 
 fn truncate(value: &str, max: usize) -> String {
@@ -440,4 +457,37 @@ fn truncate(value: &str, max: usize) -> String {
     output.push(character);
   }
   output
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn keep_selected_visible_accounts_for_expanded_rows() {
+    let mut browser = EventBrowser {
+      session_id: "session".to_string(),
+      rows: vec![
+        test_row("row 1", "one\ntwo\nthree\nfour\nfive"),
+        test_row("row 2", ""),
+        test_row("row 3", ""),
+      ],
+      selected: 2,
+      scroll: 0,
+      expanded: BTreeSet::from([0]),
+    };
+
+    browser.keep_selected_visible(3);
+
+    assert_eq!(browser.scroll, 1);
+    assert!(browser.selected_header_offset() < 3);
+  }
+
+  fn test_row(summary: &str, detail: &str) -> EventRow {
+    EventRow {
+      kind: "test",
+      summary: summary.to_string(),
+      detail: detail.to_string(),
+    }
+  }
 }
