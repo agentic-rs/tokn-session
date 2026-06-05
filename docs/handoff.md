@@ -88,6 +88,7 @@ Current browser keys:
 - OpenCode shell tools with nonzero `metadata.exit` are marked as errors even when OpenCode records the tool state as completed.
 - Tool kind classification and summary extraction live in `crates/core`; provider normalizers should use the shared helpers where possible.
 - OpenCode support currently uses the legacy-compatible `message` and `part` tables seen in local data, not the newer `session_message` projection.
+- Codex native JSONL parsing uses the published `codex-protocol` crate where lines match its `RolloutItem` definitions. Some local/vendor-current shapes are newer or looser than the published crate, so the Codex source keeps compatibility fallbacks for existing loose fixture shapes and unknown-event discovery.
 - Codex `event_msg.thread_goal_updated` maps to the visible `goal_updated` IR event.
 - Timestamps are provider-native strings/numbers today; there is no unified timestamp type yet.
 - The CLI help path currently exits through the same error-printing path as other parser errors.

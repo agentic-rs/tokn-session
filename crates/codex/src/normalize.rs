@@ -1,9 +1,13 @@
+use codex_protocol::models::{
+  ContentItem as CodexContentItem, ReasoningItemContent as CodexReasoningContent, ReasoningItemReasoningSummary,
+  ResponseItem as CodexResponseItem,
+};
+use codex_protocol::protocol::{
+  CompactedItem as CodexCompacted, EventMsg as CodexEventMsg, RolloutItem, SessionMetaLine as CodexSessionMeta,
+};
 use serde_json::Value;
 
-use crate::event::{
-  CodexCompacted, CodexContentItem, CodexEvent, CodexEventMsg, CodexLine, CodexReasoningContent, CodexResponseItem,
-  CodexSessionMeta,
-};
+use crate::event::{CodexEvent, CodexLine};
 use tokn_session_core::{
   AgentEvent, ErrorEvent, GoalUpdated, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role,
   SessionStarted, ToolCallEvent, ToolKind, ToolSummary, UnknownEvent, patch_summary, tool_kind_for_name,
@@ -22,34 +26,36 @@ impl CodexNormalizer {
   pub fn normalize(&mut self, line: CodexLine) -> Vec<AgentEvent> {
     let timestamp = line.timestamp;
     match line.event {
-      CodexEvent::SessionMeta(event) => self.normalize_session_meta(event, timestamp),
-      CodexEvent::ResponseItem(event) => normalize_response_item(self.session_id.clone(), event, timestamp),
-      CodexEvent::EventMsg(event) => normalize_event_msg(self.session_id.clone(), event, timestamp),
-      CodexEvent::TurnContext(value) => {
-        let _ = value;
-        Vec::new()
-      }
-      CodexEvent::Compacted(event) => normalize_compacted(self.session_id.clone(), event, timestamp),
+      CodexEvent::RolloutItem(event) => match event {
+        RolloutItem::SessionMeta(event) => self.normalize_session_meta(event, timestamp),
+        RolloutItem::ResponseItem(event) => normalize_response_item(self.session_id.clone(), event, timestamp),
+        RolloutItem::EventMsg(event) => normalize_event_msg(self.session_id.clone(), event, timestamp),
+        RolloutItem::TurnContext(_) => Vec::new(),
+        RolloutItem::Compacted(event) => normalize_compacted(self.session_id.clone(), event, timestamp),
+      },
+      CodexEvent::Unknown(value) => self.normalize_unknown(value, timestamp),
     }
   }
 
   fn normalize_session_meta(&mut self, event: CodexSessionMeta, line_timestamp: Option<String>) -> Vec<AgentEvent> {
-    self.session_id = Some(event.id.clone());
-    let timestamp = event.timestamp.or(line_timestamp);
+    let meta = event.meta;
+    let session_id = meta.id.to_string();
+    self.session_id = Some(session_id.clone());
+    let timestamp = Some(meta.timestamp).or(line_timestamp);
     let mut events = vec![AgentEvent::SessionStarted(SessionStarted {
       provider: Provider::Codex,
-      session_id: event.id,
-      cwd: event.cwd,
+      session_id,
+      cwd: Some(meta.cwd.display().to_string()),
       timestamp: timestamp.clone(),
     })];
 
-    if event.model_provider.is_some() {
+    if meta.model_provider.is_some() {
       events.push(AgentEvent::ProviderChanged(ProviderChanged {
         provider: Provider::Codex,
         session_id: self.session_id.clone(),
-        native_id: None,
+        native_id: Some(meta.id.to_string()),
         native_parent_id: None,
-        model_provider: event.model_provider,
+        model_provider: meta.model_provider,
         model_id: None,
         thinking_level: None,
         timestamp,
@@ -57,6 +63,47 @@ impl CodexNormalizer {
     }
 
     events
+  }
+
+  fn normalize_unknown(&mut self, value: Value, timestamp: Option<String>) -> Vec<AgentEvent> {
+    if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+      if let Some(payload) = value.get("payload") {
+        if let Some(id) = payload.get("id").and_then(Value::as_str) {
+          self.session_id = Some(id.to_string());
+          let timestamp = payload
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or(timestamp);
+          let mut events = vec![AgentEvent::SessionStarted(SessionStarted {
+            provider: Provider::Codex,
+            session_id: id.to_string(),
+            cwd: payload.get("cwd").and_then(Value::as_str).map(str::to_string),
+            timestamp: timestamp.clone(),
+          })];
+
+          if let Some(model_provider) = payload.get("model_provider").and_then(Value::as_str) {
+            events.push(AgentEvent::ProviderChanged(ProviderChanged {
+              provider: Provider::Codex,
+              session_id: self.session_id.clone(),
+              native_id: Some(id.to_string()),
+              native_parent_id: payload
+                .get("parent_thread_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+              model_provider: Some(model_provider.to_string()),
+              model_id: None,
+              thinking_level: None,
+              timestamp,
+            }));
+          }
+
+          return events;
+        }
+      }
+    }
+
+    normalize_unknown_line(self.session_id.clone(), value, timestamp)
   }
 }
 
@@ -66,12 +113,7 @@ fn normalize_response_item(
   timestamp: Option<String>,
 ) -> Vec<AgentEvent> {
   match event {
-    CodexResponseItem::Message {
-      id,
-      role,
-      content,
-      phase: _,
-    } => normalize_message(session_id, id, role, content, timestamp),
+    CodexResponseItem::Message { id, role, content } => normalize_message(session_id, id, role, content, timestamp),
     CodexResponseItem::Reasoning {
       id,
       summary,
@@ -86,7 +128,7 @@ fn normalize_response_item(
         .join("\n");
       let summary = summary
         .into_iter()
-        .filter_map(|summary| summary.text)
+        .map(reasoning_summary_text)
         .collect::<Vec<_>>()
         .join("\n");
       if text.is_empty() && summary.is_empty() && encrypted_content.is_none() {
@@ -95,7 +137,7 @@ fn normalize_response_item(
         vec![AgentEvent::Reasoning(ReasoningEvent {
           provider: Provider::Codex,
           session_id,
-          message_id: id,
+          message_id: Some(id),
           parent_id: None,
           phase: Phase::Finished,
           text: present_text(text),
@@ -109,11 +151,9 @@ fn normalize_response_item(
     CodexResponseItem::FunctionCall {
       id,
       name,
-      namespace,
       arguments,
       call_id,
     } => {
-      let tool_name = namespace.map_or(name.clone(), |namespace| format!("{namespace}.{name}"));
       let input = parse_json_string_or_text(arguments);
       vec![AgentEvent::ToolCall(ToolCallEvent {
         provider: Provider::Codex,
@@ -121,9 +161,9 @@ fn normalize_response_item(
         message_id: id,
         parent_id: None,
         tool_call_id: Some(call_id),
-        tool_name: Some(tool_name.clone()),
-        tool_kind: tool_kind_for_name(&tool_name),
-        summary: tool_summary_for_input(&tool_name, &input),
+        tool_name: Some(name.clone()),
+        tool_kind: tool_kind_for_name(&name),
+        summary: tool_summary_for_input(&name, &input),
         phase: Phase::Finished,
         input: Some(input),
         output: None,
@@ -131,9 +171,13 @@ fn normalize_response_item(
         timestamp,
       })]
     }
-    CodexResponseItem::FunctionCallOutput { call_id, output } => {
-      vec![tool_output_event(session_id, call_id, None, output, timestamp)]
-    }
+    CodexResponseItem::FunctionCallOutput { call_id, output } => vec![tool_output_event(
+      session_id,
+      call_id,
+      None,
+      serde_json::to_value(output).unwrap_or(Value::Null),
+      timestamp,
+    )],
     CodexResponseItem::LocalShellCall {
       id,
       call_id,
@@ -147,10 +191,10 @@ fn normalize_response_item(
       tool_call_id: call_id,
       tool_name: Some("local_shell".to_string()),
       tool_kind: ToolKind::Shell,
-      summary: tool_summary_for_input("local_shell", &action),
+      summary: tool_summary_for_input("local_shell", &serde_json::to_value(&action).unwrap_or(Value::Null)),
       phase: Phase::Finished,
-      input: Some(action),
-      output: status.map(Value::String),
+      input: Some(serde_json::to_value(action).unwrap_or(Value::Null)),
+      output: Some(serde_json::to_value(status).unwrap_or(Value::Null)),
       is_error: None,
       timestamp,
     })],
@@ -178,74 +222,34 @@ fn normalize_response_item(
         timestamp,
       })]
     }
-    CodexResponseItem::CustomToolCallOutput { call_id, name, output } => {
-      vec![tool_output_event(session_id, call_id, name, output, timestamp)]
-    }
-    CodexResponseItem::WebSearchCall {
-      id,
+    CodexResponseItem::CustomToolCallOutput { call_id, output } => vec![tool_output_event(
+      session_id,
       call_id,
-      status,
-      action,
-    } => vec![AgentEvent::ToolCall(ToolCallEvent {
+      None,
+      Value::String(output),
+      timestamp,
+    )],
+    CodexResponseItem::WebSearchCall { id, status, action } => vec![AgentEvent::ToolCall(ToolCallEvent {
       provider: Provider::Codex,
       session_id,
       message_id: id,
       parent_id: None,
-      tool_call_id: call_id,
+      tool_call_id: None,
       tool_name: Some("web_search".to_string()),
       tool_kind: tool_kind_for_name("web_search"),
-      summary: tool_summary_for_input("web_search", &action),
+      summary: tool_summary_for_input("web_search", &serde_json::to_value(&action).unwrap_or(Value::Null)),
       phase: Phase::Finished,
-      input: Some(action),
+      input: Some(serde_json::to_value(action).unwrap_or(Value::Null)),
       output: status.map(Value::String),
       is_error: None,
       timestamp,
     })],
-    CodexResponseItem::ToolSearchCall {
-      id,
-      call_id,
-      status,
-      execution,
-      arguments,
-    } => vec![AgentEvent::ToolCall(ToolCallEvent {
-      provider: Provider::Codex,
+    event @ (CodexResponseItem::GhostSnapshot { .. }
+    | CodexResponseItem::CompactionSummary { .. }
+    | CodexResponseItem::Other) => vec![unknown_event(
       session_id,
-      message_id: id,
-      parent_id: None,
-      tool_call_id: call_id,
-      tool_name: Some(format!("tool_search.{execution}")),
-      tool_kind: ToolKind::Search,
-      summary: tool_summary_for_input("search", &arguments),
-      phase: Phase::Finished,
-      input: Some(arguments),
-      output: status.map(Value::String),
-      is_error: None,
-      timestamp,
-    })],
-    CodexResponseItem::ToolSearchOutput {
-      call_id,
-      status,
-      execution,
-      tools,
-    } => vec![AgentEvent::ToolCall(ToolCallEvent {
-      provider: Provider::Codex,
-      session_id,
-      message_id: None,
-      parent_id: None,
-      tool_call_id: call_id,
-      tool_name: Some(format!("tool_search.{execution}")),
-      tool_kind: ToolKind::Search,
-      summary: None,
-      phase: Phase::Finished,
-      input: None,
-      output: Some(serde_json::json!({ "status": status, "tools": tools })),
-      is_error: None,
-      timestamp,
-    })],
-    CodexResponseItem::Unknown(value) => vec![unknown_event(
-      session_id,
-      unknown_type("response_item", &value),
-      Some(value),
+      Some("response_item.unknown".to_string()),
+      Some(serde_json::to_value(event).unwrap_or(Value::Null)),
       timestamp,
     )],
   }
@@ -290,22 +294,24 @@ fn normalize_message(
 
 fn normalize_event_msg(session_id: Option<String>, event: CodexEventMsg, timestamp: Option<String>) -> Vec<AgentEvent> {
   match event {
-    CodexEventMsg::TaskStarted { turn_id } | CodexEventMsg::TurnStarted { turn_id } => {
-      let _ = turn_id;
+    CodexEventMsg::TaskStarted(_) | CodexEventMsg::TaskComplete(_) => Vec::new(),
+    CodexEventMsg::UserMessage(event) => vec![message_event(session_id, Role::User, event.message, timestamp)],
+    CodexEventMsg::AgentMessage(event) => {
+      let _ = event.message;
       Vec::new()
     }
-    CodexEventMsg::TaskComplete { turn_id } => {
-      let _ = turn_id;
-      Vec::new()
-    }
-    CodexEventMsg::UserMessage { message } => vec![message_event(session_id, Role::User, message, timestamp)],
-    CodexEventMsg::AgentMessage { message, phase } => {
-      let _ = (message, phase);
-      Vec::new()
-    }
-    CodexEventMsg::AgentReasoning { text, message } => {
-      let text = text.or(message).unwrap_or_default();
-      if text.is_empty() {
+    CodexEventMsg::AgentMessageDelta(event) => vec![AgentEvent::Message(MessageEvent {
+      provider: Provider::Codex,
+      session_id,
+      message_id: None,
+      parent_id: None,
+      role: Role::Assistant,
+      phase: Phase::Delta,
+      text: event.delta,
+      timestamp,
+    })],
+    CodexEventMsg::AgentReasoning(event) => {
+      if event.text.is_empty() {
         vec![unknown_event(
           session_id,
           Some("event_msg.agent_reasoning".to_string()),
@@ -319,7 +325,7 @@ fn normalize_event_msg(session_id: Option<String>, event: CodexEventMsg, timesta
           message_id: None,
           parent_id: None,
           phase: Phase::Finished,
-          text: present_text(text),
+          text: present_text(event.text),
           summary: None,
           encrypted_content: None,
           signature: None,
@@ -327,157 +333,250 @@ fn normalize_event_msg(session_id: Option<String>, event: CodexEventMsg, timesta
         })]
       }
     }
-    CodexEventMsg::ExecCommandBegin { call_id, command } => vec![AgentEvent::ToolCall(ToolCallEvent {
+    CodexEventMsg::AgentReasoningDelta(event) => vec![AgentEvent::Reasoning(ReasoningEvent {
       provider: Provider::Codex,
       session_id,
       message_id: None,
       parent_id: None,
-      tool_call_id: call_id,
-      tool_name: Some("exec_command".to_string()),
-      tool_kind: ToolKind::Shell,
-      summary: Some(ToolSummary::Shell {
-        command: Some(command.join(" ")),
-        cwd: None,
-        exit_code: None,
-      }),
-      phase: Phase::Started,
-      input: Some(Value::Array(command.into_iter().map(Value::String).collect())),
-      output: None,
-      is_error: None,
-      timestamp,
-    })],
-    CodexEventMsg::ExecCommandEnd { call_id, status } => vec![AgentEvent::ToolCall(ToolCallEvent {
-      provider: Provider::Codex,
-      session_id,
-      message_id: None,
-      parent_id: None,
-      tool_call_id: call_id,
-      tool_name: Some("exec_command".to_string()),
-      tool_kind: ToolKind::Shell,
-      summary: Some(ToolSummary::Shell {
-        command: None,
-        cwd: None,
-        exit_code: None,
-      }),
-      phase: Phase::Finished,
-      input: None,
-      output: status.map(Value::String),
-      is_error: None,
-      timestamp,
-    })],
-    CodexEventMsg::McpToolCallBegin {
-      call_id,
-      name,
-      arguments,
-    } => vec![AgentEvent::ToolCall(ToolCallEvent {
-      provider: Provider::Codex,
-      session_id,
-      message_id: None,
-      parent_id: None,
-      tool_call_id: call_id,
-      tool_name: name.clone(),
-      tool_kind: tool_kind_for_optional_name(name.as_deref()),
-      summary: tool_summary_for_io(name.as_deref(), arguments.as_ref(), None),
-      phase: Phase::Started,
-      input: arguments,
-      output: None,
-      is_error: None,
-      timestamp,
-    })],
-    CodexEventMsg::McpToolCallEnd {
-      call_id,
-      name,
-      result,
-      error,
-    } => vec![AgentEvent::ToolCall(ToolCallEvent {
-      provider: Provider::Codex,
-      session_id,
-      message_id: None,
-      parent_id: None,
-      tool_call_id: call_id,
-      tool_name: name.clone(),
-      tool_kind: tool_kind_for_optional_name(name.as_deref()),
+      phase: Phase::Delta,
+      text: present_text(event.delta),
       summary: None,
-      phase: Phase::Finished,
-      input: None,
-      output: result.or_else(|| error.clone()),
-      is_error: Some(error.is_some()),
+      encrypted_content: None,
+      signature: None,
       timestamp,
     })],
-    CodexEventMsg::Error { message } => vec![AgentEvent::Error(ErrorEvent {
-      provider: Provider::Codex,
-      session_id,
-      message,
-      timestamp,
-    })],
-    CodexEventMsg::PatchApplyBegin { call_id, changes } => vec![AgentEvent::ToolCall(ToolCallEvent {
+    CodexEventMsg::AgentReasoningRawContent(event) => vec![AgentEvent::Reasoning(ReasoningEvent {
       provider: Provider::Codex,
       session_id,
       message_id: None,
       parent_id: None,
-      tool_call_id: Some(call_id),
-      tool_name: Some("apply_patch".to_string()),
-      tool_kind: ToolKind::FileEdit,
-      summary: Some(patch_summary(&changes)),
+      phase: Phase::Finished,
+      text: present_text(event.text),
+      summary: None,
+      encrypted_content: None,
+      signature: None,
+      timestamp,
+    })],
+    CodexEventMsg::AgentReasoningRawContentDelta(event) => vec![AgentEvent::Reasoning(ReasoningEvent {
+      provider: Provider::Codex,
+      session_id,
+      message_id: None,
+      parent_id: None,
+      phase: Phase::Delta,
+      text: present_text(event.delta),
+      summary: None,
+      encrypted_content: None,
+      signature: None,
+      timestamp,
+    })],
+    CodexEventMsg::ExecCommandBegin(event) => vec![AgentEvent::ToolCall(ToolCallEvent {
+      provider: Provider::Codex,
+      session_id,
+      message_id: None,
+      parent_id: None,
+      tool_call_id: Some(event.call_id),
+      tool_name: Some("exec_command".to_string()),
+      tool_kind: ToolKind::Shell,
+      summary: Some(ToolSummary::Shell {
+        command: Some(event.command.join(" ")),
+        cwd: Some(event.cwd.display().to_string()),
+        exit_code: None,
+      }),
       phase: Phase::Started,
-      input: Some(changes),
+      input: Some(Value::Array(event.command.into_iter().map(Value::String).collect())),
       output: None,
       is_error: None,
       timestamp,
     })],
-    CodexEventMsg::PatchApplyEnd {
-      call_id,
-      stdout,
-      stderr,
-      success,
-      changes,
-      status,
-    } => vec![AgentEvent::ToolCall(ToolCallEvent {
+    CodexEventMsg::ExecCommandOutputDelta(event) => vec![AgentEvent::ToolCall(ToolCallEvent {
       provider: Provider::Codex,
       session_id,
       message_id: None,
       parent_id: None,
-      tool_call_id: Some(call_id),
-      tool_name: Some("apply_patch".to_string()),
-      tool_kind: ToolKind::FileEdit,
-      summary: changes.as_ref().map(patch_summary),
+      tool_call_id: Some(event.call_id.clone()),
+      tool_name: Some("exec_command".to_string()),
+      tool_kind: ToolKind::Shell,
+      summary: None,
+      phase: Phase::Delta,
+      input: None,
+      output: Some(serde_json::to_value(event).unwrap_or(Value::Null)),
+      is_error: None,
+      timestamp,
+    })],
+    CodexEventMsg::ExecCommandEnd(event) => vec![AgentEvent::ToolCall(ToolCallEvent {
+      provider: Provider::Codex,
+      session_id,
+      message_id: None,
+      parent_id: None,
+      tool_call_id: Some(event.call_id),
+      tool_name: Some("exec_command".to_string()),
+      tool_kind: ToolKind::Shell,
+      summary: Some(ToolSummary::Shell {
+        command: Some(event.command.join(" ")),
+        cwd: Some(event.cwd.display().to_string()),
+        exit_code: Some(event.exit_code.into()),
+      }),
       phase: Phase::Finished,
       input: None,
       output: Some(serde_json::json!({
-        "status": status,
-        "stdout": stdout,
-        "stderr": stderr,
+        "stdout": event.stdout,
+        "stderr": event.stderr,
+        "aggregated_output": event.aggregated_output,
+        "formatted_output": event.formatted_output,
       })),
-      is_error: Some(!success),
+      is_error: Some(event.exit_code != 0),
       timestamp,
     })],
-    CodexEventMsg::TokenCount {} => Vec::new(),
-    CodexEventMsg::ThreadGoalUpdated {
-      thread_id,
-      turn_id,
-      goal,
-    } => vec![AgentEvent::GoalUpdated(GoalUpdated {
-      provider: Provider::Codex,
-      session_id: thread_id.or(session_id),
-      turn_id,
-      goal,
-      timestamp,
-    })],
-    CodexEventMsg::TurnComplete {} => Vec::new(),
-    CodexEventMsg::TurnAborted { reason } => vec![AgentEvent::Error(ErrorEvent {
+    CodexEventMsg::McpToolCallBegin(event) => {
+      let name = format!("{}.{}", event.invocation.server, event.invocation.tool);
+      vec![AgentEvent::ToolCall(ToolCallEvent {
+        provider: Provider::Codex,
+        session_id,
+        message_id: None,
+        parent_id: None,
+        tool_call_id: Some(event.call_id),
+        tool_name: Some(name.clone()),
+        tool_kind: tool_kind_for_name(&name),
+        summary: tool_summary_for_io(Some(&name), event.invocation.arguments.as_ref(), None),
+        phase: Phase::Started,
+        input: event.invocation.arguments,
+        output: None,
+        is_error: None,
+        timestamp,
+      })]
+    }
+    CodexEventMsg::McpToolCallEnd(event) => {
+      let name = format!("{}.{}", event.invocation.server, event.invocation.tool);
+      let is_success = event.is_success();
+      vec![AgentEvent::ToolCall(ToolCallEvent {
+        provider: Provider::Codex,
+        session_id,
+        message_id: None,
+        parent_id: None,
+        tool_call_id: Some(event.call_id),
+        tool_name: Some(name.clone()),
+        tool_kind: tool_kind_for_name(&name),
+        summary: None,
+        phase: Phase::Finished,
+        input: None,
+        output: Some(serde_json::to_value(event.result).unwrap_or(Value::Null)),
+        is_error: Some(!is_success),
+        timestamp,
+      })]
+    }
+    CodexEventMsg::WebSearchBegin(event) => vec![AgentEvent::ToolCall(ToolCallEvent {
       provider: Provider::Codex,
       session_id,
-      message: reason.unwrap_or_else(|| "turn aborted".to_string()),
+      message_id: None,
+      parent_id: None,
+      tool_call_id: Some(event.call_id),
+      tool_name: Some("web_search".to_string()),
+      tool_kind: ToolKind::Search,
+      summary: None,
+      phase: Phase::Started,
+      input: None,
+      output: None,
+      is_error: None,
       timestamp,
     })],
-    CodexEventMsg::Unknown(value) => {
-      vec![unknown_event(
+    CodexEventMsg::WebSearchEnd(event) => vec![AgentEvent::ToolCall(ToolCallEvent {
+      provider: Provider::Codex,
+      session_id,
+      message_id: None,
+      parent_id: None,
+      tool_call_id: Some(event.call_id),
+      tool_name: Some("web_search".to_string()),
+      tool_kind: ToolKind::Search,
+      summary: Some(ToolSummary::Search {
+        query: Some(event.query.clone()),
+      }),
+      phase: Phase::Finished,
+      input: None,
+      output: Some(serde_json::json!({ "query": event.query })),
+      is_error: None,
+      timestamp,
+    })],
+    CodexEventMsg::Error(event) => vec![AgentEvent::Error(ErrorEvent {
+      provider: Provider::Codex,
+      session_id,
+      message: event.message,
+      timestamp,
+    })],
+    CodexEventMsg::Warning(event) => vec![AgentEvent::Error(ErrorEvent {
+      provider: Provider::Codex,
+      session_id,
+      message: event.message,
+      timestamp,
+    })],
+    CodexEventMsg::PatchApplyBegin(event) => {
+      let changes = serde_json::to_value(event.changes).unwrap_or(Value::Null);
+      vec![AgentEvent::ToolCall(ToolCallEvent {
+        provider: Provider::Codex,
         session_id,
-        unknown_type("event_msg", &value),
-        Some(value),
+        message_id: None,
+        parent_id: None,
+        tool_call_id: Some(event.call_id),
+        tool_name: Some("apply_patch".to_string()),
+        tool_kind: ToolKind::FileEdit,
+        summary: Some(patch_summary(&changes)),
+        phase: Phase::Started,
+        input: Some(changes),
+        output: None,
+        is_error: None,
         timestamp,
-      )]
+      })]
     }
+    CodexEventMsg::PatchApplyEnd(event) => {
+      let changes = serde_json::to_value(event.changes).unwrap_or(Value::Null);
+      vec![AgentEvent::ToolCall(ToolCallEvent {
+        provider: Provider::Codex,
+        session_id,
+        message_id: None,
+        parent_id: None,
+        tool_call_id: Some(event.call_id),
+        tool_name: Some("apply_patch".to_string()),
+        tool_kind: ToolKind::FileEdit,
+        summary: Some(patch_summary(&changes)),
+        phase: Phase::Finished,
+        input: None,
+        output: Some(serde_json::json!({
+          "stdout": event.stdout,
+          "stderr": event.stderr,
+        })),
+        is_error: Some(!event.success),
+        timestamp,
+      })]
+    }
+    CodexEventMsg::ViewImageToolCall(event) => vec![AgentEvent::ToolCall(ToolCallEvent {
+      provider: Provider::Codex,
+      session_id,
+      message_id: None,
+      parent_id: None,
+      tool_call_id: Some(event.call_id),
+      tool_name: Some("view_image".to_string()),
+      tool_kind: ToolKind::FileRead,
+      summary: Some(ToolSummary::FileRead {
+        path: Some(event.path.display().to_string()),
+      }),
+      phase: Phase::Finished,
+      input: Some(serde_json::json!({ "path": event.path })),
+      output: None,
+      is_error: None,
+      timestamp,
+    })],
+    CodexEventMsg::TokenCount(_) => Vec::new(),
+    CodexEventMsg::TurnAborted(event) => vec![AgentEvent::Error(ErrorEvent {
+      provider: Provider::Codex,
+      session_id,
+      message: format!("{:?}", event.reason),
+      timestamp,
+    })],
+    event => vec![unknown_event(
+      session_id,
+      Some("event_msg.unknown".to_string()),
+      Some(serde_json::to_value(event).unwrap_or(Value::Null)),
+      timestamp,
+    )],
   }
 }
 
@@ -500,17 +599,20 @@ fn normalize_compacted(
 
 fn content_item_text(item: CodexContentItem) -> Option<String> {
   match item {
-    CodexContentItem::InputText { text } | CodexContentItem::OutputText { text } | CodexContentItem::Text { text } => {
-      Some(text)
-    }
-    CodexContentItem::Unknown(_) => None,
+    CodexContentItem::InputText { text } | CodexContentItem::OutputText { text } => Some(text),
+    CodexContentItem::InputImage { .. } => None,
+  }
+}
+
+fn reasoning_summary_text(item: ReasoningItemReasoningSummary) -> String {
+  match item {
+    ReasoningItemReasoningSummary::SummaryText { text } => text,
   }
 }
 
 fn reasoning_content_text(item: CodexReasoningContent) -> Option<String> {
   match item {
     CodexReasoningContent::ReasoningText { text } | CodexReasoningContent::Text { text } => Some(text),
-    CodexReasoningContent::Unknown(_) => None,
   }
 }
 
@@ -584,9 +686,170 @@ fn unknown_event(
   })
 }
 
-fn unknown_type(prefix: &str, value: &Value) -> Option<String> {
-  let suffix = value.get("type").and_then(Value::as_str).unwrap_or("unknown");
-  Some(format!("{prefix}.{suffix}"))
+fn normalize_unknown_line(session_id: Option<String>, value: Value, timestamp: Option<String>) -> Vec<AgentEvent> {
+  if value.get("type").and_then(Value::as_str) == Some("response_item") {
+    if let Some(payload) = value.get("payload") {
+      match payload.get("type").and_then(Value::as_str) {
+        Some("reasoning") => {
+          let text = payload
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+          let summary = payload
+            .get("summary")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+          let encrypted_content = payload
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+          if !text.is_empty() || !summary.is_empty() || encrypted_content.is_some() {
+            return vec![AgentEvent::Reasoning(ReasoningEvent {
+              provider: Provider::Codex,
+              session_id,
+              message_id: payload.get("id").and_then(Value::as_str).map(str::to_string),
+              parent_id: None,
+              phase: Phase::Finished,
+              text: present_text(text),
+              summary: present_text(summary),
+              encrypted_content,
+              signature: None,
+              timestamp,
+            })];
+          }
+        }
+        Some("message") => {
+          if payload.get("role").and_then(Value::as_str) == Some("assistant") {
+            let text = payload
+              .get("content")
+              .and_then(Value::as_array)
+              .into_iter()
+              .flatten()
+              .filter_map(|item| item.get("text").and_then(Value::as_str))
+              .collect::<Vec<_>>()
+              .join("\n");
+            if !text.is_empty() {
+              return vec![AgentEvent::Message(MessageEvent {
+                provider: Provider::Codex,
+                session_id,
+                message_id: payload.get("id").and_then(Value::as_str).map(str::to_string),
+                parent_id: None,
+                role: Role::Assistant,
+                phase: Phase::Finished,
+                text,
+                timestamp,
+              })];
+            }
+          }
+        }
+        _ => {}
+      }
+    }
+  }
+
+  if value.get("type").and_then(Value::as_str) == Some("event_msg") {
+    if let Some(payload) = value.get("payload") {
+      match payload.get("type").and_then(Value::as_str) {
+        Some("thread_goal_updated") => {
+          return vec![AgentEvent::GoalUpdated(GoalUpdated {
+            provider: Provider::Codex,
+            session_id: payload
+              .get("threadId")
+              .or_else(|| payload.get("thread_id"))
+              .and_then(Value::as_str)
+              .map(str::to_string)
+              .or(session_id),
+            turn_id: payload
+              .get("turnId")
+              .or_else(|| payload.get("turn_id"))
+              .and_then(Value::as_str)
+              .map(str::to_string),
+            goal: payload.get("goal").cloned(),
+            timestamp,
+          })];
+        }
+        Some("exec_command_begin") => {
+          let call_id = payload.get("call_id").and_then(Value::as_str).map(str::to_string);
+          let command = payload
+            .get("command")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+          if !command.is_empty() {
+            return vec![AgentEvent::ToolCall(ToolCallEvent {
+              provider: Provider::Codex,
+              session_id,
+              message_id: None,
+              parent_id: None,
+              tool_call_id: call_id,
+              tool_name: Some("exec_command".to_string()),
+              tool_kind: ToolKind::Shell,
+              summary: Some(ToolSummary::Shell {
+                command: Some(command.join(" ")),
+                cwd: payload.get("cwd").and_then(Value::as_str).map(str::to_string),
+                exit_code: None,
+              }),
+              phase: Phase::Started,
+              input: Some(Value::Array(command.into_iter().map(Value::String).collect())),
+              output: None,
+              is_error: None,
+              timestamp,
+            })];
+          }
+        }
+        Some("patch_apply_begin") => {
+          let changes = payload.get("changes").cloned().unwrap_or(Value::Null);
+          return vec![AgentEvent::ToolCall(ToolCallEvent {
+            provider: Provider::Codex,
+            session_id,
+            message_id: None,
+            parent_id: None,
+            tool_call_id: payload.get("call_id").and_then(Value::as_str).map(str::to_string),
+            tool_name: Some("apply_patch".to_string()),
+            tool_kind: ToolKind::FileEdit,
+            summary: Some(patch_summary(&changes)),
+            phase: Phase::Started,
+            input: Some(changes),
+            output: None,
+            is_error: None,
+            timestamp,
+          })];
+        }
+        _ => {}
+      }
+    }
+  }
+
+  vec![unknown_event(
+    session_id,
+    unknown_type_for_line(&value),
+    Some(value.get("payload").cloned().unwrap_or(value)),
+    timestamp,
+  )]
+}
+
+fn unknown_type_for_line(value: &Value) -> Option<String> {
+  let line_type = value.get("type").and_then(Value::as_str)?;
+  let payload_type = value
+    .get("payload")
+    .and_then(|payload| payload.get("type"))
+    .and_then(Value::as_str);
+
+  Some(match payload_type {
+    Some(payload_type) => format!("{line_type}.{payload_type}"),
+    None => line_type.to_string(),
+  })
 }
 
 #[cfg(test)]
