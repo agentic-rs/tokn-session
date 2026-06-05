@@ -66,6 +66,7 @@ read crates/cli/src/render.rs #call_abc
 ```
 
 Unknown tools still render their raw input/output so new provider shapes remain discoverable.
+Unknown events preserve raw provider-native payloads when available and pretty rendering shows that native payload.
 
 `browse` is the first interactive historical-session view. Without a session id, it opens an alternate-screen session list; Enter opens the selected session. With a session id, it opens the event browser directly. The event browser uses one row per normalized event. Rows are collapsed by default; expanded rows reuse the same per-event pretty rendering as linear output.
 

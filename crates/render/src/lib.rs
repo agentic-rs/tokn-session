@@ -120,9 +120,13 @@ pub fn render_event_pretty(event: &AgentEvent) -> String {
     }
     AgentEvent::Unknown(event) => {
       output.push_str(&format!(
-        "unknown {}\n\n",
+        "unknown {}\n",
         event.native_type.as_deref().unwrap_or("event")
       ));
+      if let Some(native) = &event.native {
+        write_indented(&mut output, &format!("native: {native}"));
+      }
+      output.push('\n');
     }
   }
   output
@@ -339,6 +343,7 @@ mod tests {
   use serde_json::json;
   use tokn_session_core::{
     AgentEvent, GoalUpdated, LoadedSession, MessageEvent, Provider, ProviderChanged, ReasoningEvent, SessionRef,
+    UnknownEvent,
   };
 
   use super::*;
@@ -547,6 +552,22 @@ mod tests {
     assert!(output.contains("tool mystery #call\n"));
     assert!(output.contains("input: {\"value\":1}\n"));
     assert!(output.contains("output: {\"ok\":true}\n"));
+  }
+
+  #[test]
+  fn render_pretty_keeps_unknown_event_payloads_visible() {
+    let session = loaded_session(vec![AgentEvent::Unknown(UnknownEvent {
+      provider: Provider::Codex,
+      session_id: Some("session".to_string()),
+      native_type: Some("event_msg.new_native_event".to_string()),
+      native: Some(json!({ "type": "new_native_event", "value": 123 })),
+      timestamp: None,
+    })]);
+
+    let output = render_pretty(&session);
+
+    assert!(output.contains("unknown event_msg.new_native_event\n"));
+    assert!(output.contains("native: {\"type\":\"new_native_event\",\"value\":123}\n"));
   }
 
   fn loaded_session(events: Vec<AgentEvent>) -> LoadedSession {

@@ -95,6 +95,7 @@ impl OpenCodeNormalizer {
         events.push(unknown_event(
           Some(self.session_id.clone()),
           Some(format!("message.role.{:?}", row.data.role).to_lowercase()),
+          None,
           timestamp(row.time_created),
         ));
       }
@@ -175,6 +176,7 @@ impl OpenCodeNormalizer {
       OpenCodePart::Unknown(value) => vec![unknown_event(
         Some(self.session_id.clone()),
         unknown_type("part", &value),
+        Some(value),
         timestamp(part.time_created),
       )],
     }
@@ -304,11 +306,17 @@ fn unknown_type(prefix: &str, value: &Value) -> Option<String> {
   Some(format!("{prefix}.{suffix}"))
 }
 
-fn unknown_event(session_id: Option<String>, native_type: Option<String>, timestamp: Option<String>) -> AgentEvent {
+fn unknown_event(
+  session_id: Option<String>,
+  native_type: Option<String>,
+  native: Option<Value>,
+  timestamp: Option<String>,
+) -> AgentEvent {
   AgentEvent::Unknown(UnknownEvent {
     provider: Provider::OpenCode,
     session_id,
     native_type,
+    native,
     timestamp,
   })
 }

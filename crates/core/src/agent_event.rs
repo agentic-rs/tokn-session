@@ -99,6 +99,7 @@ pub struct UnknownEvent {
   pub provider: Provider,
   pub session_id: Option<String>,
   pub native_type: Option<String>,
+  pub native: Option<Value>,
   pub timestamp: Option<String>,
 }
 

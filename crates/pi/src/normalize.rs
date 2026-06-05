@@ -65,8 +65,9 @@ impl PiNormalizer {
       PiEvent::Unknown(event) => vec![AgentEvent::Unknown(UnknownEvent {
         provider: Provider::Pi,
         session_id: self.session_id.clone(),
-        native_type: event.event_type,
-        timestamp: event.timestamp,
+        native_type: event_type(&event),
+        native: Some(event.clone()),
+        timestamp: timestamp_field(&event),
       })],
     }
   }
@@ -122,16 +123,21 @@ fn normalize_user_message(
             timestamp.clone(),
           )),
           PiUserContentBlock::Image { data, mime_type } => {
-            let _ = (data, mime_type);
+            let _ = data;
             events.push(unknown_event(
               session_id.clone(),
               Some("message.content.image".to_string()),
+              Some(serde_json::json!({
+                "type": "image",
+                "mime_type": mime_type,
+              })),
               timestamp.clone(),
             ));
           }
           PiUserContentBlock::Unknown(value) => events.push(unknown_event(
             session_id.clone(),
             unknown_content_type("message.content", &value),
+            Some(value),
             timestamp.clone(),
           )),
         }
@@ -199,6 +205,7 @@ fn normalize_assistant_message(
       PiAssistantContentBlock::Unknown(value) => events.push(unknown_event(
         session_id.clone(),
         unknown_content_type("message.content", &value),
+        Some(value),
         timestamp.clone(),
       )),
     }
@@ -262,7 +269,7 @@ fn ensure_message_events(
   timestamp: Option<String>,
 ) -> Vec<AgentEvent> {
   if events.is_empty() {
-    return vec![unknown_event(session_id, Some("message".to_string()), timestamp)];
+    return vec![unknown_event(session_id, Some("message".to_string()), None, timestamp)];
   }
   events
 }
@@ -282,11 +289,17 @@ fn tool_result_content_to_value(block: PiToolResultContentBlock) -> Value {
   }
 }
 
-fn unknown_event(session_id: Option<String>, native_type: Option<String>, timestamp: Option<String>) -> AgentEvent {
+fn unknown_event(
+  session_id: Option<String>,
+  native_type: Option<String>,
+  native: Option<Value>,
+  timestamp: Option<String>,
+) -> AgentEvent {
   AgentEvent::Unknown(UnknownEvent {
     provider: Provider::Pi,
     session_id,
     native_type,
+    native,
     timestamp,
   })
 }
@@ -298,4 +311,12 @@ fn present_text(text: String) -> Option<String> {
 fn unknown_content_type(prefix: &str, value: &Value) -> Option<String> {
   let suffix = value.get("type").and_then(Value::as_str).unwrap_or("unknown");
   Some(format!("{prefix}.{suffix}"))
+}
+
+fn event_type(value: &Value) -> Option<String> {
+  value.get("type").and_then(Value::as_str).map(str::to_string)
+}
+
+fn timestamp_field(value: &Value) -> Option<String> {
+  value.get("timestamp").and_then(Value::as_str).map(str::to_string)
 }

@@ -245,6 +245,7 @@ fn normalize_response_item(
     CodexResponseItem::Unknown(value) => vec![unknown_event(
       session_id,
       unknown_type("response_item", &value),
+      Some(value),
       timestamp,
     )],
   }
@@ -270,6 +271,7 @@ fn normalize_message(
     return vec![unknown_event(
       session_id,
       Some("response_item.message".to_string()),
+      None,
       timestamp,
     )];
   }
@@ -307,6 +309,7 @@ fn normalize_event_msg(session_id: Option<String>, event: CodexEventMsg, timesta
         vec![unknown_event(
           session_id,
           Some("event_msg.agent_reasoning".to_string()),
+          None,
           timestamp,
         )]
       } else {
@@ -467,7 +470,14 @@ fn normalize_event_msg(session_id: Option<String>, event: CodexEventMsg, timesta
       message: reason.unwrap_or_else(|| "turn aborted".to_string()),
       timestamp,
     })],
-    CodexEventMsg::Unknown(value) => vec![unknown_event(session_id, unknown_type("event_msg", &value), timestamp)],
+    CodexEventMsg::Unknown(value) => {
+      vec![unknown_event(
+        session_id,
+        unknown_type("event_msg", &value),
+        Some(value),
+        timestamp,
+      )]
+    }
   }
 }
 
@@ -559,11 +569,17 @@ fn present_text(text: String) -> Option<String> {
   (!text.is_empty()).then_some(text)
 }
 
-fn unknown_event(session_id: Option<String>, native_type: Option<String>, timestamp: Option<String>) -> AgentEvent {
+fn unknown_event(
+  session_id: Option<String>,
+  native_type: Option<String>,
+  native: Option<Value>,
+  timestamp: Option<String>,
+) -> AgentEvent {
   AgentEvent::Unknown(UnknownEvent {
     provider: Provider::Codex,
     session_id,
     native_type,
+    native,
     timestamp,
   })
 }
@@ -711,5 +727,9 @@ mod tests {
     };
     assert_eq!(event.session_id.as_deref(), Some("session-fixture"));
     assert_eq!(event.native_type.as_deref(), Some("event_msg.new_native_event"));
+    assert_eq!(
+      event.native.as_ref().and_then(|native| native.get("value")),
+      Some(&Value::Number(123.into()))
+    );
   }
 }

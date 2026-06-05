@@ -15,7 +15,7 @@ pub enum PiEvent {
   #[serde(rename = "error")]
   Error(PiErrorEvent),
   #[serde(untagged)]
-  Unknown(PiUnknownEvent),
+  Unknown(Value),
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,11 +143,4 @@ pub struct PiErrorEvent {
   pub timestamp: Option<String>,
   pub message: Option<String>,
   pub error: Option<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PiUnknownEvent {
-  #[serde(rename = "type")]
-  pub event_type: Option<String>,
-  pub timestamp: Option<String>,
 }
