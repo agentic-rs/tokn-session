@@ -13,7 +13,7 @@ tokn-session list --source codex --limit 5
 tokn-session show --source opencode <session-id> --format pretty
 tokn-session show --source pi <session-id> --format jsonl
 tokn-session browse --source codex <session-id>
-tokn-session create --source opencode --executor "tokn-gateway proxy opencode --npx -- run --format json {prompt}" "create a todo app"
+tokn-session create --source opencode --executor "tokn-gateway proxy opencode --npx --" "create a todo app"
 ```
 
 The old `tokn-session sessions list/show` shape is intentionally unsupported.
@@ -96,13 +96,15 @@ Current browser keys:
 
 ## Create Status
 
-`create` has an initial configurable executor path. It does not assume provider binaries are installed. Pass `--executor <command>` or set `TOKN_SESSION_<SOURCE>_EXECUTOR`, such as `TOKN_SESSION_OPENCODE_EXECUTOR`.
+`create` has an initial configurable executor path. It does not assume provider binaries are installed. Pass `--executor <launcher>` or set `TOKN_SESSION_<SOURCE>_EXECUTOR`, such as `TOKN_SESSION_OPENCODE_EXECUTOR`.
 
-The executor command is split into argv without using a shell. If one argv is exactly `{prompt}`, it is replaced with the prompt; otherwise the prompt is appended as the final argument. This supports gateway-style commands such as:
+The executor is only the launcher, equivalent to the provider binary. Provider-specific create arguments are added by the source adapter. For OpenCode, the adapter appends `run --format json <prompt>`, so gateway-style commands look like:
 
 ```sh
-tokn-session create --source opencode --executor "tokn-gateway proxy opencode --npx -- run --format json {prompt}" "create a todo app"
+tokn-session create --source opencode --executor "tokn-gateway proxy opencode --npx --" "create a todo app"
 ```
+
+Advanced custom executors may include an argv that is exactly `{prompt}`; in that case the executor is treated as the full command and no provider-specific args are appended.
 
 `--cwd <dir>` runs the executor from a specific working directory.
 

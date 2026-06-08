@@ -29,7 +29,7 @@ impl AgentClient {
       .executor
       .or_else(|| executor_from_env(request.source))
       .ok_or_else(|| executor_required_error(request.source))?;
-    let mut command = executor_command(&executor, &request.prompt)?;
+    let mut command = executor_command(request.source, &executor, &request.prompt)?;
     if let Some(cwd) = request.cwd {
       command.current_dir(cwd);
     }
@@ -70,6 +70,24 @@ impl Source {
       Self::OpenCode => "opencode",
     }
   }
+
+  fn create_args(self, prompt: &str) -> Vec<String> {
+    match self {
+      Self::Pi => vec![
+        "--mode".to_string(),
+        "json".to_string(),
+        "--print".to_string(),
+        prompt.to_string(),
+      ],
+      Self::Codex => vec!["exec".to_string(), "--json".to_string(), prompt.to_string()],
+      Self::OpenCode => vec![
+        "run".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+        prompt.to_string(),
+      ],
+    }
+  }
 }
 
 fn executor_from_env(source: Source) -> Option<String> {
@@ -83,13 +101,21 @@ fn executor_from_env(source: Source) -> Option<String> {
 
 fn executor_required_error(source: Source) -> String {
   format!(
-    "create requires --executor or TOKN_SESSION_{}_EXECUTOR, for example: --executor \"tokn-gateway proxy {} -- run --format json {{prompt}}\"",
+    "create requires --executor or TOKN_SESSION_{}_EXECUTOR, for example: --executor \"tokn-gateway proxy {} --npx --\"",
     source.as_str().to_ascii_uppercase(),
     source.as_str()
   )
 }
 
-fn executor_command(executor: &str, prompt: &str) -> Result<Command, String> {
+fn executor_command(source: Source, executor: &str, prompt: &str) -> Result<Command, String> {
+  let mut parts = create_argv(source, executor, prompt)?;
+  let program = parts.remove(0);
+  let mut command = Command::new(program);
+  command.args(parts);
+  Ok(command)
+}
+
+fn create_argv(source: Source, executor: &str, prompt: &str) -> Result<Vec<String>, String> {
   let mut parts = split_command_line(executor)?;
   if parts.is_empty() {
     return Err("create executor cannot be empty".to_string());
@@ -103,13 +129,10 @@ fn executor_command(executor: &str, prompt: &str) -> Result<Command, String> {
       }
     }
   } else {
-    parts.push(prompt.to_string());
+    parts.extend(source.create_args(prompt));
   }
 
-  let program = parts.remove(0);
-  let mut command = Command::new(program);
-  command.args(parts);
-  Ok(command)
+  Ok(parts)
 }
 
 fn split_command_line(input: &str) -> Result<Vec<String>, String> {
@@ -159,7 +182,7 @@ fn split_command_line(input: &str) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
-  use super::split_command_line;
+  use super::{Source, create_argv, split_command_line};
 
   #[test]
   fn split_command_line_preserves_quoted_arguments() {
@@ -169,6 +192,38 @@ mod tests {
       args,
       vec!["tokn-gateway", "proxy", "opencode", "--npx", "--", "run", "{prompt}"]
     );
+  }
+
+  #[test]
+  fn create_argv_appends_opencode_create_args_after_executor_launcher() {
+    let args = create_argv(
+      Source::OpenCode,
+      "tokn-gateway proxy opencode --npx --",
+      "create a todo app",
+    )
+    .unwrap();
+
+    assert_eq!(
+      args,
+      vec![
+        "tokn-gateway",
+        "proxy",
+        "opencode",
+        "--npx",
+        "--",
+        "run",
+        "--format",
+        "json",
+        "create a todo app"
+      ]
+    );
+  }
+
+  #[test]
+  fn create_argv_uses_placeholder_as_advanced_full_command_override() {
+    let args = create_argv(Source::OpenCode, "custom-agent --message {prompt}", "create a todo app").unwrap();
+
+    assert_eq!(args, vec!["custom-agent", "--message", "create a todo app"]);
   }
 }
 
