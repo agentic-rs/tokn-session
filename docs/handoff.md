@@ -13,6 +13,7 @@ tokn-session list --source codex --limit 5
 tokn-session show --source opencode <session-id> --format pretty
 tokn-session show --source pi <session-id> --format jsonl
 tokn-session browse --source codex <session-id>
+tokn-session create --source opencode --executor "tokn-gateway proxy opencode --npx --" "create a todo app"
 ```
 
 The old `tokn-session sessions list/show` shape is intentionally unsupported.
@@ -93,9 +94,22 @@ Current browser keys:
 - Timestamps are provider-native strings/numbers today; there is no unified timestamp type yet.
 - The CLI help path currently exits through the same error-printing path as other parser errors.
 
+## Create Status
+
+`create` has an initial configurable executor path. It does not assume provider binaries are installed. Pass `--executor <command>` or set `TOKN_SESSION_<SOURCE>_EXECUTOR`, such as `TOKN_SESSION_OPENCODE_EXECUTOR`.
+
+The executor command is split into argv without using a shell, then the prompt is appended as the final argument. This supports gateway-style commands such as:
+
+```sh
+tokn-session create --source opencode --executor "tokn-gateway proxy opencode --npx --" "create a todo app"
+```
+
+`--cwd <dir>` runs the executor from a specific working directory.
+
+Current limitation: provider output is inherited directly from the child process; live provider events are not normalized into `AgentEvent` yet.
+
 ## Known Gaps
 
-- No `create` command yet.
 - No `attach` command yet.
 - Codex has an initial normalization fixture test. Pi/OpenCode provider fixtures and CLI golden tests are still missing.
 - No live event stream abstraction yet.
@@ -112,7 +126,7 @@ cargo run -p tokn-session-cli -- show --source opencode <session-id> --format pr
 
 ## Next Likely Work
 
-- Add the first `create` path for invoking a provider and streaming normalized events.
+- Normalize live `create` output into `AgentEvent`.
 - Decide how to represent live event streams versus loaded historical sessions.
 - Extend provider fixture coverage beyond Codex, especially Pi JSONL and OpenCode SQLite normalization.
 - Add CLI golden tests for tiny fixture-backed `list` and `show` outputs.

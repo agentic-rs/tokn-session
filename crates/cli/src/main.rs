@@ -3,7 +3,7 @@ mod browser;
 
 use args::{Command, Format};
 use browser::{browse_session, browse_sessions};
-use tokn_session_client::AgentClient;
+use tokn_session_client::{AgentClient, CreateSessionRequest};
 use tokn_session_render::{render_agent_jsonl, render_pretty, render_session_list};
 
 fn main() {
@@ -57,5 +57,16 @@ fn run() -> Result<(), String> {
         AgentClient::load_session(source, session_dir.clone(), session)
       })
     }
+    Command::Create {
+      source,
+      prompt,
+      executor,
+      cwd,
+    } => AgentClient::create_session(CreateSessionRequest {
+      source,
+      executor,
+      cwd,
+      prompt,
+    }),
   }
 }

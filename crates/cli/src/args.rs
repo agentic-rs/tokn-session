@@ -25,6 +25,12 @@ pub enum Command {
     session: Option<String>,
     session_dir: Option<PathBuf>,
   },
+  Create {
+    source: Source,
+    prompt: String,
+    executor: Option<String>,
+    cwd: Option<PathBuf>,
+  },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +51,8 @@ pub fn parse(args: Vec<String>) -> Result<Cli, String> {
         format: _,
         session_dir,
         limit,
+        executor: _,
+        cwd: _,
         positionals,
       } = parse_options(&args[1..])?;
       if !positionals.is_empty() {
@@ -64,6 +72,8 @@ pub fn parse(args: Vec<String>) -> Result<Cli, String> {
         format,
         session_dir,
         limit: _,
+        executor: _,
+        cwd: _,
         mut positionals,
       } = parse_options(&args[1..])?;
       if positionals.len() != 1 {
@@ -84,6 +94,8 @@ pub fn parse(args: Vec<String>) -> Result<Cli, String> {
         format: _,
         session_dir,
         limit: _,
+        executor: _,
+        cwd: _,
         mut positionals,
       } = parse_options(&args[1..])?;
       if positionals.len() > 1 {
@@ -97,6 +109,28 @@ pub fn parse(args: Vec<String>) -> Result<Cli, String> {
         },
       })
     }
+    "create" => {
+      let Options {
+        source,
+        format: _,
+        session_dir: _,
+        limit: _,
+        executor,
+        cwd,
+        mut positionals,
+      } = parse_options(&args[1..])?;
+      if positionals.len() != 1 {
+        return Err("create requires exactly one prompt".to_string());
+      }
+      Ok(Cli {
+        command: Command::Create {
+          source,
+          prompt: positionals.remove(0),
+          executor,
+          cwd,
+        },
+      })
+    }
     "--help" | "-h" | "help" => Err(help()),
     other => Err(format!("unknown command `{other}`\n\n{}", help())),
   }
@@ -107,6 +141,8 @@ struct Options {
   format: Format,
   session_dir: Option<PathBuf>,
   limit: usize,
+  executor: Option<String>,
+  cwd: Option<PathBuf>,
   positionals: Vec<String>,
 }
 
@@ -115,6 +151,8 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
   let mut format = Format::Pretty;
   let mut session_dir = None;
   let mut limit = 20;
+  let mut executor = None;
+  let mut cwd = None;
   let mut positionals = Vec::new();
   let mut index = 0;
 
@@ -144,6 +182,18 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
           .parse::<usize>()
           .map_err(|_| format!("invalid --limit value `{value}`"))?;
       }
+      "--executor" => {
+        index += 1;
+        let value = args
+          .get(index)
+          .ok_or_else(|| "--executor requires a value".to_string())?;
+        executor = Some(value.to_string());
+      }
+      "--cwd" => {
+        index += 1;
+        let value = args.get(index).ok_or_else(|| "--cwd requires a value".to_string())?;
+        cwd = Some(PathBuf::from(value));
+      }
       "--help" | "-h" => return Err(help()),
       value if value.starts_with('-') => return Err(format!("unknown option `{value}`")),
       value => positionals.push(value.to_string()),
@@ -156,6 +206,8 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
     format,
     session_dir,
     limit,
+    executor,
+    cwd,
     positionals,
   })
 }
@@ -182,6 +234,7 @@ fn help() -> String {
   tokn-session list [--source pi|codex|opencode] [--session-dir <dir>]
   tokn-session list [--source pi|codex|opencode] [--limit <n>]
   tokn-session show [--source pi|codex|opencode] [--format pretty|jsonl] [--session-dir <dir>] <session-id-or-path>
-  tokn-session browse [--source pi|codex|opencode] [--session-dir <dir>] [session-id-or-path]"
+  tokn-session browse [--source pi|codex|opencode] [--session-dir <dir>] [session-id-or-path]
+  tokn-session create [--source pi|codex|opencode] [--executor <command>] [--cwd <dir>] <prompt>"
     .to_string()
 }
