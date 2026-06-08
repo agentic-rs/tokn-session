@@ -29,8 +29,7 @@ impl AgentClient {
       .executor
       .or_else(|| executor_from_env(request.source))
       .ok_or_else(|| executor_required_error(request.source))?;
-    let mut command = executor_command(&executor)?;
-    command.arg(request.prompt);
+    let mut command = executor_command(&executor, &request.prompt)?;
     if let Some(cwd) = request.cwd {
       command.current_dir(cwd);
     }
@@ -84,16 +83,27 @@ fn executor_from_env(source: Source) -> Option<String> {
 
 fn executor_required_error(source: Source) -> String {
   format!(
-    "create requires --executor or TOKN_SESSION_{}_EXECUTOR, for example: --executor \"tokn-gateway proxy {} --\"",
+    "create requires --executor or TOKN_SESSION_{}_EXECUTOR, for example: --executor \"tokn-gateway proxy {} -- run --format json {{prompt}}\"",
     source.as_str().to_ascii_uppercase(),
     source.as_str()
   )
 }
 
-fn executor_command(executor: &str) -> Result<Command, String> {
+fn executor_command(executor: &str, prompt: &str) -> Result<Command, String> {
   let mut parts = split_command_line(executor)?;
   if parts.is_empty() {
     return Err("create executor cannot be empty".to_string());
+  }
+
+  let has_prompt_placeholder = parts.iter().any(|part| part == "{prompt}");
+  if has_prompt_placeholder {
+    for part in &mut parts {
+      if part == "{prompt}" {
+        *part = prompt.to_string();
+      }
+    }
+  } else {
+    parts.push(prompt.to_string());
   }
 
   let program = parts.remove(0);
@@ -145,6 +155,21 @@ fn split_command_line(input: &str) -> Result<Vec<String>, String> {
   }
 
   Ok(args)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::split_command_line;
+
+  #[test]
+  fn split_command_line_preserves_quoted_arguments() {
+    let args = split_command_line(r#"tokn-gateway proxy opencode --npx -- run "{prompt}""#).unwrap();
+
+    assert_eq!(
+      args,
+      vec!["tokn-gateway", "proxy", "opencode", "--npx", "--", "run", "{prompt}"]
+    );
+  }
 }
 
 enum SessionSourceClient {

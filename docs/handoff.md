@@ -13,7 +13,7 @@ tokn-session list --source codex --limit 5
 tokn-session show --source opencode <session-id> --format pretty
 tokn-session show --source pi <session-id> --format jsonl
 tokn-session browse --source codex <session-id>
-tokn-session create --source opencode --executor "tokn-gateway proxy opencode --npx --" "create a todo app"
+tokn-session create --source opencode --executor "tokn-gateway proxy opencode --npx -- run --format json {prompt}" "create a todo app"
 ```
 
 The old `tokn-session sessions list/show` shape is intentionally unsupported.
@@ -98,10 +98,10 @@ Current browser keys:
 
 `create` has an initial configurable executor path. It does not assume provider binaries are installed. Pass `--executor <command>` or set `TOKN_SESSION_<SOURCE>_EXECUTOR`, such as `TOKN_SESSION_OPENCODE_EXECUTOR`.
 
-The executor command is split into argv without using a shell, then the prompt is appended as the final argument. This supports gateway-style commands such as:
+The executor command is split into argv without using a shell. If one argv is exactly `{prompt}`, it is replaced with the prompt; otherwise the prompt is appended as the final argument. This supports gateway-style commands such as:
 
 ```sh
-tokn-session create --source opencode --executor "tokn-gateway proxy opencode --npx --" "create a todo app"
+tokn-session create --source opencode --executor "tokn-gateway proxy opencode --npx -- run --format json {prompt}" "create a todo app"
 ```
 
 `--cwd <dir>` runs the executor from a specific working directory.
