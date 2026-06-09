@@ -14,6 +14,8 @@ tokn-session show --source opencode <session-id> --format pretty
 tokn-session show --source pi <session-id> --format jsonl
 tokn-session browse --source codex <session-id>
 tokn-session create --source opencode --executor "tokn-gateway proxy opencode --npx --" "create a todo app"
+tokn-session append --source opencode --executor "tokn-gateway proxy opencode --npx --" --session <session-id> "next turn"
+tokn-session append --source opencode --executor "tokn-gateway proxy opencode --npx --" --continue "next turn"
 ```
 
 The old `tokn-session sessions list/show` shape is intentionally unsupported.
@@ -94,14 +96,21 @@ Current browser keys:
 - Timestamps are provider-native strings/numbers today; there is no unified timestamp type yet.
 - The CLI help path currently exits through the same error-printing path as other parser errors.
 
-## Create Status
+## Print Invocation Status
 
-`create` has an initial configurable executor path. It does not assume provider binaries are installed. Pass `--executor <launcher>` or set `TOKN_SESSION_<SOURCE>_EXECUTOR`, such as `TOKN_SESSION_OPENCODE_EXECUTOR`.
+`create` and `append` have an initial configurable executor path. They do not assume provider binaries are installed. Pass `--executor <launcher>` or set `TOKN_SESSION_<SOURCE>_EXECUTOR`, such as `TOKN_SESSION_OPENCODE_EXECUTOR`.
 
-The executor is only the launcher, equivalent to the provider binary. Provider-specific create arguments are added by the source adapter. For OpenCode, the adapter appends `run --format json <prompt>`, so gateway-style commands look like:
+The executor is only the launcher, equivalent to the provider binary. Provider-specific print-mode arguments are added by the source adapter. For OpenCode, `create` appends `run --format json <prompt>`, so gateway-style commands look like:
 
 ```sh
 tokn-session create --source opencode --executor "tokn-gateway proxy opencode --npx --" "create a todo app"
+```
+
+`append` supports exactly one target:
+
+```sh
+tokn-session append --source opencode --executor "tokn-gateway proxy opencode --npx --" --session <session-id> "next turn"
+tokn-session append --source opencode --executor "tokn-gateway proxy opencode --npx --" --continue "next turn"
 ```
 
 Advanced custom executors may include an argv that is exactly `{prompt}`; in that case the executor is treated as the full command and no provider-specific args are appended.

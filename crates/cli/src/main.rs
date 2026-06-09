@@ -1,9 +1,9 @@
 mod args;
 mod browser;
 
-use args::{Command, Format};
+use args::{AppendTarget, Command, Format};
 use browser::{browse_session, browse_sessions};
-use tokn_session_client::{AgentClient, CreateSessionRequest};
+use tokn_session_client::{AgentClient, AppendAction, AppendSessionRequest, CreateSessionRequest};
 use tokn_session_render::{render_agent_jsonl, render_pretty, render_session_list};
 
 fn main() {
@@ -68,5 +68,23 @@ fn run() -> Result<(), String> {
       cwd,
       prompt,
     }),
+    Command::Append {
+      source,
+      target,
+      prompt,
+      executor,
+      cwd,
+    } => {
+      let action = match target {
+        AppendTarget::Continue => AppendAction::Continue { prompt },
+        AppendTarget::Session(session_id) => AppendAction::Session { session_id, prompt },
+      };
+      AgentClient::append_session(AppendSessionRequest {
+        source,
+        executor,
+        cwd,
+        action,
+      })
+    }
   }
 }

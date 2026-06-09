@@ -31,6 +31,19 @@ pub enum Command {
     executor: Option<String>,
     cwd: Option<PathBuf>,
   },
+  Append {
+    source: Source,
+    target: AppendTarget,
+    prompt: String,
+    executor: Option<String>,
+    cwd: Option<PathBuf>,
+  },
+}
+
+#[derive(Debug)]
+pub enum AppendTarget {
+  Continue,
+  Session(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,8 +66,10 @@ pub fn parse(args: Vec<String>) -> Result<Cli, String> {
         limit,
         executor: _,
         cwd: _,
+        append_target,
         positionals,
       } = parse_options(&args[1..])?;
+      reject_append_target("list", append_target)?;
       if !positionals.is_empty() {
         return Err("list does not accept positional arguments".to_string());
       }
@@ -74,8 +89,10 @@ pub fn parse(args: Vec<String>) -> Result<Cli, String> {
         limit: _,
         executor: _,
         cwd: _,
+        append_target,
         mut positionals,
       } = parse_options(&args[1..])?;
+      reject_append_target("show", append_target)?;
       if positionals.len() != 1 {
         return Err("show requires exactly one session id or path".to_string());
       }
@@ -96,8 +113,10 @@ pub fn parse(args: Vec<String>) -> Result<Cli, String> {
         limit: _,
         executor: _,
         cwd: _,
+        append_target,
         mut positionals,
       } = parse_options(&args[1..])?;
+      reject_append_target("browse", append_target)?;
       if positionals.len() > 1 {
         return Err("browse accepts at most one session id or path".to_string());
       }
@@ -117,14 +136,41 @@ pub fn parse(args: Vec<String>) -> Result<Cli, String> {
         limit: _,
         executor,
         cwd,
+        append_target,
         mut positionals,
       } = parse_options(&args[1..])?;
+      reject_append_target("create", append_target)?;
       if positionals.len() != 1 {
         return Err("create requires exactly one prompt".to_string());
       }
       Ok(Cli {
         command: Command::Create {
           source,
+          prompt: positionals.remove(0),
+          executor,
+          cwd,
+        },
+      })
+    }
+    "append" => {
+      let Options {
+        source,
+        format: _,
+        session_dir: _,
+        limit: _,
+        executor,
+        cwd,
+        append_target,
+        mut positionals,
+      } = parse_options(&args[1..])?;
+      if positionals.len() != 1 {
+        return Err("append requires exactly one prompt".to_string());
+      }
+      let target = append_target.ok_or_else(|| "append requires --continue or --session <id>".to_string())?;
+      Ok(Cli {
+        command: Command::Append {
+          source,
+          target,
           prompt: positionals.remove(0),
           executor,
           cwd,
@@ -143,6 +189,7 @@ struct Options {
   limit: usize,
   executor: Option<String>,
   cwd: Option<PathBuf>,
+  append_target: Option<AppendTarget>,
   positionals: Vec<String>,
 }
 
@@ -153,6 +200,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
   let mut limit = 20;
   let mut executor = None;
   let mut cwd = None;
+  let mut append_target = None;
   let mut positionals = Vec::new();
   let mut index = 0;
 
@@ -194,6 +242,22 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         let value = args.get(index).ok_or_else(|| "--cwd requires a value".to_string())?;
         cwd = Some(PathBuf::from(value));
       }
+      "--continue" => {
+        if append_target.is_some() {
+          return Err("append accepts only one of --continue or --session <id>".to_string());
+        }
+        append_target = Some(AppendTarget::Continue);
+      }
+      "--session" => {
+        if append_target.is_some() {
+          return Err("append accepts only one of --continue or --session <id>".to_string());
+        }
+        index += 1;
+        let value = args
+          .get(index)
+          .ok_or_else(|| "--session requires a value".to_string())?;
+        append_target = Some(AppendTarget::Session(value.to_string()));
+      }
       "--help" | "-h" => return Err(help()),
       value if value.starts_with('-') => return Err(format!("unknown option `{value}`")),
       value => positionals.push(value.to_string()),
@@ -208,6 +272,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
     limit,
     executor,
     cwd,
+    append_target,
     positionals,
   })
 }
@@ -219,6 +284,15 @@ fn parse_source(value: &str) -> Result<Source, String> {
     "opencode" => Ok(Source::OpenCode),
     _ => Err(format!("unknown source `{value}`")),
   }
+}
+
+fn reject_append_target(command: &str, target: Option<AppendTarget>) -> Result<(), String> {
+  if target.is_some() {
+    return Err(format!(
+      "--continue and --session are only valid for append, not {command}"
+    ));
+  }
+  Ok(())
 }
 
 fn parse_format(value: &str) -> Result<Format, String> {
@@ -235,6 +309,7 @@ fn help() -> String {
   tokn-session list [--source pi|codex|opencode] [--limit <n>]
   tokn-session show [--source pi|codex|opencode] [--format pretty|jsonl] [--session-dir <dir>] <session-id-or-path>
   tokn-session browse [--source pi|codex|opencode] [--session-dir <dir>] [session-id-or-path]
-  tokn-session create [--source pi|codex|opencode] [--executor <command>] [--cwd <dir>] <prompt>"
+  tokn-session create [--source pi|codex|opencode] [--executor <command>] [--cwd <dir>] <prompt>
+  tokn-session append [--source pi|codex|opencode] [--executor <command>] [--cwd <dir>] (--continue|--session <id>) <prompt>"
     .to_string()
 }
