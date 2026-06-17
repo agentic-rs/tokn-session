@@ -1,5 +1,7 @@
 use serde_json::Value;
-use tokn_session_core::{AgentEvent, LoadedSession, Phase, Role, SessionRef, ToolCallEvent, ToolKind, ToolSummary};
+use tokn_session_core::{
+  AgentEvent, LiveSessionEvent, LoadedSession, Phase, Role, SessionRef, ToolCallEvent, ToolKind, ToolSummary,
+};
 
 pub struct EventDisplay {
   pub kind: &'static str,
@@ -38,6 +40,38 @@ pub fn render_agent_jsonl(events: &[AgentEvent]) -> Result<String, String> {
     output.push('\n');
   }
   Ok(output)
+}
+
+pub fn render_live_event_pretty(event: &LiveSessionEvent) -> String {
+  let mut output = String::new();
+  match event {
+    LiveSessionEvent::Started(event) => {
+      output.push_str(&format!("Session {}\n", event.session_id));
+      output.push_str(&format!("cwd: {}\n\n", event.cwd.as_deref().unwrap_or("-")));
+    }
+    LiveSessionEvent::Event(event) => output.push_str(&render_event_pretty(event)),
+    LiveSessionEvent::Finished(event) => {
+      output.push_str("session finished");
+      if !event.success {
+        output.push_str(" error");
+      }
+      if let Some(exit_code) = event.exit_code {
+        output.push_str(&format!(" exit={exit_code}"));
+      }
+      output.push_str("\n\n");
+    }
+    LiveSessionEvent::Unknown(event) => {
+      output.push_str(&format!(
+        "unknown {}\n",
+        event.native_type.as_deref().unwrap_or("event")
+      ));
+      if let Some(native) = &event.native {
+        write_indented(&mut output, &format!("native: {native}"));
+      }
+      output.push('\n');
+    }
+  }
+  output
 }
 
 pub fn render_pretty(session: &LoadedSession) -> String {

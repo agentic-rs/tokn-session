@@ -190,7 +190,7 @@ fn text_part_text(part: OpenCodePartRow) -> Option<String> {
   }
 }
 
-fn tool_event(
+pub(crate) fn tool_event(
   session_id: String,
   message_id: String,
   parent_id: Option<String>,
@@ -293,7 +293,7 @@ fn error_message(value: Value) -> String {
     .unwrap_or_else(|| value.to_string())
 }
 
-fn timestamp(value: Option<i64>) -> Option<String> {
+pub(crate) fn timestamp(value: Option<i64>) -> Option<String> {
   value.map(|value| value.to_string())
 }
 

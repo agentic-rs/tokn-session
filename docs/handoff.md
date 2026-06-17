@@ -117,7 +117,9 @@ Advanced custom executors may include an argv that is exactly `{prompt}`; in tha
 
 `--cwd <dir>` runs the executor from a specific working directory.
 
-Current limitation: provider output is inherited directly from the child process; live provider events are not normalized into `AgentEvent` yet.
+Current limitation: provider output is inherited directly from the child process. The shared `LiveSessionEvent` envelope now exists in `crates/core`, and `crates/render` can pretty-render live events, but the CLI print path does not consume it yet.
+
+OpenCode has the first live-output normalizer: `OpenCodeLiveNormalizer` parses `opencode run --format json` JSONL envelopes into `LiveSessionEvent`. It currently maps `text`, `reasoning`, `tool_use`, and `error` into normalized `AgentEvent`s and preserves other live envelopes such as `step_start` as unknown native events.
 
 ## Known Gaps
 
@@ -137,8 +139,8 @@ cargo run -p tokn-session-cli -- show --source opencode <session-id> --format pr
 
 ## Next Likely Work
 
-- Normalize live `create` output into `AgentEvent`.
-- Decide how to represent live event streams versus loaded historical sessions.
+- Wire `create`/`append` stdout through provider live normalizers instead of inheriting child stdout directly.
+- Decide whether live stream consumption should live in `client` as callbacks/iterators or in the CLI command path.
 - Extend provider fixture coverage beyond Codex, especially Pi JSONL and OpenCode SQLite normalization.
 - Add CLI golden tests for tiny fixture-backed `list` and `show` outputs.
 - Consider splitting stable event IR notes into `docs/event-ir.md` once the IR changes again.
