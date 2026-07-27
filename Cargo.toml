@@ -7,6 +7,7 @@ members = [
   "crates/client",
   "crates/render",
   "crates/cli",
+  "crates/relay",
 ]
 resolver = "2"
 
@@ -17,12 +18,16 @@ edition = "2024"
 [workspace.dependencies]
 codex-protocol = "0.63.0"
 crossterm = "0.28"
+notify = "8.2.0"
 ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokn-session-client = { path = "crates/client" }
 tokn-session-codex = { path = "crates/codex" }
 tokn-session-core = { path = "crates/core" }
 tokn-session-opencode = { path = "crates/opencode" }
 tokn-session-pi = { path = "crates/pi" }
+tokn-session-relay = { path = "crates/relay" }
 tokn-session-render = { path = "crates/render" }
+zeromq = "0.6.0"

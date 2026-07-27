@@ -1,0 +1,20 @@
+[package]
+name = "tokn-session-relay"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "tokn-session-relay"
+path = "src/main.rs"
+
+[dependencies]
+notify.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokn-session-codex.workspace = true
+tokn-session-core.workspace = true
+tokn-session-pi.workspace = true
+zeromq.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

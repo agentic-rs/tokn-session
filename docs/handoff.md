@@ -16,9 +16,31 @@ tokn-session browse --source codex <session-id>
 tokn-session create --source opencode --executor "tokn-gateway proxy opencode --npx --" "create a todo app"
 tokn-session append --source opencode --executor "tokn-gateway proxy opencode --npx --" --session <session-id> "next turn"
 tokn-session append --source opencode --executor "tokn-gateway proxy opencode --npx --" --continue "next turn"
+tokn-session-relay
 ```
 
 The old `tokn-session sessions list/show` shape is intentionally unsupported.
+
+## Session Relay
+
+`tokn-session-relay` follows active Codex and Pi JSONL session trees and publishes
+normalized `AgentEvent` values through a ZeroMQ `PUB` socket.
+
+By default it binds `tcp://127.0.0.1:5556`, watches `~/.codex/sessions` and
+`~/.pi/agent/sessions`, and silently consumes existing records to seed provider
+normalizer state before following from EOF. Pass `--replay` to publish existing
+complete records too. `--codex-dir`, `--pi-dir`, and `--bind` override the
+defaults.
+
+Each publication is a two-frame ZeroMQ message:
+
+1. `codex.<session_id>` or `pi.<session_id>` topic
+2. normalized `AgentEvent` JSON
+
+The relay publishes all normalized events, including reasoning, tool calls,
+errors, lifecycle events, and unknown provider-native shapes. It buffers partial
+JSONL records, discovers newly created files, handles truncation/replacement,
+and combines native filesystem notifications with a periodic rescan.
 
 ## Provider Sources
 
@@ -125,7 +147,8 @@ OpenCode has the first live-output normalizer: `OpenCodeLiveNormalizer` parses `
 
 - No `attach` command yet.
 - Codex has an initial normalization fixture test. Pi/OpenCode provider fixtures and CLI golden tests are still missing.
-- No live event stream abstraction yet.
+- The relay uses ZeroMQ `PUB/SUB`, which intentionally has no persistence or
+  delivery acknowledgement; subscribers that are disconnected can miss events.
 
 ## Useful Smokes
 
