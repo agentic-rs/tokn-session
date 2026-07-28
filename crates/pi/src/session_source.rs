@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use crate::event::PiEvent;
+use crate::event::PiSessionLine;
 use crate::normalize::PiNormalizer;
 use tokn_session_core::{LoadedSession, SessionRef};
 
@@ -43,7 +43,7 @@ impl PiSessionSource {
       if line.trim().is_empty() {
         continue;
       }
-      let event: PiEvent = serde_json::from_str(&line)
+      let event: PiSessionLine = serde_json::from_str(&line)
         .map_err(|err| format!("invalid pi jsonl at {}:{}: {err}", path.display(), index + 1))?;
       events.extend(normalizer.normalize(event));
     }
