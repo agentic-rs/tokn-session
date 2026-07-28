@@ -39,6 +39,7 @@ The core abstraction is `AgentEvent`: provider-native historical sessions and li
 
 - `crates/core`: shared IR types such as `AgentEvent`, `SessionRef`, and `LoadedSession`.
 - `crates/codex-protocol`: tolerant, lossless wire types for persisted Codex rollout JSONL.
+- `crates/pi-protocol`: tolerant, lossless wire types for persisted Pi session JSONL.
 - `crates/client`: source dispatch and public client API.
 - `crates/cli`: argument parsing and terminal rendering.
 - `crates/pi`: Pi JSONL session source and normalization.

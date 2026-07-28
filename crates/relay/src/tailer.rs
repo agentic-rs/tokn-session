@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokn_session_codex::{event::CodexLine, normalize::CodexNormalizer};
 use tokn_session_core::{AgentEvent, Provider};
-use tokn_session_pi::{event::PiEvent, normalize::PiNormalizer};
+use tokn_session_pi::{event::PiSessionLine, normalize::PiNormalizer};
 
 use crate::context::session_id_from_path;
 use crate::{NewFileReplay, SessionContext};
@@ -452,7 +452,7 @@ impl SessionNormalizer {
         Ok(normalizer.normalize(event))
       }
       Self::Pi(normalizer) => {
-        let event: PiEvent = serde_json::from_value(value).map_err(|err| format!("invalid pi JSONL: {err}"))?;
+        let event: PiSessionLine = serde_json::from_value(value).map_err(|err| format!("invalid pi JSONL: {err}"))?;
         Ok(normalizer.normalize(event))
       }
     }

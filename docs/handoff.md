@@ -107,6 +107,11 @@ their original payloads. It does not mirror Codex's internal Rust API.
 `tokn-session-codex` uses those local wire types directly. The published
 `codex-protocol` dependency is no longer part of the workspace.
 
+Persisted Pi session wire types similarly live in `tokn-pi-protocol`.
+Top-level entries, nested message roles, and content blocks all fall back to
+lossless unknown values when Pi adds or changes a shape. `tokn-session-pi`
+owns their normalization into `AgentEvent`.
+
 Current event families include:
 
 - `session_started`
@@ -185,6 +190,13 @@ Current browser keys:
 - OpenCode shell tools with nonzero `metadata.exit` are marked as errors even when OpenCode records the tool state as completed.
 - Tool kind classification and summary extraction live in `crates/core`; provider normalizers should use the shared helpers where possible.
 - OpenCode support currently uses the legacy-compatible `message` and `part` tables seen in local data, not the newer `session_message` projection.
+- Pi native JSONL parsing uses `tokn-pi-protocol`. Unknown message roles such
+  as historical `bashExecution` records remain visible without preventing the
+  rest of the session from loading.
+- Pi compaction, branch-summary, extension, label, session-info, leaf, and
+  active-tool records are typed at the wire boundary but remain visible
+  as native `unknown` events until the display IR has a useful semantic
+  mapping.
 - Codex native JSONL parsing uses `tokn-codex-protocol`. New rollout and
   response tags retain their native identity and payload for unknown-event
   discovery instead of being erased by an upstream catch-all enum.
@@ -229,7 +241,8 @@ OpenCode has the first live-output normalizer: `OpenCodeLiveNormalizer` parses `
 ## Known Gaps
 
 - No `attach` command yet.
-- Codex has an initial normalization fixture test. Pi/OpenCode provider fixtures and CLI golden tests are still missing.
+- Codex and Pi have normalization fixtures. OpenCode provider fixtures and CLI
+  golden tests are still missing.
 - The relay uses ZeroMQ `PUB/SUB`, which intentionally has no persistence or
   delivery acknowledgement; subscribers that are disconnected can miss events.
 
@@ -249,6 +262,6 @@ cargo run -p tokn-session-relay -- zeromq
 
 - Wire `create`/`append` stdout through provider live normalizers instead of inheriting child stdout directly.
 - Decide whether live stream consumption should live in `client` as callbacks/iterators or in the CLI command path.
-- Extend provider fixture coverage beyond Codex, especially Pi JSONL and OpenCode SQLite normalization.
+- Extend provider fixture coverage with OpenCode SQLite normalization.
 - Add CLI golden tests for tiny fixture-backed `list` and `show` outputs.
 - Consider splitting stable event IR notes into `docs/event-ir.md` once the IR changes again.

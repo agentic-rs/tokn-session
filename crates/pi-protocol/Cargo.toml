@@ -1,10 +1,9 @@
 [package]
-name = "tokn-session-pi"
+name = "tokn-pi-protocol"
 version.workspace = true
 edition.workspace = true
+readme = "README.md"
 
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-tokn-pi-protocol.workspace = true
-tokn-session-core.workspace = true
