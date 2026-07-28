@@ -134,17 +134,22 @@ fn write_stdout_event(
   if show_context {
     output.push_str(&render_session_context(event, color));
   }
-  output.push_str(&prefix_human_output(event, &rendered, color));
+  output.push_str(&prefix_human_output(
+    event,
+    &rendered,
+    color,
+    format == StdoutFormat::Summary,
+  ));
   writer
     .write_all(output.as_bytes())
     .and_then(|_| writer.flush())
     .map_err(|err| format!("failed to write relay event: {err}"))
 }
 
-fn prefix_human_output(event: &RelayEvent, rendered: &str, color: bool) -> String {
+fn prefix_human_output(event: &RelayEvent, rendered: &str, color: bool, show_agent_path: bool) -> String {
   let (first_line, remainder) = rendered.split_once('\n').unwrap_or((rendered, ""));
   let mut output = String::new();
-  let prefix = human_event_prefix(event);
+  let prefix = human_event_prefix(event, show_agent_path);
   if color {
     output.push_str(event_color(&event.event));
   }
@@ -167,7 +172,7 @@ fn prefix_human_output(event: &RelayEvent, rendered: &str, color: bool) -> Strin
   output
 }
 
-fn human_event_prefix(event: &RelayEvent) -> String {
+fn human_event_prefix(event: &RelayEvent, show_agent_path: bool) -> String {
   let mut parts = Vec::new();
   if let Some(timestamp) = event_timestamp(&event.event).and_then(display_timestamp) {
     parts.push(timestamp);
@@ -185,6 +190,11 @@ fn human_event_prefix(event: &RelayEvent) -> String {
     provider_name(event.session.provider),
     abbreviate_id(&event.session.session_id)
   ));
+  if show_agent_path {
+    if let Some(agent_path) = visible_agent_path(event) {
+      parts.push(format!("agent={agent_path}"));
+    }
+  }
   if let Some(message_id) = event_message_id(&event.event) {
     parts.push(format!("#{}", abbreviate_id(message_id)));
   }
@@ -211,8 +221,7 @@ fn render_session_context(event: &RelayEvent, color: bool) -> String {
 
   append_context_line(&mut output, "title", context.title.as_deref(), color);
   append_context_line(&mut output, "parent", context.parent_session_id.as_deref(), color);
-  let visible_agent_path = context.agent_path.as_deref().filter(|path| *path != "/root");
-  append_context_line(&mut output, "agent", visible_agent_path, color);
+  append_context_line(&mut output, "agent", visible_agent_path(event), color);
   append_context_line(&mut output, "nickname", context.agent_nickname.as_deref(), color);
   append_context_line(&mut output, "role", context.agent_role.as_deref(), color);
   append_context_line(&mut output, "started", context.started_at.as_deref(), color);
@@ -231,6 +240,10 @@ fn render_session_context(event: &RelayEvent, color: bool) -> String {
   }
   output.push('\n');
   output
+}
+
+fn visible_agent_path(event: &RelayEvent) -> Option<&str> {
+  event.session.agent_path.as_deref().filter(|path| *path != "/root")
 }
 
 fn append_context_line(output: &mut String, label: &str, value: Option<&str>, color: bool) {
@@ -772,6 +785,29 @@ mod tests {
     let mut missing = RecordingWriter::default();
     write_stdout_event(&mut missing, &event, StdoutFormat::Pretty, false, true).unwrap();
     assert!(!String::from_utf8(missing.bytes).unwrap().contains("  agent "));
+  }
+
+  #[test]
+  fn summary_shows_only_non_root_agent_paths() {
+    let mut event = message_event();
+    event.session.agent_path = Some("/root/researcher".to_string());
+    let mut child = RecordingWriter::default();
+    write_stdout_event(&mut child, &event, StdoutFormat::Summary, false, false).unwrap();
+    assert!(
+      String::from_utf8(child.bytes)
+        .unwrap()
+        .contains(" agent=/root/researcher ")
+    );
+
+    event.session.agent_path = Some("/root".to_string());
+    let mut root = RecordingWriter::default();
+    write_stdout_event(&mut root, &event, StdoutFormat::Summary, false, false).unwrap();
+    assert!(!String::from_utf8(root.bytes).unwrap().contains(" agent="));
+
+    event.session.agent_path = None;
+    let mut missing = RecordingWriter::default();
+    write_stdout_event(&mut missing, &event, StdoutFormat::Summary, false, false).unwrap();
+    assert!(!String::from_utf8(missing.bytes).unwrap().contains(" agent="));
   }
 
   #[test]
