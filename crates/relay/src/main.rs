@@ -211,7 +211,8 @@ fn render_session_context(event: &RelayEvent, color: bool) -> String {
 
   append_context_line(&mut output, "title", context.title.as_deref(), color);
   append_context_line(&mut output, "parent", context.parent_session_id.as_deref(), color);
-  append_context_line(&mut output, "agent", context.agent_path.as_deref(), color);
+  let visible_agent_path = context.agent_path.as_deref().filter(|path| *path != "/root");
+  append_context_line(&mut output, "agent", visible_agent_path, color);
   append_context_line(&mut output, "nickname", context.agent_nickname.as_deref(), color);
   append_context_line(&mut output, "role", context.agent_role.as_deref(), color);
   append_context_line(&mut output, "started", context.started_at.as_deref(), color);
@@ -748,6 +749,29 @@ mod tests {
     let mut json = RecordingWriter::default();
     write_stdout_event(&mut json, &event, StdoutFormat::Json, true, false).unwrap();
     assert!(!String::from_utf8(json.bytes).unwrap().contains("\u{1b}["));
+  }
+
+  #[test]
+  fn pretty_shows_only_non_root_agent_paths() {
+    let mut event = message_event();
+    event.session.agent_path = Some("/root/researcher".to_string());
+    let mut child = RecordingWriter::default();
+    write_stdout_event(&mut child, &event, StdoutFormat::Pretty, false, true).unwrap();
+    assert!(
+      String::from_utf8(child.bytes)
+        .unwrap()
+        .contains("  agent /root/researcher\n")
+    );
+
+    event.session.agent_path = Some("/root".to_string());
+    let mut root = RecordingWriter::default();
+    write_stdout_event(&mut root, &event, StdoutFormat::Pretty, false, true).unwrap();
+    assert!(!String::from_utf8(root.bytes).unwrap().contains("  agent "));
+
+    event.session.agent_path = None;
+    let mut missing = RecordingWriter::default();
+    write_stdout_event(&mut missing, &event, StdoutFormat::Pretty, false, true).unwrap();
+    assert!(!String::from_utf8(missing.bytes).unwrap().contains("  agent "));
   }
 
   #[test]

@@ -73,6 +73,10 @@ subagent sessions; the relay does not derive `/root`. Project name is display
 metadata inferred from the repository URL or cwd basename; title is never
 invented when the provider file does not contain one.
 
+Pretty session context shows `agent_path` only when it is present and not
+`/root`. JSON preserves the recorded value unchanged, including null or an
+explicit `/root`.
+
 The relay publishes all normalized events, including reasoning, tool calls,
 errors, lifecycle events, and unknown provider-native shapes. It buffers partial
 JSONL records, discovers newly created files, handles truncation/replacement,
