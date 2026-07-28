@@ -1992,6 +1992,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokn-codex-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "tokn-session-cli"
 version = "0.1.0"
 dependencies = [

@@ -98,6 +98,16 @@ that can be retried are returned as warnings in `TailUpdate`.
 
 The shared IR is `AgentEvent`.
 
+Persisted Codex rollout wire types live in the standalone
+`tokn-codex-protocol` crate. The crate is intentionally decode-oriented:
+stable session, response, agent-communication, turn-context, and world-state
+fields are typed; volatile subtrees remain JSON values; and unknown tags retain
+their original payloads. It does not mirror Codex's internal Rust API.
+
+`tokn-session-codex` still uses the published `codex-protocol` dependency while
+its normalizer is migrated. Removing that dependency is the next step; the two
+protocol crates should not remain in parallel long term.
+
 Current event families include:
 
 - `session_started`
