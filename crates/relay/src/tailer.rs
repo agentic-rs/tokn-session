@@ -483,6 +483,7 @@ fn event_session_id(event: &AgentEvent) -> Option<&str> {
     AgentEvent::Message(event) => event.session_id.as_deref(),
     AgentEvent::Reasoning(event) => event.session_id.as_deref(),
     AgentEvent::GoalUpdated(event) => event.session_id.as_deref(),
+    AgentEvent::AgentActivity(event) => event.session_id.as_deref(),
     AgentEvent::ToolCall(event) => event.session_id.as_deref(),
     AgentEvent::Error(event) => event.session_id.as_deref(),
     AgentEvent::Unknown(event) => event.session_id.as_deref(),
@@ -873,6 +874,9 @@ mod tests {
         "{\"timestamp\":\"2026-06-04T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{",
         "\"id\":\"codex-session\",",
         "\"parent_thread_id\":\"parent-session\",",
+        "\"agent_path\":\"/root/researcher\",",
+        "\"agent_nickname\":\"Hubble\",",
+        "\"agent_role\":\"explorer\",",
         "\"timestamp\":\"2026-06-04T00:00:00Z\",",
         "\"cwd\":\"/tmp/worktree\",",
         "\"model_provider\":\"openai\",",
@@ -907,8 +911,15 @@ mod tests {
     let context = &update.events[0].session;
     assert_eq!(context.session_id, "codex-session");
     assert_eq!(context.parent_session_id.as_deref(), Some("parent-session"));
+    assert_eq!(context.agent_path.as_deref(), Some("/root/researcher"));
+    assert_eq!(context.agent_nickname.as_deref(), Some("Hubble"));
+    assert_eq!(context.agent_role.as_deref(), Some("explorer"));
     assert_eq!(context.cwd.as_deref(), Some("/tmp/worktree/subdir"));
     assert_eq!(context.started_at.as_deref(), Some("2026-06-04T00:00:00Z"));
+    let relay_json = serde_json::to_value(&update.events[0]).unwrap();
+    assert_eq!(relay_json["session"]["agent_path"], "/root/researcher");
+    assert_eq!(relay_json["session"]["agent_nickname"], "Hubble");
+    assert_eq!(relay_json["session"]["agent_role"], "explorer");
     let project = context.project.as_ref().unwrap();
     assert_eq!(
       project.id.as_deref(),

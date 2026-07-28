@@ -65,10 +65,17 @@ ZeroMQ message:
 
 `RelayEvent` wraps the normalized `AgentEvent` with the source path, topic, and
 `SessionContext`. Context includes session id, optional parent/title, cwd and
-start time, plus project name/folder. Codex session metadata also contributes
-repository URL, branch, and commit when present. Project name is display
+start time, optional agent path/nickname/role, plus project name/folder. Codex
+session metadata also contributes repository URL, branch, and commit when
+present. Agent metadata comes only from the first session header, including its
+thread-spawn source when needed. Missing paths remain null for root and
+subagent sessions; the relay does not derive `/root`. Project name is display
 metadata inferred from the repository URL or cwd basename; title is never
 invented when the provider file does not contain one.
+
+Pretty session context shows `agent_path` only when it is present and not
+`/root`. Summary lines include the same paths as `agent=<path>`. JSON preserves
+the recorded value unchanged, including null or an explicit `/root`.
 
 The relay publishes all normalized events, including reasoning, tool calls,
 errors, lifecycle events, and unknown provider-native shapes. It buffers partial
@@ -99,6 +106,7 @@ Current event families include:
 - `message`
 - `reasoning`
 - `goal_updated`
+- `agent_activity`
 - `tool_call`
 - `error`
 - `unknown`
@@ -125,6 +133,15 @@ snapshot and retains the provider-native snapshot for JSON consumers. Human
 rendering intentionally omits permission internals and embedded developer
 instructions. The relay updates `SessionContext.cwd` when these settings change
 without replacing the session's original project metadata.
+
+Codex `event_msg.sub_agent_activity` maps to `agent_activity`. Its
+`agent_thread_id` and `agent_path` identify the target of the activity, so the
+IR names them `target_session_id` and `target_agent_path`. Actor identity is
+optional and is not inferred from the containing rollout because child files
+can include copied parent history. Human output therefore says `interaction
+with /root` unless an actor is independently known. The first Codex
+`session_meta` owns the rollout; later copied session headers do not replace
+the normalizer or relay session identity.
 
 Reusable display formatting lives in `crates/render`. It depends on `core`, not on terminal libraries. The CLI uses it for linear output and the interactive browser uses its `EventDisplay` rows for collapsed summaries and expanded detail.
 

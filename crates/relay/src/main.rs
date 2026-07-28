@@ -134,17 +134,22 @@ fn write_stdout_event(
   if show_context {
     output.push_str(&render_session_context(event, color));
   }
-  output.push_str(&prefix_human_output(event, &rendered, color));
+  output.push_str(&prefix_human_output(
+    event,
+    &rendered,
+    color,
+    format == StdoutFormat::Summary,
+  ));
   writer
     .write_all(output.as_bytes())
     .and_then(|_| writer.flush())
     .map_err(|err| format!("failed to write relay event: {err}"))
 }
 
-fn prefix_human_output(event: &RelayEvent, rendered: &str, color: bool) -> String {
+fn prefix_human_output(event: &RelayEvent, rendered: &str, color: bool, show_agent_path: bool) -> String {
   let (first_line, remainder) = rendered.split_once('\n').unwrap_or((rendered, ""));
   let mut output = String::new();
-  let prefix = human_event_prefix(event);
+  let prefix = human_event_prefix(event, show_agent_path);
   if color {
     output.push_str(event_color(&event.event));
   }
@@ -167,7 +172,7 @@ fn prefix_human_output(event: &RelayEvent, rendered: &str, color: bool) -> Strin
   output
 }
 
-fn human_event_prefix(event: &RelayEvent) -> String {
+fn human_event_prefix(event: &RelayEvent, show_agent_path: bool) -> String {
   let mut parts = Vec::new();
   if let Some(timestamp) = event_timestamp(&event.event).and_then(display_timestamp) {
     parts.push(timestamp);
@@ -185,6 +190,11 @@ fn human_event_prefix(event: &RelayEvent) -> String {
     provider_name(event.session.provider),
     abbreviate_id(&event.session.session_id)
   ));
+  if show_agent_path {
+    if let Some(agent_path) = visible_agent_path(event) {
+      parts.push(format!("agent={agent_path}"));
+    }
+  }
   if let Some(message_id) = event_message_id(&event.event) {
     parts.push(format!("#{}", abbreviate_id(message_id)));
   }
@@ -211,6 +221,9 @@ fn render_session_context(event: &RelayEvent, color: bool) -> String {
 
   append_context_line(&mut output, "title", context.title.as_deref(), color);
   append_context_line(&mut output, "parent", context.parent_session_id.as_deref(), color);
+  append_context_line(&mut output, "agent", visible_agent_path(event), color);
+  append_context_line(&mut output, "nickname", context.agent_nickname.as_deref(), color);
+  append_context_line(&mut output, "role", context.agent_role.as_deref(), color);
   append_context_line(&mut output, "started", context.started_at.as_deref(), color);
 
   if let Some(project) = &context.project {
@@ -227,6 +240,10 @@ fn render_session_context(event: &RelayEvent, color: bool) -> String {
   }
   output.push('\n');
   output
+}
+
+fn visible_agent_path(event: &RelayEvent) -> Option<&str> {
+  event.session.agent_path.as_deref().filter(|path| *path != "/root")
 }
 
 fn append_context_line(output: &mut String, label: &str, value: Option<&str>, color: bool) {
@@ -283,6 +300,7 @@ fn event_timestamp(event: &tokn_session_core::AgentEvent) -> Option<&str> {
     AgentEvent::Message(event) => event.timestamp.as_deref(),
     AgentEvent::Reasoning(event) => event.timestamp.as_deref(),
     AgentEvent::GoalUpdated(event) => event.timestamp.as_deref(),
+    AgentEvent::AgentActivity(event) => event.timestamp.as_deref(),
     AgentEvent::ToolCall(event) => event.timestamp.as_deref(),
     AgentEvent::Error(event) => event.timestamp.as_deref(),
     AgentEvent::Unknown(event) => event.timestamp.as_deref(),
@@ -318,7 +336,8 @@ fn event_color(event: &tokn_session_core::AgentEvent) -> &'static str {
     AgentEvent::SessionStarted(_)
     | AgentEvent::ProviderChanged(_)
     | AgentEvent::SessionSettingsApplied(_)
-    | AgentEvent::GoalUpdated(_) => ANSI_BLUE,
+    | AgentEvent::GoalUpdated(_)
+    | AgentEvent::AgentActivity(_) => ANSI_BLUE,
     AgentEvent::Message(event) => match event.role {
       Role::User => ANSI_CYAN,
       Role::Assistant => ANSI_GREEN,
@@ -703,6 +722,7 @@ mod tests {
     let value: serde_json::Value = serde_json::from_slice(&output.bytes).unwrap();
     assert_eq!(value["topic"], "pi.session-1");
     assert_eq!(value["session"]["project"]["name"], "project");
+    assert!(value["session"]["agent_path"].is_null());
     assert_eq!(value["event"]["type"], "message");
     assert_eq!(value["event"]["text"], "done");
     assert_eq!(output.flushes, 1);
@@ -742,6 +762,52 @@ mod tests {
     let mut json = RecordingWriter::default();
     write_stdout_event(&mut json, &event, StdoutFormat::Json, true, false).unwrap();
     assert!(!String::from_utf8(json.bytes).unwrap().contains("\u{1b}["));
+  }
+
+  #[test]
+  fn pretty_shows_only_non_root_agent_paths() {
+    let mut event = message_event();
+    event.session.agent_path = Some("/root/researcher".to_string());
+    let mut child = RecordingWriter::default();
+    write_stdout_event(&mut child, &event, StdoutFormat::Pretty, false, true).unwrap();
+    assert!(
+      String::from_utf8(child.bytes)
+        .unwrap()
+        .contains("  agent /root/researcher\n")
+    );
+
+    event.session.agent_path = Some("/root".to_string());
+    let mut root = RecordingWriter::default();
+    write_stdout_event(&mut root, &event, StdoutFormat::Pretty, false, true).unwrap();
+    assert!(!String::from_utf8(root.bytes).unwrap().contains("  agent "));
+
+    event.session.agent_path = None;
+    let mut missing = RecordingWriter::default();
+    write_stdout_event(&mut missing, &event, StdoutFormat::Pretty, false, true).unwrap();
+    assert!(!String::from_utf8(missing.bytes).unwrap().contains("  agent "));
+  }
+
+  #[test]
+  fn summary_shows_only_non_root_agent_paths() {
+    let mut event = message_event();
+    event.session.agent_path = Some("/root/researcher".to_string());
+    let mut child = RecordingWriter::default();
+    write_stdout_event(&mut child, &event, StdoutFormat::Summary, false, false).unwrap();
+    assert!(
+      String::from_utf8(child.bytes)
+        .unwrap()
+        .contains(" agent=/root/researcher ")
+    );
+
+    event.session.agent_path = Some("/root".to_string());
+    let mut root = RecordingWriter::default();
+    write_stdout_event(&mut root, &event, StdoutFormat::Summary, false, false).unwrap();
+    assert!(!String::from_utf8(root.bytes).unwrap().contains(" agent="));
+
+    event.session.agent_path = None;
+    let mut missing = RecordingWriter::default();
+    write_stdout_event(&mut missing, &event, StdoutFormat::Summary, false, false).unwrap();
+    assert!(!String::from_utf8(missing.bytes).unwrap().contains(" agent="));
   }
 
   #[test]
@@ -788,6 +854,9 @@ mod tests {
       provider: Provider::Pi,
       session_id: "session-1".to_string(),
       parent_session_id: None,
+      agent_path: None,
+      agent_nickname: None,
+      agent_role: None,
       title: None,
       cwd: Some("/tmp/project".to_string()),
       started_at: Some("2026-01-01T00:00:00Z".to_string()),

@@ -19,6 +19,9 @@ pub struct SessionContext {
   pub provider: Provider,
   pub session_id: String,
   pub parent_session_id: Option<String>,
+  pub agent_path: Option<String>,
+  pub agent_nickname: Option<String>,
+  pub agent_role: Option<String>,
   pub title: Option<String>,
   pub cwd: Option<String>,
   pub started_at: Option<String>,
@@ -31,6 +34,9 @@ impl SessionContext {
       provider,
       session_id: session_id_from_path(path),
       parent_session_id: None,
+      agent_path: None,
+      agent_nickname: None,
+      agent_role: None,
       title: None,
       cwd: None,
       started_at: None,
@@ -64,10 +70,25 @@ impl SessionContext {
   }
 
   fn update_codex_session_meta(&mut self, value: &Value, payload: &Value) {
+    if self.started_at.is_some() {
+      return;
+    }
+
     if let Some(id) = string_field(payload, "id") {
       self.session_id = id;
     }
     self.parent_session_id = first_string_field(payload, &["parent_thread_id", "forked_from_id"]);
+    let thread_spawn = payload
+      .get("source")
+      .and_then(|source| source.get("subagent"))
+      .and_then(|subagent| subagent.get("thread_spawn"));
+    self.agent_path = string_field(payload, "agent_path")
+      .or_else(|| thread_spawn.and_then(|thread_spawn| string_field(thread_spawn, "agent_path")));
+    self.agent_nickname = string_field(payload, "agent_nickname")
+      .or_else(|| thread_spawn.and_then(|thread_spawn| string_field(thread_spawn, "agent_nickname")));
+    self.agent_role = first_string_field(payload, &["agent_role", "agent_type"]).or_else(|| {
+      thread_spawn.and_then(|thread_spawn| first_string_field(thread_spawn, &["agent_role", "agent_type"]))
+    });
     self.title = string_field(payload, "title");
     self.cwd = string_field(payload, "cwd");
     self.started_at = string_field(payload, "timestamp").or_else(|| string_field(value, "timestamp"));
@@ -181,6 +202,9 @@ mod tests {
       "payload": {
         "id": "session-1",
         "parent_thread_id": "parent-1",
+        "agent_path": "/root/researcher",
+        "agent_nickname": "Hubble",
+        "agent_role": "explorer",
         "title": "Investigate relay",
         "cwd": "/tmp/worktree",
         "git": {
@@ -193,6 +217,9 @@ mod tests {
 
     assert_eq!(context.session_id, "session-1");
     assert_eq!(context.parent_session_id.as_deref(), Some("parent-1"));
+    assert_eq!(context.agent_path.as_deref(), Some("/root/researcher"));
+    assert_eq!(context.agent_nickname.as_deref(), Some("Hubble"));
+    assert_eq!(context.agent_role.as_deref(), Some("explorer"));
     assert_eq!(context.title.as_deref(), Some("Investigate relay"));
     assert_eq!(context.started_at.as_deref(), Some("2026-06-04T00:00:00Z"));
     let project = context.project.unwrap();
@@ -225,5 +252,92 @@ mod tests {
       context.project.as_ref().and_then(|project| project.folder.as_deref()),
       Some("/tmp/project")
     );
+  }
+
+  #[test]
+  fn keeps_first_codex_session_meta_as_the_owning_session() {
+    let mut context = SessionContext::from_path(Provider::Codex, Path::new("fallback.jsonl"));
+    context.update(&json!({
+      "type": "session_meta",
+      "payload": {
+        "id": "child-session",
+        "parent_thread_id": "root-session",
+        "timestamp": "2026-07-24T17:52:40Z",
+        "cwd": "/tmp/child"
+      }
+    }));
+    context.update(&json!({
+      "type": "session_meta",
+      "payload": {
+        "id": "root-session",
+        "timestamp": "2026-07-15T10:00:00Z",
+        "cwd": "/tmp/root"
+      }
+    }));
+
+    assert_eq!(context.session_id, "child-session");
+    assert_eq!(context.parent_session_id.as_deref(), Some("root-session"));
+    assert_eq!(context.agent_path, None);
+    assert_eq!(context.cwd.as_deref(), Some("/tmp/child"));
+    assert_eq!(context.started_at.as_deref(), Some("2026-07-24T17:52:40Z"));
+  }
+
+  #[test]
+  fn reads_agent_metadata_from_thread_spawn_source() {
+    let mut context = SessionContext::from_path(Provider::Codex, Path::new("fallback.jsonl"));
+    context.update(&json!({
+      "type": "session_meta",
+      "payload": {
+        "id": "child-session",
+        "timestamp": "2026-07-24T17:52:40Z",
+        "cwd": "/tmp/child",
+        "source": {
+          "subagent": {
+            "thread_spawn": {
+              "agent_path": "/root/researcher",
+              "agent_nickname": "Hubble",
+              "agent_role": "explorer"
+            }
+          }
+        }
+      }
+    }));
+
+    assert_eq!(context.agent_path.as_deref(), Some("/root/researcher"));
+    assert_eq!(context.agent_nickname.as_deref(), Some("Hubble"));
+    assert_eq!(context.agent_role.as_deref(), Some("explorer"));
+  }
+
+  #[test]
+  fn leaves_unavailable_root_and_subagent_paths_null() {
+    let mut root = SessionContext::from_path(Provider::Codex, Path::new("root.jsonl"));
+    root.update(&json!({
+      "type": "session_meta",
+      "payload": {
+        "id": "root-session",
+        "timestamp": "2026-07-24T17:52:40Z",
+        "cwd": "/tmp/root",
+        "source": "vscode"
+      }
+    }));
+
+    let mut guardian = SessionContext::from_path(Provider::Codex, Path::new("guardian.jsonl"));
+    guardian.update(&json!({
+      "type": "session_meta",
+      "payload": {
+        "id": "guardian-session",
+        "parent_thread_id": "root-session",
+        "timestamp": "2026-07-24T17:52:40Z",
+        "cwd": "/tmp/root",
+        "source": {
+          "subagent": {
+            "other": "guardian"
+          }
+        }
+      }
+    }));
+
+    assert_eq!(root.agent_path, None);
+    assert_eq!(guardian.agent_path, None);
   }
 }
