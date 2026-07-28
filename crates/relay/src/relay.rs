@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use crate::{ProviderRoot, SessionTailer, TailUpdate};
 
@@ -46,7 +47,7 @@ pub struct SessionRelay {
   tailer: SessionTailer,
   watcher: RecommendedWatcher,
   watched_roots: HashSet<PathBuf>,
-  wake_rx: mpsc::UnboundedReceiver<Result<(), String>>,
+  wake_rx: mpsc::UnboundedReceiver<Result<Vec<PathBuf>, String>>,
   poll: tokio::time::Interval,
   initial: Option<TailUpdate>,
 }
@@ -61,7 +62,7 @@ impl SessionRelay {
     let tailer = SessionTailer::prepare(config.roots, config.new_file_replay)?;
     let (wake_tx, wake_rx) = mpsc::unbounded_channel();
     let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
-      let result = result.map(|_| ()).map_err(|err| err.to_string());
+      let result = result.map(|event| event.paths).map_err(|err| err.to_string());
       let _ = wake_tx.send(result);
     })
     .map_err(|err| format!("failed to create filesystem watcher: {err}"))?;
@@ -70,7 +71,7 @@ impl SessionRelay {
       watcher,
       watched_roots: HashSet::new(),
       wake_rx,
-      poll: tokio::time::interval(config.poll_interval),
+      poll: tokio::time::interval_at(Instant::now() + config.poll_interval, config.poll_interval),
       initial: None,
     };
     relay
@@ -93,31 +94,59 @@ impl SessionRelay {
       return Ok(initial);
     }
 
-    let watcher_warning = tokio::select! {
-      _ = self.poll.tick() => None,
+    let wake = tokio::select! {
+      _ = self.poll.tick() => ScanRequest::Full,
       wake = self.wake_rx.recv() => {
         match wake {
-          Some(Ok(())) => None,
-          Some(Err(err)) => Some(format!("filesystem watcher error: {err}")),
+          Some(wake) => ScanRequest::Watcher(wake),
           None => return Err("filesystem watcher stopped unexpectedly".to_string()),
         }
       }
     };
 
-    let mut update = match self.tailer.scan() {
+    let (scan_all, paths, mut watcher_warnings) = match wake {
+      ScanRequest::Full => (true, HashSet::new(), Vec::new()),
+      ScanRequest::Watcher(first) => self.collect_watcher_events(first),
+    };
+    let scan = if scan_all {
+      self.tailer.scan()
+    } else {
+      self.tailer.scan_paths(paths)
+    };
+    let mut update = match scan {
       Ok(update) => update,
       Err(err) => TailUpdate {
         events: Vec::new(),
         warnings: vec![err],
       },
     };
-    if let Some(warning) = watcher_warning {
-      update.warnings.insert(0, warning);
-    }
+    watcher_warnings.append(&mut update.warnings);
+    update.warnings = watcher_warnings;
     if let Err(err) = self.watch_available_roots() {
       update.warnings.push(err);
     }
     Ok(update)
+  }
+
+  fn collect_watcher_events(&mut self, first: Result<Vec<PathBuf>, String>) -> (bool, HashSet<PathBuf>, Vec<String>) {
+    let mut scan_all = false;
+    let mut paths = HashSet::new();
+    let mut warnings = Vec::new();
+    let mut wakes = vec![first];
+    while let Ok(wake) = self.wake_rx.try_recv() {
+      wakes.push(wake);
+    }
+    for wake in wakes {
+      match wake {
+        Ok(event_paths) if event_paths.is_empty() => scan_all = true,
+        Ok(event_paths) => paths.extend(event_paths),
+        Err(err) => {
+          scan_all = true;
+          warnings.push(format!("filesystem watcher error: {err}"));
+        }
+      }
+    }
+    (scan_all, paths, warnings)
   }
 
   fn watch_available_roots(&mut self) -> Result<(), String> {
@@ -133,6 +162,11 @@ impl SessionRelay {
     }
     Ok(())
   }
+}
+
+enum ScanRequest {
+  Full,
+  Watcher(Result<Vec<PathBuf>, String>),
 }
 
 #[cfg(test)]

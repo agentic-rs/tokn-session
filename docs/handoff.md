@@ -41,6 +41,9 @@ options.
 Native filesystem watching is registered between the initial file snapshot and
 the EOF-seeding pass, so appends during startup remain visible. The periodic
 scan is a fallback for missed notifications and roots created after startup.
+Watcher notifications retain and coalesce their affected paths, so normal
+updates inspect only changed files instead of rescanning every session. macOS
+uses the kqueue backend because FSEvents can omit these session-file writes.
 Newly discovered or replaced files emit all normalized events beginning at the
 third-most-recent message by default. `--replay=<count>` changes that window,
 while `--replay-all` emits every complete record. These replay options only

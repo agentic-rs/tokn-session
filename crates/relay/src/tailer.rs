@@ -104,8 +104,60 @@ impl SessionTailer {
     Ok(update)
   }
 
+  pub fn scan_paths(&mut self, changed_paths: HashSet<PathBuf>) -> Result<TailUpdate, String> {
+    let mut candidates = HashMap::new();
+    let mut changed_directories = Vec::new();
+
+    for path in changed_paths {
+      let Some(provider) = self.provider_for_path(&path) else {
+        continue;
+      };
+      if path.is_dir() {
+        changed_directories.push(path.clone());
+        let mut seen = HashSet::new();
+        let mut discovered = Vec::new();
+        collect_jsonl_files(&path, provider, &mut seen, &mut discovered)?;
+        candidates.extend(discovered);
+      } else if is_jsonl(&path) {
+        candidates.insert(path, provider);
+      } else if !path.exists() {
+        changed_directories.push(path);
+      }
+    }
+
+    if !changed_directories.is_empty() {
+      self.files.retain(|path, _| {
+        !changed_directories
+          .iter()
+          .any(|directory| path.starts_with(directory) && !path.exists())
+      });
+    }
+
+    let mut update = TailUpdate::default();
+    for (path, provider) in candidates {
+      self.scan_file(path, provider, &mut update)?;
+    }
+    Ok(update)
+  }
+
   pub fn roots(&self) -> &[ProviderRoot] {
     &self.roots
+  }
+
+  fn scan_file(&mut self, path: PathBuf, provider: Provider, update: &mut TailUpdate) -> Result<(), String> {
+    if !path.exists() {
+      self.files.remove(&path);
+      return Ok(());
+    }
+    let Some(state) = self.files.get_mut(&path) else {
+      return self.add_file(path, provider, InitialRead::Replay(self.new_file_replay), update);
+    };
+    let (mut appended, restarted) = state.read_appended(true)?;
+    if restarted {
+      apply_replay_policy(&mut appended.events, self.new_file_replay);
+    }
+    update.append(appended);
+    Ok(())
   }
 
   fn add_file(
@@ -129,6 +181,15 @@ impl SessionTailer {
       collect_jsonl_files(&root.path, root.provider, &mut seen, &mut paths)?;
     }
     Ok(paths)
+  }
+
+  fn provider_for_path(&self, path: &Path) -> Option<Provider> {
+    self
+      .roots
+      .iter()
+      .filter(|root| path.starts_with(&root.path))
+      .max_by_key(|root| root.path.components().count())
+      .map(|root| root.provider)
   }
 }
 
@@ -490,6 +551,7 @@ fn file_identity(metadata: &std::fs::Metadata) -> FileIdentity {
 
 #[cfg(test)]
 mod tests {
+  use std::collections::HashSet;
   use std::fs::OpenOptions;
   use std::io::Write;
 
@@ -657,6 +719,42 @@ mod tests {
   }
 
   #[test]
+  fn scans_only_files_named_by_watcher_events() {
+    let fixture = TempDir::new().unwrap();
+    let first = fixture.path().join("session_first.jsonl");
+    let second = fixture.path().join("session_second.jsonl");
+    for (path, session_id) in [(&first, "first"), (&second, "second")] {
+      std::fs::write(
+        path,
+        format!("{{\"type\":\"session\",\"id\":\"{session_id}\",\"timestamp\":\"2026-01-01\",\"cwd\":\"/tmp\"}}\n"),
+      )
+      .unwrap();
+    }
+    let (mut tailer, _) = SessionTailer::initialize(
+      vec![ProviderRoot::new(Provider::Pi, fixture.path().to_path_buf())],
+      NewFileReplay::Messages(3),
+    )
+    .unwrap();
+
+    append(
+      &first,
+      "{\"type\":\"message\",\"id\":\"first\",\"message\":{\"role\":\"user\",\"content\":\"first\"}}\n",
+    );
+    append(
+      &second,
+      "{\"type\":\"message\",\"id\":\"second\",\"message\":{\"role\":\"user\",\"content\":\"second\"}}\n",
+    );
+
+    let first_update = tailer.scan_paths(HashSet::from([first])).unwrap();
+    assert_eq!(first_update.events.len(), 1);
+    assert_eq!(first_update.events[0].topic, "pi.first");
+
+    let second_update = tailer.scan_paths(HashSet::from([second])).unwrap();
+    assert_eq!(second_update.events.len(), 1);
+    assert_eq!(second_update.events[0].topic, "pi.second");
+  }
+
+  #[test]
   fn preserves_a_partial_line_present_at_startup() {
     let fixture = TempDir::new().unwrap();
     let path = fixture.path().join("session_test.jsonl");
@@ -691,8 +789,9 @@ mod tests {
       NewFileReplay::All,
     )
     .unwrap();
+    let path = fixture.path().join("session_new.jsonl");
     std::fs::write(
-      fixture.path().join("session_new.jsonl"),
+      &path,
       concat!(
         "{\"type\":\"session\",\"id\":\"new-session\",\"timestamp\":\"2026-01-01\",\"cwd\":\"/tmp\"}\n",
         "{\"type\":\"message\",\"id\":\"old\",\"message\":{\"role\":\"user\",\"content\":\"old\"}}\n",
@@ -701,7 +800,7 @@ mod tests {
     )
     .unwrap();
 
-    let update = tailer.scan().unwrap();
+    let update = tailer.scan_paths(HashSet::from([path])).unwrap();
     assert_eq!(update.events.len(), 3);
     assert!(update.events.iter().all(|event| event.topic == "pi.new-session"));
   }
@@ -714,8 +813,9 @@ mod tests {
       NewFileReplay::Messages(3),
     )
     .unwrap();
+    let path = fixture.path().join("session_new.jsonl");
     std::fs::write(
-      fixture.path().join("session_new.jsonl"),
+      &path,
       concat!(
         "{\"type\":\"session\",\"id\":\"new-session\",\"timestamp\":\"2026-01-01\",\"cwd\":\"/tmp\"}\n",
         "{\"type\":\"message\",\"id\":\"1\",\"message\":{\"role\":\"user\",\"content\":\"one\"}}\n",
@@ -729,7 +829,7 @@ mod tests {
     )
     .unwrap();
 
-    let update = tailer.scan().unwrap();
+    let update = tailer.scan_paths(HashSet::from([path])).unwrap();
     assert_eq!(update.events.len(), 4);
     let texts = update
       .events
@@ -768,7 +868,7 @@ mod tests {
       &path,
       "{\"timestamp\":\"2026-06-04T00:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hello\"}}\n",
     );
-    let update = tailer.scan().unwrap();
+    let update = tailer.scan_paths(HashSet::from([path])).unwrap();
     assert_eq!(update.events.len(), 1);
     assert_eq!(update.events[0].topic, "codex.codex-session");
     let AgentEvent::Message(message) = &update.events[0].event else {
@@ -804,7 +904,7 @@ mod tests {
     .unwrap();
     std::fs::rename(replacement, &path).unwrap();
 
-    let update = tailer.scan().unwrap();
+    let update = tailer.scan_paths(HashSet::from([path])).unwrap();
     assert_eq!(update.events.len(), 2);
     assert!(update.events.iter().all(|event| event.topic == "pi.new-session"));
   }
