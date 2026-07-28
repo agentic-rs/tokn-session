@@ -10,30 +10,34 @@ use crate::{ProviderRoot, SessionTailer, TailUpdate};
 /// Default interval for recovering from missed filesystem notifications and
 /// discovering roots created after startup.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
-/// Default number of recent messages used to anchor a newly discovered
-/// session's event history.
-pub const DEFAULT_NEW_FILE_HISTORY: usize = 3;
+/// Default number of recent messages replayed from a newly discovered session.
+pub const DEFAULT_REPLAY_MESSAGES: usize = 3;
+
+/// History emitted when a session file is discovered or replaced after startup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NewFileReplay {
+  /// Emit all complete records.
+  All,
+  /// Emit events beginning at the specified most-recent message.
+  Messages(usize),
+}
 
 #[derive(Clone, Debug)]
 pub struct RelayConfig {
   /// Provider session trees to follow.
   pub roots: Vec<ProviderRoot>,
-  /// Whether records present at startup should be emitted.
-  pub replay: bool,
   /// Interval for the fallback filesystem rescan.
   pub poll_interval: Duration,
-  /// Number of recent message-anchored events to emit for a newly discovered
-  /// or replaced session file.
-  pub new_file_history: usize,
+  /// History emitted for a newly discovered or replaced session file.
+  pub new_file_replay: NewFileReplay,
 }
 
 impl RelayConfig {
   pub fn new(roots: Vec<ProviderRoot>) -> Self {
     Self {
       roots,
-      replay: false,
       poll_interval: DEFAULT_POLL_INTERVAL,
-      new_file_history: DEFAULT_NEW_FILE_HISTORY,
+      new_file_replay: NewFileReplay::Messages(DEFAULT_REPLAY_MESSAGES),
     }
   }
 }
@@ -54,7 +58,7 @@ impl SessionRelay {
       return Err("relay poll interval must be greater than zero".to_string());
     }
 
-    let tailer = SessionTailer::prepare(config.roots, config.new_file_history)?;
+    let tailer = SessionTailer::prepare(config.roots, config.new_file_replay)?;
     let (wake_tx, wake_rx) = mpsc::unbounded_channel();
     let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
       let result = result.map(|_| ()).map_err(|err| err.to_string());
@@ -73,7 +77,7 @@ impl SessionRelay {
       .poll
       .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     relay.watch_available_roots()?;
-    relay.initial = Some(relay.tailer.start(config.replay)?);
+    relay.initial = Some(relay.tailer.start()?);
     Ok(relay)
   }
 

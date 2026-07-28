@@ -34,16 +34,17 @@ tokn-session-relay stdout
 
 Both modes watch `~/.codex/sessions` and `~/.pi/agent/sessions` by default and
 seed existing files from their session header before following from the
-snapshotted EOF. Historical bodies are not parsed unless `--replay` is passed.
-`--codex-dir`, `--pi-dir`, `--poll-interval`, and `--new-file-history` are
-shared options.
+snapshotted EOF. Their historical bodies are not replayed. `--codex-dir`,
+`--pi-dir`, `--poll-interval`, `--replay=<count>`, and `--replay-all` are shared
+options.
 
 Native filesystem watching is registered between the initial file snapshot and
 the EOF-seeding pass, so appends during startup remain visible. The periodic
 scan is a fallback for missed notifications and roots created after startup.
 Newly discovered or replaced files emit all normalized events beginning at the
-third-most-recent message by default; `--new-file-history <count>` changes that
-window.
+third-most-recent message by default. `--replay=<count>` changes that window,
+while `--replay-all` emits every complete record. These replay options only
+apply to files discovered or replaced after startup.
 
 `stdout` writes one normalized `AgentEvent` JSON object per line and flushes
 after every event. Diagnostics remain on stderr.
@@ -60,10 +61,9 @@ JSONL records, discovers newly created files, handles truncation/replacement,
 and combines native filesystem notifications with a periodic rescan.
 
 The reusable relay loop lives in the library as `SessionRelay`. `RelayConfig`
-controls provider roots, initial replay, new-file message history, and the
-periodic recovery interval. Library consumers call `next_update().await`;
-notification and scan failures that can be retried are returned as warnings in
-`TailUpdate`.
+controls provider roots, new-file replay, and the periodic recovery interval.
+Library consumers call `next_update().await`; notification and scan failures
+that can be retried are returned as warnings in `TailUpdate`.
 
 ## Provider Sources
 

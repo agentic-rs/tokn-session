@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use tokn_session_core::Provider;
 use tokn_session_relay::{
-  DEFAULT_NEW_FILE_HISTORY, DEFAULT_POLL_INTERVAL, ProviderRoot, RelayConfig, RelayEvent, SessionRelay, TailUpdate,
-  ZmqPublisher,
+  DEFAULT_POLL_INTERVAL, DEFAULT_REPLAY_MESSAGES, NewFileReplay, ProviderRoot, RelayConfig, RelayEvent, SessionRelay,
+  TailUpdate, ZmqPublisher,
 };
 
 const DEFAULT_ENDPOINT: &str = "tcp://127.0.0.1:5556";
@@ -30,9 +30,8 @@ async fn main() {
 async fn run(args: Args) -> Result<(), String> {
   let config = RelayConfig {
     roots: args.roots()?,
-    replay: args.replay,
     poll_interval: args.poll_interval,
-    new_file_history: args.new_file_history,
+    new_file_replay: args.new_file_replay,
   };
   let mut relay = SessionRelay::new(config).await?;
   let mut output = match args.command {
@@ -99,9 +98,8 @@ struct Args {
   command: Command,
   codex_dir: Option<PathBuf>,
   pi_dir: Option<PathBuf>,
-  replay: bool,
   poll_interval: Duration,
-  new_file_history: usize,
+  new_file_replay: NewFileReplay,
 }
 
 enum ArgsParse {
@@ -135,10 +133,10 @@ impl Args {
       },
       codex_dir: None,
       pi_dir: None,
-      replay: false,
       poll_interval: DEFAULT_POLL_INTERVAL,
-      new_file_history: DEFAULT_NEW_FILE_HISTORY,
+      new_file_replay: NewFileReplay::Messages(DEFAULT_REPLAY_MESSAGES),
     };
+    let mut replay_option_seen = false;
 
     while let Some(arg) = args.next() {
       match arg.as_str() {
@@ -149,12 +147,19 @@ impl Args {
         "--codex-dir" => parsed.codex_dir = Some(PathBuf::from(next_value(&mut args, "--codex-dir")?)),
         "--pi-dir" => parsed.pi_dir = Some(PathBuf::from(next_value(&mut args, "--pi-dir")?)),
         "--poll-interval" => parsed.poll_interval = parse_duration(&next_value(&mut args, "--poll-interval")?)?,
-        "--new-file-history" => {
-          parsed.new_file_history = next_value(&mut args, "--new-file-history")?
-            .parse()
-            .map_err(|_| "`--new-file-history` requires a non-negative integer".to_string())?
+        "--replay-all" => {
+          set_replay_option(&mut replay_option_seen)?;
+          parsed.new_file_replay = NewFileReplay::All;
         }
-        "--replay" => parsed.replay = true,
+        replay if replay.starts_with("--replay=") => {
+          set_replay_option(&mut replay_option_seen)?;
+          let count = replay
+            .strip_prefix("--replay=")
+            .expect("replay prefix was checked")
+            .parse()
+            .map_err(|_| "`--replay` requires a non-negative integer".to_string())?;
+          parsed.new_file_replay = NewFileReplay::Messages(count);
+        }
         "-h" | "--help" => {
           let help = match parsed.command {
             Command::ZeroMq { .. } => Help::ZeroMq,
@@ -181,6 +186,14 @@ impl Args {
 
 fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
   args.next().ok_or_else(|| format!("{flag} requires a value"))
+}
+
+fn set_replay_option(seen: &mut bool) -> Result<(), String> {
+  if *seen {
+    return Err("`--replay=<count>` and `--replay-all` are mutually exclusive".to_string());
+  }
+  *seen = true;
+  Ok(())
 }
 
 fn parse_duration(value: &str) -> Result<Duration, String> {
@@ -244,8 +257,8 @@ Options:
   --codex-dir <path>          Codex session root (default: ~/.codex/sessions)
   --pi-dir <path>             Pi session root (default: ~/.pi/agent/sessions)
   --poll-interval <duration>  Fallback rescan interval, such as 250ms, 2s, or 1m (default: 2s)
-  --new-file-history <count>  Message history for newly discovered files (default: 3)
-  --replay                    Emit existing complete records before following
+  --replay=<count>            Messages replayed for a newly discovered file (default: 3)
+  --replay-all                Replay all records for a newly discovered file
   -h, --help                  Show this help
 
 Messages use two frames:
@@ -263,8 +276,8 @@ Options:
   --codex-dir <path>          Codex session root (default: ~/.codex/sessions)
   --pi-dir <path>             Pi session root (default: ~/.pi/agent/sessions)
   --poll-interval <duration>  Fallback rescan interval, such as 250ms, 2s, or 1m (default: 2s)
-  --new-file-history <count>  Message history for newly discovered files (default: 3)
-  --replay                    Emit existing complete records before following
+  --replay=<count>            Messages replayed for a newly discovered file (default: 3)
+  --replay-all                Replay all records for a newly discovered file
   -h, --help                  Show this help"
     ),
   }
@@ -277,7 +290,7 @@ mod tests {
   use std::time::Duration;
 
   use tokn_session_core::{AgentEvent, MessageEvent, Phase, Provider, Role};
-  use tokn_session_relay::RelayEvent;
+  use tokn_session_relay::{NewFileReplay, RelayEvent};
 
   use super::{Args, ArgsParse, Command, write_jsonl_event};
 
@@ -288,11 +301,9 @@ mod tests {
         "zeromq",
         "--bind",
         "ipc:///tmp/relay.sock",
-        "--replay",
+        "--replay=5",
         "--poll-interval",
         "250ms",
-        "--new-file-history",
-        "5",
       ]
       .into_iter()
       .map(str::to_string),
@@ -306,15 +317,14 @@ mod tests {
         endpoint: "ipc:///tmp/relay.sock".to_string()
       }
     );
-    assert!(args.replay);
     assert_eq!(args.poll_interval, Duration::from_millis(250));
-    assert_eq!(args.new_file_history, 5);
+    assert_eq!(args.new_file_replay, NewFileReplay::Messages(5));
   }
 
   #[test]
   fn requires_a_subcommand() {
     assert!(Args::parse(std::iter::empty()).is_err());
-    assert!(Args::parse(["--replay".to_string()].into_iter()).is_err());
+    assert!(Args::parse(["--replay=3".to_string()].into_iter()).is_err());
   }
 
   #[test]
@@ -324,6 +334,17 @@ mod tests {
         .into_iter()
         .map(str::to_string),
     );
+    assert!(result.is_err());
+  }
+
+  #[test]
+  fn parses_replay_all_and_rejects_conflicting_replay_options() {
+    let ArgsParse::Run(args) = Args::parse(["stdout", "--replay-all"].into_iter().map(str::to_string)).unwrap() else {
+      panic!("expected runnable args");
+    };
+    assert_eq!(args.new_file_replay, NewFileReplay::All);
+
+    let result = Args::parse(["stdout", "--replay=3", "--replay-all"].into_iter().map(str::to_string));
     assert!(result.is_err());
   }
 

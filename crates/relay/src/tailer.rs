@@ -7,6 +7,8 @@ use tokn_session_codex::{event::CodexLine, normalize::CodexNormalizer};
 use tokn_session_core::{AgentEvent, Provider};
 use tokn_session_pi::{event::PiEvent, normalize::PiNormalizer};
 
+use crate::NewFileReplay;
+
 #[derive(Clone, Debug)]
 pub struct ProviderRoot {
   pub provider: Provider,
@@ -35,25 +37,21 @@ pub struct TailUpdate {
 pub struct SessionTailer {
   roots: Vec<ProviderRoot>,
   files: HashMap<PathBuf, FileState>,
-  new_file_history: usize,
+  new_file_replay: NewFileReplay,
 }
 
 impl SessionTailer {
-  pub fn initialize(
-    roots: Vec<ProviderRoot>,
-    replay: bool,
-    new_file_history: usize,
-  ) -> Result<(Self, TailUpdate), String> {
-    let mut tailer = Self::prepare(roots, new_file_history)?;
-    let update = tailer.start(replay)?;
+  pub fn initialize(roots: Vec<ProviderRoot>, new_file_replay: NewFileReplay) -> Result<(Self, TailUpdate), String> {
+    let mut tailer = Self::prepare(roots, new_file_replay)?;
+    let update = tailer.start()?;
     Ok((tailer, update))
   }
 
-  pub(crate) fn prepare(roots: Vec<ProviderRoot>, new_file_history: usize) -> Result<Self, String> {
+  pub(crate) fn prepare(roots: Vec<ProviderRoot>, new_file_replay: NewFileReplay) -> Result<Self, String> {
     let mut tailer = Self {
       roots,
       files: HashMap::new(),
-      new_file_history,
+      new_file_replay,
     };
     let paths = tailer.discover_paths()?;
     for (path, provider) in paths {
@@ -62,16 +60,14 @@ impl SessionTailer {
     Ok(tailer)
   }
 
-  pub(crate) fn start(&mut self, replay: bool) -> Result<TailUpdate, String> {
+  pub(crate) fn start(&mut self) -> Result<TailUpdate, String> {
     let mut update = TailUpdate::default();
-    let new_file_history = self.new_file_history;
+    let new_file_replay = self.new_file_replay;
     for state in self.files.values_mut() {
-      let mode = if replay {
-        InitialRead::Replay
-      } else if state.matches_initial_snapshot()? {
+      let mode = if state.matches_initial_snapshot()? {
         InitialRead::Follow
       } else {
-        InitialRead::Backfill(new_file_history)
+        InitialRead::Replay(new_file_replay)
       };
       let initial = read_initial(state, mode)?;
       update.append(initial);
@@ -85,12 +81,7 @@ impl SessionTailer {
 
     for (path, provider) in discovered {
       if !self.files.contains_key(&path) {
-        self.add_file(
-          path,
-          provider,
-          InitialRead::Backfill(self.new_file_history),
-          &mut update,
-        )?;
+        self.add_file(path, provider, InitialRead::Replay(self.new_file_replay), &mut update)?;
       }
     }
 
@@ -105,7 +96,7 @@ impl SessionTailer {
       }
       let (mut appended, restarted) = state.read_appended(true)?;
       if restarted {
-        retain_message_history(&mut appended.events, self.new_file_history);
+        apply_replay_policy(&mut appended.events, self.new_file_replay);
       }
       update.append(appended);
     }
@@ -144,8 +135,8 @@ impl SessionTailer {
 fn read_initial(state: &mut FileState, mode: InitialRead) -> Result<TailUpdate, String> {
   match mode {
     InitialRead::Follow => state.seed_at_eof(),
-    InitialRead::Replay => Ok(state.read_appended(true)?.0),
-    InitialRead::Backfill(message_count) => {
+    InitialRead::Replay(NewFileReplay::All) => Ok(state.read_appended(true)?.0),
+    InitialRead::Replay(NewFileReplay::Messages(message_count)) => {
       let mut update = state.read_appended(true)?.0;
       retain_message_history(&mut update.events, message_count);
       Ok(update)
@@ -156,8 +147,7 @@ fn read_initial(state: &mut FileState, mode: InitialRead) -> Result<TailUpdate, 
 #[derive(Clone, Copy)]
 enum InitialRead {
   Follow,
-  Replay,
-  Backfill(usize),
+  Replay(NewFileReplay),
 }
 
 impl TailUpdate {
@@ -322,6 +312,12 @@ fn retain_message_history(events: &mut Vec<RelayEvent>, message_count: usize) {
 
   let start = message_indices[message_indices.len() - message_count];
   events.drain(..start);
+}
+
+fn apply_replay_policy(events: &mut Vec<RelayEvent>, replay: NewFileReplay) {
+  if let NewFileReplay::Messages(message_count) = replay {
+    retain_message_history(events, message_count);
+  }
 }
 
 fn trailing_partial_line(path: &Path, length: u64) -> Result<Vec<u8>, String> {
@@ -501,6 +497,7 @@ mod tests {
   use tokn_session_core::{AgentEvent, Provider};
 
   use super::{ProviderRoot, SessionTailer};
+  use crate::NewFileReplay;
 
   #[test]
   fn starts_at_eof_but_seeds_pi_session_context() {
@@ -517,8 +514,7 @@ mod tests {
 
     let (mut tailer, initial) = SessionTailer::initialize(
       vec![ProviderRoot::new(Provider::Pi, fixture.path().to_path_buf())],
-      false,
-      3,
+      NewFileReplay::Messages(3),
     )
     .unwrap();
     assert!(initial.events.is_empty());
@@ -538,7 +534,7 @@ mod tests {
   }
 
   #[test]
-  fn starts_at_eof_without_parsing_the_existing_history() {
+  fn replay_all_does_not_apply_to_files_present_at_startup() {
     let fixture = TempDir::new().unwrap();
     let path = fixture.path().join("session_test.jsonl");
     std::fs::write(
@@ -553,8 +549,7 @@ mod tests {
 
     let (mut tailer, initial) = SessionTailer::initialize(
       vec![ProviderRoot::new(Provider::Pi, fixture.path().to_path_buf())],
-      false,
-      3,
+      NewFileReplay::All,
     )
     .unwrap();
     assert!(initial.events.is_empty());
@@ -581,14 +576,17 @@ mod tests {
       "{\"type\":\"session\",\"id\":\"pi-session\",\"timestamp\":\"2026-01-01\",\"cwd\":\"/tmp\"}\n",
     )
     .unwrap();
-    let mut tailer =
-      SessionTailer::prepare(vec![ProviderRoot::new(Provider::Pi, fixture.path().to_path_buf())], 3).unwrap();
+    let mut tailer = SessionTailer::prepare(
+      vec![ProviderRoot::new(Provider::Pi, fixture.path().to_path_buf())],
+      NewFileReplay::Messages(3),
+    )
+    .unwrap();
 
     append(
       &path,
       "{\"type\":\"message\",\"id\":\"new\",\"message\":{\"role\":\"user\",\"content\":\"not lost\"}}\n",
     );
-    assert!(tailer.start(false).unwrap().events.is_empty());
+    assert!(tailer.start().unwrap().events.is_empty());
 
     let update = tailer.scan().unwrap();
     assert_eq!(update.events.len(), 1);
@@ -607,8 +605,11 @@ mod tests {
       "{\"type\":\"session\",\"id\":\"old-session\",\"timestamp\":\"2026-01-01\",\"cwd\":\"/tmp\"}\n",
     )
     .unwrap();
-    let mut tailer =
-      SessionTailer::prepare(vec![ProviderRoot::new(Provider::Pi, fixture.path().to_path_buf())], 1).unwrap();
+    let mut tailer = SessionTailer::prepare(
+      vec![ProviderRoot::new(Provider::Pi, fixture.path().to_path_buf())],
+      NewFileReplay::Messages(1),
+    )
+    .unwrap();
 
     let replacement = fixture.path().join("replacement.jsonl");
     std::fs::write(
@@ -622,7 +623,7 @@ mod tests {
     .unwrap();
     std::fs::rename(replacement, &path).unwrap();
 
-    let update = tailer.start(false).unwrap();
+    let update = tailer.start().unwrap();
     assert_eq!(update.events.len(), 1);
     let AgentEvent::Message(message) = &update.events[0].event else {
       panic!("expected message");
@@ -642,8 +643,7 @@ mod tests {
     .unwrap();
     let (mut tailer, _) = SessionTailer::initialize(
       vec![ProviderRoot::new(Provider::Pi, fixture.path().to_path_buf())],
-      false,
-      3,
+      NewFileReplay::Messages(3),
     )
     .unwrap();
 
@@ -670,8 +670,7 @@ mod tests {
     .unwrap();
     let (mut tailer, _) = SessionTailer::initialize(
       vec![ProviderRoot::new(Provider::Pi, fixture.path().to_path_buf())],
-      false,
-      3,
+      NewFileReplay::Messages(3),
     )
     .unwrap();
 
@@ -685,25 +684,25 @@ mod tests {
   }
 
   #[test]
-  fn publishes_new_files_from_the_beginning() {
+  fn replays_all_events_for_new_files() {
     let fixture = TempDir::new().unwrap();
     let (mut tailer, _) = SessionTailer::initialize(
       vec![ProviderRoot::new(Provider::Pi, fixture.path().to_path_buf())],
-      false,
-      3,
+      NewFileReplay::All,
     )
     .unwrap();
     std::fs::write(
       fixture.path().join("session_new.jsonl"),
       concat!(
         "{\"type\":\"session\",\"id\":\"new-session\",\"timestamp\":\"2026-01-01\",\"cwd\":\"/tmp\"}\n",
+        "{\"type\":\"message\",\"id\":\"old\",\"message\":{\"role\":\"user\",\"content\":\"old\"}}\n",
         "{\"type\":\"message\",\"id\":\"new\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n"
       ),
     )
     .unwrap();
 
     let update = tailer.scan().unwrap();
-    assert_eq!(update.events.len(), 2);
+    assert_eq!(update.events.len(), 3);
     assert!(update.events.iter().all(|event| event.topic == "pi.new-session"));
   }
 
@@ -712,8 +711,7 @@ mod tests {
     let fixture = TempDir::new().unwrap();
     let (mut tailer, _) = SessionTailer::initialize(
       vec![ProviderRoot::new(Provider::Pi, fixture.path().to_path_buf())],
-      false,
-      3,
+      NewFileReplay::Messages(3),
     )
     .unwrap();
     std::fs::write(
@@ -761,8 +759,7 @@ mod tests {
     .unwrap();
     let (mut tailer, initial) = SessionTailer::initialize(
       vec![ProviderRoot::new(Provider::Codex, fixture.path().to_path_buf())],
-      false,
-      3,
+      NewFileReplay::Messages(3),
     )
     .unwrap();
     assert!(initial.events.is_empty());
@@ -792,8 +789,7 @@ mod tests {
     .unwrap();
     let (mut tailer, _) = SessionTailer::initialize(
       vec![ProviderRoot::new(Provider::Pi, fixture.path().to_path_buf())],
-      false,
-      3,
+      NewFileReplay::Messages(3),
     )
     .unwrap();
 
