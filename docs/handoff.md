@@ -29,7 +29,7 @@ an output subcommand:
 
 ```sh
 tokn-session-relay zeromq --bind tcp://127.0.0.1:5556
-tokn-session-relay stdout
+tokn-session-relay stdout --format summary
 ```
 
 Both modes watch `~/.codex/sessions` and `~/.pi/agent/sessions` by default and
@@ -49,8 +49,11 @@ third-most-recent message by default. `--replay=<count>` changes that window,
 while `--replay-all` emits every complete record. These replay options only
 apply to files discovered or replaced after startup.
 
-`stdout` writes one normalized `AgentEvent` JSON object per line and flushes
-after every event. Diagnostics remain on stderr.
+`stdout` supports `--format pretty|summary|json` and defaults to `summary`.
+Human-readable formats prefix each event with its relay topic; `--color` adds
+ANSI color to those formats. JSON remains colorless normalized `AgentEvent`
+JSONL even when `--color` is present. Every format flushes after each event,
+and diagnostics remain on stderr.
 
 `zeromq` binds `tcp://127.0.0.1:5556` by default. Each publication is a two-frame
 ZeroMQ message:

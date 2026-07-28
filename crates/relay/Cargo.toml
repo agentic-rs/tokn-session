@@ -14,6 +14,7 @@ tokio.workspace = true
 tokn-session-codex.workspace = true
 tokn-session-core.workspace = true
 tokn-session-pi.workspace = true
+tokn-session-render.workspace = true
 zeromq.workspace = true
 
 [dev-dependencies]

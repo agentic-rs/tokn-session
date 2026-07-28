@@ -2061,6 +2061,7 @@ dependencies = [
  "tokn-session-codex",
  "tokn-session-core",
  "tokn-session-pi",
+ "tokn-session-render",
  "zeromq",
 ]
 
