@@ -1,6 +1,9 @@
+use std::path::Path;
+
 use serde_json::Value;
 use tokn_session_core::{
-  AgentEvent, LiveSessionEvent, LoadedSession, Phase, Role, SessionRef, ToolCallEvent, ToolKind, ToolSummary,
+  AgentEvent, LiveSessionEvent, LoadedSession, Phase, Role, SessionRef, SessionSettingsApplied, ToolCallEvent,
+  ToolKind, ToolSummary,
 };
 
 pub struct EventDisplay {
@@ -103,6 +106,7 @@ pub fn render_event_pretty(event: &AgentEvent) -> String {
         output.push_str(&format!("[thinking] {level}\n\n"));
       }
     }
+    AgentEvent::SessionSettingsApplied(event) => render_session_settings(&mut output, event),
     AgentEvent::Message(event) => {
       output.push_str(role_label(event.role));
       output.push('\n');
@@ -179,6 +183,7 @@ pub fn render_event_summary(event: &AgentEvent) -> String {
         "provider changed".to_string()
       }
     }
+    AgentEvent::SessionSettingsApplied(event) => render_session_settings_summary(event),
     AgentEvent::Message(event) => format!("{} {}", role_label(event.role), first_line(&event.text)),
     AgentEvent::Reasoning(event) => {
       if let Some(summary) = &event.summary {
@@ -218,6 +223,7 @@ pub fn event_type(event: &AgentEvent) -> &'static str {
   match event {
     AgentEvent::SessionStarted(_) => "session",
     AgentEvent::ProviderChanged(_) => "provider",
+    AgentEvent::SessionSettingsApplied(_) => "settings",
     AgentEvent::Message(_) => "message",
     AgentEvent::Reasoning(_) => "reasoning",
     AgentEvent::GoalUpdated(_) => "goal",
@@ -225,6 +231,90 @@ pub fn event_type(event: &AgentEvent) -> &'static str {
     AgentEvent::Error(_) => "error",
     AgentEvent::Unknown(_) => "unknown",
   }
+}
+
+fn render_session_settings(output: &mut String, event: &SessionSettingsApplied) {
+  output.push_str("session settings applied\n");
+  if let Some(model) = joined_values(event.model_provider.as_deref(), event.model_id.as_deref(), "/") {
+    write_setting(output, "model", &model);
+  }
+  if let Some(service_tier) = &event.service_tier {
+    write_setting(output, "service tier", service_tier);
+  }
+  if let Some(reasoning) = joined_values(
+    event.reasoning_effort.as_deref(),
+    event.reasoning_summary.as_deref(),
+    " / ",
+  ) {
+    write_setting(output, "reasoning", &reasoning);
+  }
+  if let Some(mode) = &event.collaboration_mode {
+    write_setting(output, "mode", mode);
+  }
+  if let Some(personality) = &event.personality {
+    write_setting(output, "personality", personality);
+  }
+  if let Some(approval) = joined_values(
+    event.approval_policy.as_deref(),
+    event.approvals_reviewer.as_deref(),
+    " / ",
+  ) {
+    write_setting(output, "approval", &approval);
+  }
+  if let Some(profile) = &event.active_permission_profile_id {
+    write_setting(output, "permissions", profile);
+  }
+  if let Some(cwd) = &event.cwd {
+    write_setting(output, "cwd", cwd);
+  }
+  output.push('\n');
+}
+
+fn render_session_settings_summary(event: &SessionSettingsApplied) -> String {
+  let mut parts = vec!["settings".to_string()];
+  match (&event.model_provider, &event.model_id) {
+    (Some(provider), Some(model)) => parts.push(format!("model={provider}/{model}")),
+    (Some(provider), None) => parts.push(format!("provider={provider}")),
+    (None, Some(model)) => parts.push(format!("model={model}")),
+    (None, None) => {}
+  }
+  if let Some(service_tier) = &event.service_tier {
+    parts.push(format!("tier={service_tier}"));
+  }
+  if let Some(effort) = &event.reasoning_effort {
+    parts.push(format!("effort={effort}"));
+  }
+  if let Some(mode) = &event.collaboration_mode {
+    parts.push(format!("mode={mode}"));
+  }
+  if let Some(cwd) = event.cwd.as_deref().and_then(cwd_name) {
+    parts.push(format!("cwd={cwd}"));
+  }
+  parts.join(" ")
+}
+
+fn write_setting(output: &mut String, label: &str, value: &str) {
+  output.push_str("  ");
+  output.push_str(label);
+  output.push(' ');
+  output.push_str(value);
+  output.push('\n');
+}
+
+fn joined_values(first: Option<&str>, second: Option<&str>, separator: &str) -> Option<String> {
+  match (first, second) {
+    (Some(first), Some(second)) => Some(format!("{first}{separator}{second}")),
+    (Some(first), None) => Some(first.to_string()),
+    (None, Some(second)) => Some(second.to_string()),
+    (None, None) => None,
+  }
+}
+
+fn cwd_name(cwd: &str) -> Option<&str> {
+  Path::new(cwd)
+    .file_name()
+    .and_then(|name| name.to_str())
+    .filter(|name| !name.is_empty())
 }
 
 fn render_tool(output: &mut String, event: &ToolCallEvent) {
@@ -377,7 +467,7 @@ mod tests {
   use serde_json::json;
   use tokn_session_core::{
     AgentEvent, GoalUpdated, LoadedSession, MessageEvent, Provider, ProviderChanged, ReasoningEvent, SessionRef,
-    UnknownEvent,
+    SessionSettingsApplied, UnknownEvent,
   };
 
   use super::*;
@@ -509,6 +599,45 @@ mod tests {
 
     assert!(output.contains("[model] openai/gpt-5\n\n"));
     assert!(output.contains("[thinking] high\n\n"));
+  }
+
+  #[test]
+  fn renders_session_settings_without_native_details() {
+    let event = AgentEvent::SessionSettingsApplied(SessionSettingsApplied {
+      provider: Provider::Codex,
+      session_id: Some("session".to_string()),
+      model_provider: Some("openai".to_string()),
+      model_id: Some("gpt-5".to_string()),
+      service_tier: Some("priority".to_string()),
+      cwd: Some("/tmp/project".to_string()),
+      reasoning_effort: Some("high".to_string()),
+      reasoning_summary: Some("detailed".to_string()),
+      personality: Some("friendly".to_string()),
+      collaboration_mode: Some("default".to_string()),
+      approval_policy: Some("on-request".to_string()),
+      approvals_reviewer: Some("auto_review".to_string()),
+      active_permission_profile_id: Some(":workspace".to_string()),
+      native: Some(json!({
+        "collaboration_mode": {
+          "settings": {
+            "developer_instructions": "sensitive instructions"
+          }
+        }
+      })),
+      timestamp: None,
+    });
+
+    assert_eq!(
+      render_event_summary(&event),
+      "settings model=openai/gpt-5 tier=priority effort=high mode=default cwd=project"
+    );
+    let pretty = render_event_pretty(&event);
+    assert!(pretty.contains("session settings applied\n"));
+    assert!(pretty.contains("  model openai/gpt-5\n"));
+    assert!(pretty.contains("  reasoning high / detailed\n"));
+    assert!(pretty.contains("  approval on-request / auto_review\n"));
+    assert!(pretty.contains("  permissions :workspace\n"));
+    assert!(!pretty.contains("sensitive instructions"));
   }
 
   #[test]

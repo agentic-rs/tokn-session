@@ -6,6 +6,7 @@ use serde_json::Value;
 pub enum AgentEvent {
   SessionStarted(SessionStarted),
   ProviderChanged(ProviderChanged),
+  SessionSettingsApplied(SessionSettingsApplied),
   Message(MessageEvent),
   Reasoning(ReasoningEvent),
   GoalUpdated(GoalUpdated),
@@ -31,6 +32,25 @@ pub struct ProviderChanged {
   pub model_provider: Option<String>,
   pub model_id: Option<String>,
   pub thinking_level: Option<String>,
+  pub timestamp: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionSettingsApplied {
+  pub provider: Provider,
+  pub session_id: Option<String>,
+  pub model_provider: Option<String>,
+  pub model_id: Option<String>,
+  pub service_tier: Option<String>,
+  pub cwd: Option<String>,
+  pub reasoning_effort: Option<String>,
+  pub reasoning_summary: Option<String>,
+  pub personality: Option<String>,
+  pub collaboration_mode: Option<String>,
+  pub approval_policy: Option<String>,
+  pub approvals_reviewer: Option<String>,
+  pub active_permission_profile_id: Option<String>,
+  pub native: Option<Value>,
   pub timestamp: Option<String>,
 }
 

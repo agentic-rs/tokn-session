@@ -3,11 +3,14 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
+use serde_json::Value;
 use tokn_session_codex::{event::CodexLine, normalize::CodexNormalizer};
 use tokn_session_core::{AgentEvent, Provider};
 use tokn_session_pi::{event::PiEvent, normalize::PiNormalizer};
 
-use crate::NewFileReplay;
+use crate::context::session_id_from_path;
+use crate::{NewFileReplay, SessionContext};
 
 #[derive(Clone, Debug)]
 pub struct ProviderRoot {
@@ -21,10 +24,11 @@ impl ProviderRoot {
   }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct RelayEvent {
   pub path: PathBuf,
   pub topic: String,
+  pub session: SessionContext,
   pub event: AgentEvent,
 }
 
@@ -226,11 +230,13 @@ struct FileState {
   offset: u64,
   pending: Vec<u8>,
   normalizer: SessionNormalizer,
+  context: SessionContext,
 }
 
 impl FileState {
   fn open(path: PathBuf, provider: Provider) -> Result<Self, String> {
     let metadata = std::fs::metadata(&path).map_err(|err| format!("failed to inspect {}: {err}", path.display()))?;
+    let context = SessionContext::from_path(provider, &path);
     Ok(Self {
       path,
       provider,
@@ -239,6 +245,7 @@ impl FileState {
       offset: 0,
       pending: Vec::new(),
       normalizer: SessionNormalizer::new(provider),
+      context,
     })
   }
 
@@ -257,7 +264,10 @@ impl FileState {
       if bytes == 0 || !line.ends_with('\n') {
         break;
       }
-      match self.normalizer.normalize_line(line.trim_end_matches(['\r', '\n'])) {
+      match self
+        .normalizer
+        .normalize_line(line.trim_end_matches(['\r', '\n']), &mut self.context)
+      {
         Ok(events)
           if events
             .iter()
@@ -295,6 +305,7 @@ impl FileState {
       self.offset = 0;
       self.pending.clear();
       self.normalizer = SessionNormalizer::new(self.provider);
+      self.context = SessionContext::from_path(self.provider, &self.path);
       should_publish = true;
       restarted = true;
     }
@@ -338,11 +349,12 @@ impl FileState {
         }
       };
 
-      match self.normalizer.normalize_line(line) {
+      match self.normalizer.normalize_line(line, &mut self.context) {
         Ok(events) if should_publish => {
           update.events.extend(events.into_iter().map(|event| RelayEvent {
             topic: event_topic(self.provider, &self.path, &event),
             path: self.path.clone(),
+            session: self.context.clone(),
             event,
           }));
         }
@@ -430,14 +442,17 @@ impl SessionNormalizer {
     }
   }
 
-  fn normalize_line(&mut self, line: &str) -> Result<Vec<AgentEvent>, String> {
+  fn normalize_line(&mut self, line: &str, context: &mut SessionContext) -> Result<Vec<AgentEvent>, String> {
+    let value: Value = serde_json::from_str(line).map_err(|err| format!("invalid session JSONL: {err}"))?;
+    context.update(&value);
+
     match self {
       Self::Codex(normalizer) => {
-        let event: CodexLine = serde_json::from_str(line).map_err(|err| format!("invalid codex JSONL: {err}"))?;
+        let event: CodexLine = serde_json::from_value(value).map_err(|err| format!("invalid codex JSONL: {err}"))?;
         Ok(normalizer.normalize(event))
       }
       Self::Pi(normalizer) => {
-        let event: PiEvent = serde_json::from_str(line).map_err(|err| format!("invalid pi JSONL: {err}"))?;
+        let event: PiEvent = serde_json::from_value(value).map_err(|err| format!("invalid pi JSONL: {err}"))?;
         Ok(normalizer.normalize(event))
       }
     }
@@ -464,6 +479,7 @@ fn event_session_id(event: &AgentEvent) -> Option<&str> {
   match event {
     AgentEvent::SessionStarted(event) => Some(&event.session_id),
     AgentEvent::ProviderChanged(event) => event.session_id.as_deref(),
+    AgentEvent::SessionSettingsApplied(event) => event.session_id.as_deref(),
     AgentEvent::Message(event) => event.session_id.as_deref(),
     AgentEvent::Reasoning(event) => event.session_id.as_deref(),
     AgentEvent::GoalUpdated(event) => event.session_id.as_deref(),
@@ -471,17 +487,6 @@ fn event_session_id(event: &AgentEvent) -> Option<&str> {
     AgentEvent::Error(event) => event.session_id.as_deref(),
     AgentEvent::Unknown(event) => event.session_id.as_deref(),
   }
-}
-
-fn session_id_from_path(path: &Path) -> String {
-  path
-    .file_stem()
-    .and_then(|value| value.to_str())
-    .unwrap_or("unknown")
-    .rsplit(['-', '_'])
-    .next()
-    .unwrap_or("unknown")
-    .to_string()
 }
 
 fn collect_jsonl_files(
@@ -588,6 +593,16 @@ mod tests {
     let update = tailer.scan().unwrap();
     assert_eq!(update.events.len(), 1);
     assert_eq!(update.events[0].topic, "pi.pi-session");
+    assert_eq!(update.events[0].session.session_id, "pi-session");
+    assert_eq!(update.events[0].session.started_at.as_deref(), Some("2026-01-01"));
+    assert_eq!(
+      update.events[0]
+        .session
+        .project
+        .as_ref()
+        .and_then(|project| project.name.as_deref()),
+      Some("tmp")
+    );
     let AgentEvent::Message(message) = &update.events[0].event else {
       panic!("expected message");
     };
@@ -854,7 +869,19 @@ mod tests {
     let path = fixture.path().join("rollout-session-fixture.jsonl");
     std::fs::write(
       &path,
-      "{\"timestamp\":\"2026-06-04T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-session\",\"timestamp\":\"2026-06-04T00:00:00Z\",\"cwd\":\"/tmp/project\",\"model_provider\":\"openai\"}}\n",
+      concat!(
+        "{\"timestamp\":\"2026-06-04T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{",
+        "\"id\":\"codex-session\",",
+        "\"parent_thread_id\":\"parent-session\",",
+        "\"timestamp\":\"2026-06-04T00:00:00Z\",",
+        "\"cwd\":\"/tmp/worktree\",",
+        "\"model_provider\":\"openai\",",
+        "\"git\":{",
+        "\"commit_hash\":\"abcdef123456\",",
+        "\"branch\":\"main\",",
+        "\"repository_url\":\"https://github.com/agentic-rs/tokn-session.git\"",
+        "}}}\n",
+      ),
     )
     .unwrap();
     let (mut tailer, initial) = SessionTailer::initialize(
@@ -866,12 +893,36 @@ mod tests {
 
     append(
       &path,
-      "{\"timestamp\":\"2026-06-04T00:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hello\"}}\n",
+      concat!(
+        "{\"timestamp\":\"2026-06-04T00:00:01Z\",\"type\":\"event_msg\",\"payload\":{",
+        "\"type\":\"thread_settings_applied\",",
+        "\"thread_settings\":{\"model\":\"gpt-5\",\"cwd\":\"/tmp/worktree/subdir\"}}}\n",
+        "{\"timestamp\":\"2026-06-04T00:00:02Z\",\"type\":\"event_msg\",",
+        "\"payload\":{\"type\":\"user_message\",\"message\":\"hello\"}}\n",
+      ),
     );
     let update = tailer.scan_paths(HashSet::from([path])).unwrap();
-    assert_eq!(update.events.len(), 1);
+    assert_eq!(update.events.len(), 2);
     assert_eq!(update.events[0].topic, "codex.codex-session");
-    let AgentEvent::Message(message) = &update.events[0].event else {
+    let context = &update.events[0].session;
+    assert_eq!(context.session_id, "codex-session");
+    assert_eq!(context.parent_session_id.as_deref(), Some("parent-session"));
+    assert_eq!(context.cwd.as_deref(), Some("/tmp/worktree/subdir"));
+    assert_eq!(context.started_at.as_deref(), Some("2026-06-04T00:00:00Z"));
+    let project = context.project.as_ref().unwrap();
+    assert_eq!(
+      project.id.as_deref(),
+      Some("https://github.com/agentic-rs/tokn-session.git")
+    );
+    assert_eq!(project.name.as_deref(), Some("tokn-session"));
+    assert_eq!(project.folder.as_deref(), Some("/tmp/worktree"));
+    assert_eq!(project.branch.as_deref(), Some("main"));
+    assert_eq!(project.commit_hash.as_deref(), Some("abcdef123456"));
+    let AgentEvent::SessionSettingsApplied(settings) = &update.events[0].event else {
+      panic!("expected settings event");
+    };
+    assert_eq!(settings.cwd.as_deref(), Some("/tmp/worktree/subdir"));
+    let AgentEvent::Message(message) = &update.events[1].event else {
       panic!("expected message");
     };
     assert_eq!(message.text, "hello");

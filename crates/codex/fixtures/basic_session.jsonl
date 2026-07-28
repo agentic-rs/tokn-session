@@ -5,4 +5,5 @@
 {"timestamp":"2026-06-04T00:00:04Z","type":"event_msg","payload":{"type":"exec_command_begin","call_id":"call-shell","command":["cargo","test"]}}
 {"timestamp":"2026-06-04T00:00:05Z","type":"event_msg","payload":{"type":"patch_apply_begin","call_id":"call-edit","changes":{"crates/core/src/lib.rs":{"unified_diff":"@@\n-old\n+new\n+another\n"}}}}
 {"timestamp":"2026-06-04T00:00:06Z","type":"event_msg","payload":{"type":"thread_goal_updated","threadId":"session-fixture","turnId":"turn-1","goal":{"status":"complete","objective":"test fixture"}}}
-{"timestamp":"2026-06-04T00:00:07Z","type":"event_msg","payload":{"type":"new_native_event","value":123}}
+{"timestamp":"2026-06-04T00:00:07Z","type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-5","model_provider_id":"openai","service_tier":"priority","approval_policy":"on-request","approvals_reviewer":"auto_review","permission_profile":{"type":"managed","file_system":{"type":"restricted"}},"active_permission_profile":{"id":":workspace"},"cwd":"/tmp/project/subdir","reasoning_effort":"high","reasoning_summary":"detailed","personality":"friendly","collaboration_mode":{"mode":"default","settings":{"developer_instructions":"do not render this"}}}}}
+{"timestamp":"2026-06-04T00:00:08Z","type":"event_msg","payload":{"type":"new_native_event","value":123}}
