@@ -65,8 +65,11 @@ ZeroMQ message:
 
 `RelayEvent` wraps the normalized `AgentEvent` with the source path, topic, and
 `SessionContext`. Context includes session id, optional parent/title, cwd and
-start time, plus project name/folder. Codex session metadata also contributes
-repository URL, branch, and commit when present. Project name is display
+start time, optional agent path/nickname/role, plus project name/folder. Codex
+session metadata also contributes repository URL, branch, and commit when
+present. Agent metadata comes only from the first session header, including its
+thread-spawn source when needed. Missing paths remain null for root and
+subagent sessions; the relay does not derive `/root`. Project name is display
 metadata inferred from the repository URL or cwd basename; title is never
 invented when the provider file does not contain one.
 

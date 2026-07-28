@@ -211,6 +211,9 @@ fn render_session_context(event: &RelayEvent, color: bool) -> String {
 
   append_context_line(&mut output, "title", context.title.as_deref(), color);
   append_context_line(&mut output, "parent", context.parent_session_id.as_deref(), color);
+  append_context_line(&mut output, "agent", context.agent_path.as_deref(), color);
+  append_context_line(&mut output, "nickname", context.agent_nickname.as_deref(), color);
+  append_context_line(&mut output, "role", context.agent_role.as_deref(), color);
   append_context_line(&mut output, "started", context.started_at.as_deref(), color);
 
   if let Some(project) = &context.project {
@@ -705,6 +708,7 @@ mod tests {
     let value: serde_json::Value = serde_json::from_slice(&output.bytes).unwrap();
     assert_eq!(value["topic"], "pi.session-1");
     assert_eq!(value["session"]["project"]["name"], "project");
+    assert!(value["session"]["agent_path"].is_null());
     assert_eq!(value["event"]["type"], "message");
     assert_eq!(value["event"]["text"], "done");
     assert_eq!(output.flushes, 1);
@@ -790,6 +794,9 @@ mod tests {
       provider: Provider::Pi,
       session_id: "session-1".to_string(),
       parent_session_id: None,
+      agent_path: None,
+      agent_nickname: None,
+      agent_role: None,
       title: None,
       cwd: Some("/tmp/project".to_string()),
       started_at: Some("2026-01-01T00:00:00Z".to_string()),

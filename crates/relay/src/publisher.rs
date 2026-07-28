@@ -68,6 +68,9 @@ mod tests {
           provider: Provider::Pi,
           session_id: "session-1".to_string(),
           parent_session_id: None,
+          agent_path: None,
+          agent_nickname: None,
+          agent_role: None,
           title: None,
           cwd: Some("/tmp/project".to_string()),
           started_at: None,
@@ -94,6 +97,7 @@ mod tests {
     let payload: serde_json::Value = serde_json::from_slice(message.get(1).unwrap()).unwrap();
     assert_eq!(payload["topic"], "pi.session-1");
     assert_eq!(payload["session"]["project"]["name"], "project");
+    assert!(payload["session"]["agent_path"].is_null());
     assert_eq!(payload["event"]["type"], "message");
     assert_eq!(payload["event"]["session_id"], "session-1");
     assert_eq!(payload["event"]["text"], "done");
