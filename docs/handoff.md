@@ -99,6 +99,7 @@ Current event families include:
 - `message`
 - `reasoning`
 - `goal_updated`
+- `agent_activity`
 - `tool_call`
 - `error`
 - `unknown`
@@ -125,6 +126,15 @@ snapshot and retains the provider-native snapshot for JSON consumers. Human
 rendering intentionally omits permission internals and embedded developer
 instructions. The relay updates `SessionContext.cwd` when these settings change
 without replacing the session's original project metadata.
+
+Codex `event_msg.sub_agent_activity` maps to `agent_activity`. Its
+`agent_thread_id` and `agent_path` identify the target of the activity, so the
+IR names them `target_session_id` and `target_agent_path`. Actor identity is
+optional and is not inferred from the containing rollout because child files
+can include copied parent history. Human output therefore says `interaction
+with /root` unless an actor is independently known. The first Codex
+`session_meta` owns the rollout; later copied session headers do not replace
+the normalizer or relay session identity.
 
 Reusable display formatting lives in `crates/render`. It depends on `core`, not on terminal libraries. The CLI uses it for linear output and the interactive browser uses its `EventDisplay` rows for collapsed summaries and expanded detail.
 

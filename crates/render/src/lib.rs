@@ -2,8 +2,8 @@ use std::path::Path;
 
 use serde_json::Value;
 use tokn_session_core::{
-  AgentEvent, LiveSessionEvent, LoadedSession, Phase, Role, SessionRef, SessionSettingsApplied, ToolCallEvent,
-  ToolKind, ToolSummary,
+  AgentActivity, AgentEvent, LiveSessionEvent, LoadedSession, Phase, Role, SessionRef, SessionSettingsApplied,
+  ToolCallEvent, ToolKind, ToolSummary,
 };
 
 pub struct EventDisplay {
@@ -148,6 +148,10 @@ pub fn render_event_pretty(event: &AgentEvent) -> String {
       }
       output.push('\n');
     }
+    AgentEvent::AgentActivity(event) => {
+      output.push_str(&render_agent_activity_summary(event));
+      output.push_str("\n\n");
+    }
     AgentEvent::ToolCall(event) => {
       render_tool(&mut output, event);
     }
@@ -205,6 +209,7 @@ pub fn render_event_summary(event: &AgentEvent) -> String {
       }
       summary
     }
+    AgentEvent::AgentActivity(event) => render_agent_activity_summary(event),
     AgentEvent::ToolCall(event) => render_tool_summary(event).unwrap_or_else(|| {
       let mut summary = "tool".to_string();
       if let Some(name) = &event.tool_name {
@@ -227,10 +232,29 @@ pub fn event_type(event: &AgentEvent) -> &'static str {
     AgentEvent::Message(_) => "message",
     AgentEvent::Reasoning(_) => "reasoning",
     AgentEvent::GoalUpdated(_) => "goal",
+    AgentEvent::AgentActivity(_) => "agent",
     AgentEvent::ToolCall(_) => "tool",
     AgentEvent::Error(_) => "error",
     AgentEvent::Unknown(_) => "unknown",
   }
+}
+
+fn render_agent_activity_summary(event: &AgentActivity) -> String {
+  let target = event.target_agent_path.as_deref().unwrap_or("unknown agent");
+  let mut summary = match event.actor_agent_path.as_deref() {
+    Some(actor) => format!("{actor} → {target} {}", event.kind),
+    None => match event.kind.as_str() {
+      "started" => format!("agent started {target}"),
+      "interacted" => format!("interaction with {target}"),
+      "interrupted" => format!("agent interrupted {target}"),
+      kind => format!("agent activity {kind} {target}"),
+    },
+  };
+  if let Some(event_id) = &event.event_id {
+    summary.push_str(" #");
+    summary.push_str(event_id);
+  }
+  summary
 }
 
 fn render_session_settings(output: &mut String, event: &SessionSettingsApplied) {
@@ -466,8 +490,8 @@ mod tests {
 
   use serde_json::json;
   use tokn_session_core::{
-    AgentEvent, GoalUpdated, LoadedSession, MessageEvent, Provider, ProviderChanged, ReasoningEvent, SessionRef,
-    SessionSettingsApplied, UnknownEvent,
+    AgentActivity, AgentEvent, GoalUpdated, LoadedSession, MessageEvent, Provider, ProviderChanged, ReasoningEvent,
+    SessionRef, SessionSettingsApplied, UnknownEvent,
   };
 
   use super::*;
@@ -543,6 +567,24 @@ mod tests {
     });
 
     assert_eq!(render_event_summary(&event), "assistant first line");
+  }
+
+  #[test]
+  fn renders_agent_activity_as_target_when_actor_is_unknown() {
+    let event = agent_activity(None);
+
+    assert_eq!(render_event_summary(&event), "interaction with /root #call-agent");
+    assert_eq!(render_event_pretty(&event), "interaction with /root #call-agent\n\n");
+  }
+
+  #[test]
+  fn renders_agent_activity_direction_when_actor_is_known() {
+    let event = agent_activity(Some("/root/researcher"));
+
+    assert_eq!(
+      render_event_summary(&event),
+      "/root/researcher → /root interacted #call-agent"
+    );
   }
 
   #[test]
@@ -744,5 +786,21 @@ mod tests {
       },
       events,
     }
+  }
+
+  fn agent_activity(actor_agent_path: Option<&str>) -> AgentEvent {
+    AgentEvent::AgentActivity(AgentActivity {
+      provider: Provider::Codex,
+      session_id: Some("child-session".to_string()),
+      event_id: Some("call-agent".to_string()),
+      actor_session_id: actor_agent_path.map(|_| "child-session".to_string()),
+      actor_agent_path: actor_agent_path.map(str::to_string),
+      target_session_id: Some("root-session".to_string()),
+      target_agent_path: Some("/root".to_string()),
+      kind: "interacted".to_string(),
+      occurred_at_ms: Some(1_784_915_647_361),
+      native: None,
+      timestamp: Some("2026-07-24T17:54:07.361Z".to_string()),
+    })
   }
 }

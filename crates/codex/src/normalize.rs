@@ -9,8 +9,8 @@ use serde_json::Value;
 
 use crate::event::{CodexEvent, CodexLine};
 use tokn_session_core::{
-  AgentEvent, ErrorEvent, GoalUpdated, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role,
-  SessionSettingsApplied, SessionStarted, ToolCallEvent, ToolKind, ToolSummary, UnknownEvent, patch_summary,
+  AgentActivity, AgentEvent, ErrorEvent, GoalUpdated, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent,
+  Role, SessionSettingsApplied, SessionStarted, ToolCallEvent, ToolKind, ToolSummary, UnknownEvent, patch_summary,
   tool_kind_for_name, tool_kind_for_optional_name, tool_summary_for_input, tool_summary_for_io,
 };
 
@@ -38,6 +38,10 @@ impl CodexNormalizer {
   }
 
   fn normalize_session_meta(&mut self, event: CodexSessionMeta, line_timestamp: Option<String>) -> Vec<AgentEvent> {
+    if self.session_id.is_some() {
+      return Vec::new();
+    }
+
     let meta = event.meta;
     let session_id = meta.id.to_string();
     self.session_id = Some(session_id.clone());
@@ -67,6 +71,10 @@ impl CodexNormalizer {
 
   fn normalize_unknown(&mut self, value: Value, timestamp: Option<String>) -> Vec<AgentEvent> {
     if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+      if self.session_id.is_some() {
+        return Vec::new();
+      }
+
       if let Some(payload) = value.get("payload") {
         if let Some(id) = payload.get("id").and_then(Value::as_str) {
           self.session_id = Some(id.to_string());
@@ -816,6 +824,29 @@ fn normalize_unknown_line(session_id: Option<String>, value: Value, timestamp: O
             timestamp,
           })];
         }
+        Some("sub_agent_activity") => {
+          let Some(kind) = string_field(payload, "kind") else {
+            return vec![unknown_event(
+              session_id,
+              Some("event_msg.sub_agent_activity".to_string()),
+              Some(payload.clone()),
+              timestamp,
+            )];
+          };
+          return vec![AgentEvent::AgentActivity(AgentActivity {
+            provider: Provider::Codex,
+            session_id,
+            event_id: string_field(payload, "event_id"),
+            actor_session_id: None,
+            actor_agent_path: None,
+            target_session_id: string_field(payload, "agent_thread_id"),
+            target_agent_path: string_field(payload, "agent_path"),
+            kind,
+            occurred_at_ms: payload.get("occurred_at_ms").and_then(Value::as_u64),
+            native: Some(payload.clone()),
+            timestamp,
+          })];
+        }
         Some("exec_command_begin") => {
           let call_id = payload.get("call_id").and_then(Value::as_str).map(str::to_string);
           let command = payload
@@ -904,7 +935,7 @@ mod tests {
   fn normalizes_basic_fixture_events() {
     let events = normalize_fixture(include_str!("../fixtures/basic_session.jsonl"));
 
-    assert_eq!(events.len(), 10);
+    assert_eq!(events.len(), 11);
     assert_session_started(&events[0]);
     assert_provider_changed(&events[1]);
     assert_user_message(&events[2]);
@@ -914,7 +945,28 @@ mod tests {
     assert_patch_tool_started(&events[6]);
     assert_goal_updated(&events[7]);
     assert_session_settings_applied(&events[8]);
-    assert_unknown_event(&events[9]);
+    assert_agent_activity(&events[9]);
+    assert_unknown_event(&events[10]);
+  }
+
+  #[test]
+  fn keeps_first_session_header_when_parent_history_is_copied() {
+    let events = normalize_fixture(
+      r#"{"timestamp":"2026-07-24T17:52:40Z","type":"session_meta","payload":{"id":"child-session","parent_thread_id":"root-session","timestamp":"2026-07-24T17:52:40Z","cwd":"/tmp/project","agent_path":"/root/researcher"}}
+{"timestamp":"2026-07-15T10:00:00Z","type":"session_meta","payload":{"id":"root-session","timestamp":"2026-07-15T10:00:00Z","cwd":"/tmp/project"}}
+{"timestamp":"2026-07-24T17:54:07Z","type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"call-agent","occurred_at_ms":1784915647361,"agent_thread_id":"root-session","agent_path":"/root","kind":"interacted"}}"#,
+    );
+
+    assert_eq!(events.len(), 2);
+    let AgentEvent::SessionStarted(started) = &events[0] else {
+      panic!("expected child session start");
+    };
+    assert_eq!(started.session_id, "child-session");
+    let AgentEvent::AgentActivity(activity) = &events[1] else {
+      panic!("expected agent activity");
+    };
+    assert_eq!(activity.session_id.as_deref(), Some("child-session"));
+    assert_eq!(activity.target_session_id.as_deref(), Some("root-session"));
   }
 
   fn normalize_fixture(input: &str) -> Vec<AgentEvent> {
@@ -1051,6 +1103,25 @@ mod tests {
         .and_then(|settings| settings.get("developer_instructions"))
         .and_then(Value::as_str),
       Some("do not render this")
+    );
+  }
+
+  fn assert_agent_activity(event: &AgentEvent) {
+    let AgentEvent::AgentActivity(event) = event else {
+      panic!("expected agent activity event");
+    };
+    assert_eq!(event.session_id.as_deref(), Some("session-fixture"));
+    assert_eq!(event.event_id.as_deref(), Some("call-agent"));
+    assert_eq!(event.actor_session_id, None);
+    assert_eq!(event.actor_agent_path, None);
+    assert_eq!(event.target_session_id.as_deref(), Some("root-session"));
+    assert_eq!(event.target_agent_path.as_deref(), Some("/root"));
+    assert_eq!(event.kind, "interacted");
+    assert_eq!(event.occurred_at_ms, Some(1_784_915_647_361));
+    assert_eq!(event.timestamp.as_deref(), Some("2026-06-04T00:00:08Z"));
+    assert_eq!(
+      event.native.as_ref().and_then(|native| native.get("agent_path")),
+      Some(&Value::String("/root".to_string()))
     );
   }
 

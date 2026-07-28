@@ -64,6 +64,10 @@ impl SessionContext {
   }
 
   fn update_codex_session_meta(&mut self, value: &Value, payload: &Value) {
+    if self.started_at.is_some() {
+      return;
+    }
+
     if let Some(id) = string_field(payload, "id") {
       self.session_id = id;
     }
@@ -225,5 +229,32 @@ mod tests {
       context.project.as_ref().and_then(|project| project.folder.as_deref()),
       Some("/tmp/project")
     );
+  }
+
+  #[test]
+  fn keeps_first_codex_session_meta_as_the_owning_session() {
+    let mut context = SessionContext::from_path(Provider::Codex, Path::new("fallback.jsonl"));
+    context.update(&json!({
+      "type": "session_meta",
+      "payload": {
+        "id": "child-session",
+        "parent_thread_id": "root-session",
+        "timestamp": "2026-07-24T17:52:40Z",
+        "cwd": "/tmp/child"
+      }
+    }));
+    context.update(&json!({
+      "type": "session_meta",
+      "payload": {
+        "id": "root-session",
+        "timestamp": "2026-07-15T10:00:00Z",
+        "cwd": "/tmp/root"
+      }
+    }));
+
+    assert_eq!(context.session_id, "child-session");
+    assert_eq!(context.parent_session_id.as_deref(), Some("root-session"));
+    assert_eq!(context.cwd.as_deref(), Some("/tmp/child"));
+    assert_eq!(context.started_at.as_deref(), Some("2026-07-24T17:52:40Z"));
   }
 }

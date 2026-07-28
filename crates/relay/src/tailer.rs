@@ -483,6 +483,7 @@ fn event_session_id(event: &AgentEvent) -> Option<&str> {
     AgentEvent::Message(event) => event.session_id.as_deref(),
     AgentEvent::Reasoning(event) => event.session_id.as_deref(),
     AgentEvent::GoalUpdated(event) => event.session_id.as_deref(),
+    AgentEvent::AgentActivity(event) => event.session_id.as_deref(),
     AgentEvent::ToolCall(event) => event.session_id.as_deref(),
     AgentEvent::Error(event) => event.session_id.as_deref(),
     AgentEvent::Unknown(event) => event.session_id.as_deref(),

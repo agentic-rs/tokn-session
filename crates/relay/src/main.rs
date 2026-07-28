@@ -283,6 +283,7 @@ fn event_timestamp(event: &tokn_session_core::AgentEvent) -> Option<&str> {
     AgentEvent::Message(event) => event.timestamp.as_deref(),
     AgentEvent::Reasoning(event) => event.timestamp.as_deref(),
     AgentEvent::GoalUpdated(event) => event.timestamp.as_deref(),
+    AgentEvent::AgentActivity(event) => event.timestamp.as_deref(),
     AgentEvent::ToolCall(event) => event.timestamp.as_deref(),
     AgentEvent::Error(event) => event.timestamp.as_deref(),
     AgentEvent::Unknown(event) => event.timestamp.as_deref(),
@@ -318,7 +319,8 @@ fn event_color(event: &tokn_session_core::AgentEvent) -> &'static str {
     AgentEvent::SessionStarted(_)
     | AgentEvent::ProviderChanged(_)
     | AgentEvent::SessionSettingsApplied(_)
-    | AgentEvent::GoalUpdated(_) => ANSI_BLUE,
+    | AgentEvent::GoalUpdated(_)
+    | AgentEvent::AgentActivity(_) => ANSI_BLUE,
     AgentEvent::Message(event) => match event.role {
       Role::User => ANSI_CYAN,
       Role::Assistant => ANSI_GREEN,
