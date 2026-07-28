@@ -1,5 +1,6 @@
-use tokn_session_core::AgentEvent;
 use zeromq::{PubSocket, Socket, SocketSend, ZmqMessage};
+
+use crate::RelayEvent;
 
 pub struct ZmqPublisher {
   socket: PubSocket,
@@ -15,9 +16,9 @@ impl ZmqPublisher {
     Ok(Self { socket })
   }
 
-  pub async fn publish(&mut self, topic: &str, event: &AgentEvent) -> Result<(), String> {
-    let payload = serde_json::to_vec(event).map_err(|err| format!("failed to serialize relay event: {err}"))?;
-    let mut message = ZmqMessage::from(topic);
+  pub async fn publish(&mut self, event: &RelayEvent) -> Result<(), String> {
+    let payload = serde_json::to_vec(&event.event).map_err(|err| format!("failed to serialize relay event: {err}"))?;
+    let mut message = ZmqMessage::from(event.topic.as_str());
     message.push_back(payload.into());
     self
       .socket
@@ -29,6 +30,7 @@ impl ZmqPublisher {
 
 #[cfg(test)]
 mod tests {
+  use std::path::PathBuf;
   use std::time::Duration;
 
   use tempfile::TempDir;
@@ -36,6 +38,7 @@ mod tests {
   use zeromq::{Socket, SocketRecv, SubSocket};
 
   use super::ZmqPublisher;
+  use crate::RelayEvent;
 
   #[tokio::test]
   async fn publishes_topic_and_json_as_multipart_message() {
@@ -57,7 +60,14 @@ mod tests {
       text: "done".to_string(),
       timestamp: None,
     });
-    publisher.publish("pi.session-1", &event).await.unwrap();
+    publisher
+      .publish(&RelayEvent {
+        path: PathBuf::from("session.jsonl"),
+        topic: "pi.session-1".to_string(),
+        event,
+      })
+      .await
+      .unwrap();
 
     let message = tokio::time::timeout(Duration::from_secs(2), subscriber.recv())
       .await

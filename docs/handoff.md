@@ -16,23 +16,44 @@ tokn-session browse --source codex <session-id>
 tokn-session create --source opencode --executor "tokn-gateway proxy opencode --npx --" "create a todo app"
 tokn-session append --source opencode --executor "tokn-gateway proxy opencode --npx --" --session <session-id> "next turn"
 tokn-session append --source opencode --executor "tokn-gateway proxy opencode --npx --" --continue "next turn"
-tokn-session-relay
+tokn-session-relay zeromq
+tokn-session-relay stdout
 ```
 
 The old `tokn-session sessions list/show` shape is intentionally unsupported.
 
 ## Session Relay
 
-`tokn-session-relay` follows active Codex and Pi JSONL session trees and publishes
-normalized `AgentEvent` values through a ZeroMQ `PUB` socket.
+`tokn-session-relay` follows active Codex and Pi JSONL session trees. It requires
+an output subcommand:
 
-By default it binds `tcp://127.0.0.1:5556`, watches `~/.codex/sessions` and
-`~/.pi/agent/sessions`, and silently consumes existing records to seed provider
-normalizer state before following from EOF. Pass `--replay` to publish existing
-complete records too. `--codex-dir`, `--pi-dir`, and `--bind` override the
-defaults.
+```sh
+tokn-session-relay zeromq --bind tcp://127.0.0.1:5556
+tokn-session-relay stdout
+```
 
-Each publication is a two-frame ZeroMQ message:
+Both modes watch `~/.codex/sessions` and `~/.pi/agent/sessions` by default and
+seed existing files from their session header before following from the
+snapshotted EOF. Their historical bodies are not replayed. `--codex-dir`,
+`--pi-dir`, `--poll-interval`, `--replay=<count>`, and `--replay-all` are shared
+options.
+
+Native filesystem watching is registered between the initial file snapshot and
+the EOF-seeding pass, so appends during startup remain visible. The periodic
+scan is a fallback for missed notifications and roots created after startup.
+Watcher notifications retain and coalesce their affected paths, so normal
+updates inspect only changed files instead of rescanning every session. macOS
+uses the kqueue backend because FSEvents can omit these session-file writes.
+Newly discovered or replaced files emit all normalized events beginning at the
+third-most-recent message by default. `--replay=<count>` changes that window,
+while `--replay-all` emits every complete record. These replay options only
+apply to files discovered or replaced after startup.
+
+`stdout` writes one normalized `AgentEvent` JSON object per line and flushes
+after every event. Diagnostics remain on stderr.
+
+`zeromq` binds `tcp://127.0.0.1:5556` by default. Each publication is a two-frame
+ZeroMQ message:
 
 1. `codex.<session_id>` or `pi.<session_id>` topic
 2. normalized `AgentEvent` JSON
@@ -41,6 +62,11 @@ The relay publishes all normalized events, including reasoning, tool calls,
 errors, lifecycle events, and unknown provider-native shapes. It buffers partial
 JSONL records, discovers newly created files, handles truncation/replacement,
 and combines native filesystem notifications with a periodic rescan.
+
+The reusable relay loop lives in the library as `SessionRelay`. `RelayConfig`
+controls provider roots, new-file replay, and the periodic recovery interval.
+Library consumers call `next_update().await`; notification and scan failures
+that can be retried are returned as warnings in `TailUpdate`.
 
 ## Provider Sources
 
@@ -158,6 +184,8 @@ GitHub Actions CI runs format check, workspace check/test, and CLI build on push
 cargo run -p tokn-session-cli -- list --source codex --limit 1
 cargo run -p tokn-session-cli -- list --source opencode --limit 1
 cargo run -p tokn-session-cli -- show --source opencode <session-id> --format pretty
+cargo run -p tokn-session-relay -- stdout
+cargo run -p tokn-session-relay -- zeromq
 ```
 
 ## Next Likely Work
