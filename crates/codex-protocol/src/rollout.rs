@@ -79,7 +79,7 @@ pub enum RolloutItem {
   InterAgentCommunication(InterAgentCommunicationItem),
   InterAgentCommunicationMetadata(InterAgentCommunicationMetadataItem),
   Compacted(CompactedItem),
-  TurnContext(TurnContextItem),
+  TurnContext(Box<TurnContextItem>),
   WorldState(WorldStateItem),
   EventMessage(EventMessage),
   Unknown(UnknownItem),
@@ -168,7 +168,7 @@ pub struct CompactedItem {
   #[serde(default)]
   pub message: Option<String>,
   #[serde(default)]
-  pub replacement_history: Vec<ResponseItem>,
+  pub replacement_history: Option<Vec<ResponseItem>>,
   #[serde(default)]
   pub window_number: Option<u64>,
   #[serde(default)]
@@ -192,7 +192,7 @@ pub struct TurnContextItem {
   #[serde(default)]
   pub cwd: Option<String>,
   #[serde(default)]
-  pub workspace_roots: Vec<String>,
+  pub workspace_roots: Option<Vec<String>>,
   #[serde(default)]
   pub current_date: Option<String>,
   #[serde(default)]
@@ -421,7 +421,7 @@ pub struct ReasoningItem {
   #[serde(default)]
   pub summary: Vec<ContentItem>,
   #[serde(default)]
-  pub content: Vec<ContentItem>,
+  pub content: Option<Vec<ContentItem>>,
   #[serde(default)]
   pub encrypted_content: Option<String>,
   #[serde(default)]
@@ -608,7 +608,7 @@ fn decode_rollout_item(native_type: Option<String>, payload: Value) -> RolloutIt
       decode_payload(native_type, payload, RolloutItem::InterAgentCommunicationMetadata)
     }
     Some("compacted") => decode_payload(native_type, payload, RolloutItem::Compacted),
-    Some("turn_context") => decode_payload(native_type, payload, RolloutItem::TurnContext),
+    Some("turn_context") => decode_payload(native_type, payload, |item| RolloutItem::TurnContext(Box::new(item))),
     Some("world_state") => decode_payload(native_type, payload, RolloutItem::WorldState),
     Some("event_msg") => decode_payload(native_type, payload, RolloutItem::EventMessage),
     _ => RolloutItem::Unknown(UnknownItem {

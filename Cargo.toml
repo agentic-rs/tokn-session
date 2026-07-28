@@ -17,7 +17,6 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
-codex-protocol = "0.63.0"
 crossterm = "0.28"
 notify = { version = "8.2.0", features = ["macos_kqueue"] }
 ratatui = "0.29"
