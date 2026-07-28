@@ -17,7 +17,7 @@ impl ZmqPublisher {
   }
 
   pub async fn publish(&mut self, event: &RelayEvent) -> Result<(), String> {
-    let payload = serde_json::to_vec(&event.event).map_err(|err| format!("failed to serialize relay event: {err}"))?;
+    let payload = serde_json::to_vec(event).map_err(|err| format!("failed to serialize relay event: {err}"))?;
     let mut message = ZmqMessage::from(event.topic.as_str());
     message.push_back(payload.into());
     self
@@ -38,7 +38,7 @@ mod tests {
   use zeromq::{Socket, SocketRecv, SubSocket};
 
   use super::ZmqPublisher;
-  use crate::RelayEvent;
+  use crate::{ProjectContext, RelayEvent, SessionContext};
 
   #[tokio::test]
   async fn publishes_topic_and_json_as_multipart_message() {
@@ -64,6 +64,22 @@ mod tests {
       .publish(&RelayEvent {
         path: PathBuf::from("session.jsonl"),
         topic: "pi.session-1".to_string(),
+        session: SessionContext {
+          provider: Provider::Pi,
+          session_id: "session-1".to_string(),
+          parent_session_id: None,
+          title: None,
+          cwd: Some("/tmp/project".to_string()),
+          started_at: None,
+          project: Some(ProjectContext {
+            id: None,
+            name: Some("project".to_string()),
+            folder: Some("/tmp/project".to_string()),
+            repository_url: None,
+            branch: None,
+            commit_hash: None,
+          }),
+        },
         event,
       })
       .await
@@ -76,8 +92,10 @@ mod tests {
     assert_eq!(message.len(), 2);
     assert_eq!(message.get(0).unwrap().as_ref(), b"pi.session-1");
     let payload: serde_json::Value = serde_json::from_slice(message.get(1).unwrap()).unwrap();
-    assert_eq!(payload["type"], "message");
-    assert_eq!(payload["session_id"], "session-1");
-    assert_eq!(payload["text"], "done");
+    assert_eq!(payload["topic"], "pi.session-1");
+    assert_eq!(payload["session"]["project"]["name"], "project");
+    assert_eq!(payload["event"]["type"], "message");
+    assert_eq!(payload["event"]["session_id"], "session-1");
+    assert_eq!(payload["event"]["text"], "done");
   }
 }

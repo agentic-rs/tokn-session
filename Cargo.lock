@@ -2055,6 +2055,7 @@ name = "tokn-session-relay"
 version = "0.1.0"
 dependencies = [
  "notify",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

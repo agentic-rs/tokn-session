@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -47,6 +48,7 @@ async fn run(args: Args) -> Result<(), String> {
         writer: BufWriter::new(std::io::stdout()),
         format,
         color,
+        seen_sessions: HashSet::new(),
       }
     }
   };
@@ -68,6 +70,7 @@ enum Output {
     writer: BufWriter<std::io::Stdout>,
     format: StdoutFormat,
     color: bool,
+    seen_sessions: HashSet<String>,
   },
 }
 
@@ -79,7 +82,15 @@ impl Output {
     for event in update.events {
       let result = match self {
         Self::ZeroMq(publisher) => publisher.publish(&event).await,
-        Self::Stdout { writer, format, color } => write_stdout_event(writer, &event, *format, *color),
+        Self::Stdout {
+          writer,
+          format,
+          color,
+          seen_sessions,
+        } => {
+          let show_context = *format == StdoutFormat::Pretty && seen_sessions.insert(event.topic.clone());
+          write_stdout_event(writer, &event, *format, *color, show_context)
+        }
       };
       if let Err(err) = result {
         eprintln!("warning: {err}");
@@ -89,7 +100,7 @@ impl Output {
 }
 
 fn write_jsonl_event(writer: &mut impl Write, event: &RelayEvent) -> Result<(), String> {
-  serde_json::to_writer(&mut *writer, &event.event).map_err(|err| format!("failed to serialize relay event: {err}"))?;
+  serde_json::to_writer(&mut *writer, event).map_err(|err| format!("failed to serialize relay event: {err}"))?;
   writer
     .write_all(b"\n")
     .and_then(|_| writer.flush())
@@ -101,6 +112,7 @@ fn write_stdout_event(
   event: &RelayEvent,
   format: StdoutFormat,
   color: bool,
+  show_context: bool,
 ) -> Result<(), String> {
   if format == StdoutFormat::Json {
     return write_jsonl_event(writer, event);
@@ -118,7 +130,11 @@ fn write_stdout_event(
     StdoutFormat::Summary => format!("{}\n", render_event_summary(&event.event)),
     StdoutFormat::Json => unreachable!(),
   };
-  let output = prefix_human_output(event, &rendered, color);
+  let mut output = String::new();
+  if show_context {
+    output.push_str(&render_session_context(event, color));
+  }
+  output.push_str(&prefix_human_output(event, &rendered, color));
   writer
     .write_all(output.as_bytes())
     .and_then(|_| writer.flush())
@@ -128,10 +144,11 @@ fn write_stdout_event(
 fn prefix_human_output(event: &RelayEvent, rendered: &str, color: bool) -> String {
   let (first_line, remainder) = rendered.split_once('\n').unwrap_or((rendered, ""));
   let mut output = String::new();
+  let prefix = human_event_prefix(event);
   if color {
     output.push_str(event_color(&event.event));
   }
-  output.push_str(&event.topic);
+  output.push_str(&prefix);
   if color {
     output.push_str(ANSI_RESET);
   }
@@ -148,6 +165,146 @@ fn prefix_human_output(event: &RelayEvent, rendered: &str, color: bool) -> Strin
   output.push('\n');
   output.push_str(remainder);
   output
+}
+
+fn human_event_prefix(event: &RelayEvent) -> String {
+  let mut parts = Vec::new();
+  if let Some(timestamp) = event_timestamp(&event.event).and_then(display_timestamp) {
+    parts.push(timestamp);
+  }
+  if let Some(project) = event
+    .session
+    .project
+    .as_ref()
+    .and_then(|project| project.name.as_deref())
+  {
+    parts.push(project.to_string());
+  }
+  parts.push(format!(
+    "{}/{}",
+    provider_name(event.session.provider),
+    abbreviate_id(&event.session.session_id)
+  ));
+  if let Some(message_id) = event_message_id(&event.event) {
+    parts.push(format!("#{}", abbreviate_id(message_id)));
+  }
+  if let Some(parent_id) = event_parent_id(&event.event) {
+    parts.push(format!("←#{}", abbreviate_id(parent_id)));
+  }
+  parts.join(" ")
+}
+
+fn render_session_context(event: &RelayEvent, color: bool) -> String {
+  let context = &event.session;
+  let mut output = String::new();
+  if color {
+    output.push_str(ANSI_BLUE);
+  }
+  output.push_str("session ");
+  output.push_str(provider_name(context.provider));
+  output.push('/');
+  output.push_str(&context.session_id);
+  if color {
+    output.push_str(ANSI_RESET);
+  }
+  output.push('\n');
+
+  append_context_line(&mut output, "title", context.title.as_deref(), color);
+  append_context_line(&mut output, "parent", context.parent_session_id.as_deref(), color);
+  append_context_line(&mut output, "started", context.started_at.as_deref(), color);
+
+  if let Some(project) = &context.project {
+    append_context_line(&mut output, "project", project.name.as_deref(), color);
+    append_context_line(&mut output, "folder", project.folder.as_deref(), color);
+    append_context_line(&mut output, "repository", project.repository_url.as_deref(), color);
+    append_context_line(&mut output, "branch", project.branch.as_deref(), color);
+    append_context_line(&mut output, "commit", project.commit_hash.as_deref(), color);
+  } else {
+    append_context_line(&mut output, "folder", context.cwd.as_deref(), color);
+  }
+  output.push('\n');
+  output
+}
+
+fn append_context_line(output: &mut String, label: &str, value: Option<&str>, color: bool) {
+  let Some(value) = value else {
+    return;
+  };
+  output.push_str("  ");
+  if color {
+    output.push_str(ANSI_DIM);
+  }
+  output.push_str(label);
+  if color {
+    output.push_str(ANSI_RESET);
+  }
+  output.push(' ');
+  output.push_str(value);
+  output.push('\n');
+}
+
+fn provider_name(provider: Provider) -> &'static str {
+  match provider {
+    Provider::Pi => "pi",
+    Provider::Codex => "codex",
+    Provider::OpenCode => "opencode",
+  }
+}
+
+fn display_timestamp(timestamp: &str) -> Option<String> {
+  if timestamp.is_empty() {
+    return None;
+  }
+  if let Some(time) = timestamp.split_once('T').map(|(_, time)| time) {
+    return Some(time.chars().take(8).collect());
+  }
+  Some(timestamp.to_string())
+}
+
+fn abbreviate_id(id: &str) -> String {
+  const DISPLAY_CHARS: usize = 8;
+
+  if id.chars().count() <= DISPLAY_CHARS + 2 {
+    return id.to_string();
+  }
+  format!("{}…", id.chars().take(DISPLAY_CHARS).collect::<String>())
+}
+
+fn event_timestamp(event: &tokn_session_core::AgentEvent) -> Option<&str> {
+  use tokn_session_core::AgentEvent;
+
+  match event {
+    AgentEvent::SessionStarted(event) => event.timestamp.as_deref(),
+    AgentEvent::ProviderChanged(event) => event.timestamp.as_deref(),
+    AgentEvent::Message(event) => event.timestamp.as_deref(),
+    AgentEvent::Reasoning(event) => event.timestamp.as_deref(),
+    AgentEvent::GoalUpdated(event) => event.timestamp.as_deref(),
+    AgentEvent::ToolCall(event) => event.timestamp.as_deref(),
+    AgentEvent::Error(event) => event.timestamp.as_deref(),
+    AgentEvent::Unknown(event) => event.timestamp.as_deref(),
+  }
+}
+
+fn event_message_id(event: &tokn_session_core::AgentEvent) -> Option<&str> {
+  use tokn_session_core::AgentEvent;
+
+  match event {
+    AgentEvent::Message(event) => event.message_id.as_deref(),
+    AgentEvent::Reasoning(event) => event.message_id.as_deref(),
+    AgentEvent::ToolCall(event) => event.message_id.as_deref(),
+    _ => None,
+  }
+}
+
+fn event_parent_id(event: &tokn_session_core::AgentEvent) -> Option<&str> {
+  use tokn_session_core::AgentEvent;
+
+  match event {
+    AgentEvent::Message(event) => event.parent_id.as_deref(),
+    AgentEvent::Reasoning(event) => event.parent_id.as_deref(),
+    AgentEvent::ToolCall(event) => event.parent_id.as_deref(),
+    _ => None,
+  }
 }
 
 fn event_color(event: &tokn_session_core::AgentEvent) -> &'static str {
@@ -394,11 +551,11 @@ Options:
 
 Messages use two frames:
   1. topic: codex.<session_id> or pi.<session_id>
-  2. JSON: normalized AgentEvent"
+  2. JSON: RelayEvent envelope with session context and normalized AgentEvent"
     ),
     Help::Stdout => println!(
       "\
-Write normalized AgentEvent output to stdout.
+Write relay events with session context to stdout.
 
 Usage:
   tokn-session-relay stdout [options]
@@ -423,7 +580,7 @@ mod tests {
   use std::time::Duration;
 
   use tokn_session_core::{AgentEvent, MessageEvent, Phase, Provider, Role, SessionStarted};
-  use tokn_session_relay::{NewFileReplay, RelayEvent};
+  use tokn_session_relay::{NewFileReplay, ProjectContext, RelayEvent, SessionContext};
 
   use super::{Args, ArgsParse, Command, StdoutFormat, write_jsonl_event, write_stdout_event};
 
@@ -532,14 +689,15 @@ mod tests {
   }
 
   #[test]
-  fn writes_raw_agent_event_jsonl() {
+  fn writes_relay_event_jsonl() {
     let event = message_event();
     let mut output = RecordingWriter::default();
     write_jsonl_event(&mut output, &event).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&output.bytes).unwrap();
-    assert_eq!(value["type"], "message");
-    assert_eq!(value["text"], "done");
-    assert!(value.get("topic").is_none());
+    assert_eq!(value["topic"], "pi.session-1");
+    assert_eq!(value["session"]["project"]["name"], "project");
+    assert_eq!(value["event"]["type"], "message");
+    assert_eq!(value["event"]["text"], "done");
     assert_eq!(output.flushes, 1);
   }
 
@@ -548,25 +706,34 @@ mod tests {
     let event = message_event();
 
     let mut summary = RecordingWriter::default();
-    write_stdout_event(&mut summary, &event, StdoutFormat::Summary, false).unwrap();
+    write_stdout_event(&mut summary, &event, StdoutFormat::Summary, false, false).unwrap();
     assert_eq!(
       String::from_utf8(summary.bytes).unwrap(),
-      "pi.session-1 assistant done\n"
+      "00:00:01 project pi/session-1 #message-1 ←#parent-1 assistant done\n"
     );
 
     let mut pretty = RecordingWriter::default();
-    write_stdout_event(&mut pretty, &event, StdoutFormat::Pretty, false).unwrap();
+    write_stdout_event(&mut pretty, &event, StdoutFormat::Pretty, false, true).unwrap();
     assert_eq!(
       String::from_utf8(pretty.bytes).unwrap(),
-      "pi.session-1 assistant\n  done\n\n"
+      concat!(
+        "session pi/session-1\n",
+        "  started 2026-01-01T00:00:00Z\n",
+        "  project project\n",
+        "  folder /tmp/project\n",
+        "\n",
+        "00:00:01 project pi/session-1 #message-1 ←#parent-1 assistant\n",
+        "  done\n",
+        "\n",
+      )
     );
 
     let mut colored = RecordingWriter::default();
-    write_stdout_event(&mut colored, &event, StdoutFormat::Summary, true).unwrap();
+    write_stdout_event(&mut colored, &event, StdoutFormat::Summary, true, false).unwrap();
     assert!(String::from_utf8(colored.bytes).unwrap().contains("\u{1b}["));
 
     let mut json = RecordingWriter::default();
-    write_stdout_event(&mut json, &event, StdoutFormat::Json, true).unwrap();
+    write_stdout_event(&mut json, &event, StdoutFormat::Json, true, false).unwrap();
     assert!(!String::from_utf8(json.bytes).unwrap().contains("\u{1b}["));
   }
 
@@ -575,6 +742,7 @@ mod tests {
     let event = RelayEvent {
       path: PathBuf::from("session.jsonl"),
       topic: "pi.session-1".to_string(),
+      session: session_context(),
       event: AgentEvent::SessionStarted(SessionStarted {
         provider: Provider::Pi,
         session_id: "session-1".to_string(),
@@ -583,10 +751,10 @@ mod tests {
       }),
     };
     let mut output = RecordingWriter::default();
-    write_stdout_event(&mut output, &event, StdoutFormat::Pretty, false).unwrap();
+    write_stdout_event(&mut output, &event, StdoutFormat::Pretty, false, false).unwrap();
     assert_eq!(
       String::from_utf8(output.bytes).unwrap(),
-      "pi.session-1 session started session-1\n\n"
+      "project pi/session-1 session started session-1\n\n"
     );
   }
 
@@ -594,15 +762,35 @@ mod tests {
     RelayEvent {
       path: PathBuf::from("session.jsonl"),
       topic: "pi.session-1".to_string(),
+      session: session_context(),
       event: AgentEvent::Message(MessageEvent {
         provider: Provider::Pi,
         session_id: Some("session-1".to_string()),
-        message_id: None,
-        parent_id: None,
+        message_id: Some("message-1".to_string()),
+        parent_id: Some("parent-1".to_string()),
         role: Role::Assistant,
         phase: Phase::Finished,
         text: "done".to_string(),
-        timestamp: None,
+        timestamp: Some("2026-01-01T00:00:01Z".to_string()),
+      }),
+    }
+  }
+
+  fn session_context() -> SessionContext {
+    SessionContext {
+      provider: Provider::Pi,
+      session_id: "session-1".to_string(),
+      parent_session_id: None,
+      title: None,
+      cwd: Some("/tmp/project".to_string()),
+      started_at: Some("2026-01-01T00:00:00Z".to_string()),
+      project: Some(ProjectContext {
+        id: None,
+        name: Some("project".to_string()),
+        folder: Some("/tmp/project".to_string()),
+        repository_url: None,
+        branch: None,
+        commit_hash: None,
       }),
     }
   }

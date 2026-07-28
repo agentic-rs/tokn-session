@@ -50,16 +50,25 @@ while `--replay-all` emits every complete record. These replay options only
 apply to files discovered or replaced after startup.
 
 `stdout` supports `--format pretty|summary|json` and defaults to `summary`.
-Human-readable formats prefix each event with its relay topic; `--color` adds
-ANSI color to those formats. JSON remains colorless normalized `AgentEvent`
-JSONL even when `--color` is present. Every format flushes after each event,
-and diagnostics remain on stderr.
+Human-readable formats include the event timestamp, inferred project name,
+abbreviated session id, and message id/parent when available. Pretty output
+also prints the full session context before the first event observed for each
+session. `--color` adds ANSI color to human output. JSON remains colorless
+`RelayEvent` JSONL even when `--color` is present. Every format flushes after
+each event, and diagnostics remain on stderr.
 
 `zeromq` binds `tcp://127.0.0.1:5556` by default. Each publication is a two-frame
 ZeroMQ message:
 
 1. `codex.<session_id>` or `pi.<session_id>` topic
-2. normalized `AgentEvent` JSON
+2. serialized `RelayEvent` JSON
+
+`RelayEvent` wraps the normalized `AgentEvent` with the source path, topic, and
+`SessionContext`. Context includes session id, optional parent/title, cwd and
+start time, plus project name/folder. Codex session metadata also contributes
+repository URL, branch, and commit when present. Project name is display
+metadata inferred from the repository URL or cwd basename; title is never
+invented when the provider file does not contain one.
 
 The relay publishes all normalized events, including reasoning, tool calls,
 errors, lifecycle events, and unknown provider-native shapes. It buffers partial
