@@ -68,7 +68,34 @@ fn accepts_new_turn_context_values_without_schema_failure() {
   };
   assert_eq!(item.effort.as_deref(), Some("ultra"));
   assert_eq!(item.approvals_reviewer.as_deref(), Some("auto_review"));
-  assert_eq!(item.workspace_roots, ["/tmp/project"]);
+  assert_eq!(
+    item
+      .workspace_roots
+      .as_deref()
+      .and_then(|roots| roots.first())
+      .map(String::as_str),
+    Some("/tmp/project")
+  );
+}
+
+#[test]
+fn accepts_null_optional_reasoning_content() {
+  let line: RolloutLine = serde_json::from_value(json!({
+    "type": "response_item",
+    "payload": {
+      "type": "reasoning",
+      "summary": [],
+      "content": null,
+      "encrypted_content": "ciphertext"
+    }
+  }))
+  .expect("reasoning should decode");
+
+  let RolloutItem::ResponseItem(ResponseItem::Reasoning(item)) = line.item() else {
+    panic!("expected reasoning item");
+  };
+  assert!(item.content.is_none());
+  assert_eq!(item.encrypted_content.as_deref(), Some("ciphertext"));
 }
 
 #[test]

@@ -104,9 +104,8 @@ stable session, response, agent-communication, turn-context, and world-state
 fields are typed; volatile subtrees remain JSON values; and unknown tags retain
 their original payloads. It does not mirror Codex's internal Rust API.
 
-`tokn-session-codex` still uses the published `codex-protocol` dependency while
-its normalizer is migrated. Removing that dependency is the next step; the two
-protocol crates should not remain in parallel long term.
+`tokn-session-codex` uses those local wire types directly. The published
+`codex-protocol` dependency is no longer part of the workspace.
 
 Current event families include:
 
@@ -186,7 +185,16 @@ Current browser keys:
 - OpenCode shell tools with nonzero `metadata.exit` are marked as errors even when OpenCode records the tool state as completed.
 - Tool kind classification and summary extraction live in `crates/core`; provider normalizers should use the shared helpers where possible.
 - OpenCode support currently uses the legacy-compatible `message` and `part` tables seen in local data, not the newer `session_message` projection.
-- Codex native JSONL parsing uses the published `codex-protocol` crate where lines match its `RolloutItem` definitions. Some local/vendor-current shapes are newer or looser than the published crate, so the Codex source keeps compatibility fallbacks for existing loose fixture shapes and unknown-event discovery.
+- Codex native JSONL parsing uses `tokn-codex-protocol`. New rollout and
+  response tags retain their native identity and payload for unknown-event
+  discovery instead of being erased by an upstream catch-all enum.
+- Codex `response_item.agent_message` and legacy
+  `inter_agent_communication` records map to `agent_activity` with
+  provider-supplied author and recipient paths. Paths remain null when the
+  record does not supply them.
+- Codex `world_state`, `turn_context`, and
+  `inter_agent_communication_metadata` are known control records and are not
+  emitted into the display-oriented event stream.
 - Codex `event_msg.thread_goal_updated` maps to the visible `goal_updated` IR event.
 - Codex `event_msg.thread_settings_applied` is a full effective snapshot, not a
   diff. Repeated applications remain visible in the event stream.
