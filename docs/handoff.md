@@ -95,6 +95,7 @@ Current event families include:
 
 - `session_started`
 - `provider_changed`
+- `session_settings_applied`
 - `message`
 - `reasoning`
 - `goal_updated`
@@ -117,6 +118,13 @@ Reasoning is intentionally flat:
 - `signature`
 
 Pretty rendering shows visible reasoning text and summaries, but does not display encrypted reasoning payloads. JSONL preserves encrypted reasoning in the IR.
+
+Codex `event_msg.thread_settings_applied` maps to
+`session_settings_applied`. The normalized event exposes a compact settings
+snapshot and retains the provider-native snapshot for JSON consumers. Human
+rendering intentionally omits permission internals and embedded developer
+instructions. The relay updates `SessionContext.cwd` when these settings change
+without replacing the session's original project metadata.
 
 Reusable display formatting lives in `crates/render`. It depends on `core`, not on terminal libraries. The CLI uses it for linear output and the interactive browser uses its `EventDisplay` rows for collapsed summaries and expanded detail.
 
@@ -153,6 +161,8 @@ Current browser keys:
 - OpenCode support currently uses the legacy-compatible `message` and `part` tables seen in local data, not the newer `session_message` projection.
 - Codex native JSONL parsing uses the published `codex-protocol` crate where lines match its `RolloutItem` definitions. Some local/vendor-current shapes are newer or looser than the published crate, so the Codex source keeps compatibility fallbacks for existing loose fixture shapes and unknown-event discovery.
 - Codex `event_msg.thread_goal_updated` maps to the visible `goal_updated` IR event.
+- Codex `event_msg.thread_settings_applied` is a full effective snapshot, not a
+  diff. Repeated applications remain visible in the event stream.
 - Timestamps are provider-native strings/numbers today; there is no unified timestamp type yet.
 - The CLI help path currently exits through the same error-printing path as other parser errors.
 

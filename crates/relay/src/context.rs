@@ -47,13 +47,23 @@ impl SessionContext {
   }
 
   fn update_codex(&mut self, value: &Value) {
-    if value.get("type").and_then(Value::as_str) != Some("session_meta") {
-      return;
-    }
     let Some(payload) = value.get("payload") else {
       return;
     };
 
+    match (
+      value.get("type").and_then(Value::as_str),
+      payload.get("type").and_then(Value::as_str),
+    ) {
+      (Some("session_meta"), _) => self.update_codex_session_meta(value, payload),
+      (Some("event_msg"), Some("thread_settings_applied")) => {
+        self.update_codex_thread_settings(payload);
+      }
+      _ => {}
+    }
+  }
+
+  fn update_codex_session_meta(&mut self, value: &Value, payload: &Value) {
     if let Some(id) = string_field(payload, "id") {
       self.session_id = id;
     }
@@ -62,6 +72,15 @@ impl SessionContext {
     self.cwd = string_field(payload, "cwd");
     self.started_at = string_field(payload, "timestamp").or_else(|| string_field(value, "timestamp"));
     self.project = project_context(self.cwd.as_deref(), payload.get("git"));
+  }
+
+  fn update_codex_thread_settings(&mut self, payload: &Value) {
+    if let Some(cwd) = payload
+      .get("thread_settings")
+      .and_then(|settings| string_field(settings, "cwd"))
+    {
+      self.cwd = Some(cwd);
+    }
   }
 
   fn update_pi(&mut self, value: &Value) {
@@ -179,5 +198,32 @@ mod tests {
     let project = context.project.unwrap();
     assert_eq!(project.name.as_deref(), Some("tokn-session"));
     assert_eq!(project.folder.as_deref(), Some("/tmp/worktree"));
+  }
+
+  #[test]
+  fn updates_effective_cwd_from_codex_thread_settings() {
+    let mut context = SessionContext::from_path(Provider::Codex, Path::new("fallback.jsonl"));
+    context.update(&json!({
+      "type": "session_meta",
+      "payload": {
+        "id": "session-1",
+        "cwd": "/tmp/project"
+      }
+    }));
+    context.update(&json!({
+      "type": "event_msg",
+      "payload": {
+        "type": "thread_settings_applied",
+        "thread_settings": {
+          "cwd": "/tmp/project/subdir"
+        }
+      }
+    }));
+
+    assert_eq!(context.cwd.as_deref(), Some("/tmp/project/subdir"));
+    assert_eq!(
+      context.project.as_ref().and_then(|project| project.folder.as_deref()),
+      Some("/tmp/project")
+    );
   }
 }

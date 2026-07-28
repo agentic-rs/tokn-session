@@ -479,6 +479,7 @@ fn event_session_id(event: &AgentEvent) -> Option<&str> {
   match event {
     AgentEvent::SessionStarted(event) => Some(&event.session_id),
     AgentEvent::ProviderChanged(event) => event.session_id.as_deref(),
+    AgentEvent::SessionSettingsApplied(event) => event.session_id.as_deref(),
     AgentEvent::Message(event) => event.session_id.as_deref(),
     AgentEvent::Reasoning(event) => event.session_id.as_deref(),
     AgentEvent::GoalUpdated(event) => event.session_id.as_deref(),
@@ -892,14 +893,21 @@ mod tests {
 
     append(
       &path,
-      "{\"timestamp\":\"2026-06-04T00:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hello\"}}\n",
+      concat!(
+        "{\"timestamp\":\"2026-06-04T00:00:01Z\",\"type\":\"event_msg\",\"payload\":{",
+        "\"type\":\"thread_settings_applied\",",
+        "\"thread_settings\":{\"model\":\"gpt-5\",\"cwd\":\"/tmp/worktree/subdir\"}}}\n",
+        "{\"timestamp\":\"2026-06-04T00:00:02Z\",\"type\":\"event_msg\",",
+        "\"payload\":{\"type\":\"user_message\",\"message\":\"hello\"}}\n",
+      ),
     );
     let update = tailer.scan_paths(HashSet::from([path])).unwrap();
-    assert_eq!(update.events.len(), 1);
+    assert_eq!(update.events.len(), 2);
     assert_eq!(update.events[0].topic, "codex.codex-session");
     let context = &update.events[0].session;
     assert_eq!(context.session_id, "codex-session");
     assert_eq!(context.parent_session_id.as_deref(), Some("parent-session"));
+    assert_eq!(context.cwd.as_deref(), Some("/tmp/worktree/subdir"));
     assert_eq!(context.started_at.as_deref(), Some("2026-06-04T00:00:00Z"));
     let project = context.project.as_ref().unwrap();
     assert_eq!(
@@ -910,7 +918,11 @@ mod tests {
     assert_eq!(project.folder.as_deref(), Some("/tmp/worktree"));
     assert_eq!(project.branch.as_deref(), Some("main"));
     assert_eq!(project.commit_hash.as_deref(), Some("abcdef123456"));
-    let AgentEvent::Message(message) = &update.events[0].event else {
+    let AgentEvent::SessionSettingsApplied(settings) = &update.events[0].event else {
+      panic!("expected settings event");
+    };
+    assert_eq!(settings.cwd.as_deref(), Some("/tmp/worktree/subdir"));
+    let AgentEvent::Message(message) = &update.events[1].event else {
       panic!("expected message");
     };
     assert_eq!(message.text, "hello");

@@ -216,11 +216,14 @@ fn render_session_context(event: &RelayEvent, color: bool) -> String {
   if let Some(project) = &context.project {
     append_context_line(&mut output, "project", project.name.as_deref(), color);
     append_context_line(&mut output, "folder", project.folder.as_deref(), color);
+    if context.cwd.as_deref() != project.folder.as_deref() {
+      append_context_line(&mut output, "cwd", context.cwd.as_deref(), color);
+    }
     append_context_line(&mut output, "repository", project.repository_url.as_deref(), color);
     append_context_line(&mut output, "branch", project.branch.as_deref(), color);
     append_context_line(&mut output, "commit", project.commit_hash.as_deref(), color);
   } else {
-    append_context_line(&mut output, "folder", context.cwd.as_deref(), color);
+    append_context_line(&mut output, "cwd", context.cwd.as_deref(), color);
   }
   output.push('\n');
   output
@@ -276,6 +279,7 @@ fn event_timestamp(event: &tokn_session_core::AgentEvent) -> Option<&str> {
   match event {
     AgentEvent::SessionStarted(event) => event.timestamp.as_deref(),
     AgentEvent::ProviderChanged(event) => event.timestamp.as_deref(),
+    AgentEvent::SessionSettingsApplied(event) => event.timestamp.as_deref(),
     AgentEvent::Message(event) => event.timestamp.as_deref(),
     AgentEvent::Reasoning(event) => event.timestamp.as_deref(),
     AgentEvent::GoalUpdated(event) => event.timestamp.as_deref(),
@@ -311,7 +315,10 @@ fn event_color(event: &tokn_session_core::AgentEvent) -> &'static str {
   use tokn_session_core::{AgentEvent, Role};
 
   match event {
-    AgentEvent::SessionStarted(_) | AgentEvent::ProviderChanged(_) | AgentEvent::GoalUpdated(_) => ANSI_BLUE,
+    AgentEvent::SessionStarted(_)
+    | AgentEvent::ProviderChanged(_)
+    | AgentEvent::SessionSettingsApplied(_)
+    | AgentEvent::GoalUpdated(_) => ANSI_BLUE,
     AgentEvent::Message(event) => match event.role {
       Role::User => ANSI_CYAN,
       Role::Assistant => ANSI_GREEN,

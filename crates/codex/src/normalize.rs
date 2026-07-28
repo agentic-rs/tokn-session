@@ -10,8 +10,8 @@ use serde_json::Value;
 use crate::event::{CodexEvent, CodexLine};
 use tokn_session_core::{
   AgentEvent, ErrorEvent, GoalUpdated, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role,
-  SessionStarted, ToolCallEvent, ToolKind, ToolSummary, UnknownEvent, patch_summary, tool_kind_for_name,
-  tool_kind_for_optional_name, tool_summary_for_input, tool_summary_for_io,
+  SessionSettingsApplied, SessionStarted, ToolCallEvent, ToolKind, ToolSummary, UnknownEvent, patch_summary,
+  tool_kind_for_name, tool_kind_for_optional_name, tool_summary_for_input, tool_summary_for_io,
 };
 
 pub struct CodexNormalizer {
@@ -686,6 +686,43 @@ fn unknown_event(
   })
 }
 
+fn session_settings_applied_event(
+  session_id: Option<String>,
+  payload: &Value,
+  timestamp: Option<String>,
+) -> AgentEvent {
+  let settings = payload.get("thread_settings");
+  AgentEvent::SessionSettingsApplied(SessionSettingsApplied {
+    provider: Provider::Codex,
+    session_id,
+    model_provider: settings.and_then(|settings| string_field(settings, "model_provider_id")),
+    model_id: settings.and_then(|settings| string_field(settings, "model")),
+    service_tier: settings.and_then(|settings| string_field(settings, "service_tier")),
+    cwd: settings.and_then(|settings| string_field(settings, "cwd")),
+    reasoning_effort: settings.and_then(|settings| string_field(settings, "reasoning_effort")),
+    reasoning_summary: settings.and_then(|settings| string_field(settings, "reasoning_summary")),
+    personality: settings.and_then(|settings| string_field(settings, "personality")),
+    collaboration_mode: settings
+      .and_then(|settings| settings.get("collaboration_mode"))
+      .and_then(|mode| string_field(mode, "mode")),
+    approval_policy: settings.and_then(|settings| string_field(settings, "approval_policy")),
+    approvals_reviewer: settings.and_then(|settings| string_field(settings, "approvals_reviewer")),
+    active_permission_profile_id: settings
+      .and_then(|settings| settings.get("active_permission_profile"))
+      .and_then(|profile| string_field(profile, "id")),
+    native: settings.cloned(),
+    timestamp,
+  })
+}
+
+fn string_field(value: &Value, field: &str) -> Option<String> {
+  value
+    .get(field)
+    .and_then(Value::as_str)
+    .filter(|value| !value.is_empty())
+    .map(str::to_string)
+}
+
 fn normalize_unknown_line(session_id: Option<String>, value: Value, timestamp: Option<String>) -> Vec<AgentEvent> {
   if value.get("type").and_then(Value::as_str) == Some("response_item") {
     if let Some(payload) = value.get("payload") {
@@ -758,6 +795,9 @@ fn normalize_unknown_line(session_id: Option<String>, value: Value, timestamp: O
   if value.get("type").and_then(Value::as_str) == Some("event_msg") {
     if let Some(payload) = value.get("payload") {
       match payload.get("type").and_then(Value::as_str) {
+        Some("thread_settings_applied") => {
+          return vec![session_settings_applied_event(session_id, payload, timestamp)];
+        }
         Some("thread_goal_updated") => {
           return vec![AgentEvent::GoalUpdated(GoalUpdated {
             provider: Provider::Codex,
@@ -864,7 +904,7 @@ mod tests {
   fn normalizes_basic_fixture_events() {
     let events = normalize_fixture(include_str!("../fixtures/basic_session.jsonl"));
 
-    assert_eq!(events.len(), 9);
+    assert_eq!(events.len(), 10);
     assert_session_started(&events[0]);
     assert_provider_changed(&events[1]);
     assert_user_message(&events[2]);
@@ -873,7 +913,8 @@ mod tests {
     assert_shell_tool_started(&events[5]);
     assert_patch_tool_started(&events[6]);
     assert_goal_updated(&events[7]);
-    assert_unknown_event(&events[8]);
+    assert_session_settings_applied(&events[8]);
+    assert_unknown_event(&events[9]);
   }
 
   fn normalize_fixture(input: &str) -> Vec<AgentEvent> {
@@ -981,6 +1022,35 @@ mod tests {
     assert_eq!(
       event.goal.as_ref().and_then(|goal| goal.get("status")),
       Some(&Value::String("complete".to_string()))
+    );
+  }
+
+  fn assert_session_settings_applied(event: &AgentEvent) {
+    let AgentEvent::SessionSettingsApplied(event) = event else {
+      panic!("expected session settings event");
+    };
+    assert_eq!(event.session_id.as_deref(), Some("session-fixture"));
+    assert_eq!(event.model_provider.as_deref(), Some("openai"));
+    assert_eq!(event.model_id.as_deref(), Some("gpt-5"));
+    assert_eq!(event.service_tier.as_deref(), Some("priority"));
+    assert_eq!(event.cwd.as_deref(), Some("/tmp/project/subdir"));
+    assert_eq!(event.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(event.reasoning_summary.as_deref(), Some("detailed"));
+    assert_eq!(event.personality.as_deref(), Some("friendly"));
+    assert_eq!(event.collaboration_mode.as_deref(), Some("default"));
+    assert_eq!(event.approval_policy.as_deref(), Some("on-request"));
+    assert_eq!(event.approvals_reviewer.as_deref(), Some("auto_review"));
+    assert_eq!(event.active_permission_profile_id.as_deref(), Some(":workspace"));
+    assert_eq!(event.timestamp.as_deref(), Some("2026-06-04T00:00:07Z"));
+    assert_eq!(
+      event
+        .native
+        .as_ref()
+        .and_then(|native| native.get("collaboration_mode"))
+        .and_then(|mode| mode.get("settings"))
+        .and_then(|settings| settings.get("developer_instructions"))
+        .and_then(Value::as_str),
+      Some("do not render this")
     );
   }
 
