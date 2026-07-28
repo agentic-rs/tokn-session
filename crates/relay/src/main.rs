@@ -7,6 +7,7 @@ use tokn_session_relay::{
   DEFAULT_POLL_INTERVAL, DEFAULT_REPLAY_MESSAGES, NewFileReplay, ProviderRoot, RelayConfig, RelayEvent, SessionRelay,
   TailUpdate, ZmqPublisher,
 };
+use tokn_session_render::{render_event_pretty, render_event_summary};
 
 const DEFAULT_ENDPOINT: &str = "tcp://127.0.0.1:5556";
 
@@ -40,9 +41,13 @@ async fn run(args: Args) -> Result<(), String> {
       eprintln!("following Codex/Pi session events via ZeroMQ on {endpoint}");
       Output::ZeroMq(publisher)
     }
-    Command::Stdout => {
-      eprintln!("following Codex/Pi session events on stdout");
-      Output::Stdout(BufWriter::new(std::io::stdout()))
+    Command::Stdout { format, color } => {
+      eprintln!("following Codex/Pi session events on stdout ({})", format.name());
+      Output::Stdout {
+        writer: BufWriter::new(std::io::stdout()),
+        format,
+        color,
+      }
     }
   };
 
@@ -59,7 +64,11 @@ async fn run(args: Args) -> Result<(), String> {
 
 enum Output {
   ZeroMq(ZmqPublisher),
-  Stdout(BufWriter<std::io::Stdout>),
+  Stdout {
+    writer: BufWriter<std::io::Stdout>,
+    format: StdoutFormat,
+    color: bool,
+  },
 }
 
 impl Output {
@@ -70,7 +79,7 @@ impl Output {
     for event in update.events {
       let result = match self {
         Self::ZeroMq(publisher) => publisher.publish(&event).await,
-        Self::Stdout(writer) => write_jsonl_event(writer, &event),
+        Self::Stdout { writer, format, color } => write_stdout_event(writer, &event, *format, *color),
       };
       if let Err(err) = result {
         eprintln!("warning: {err}");
@@ -87,10 +96,121 @@ fn write_jsonl_event(writer: &mut impl Write, event: &RelayEvent) -> Result<(), 
     .map_err(|err| format!("failed to write relay event: {err}"))
 }
 
+fn write_stdout_event(
+  writer: &mut impl Write,
+  event: &RelayEvent,
+  format: StdoutFormat,
+  color: bool,
+) -> Result<(), String> {
+  if format == StdoutFormat::Json {
+    return write_jsonl_event(writer, event);
+  }
+
+  let rendered = match format {
+    StdoutFormat::Pretty => {
+      let pretty = render_event_pretty(&event.event);
+      if pretty.is_empty() {
+        format!("{}\n\n", render_event_summary(&event.event))
+      } else {
+        pretty
+      }
+    }
+    StdoutFormat::Summary => format!("{}\n", render_event_summary(&event.event)),
+    StdoutFormat::Json => unreachable!(),
+  };
+  let output = prefix_human_output(event, &rendered, color);
+  writer
+    .write_all(output.as_bytes())
+    .and_then(|_| writer.flush())
+    .map_err(|err| format!("failed to write relay event: {err}"))
+}
+
+fn prefix_human_output(event: &RelayEvent, rendered: &str, color: bool) -> String {
+  let (first_line, remainder) = rendered.split_once('\n').unwrap_or((rendered, ""));
+  let mut output = String::new();
+  if color {
+    output.push_str(event_color(&event.event));
+  }
+  output.push_str(&event.topic);
+  if color {
+    output.push_str(ANSI_RESET);
+  }
+  if !first_line.is_empty() {
+    output.push(' ');
+    if color {
+      output.push_str(event_color(&event.event));
+    }
+    output.push_str(first_line);
+    if color {
+      output.push_str(ANSI_RESET);
+    }
+  }
+  output.push('\n');
+  output.push_str(remainder);
+  output
+}
+
+fn event_color(event: &tokn_session_core::AgentEvent) -> &'static str {
+  use tokn_session_core::{AgentEvent, Role};
+
+  match event {
+    AgentEvent::SessionStarted(_) | AgentEvent::ProviderChanged(_) | AgentEvent::GoalUpdated(_) => ANSI_BLUE,
+    AgentEvent::Message(event) => match event.role {
+      Role::User => ANSI_CYAN,
+      Role::Assistant => ANSI_GREEN,
+      Role::System => ANSI_BLUE,
+      Role::Tool => ANSI_YELLOW,
+      Role::Unknown => ANSI_DIM,
+    },
+    AgentEvent::Reasoning(_) => ANSI_MAGENTA,
+    AgentEvent::ToolCall(event) if event.is_error == Some(true) => ANSI_BOLD_RED,
+    AgentEvent::ToolCall(_) => ANSI_YELLOW,
+    AgentEvent::Error(_) => ANSI_BOLD_RED,
+    AgentEvent::Unknown(_) => ANSI_DIM,
+  }
+}
+
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_BOLD_RED: &str = "\x1b[1;31m";
+const ANSI_GREEN: &str = "\x1b[32m";
+const ANSI_YELLOW: &str = "\x1b[33m";
+const ANSI_BLUE: &str = "\x1b[34m";
+const ANSI_MAGENTA: &str = "\x1b[35m";
+const ANSI_CYAN: &str = "\x1b[36m";
+const ANSI_DIM: &str = "\x1b[2m";
+
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
   ZeroMq { endpoint: String },
-  Stdout,
+  Stdout { format: StdoutFormat, color: bool },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StdoutFormat {
+  Pretty,
+  Summary,
+  Json,
+}
+
+impl StdoutFormat {
+  fn parse(value: &str) -> Result<Self, String> {
+    match value {
+      "pretty" => Ok(Self::Pretty),
+      "summary" => Ok(Self::Summary),
+      "json" => Ok(Self::Json),
+      _ => Err(format!(
+        "unknown stdout format `{value}`; expected `pretty`, `summary`, or `json`"
+      )),
+    }
+  }
+
+  fn name(self) -> &'static str {
+    match self {
+      Self::Pretty => "pretty",
+      Self::Summary => "summary",
+      Self::Json => "json",
+    }
+  }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -128,7 +248,10 @@ impl Args {
         "zeromq" => Command::ZeroMq {
           endpoint: DEFAULT_ENDPOINT.to_string(),
         },
-        "stdout" => Command::Stdout,
+        "stdout" => Command::Stdout {
+          format: StdoutFormat::Summary,
+          color: false,
+        },
         _ => return Err(format!("unknown subcommand `{command}`; expected `zeromq` or `stdout`")),
       },
       codex_dir: None,
@@ -142,7 +265,15 @@ impl Args {
       match arg.as_str() {
         "--bind" => match &mut parsed.command {
           Command::ZeroMq { endpoint } => *endpoint = next_value(&mut args, "--bind")?,
-          Command::Stdout => return Err("`--bind` is only valid for the `zeromq` subcommand".to_string()),
+          Command::Stdout { .. } => return Err("`--bind` is only valid for the `zeromq` subcommand".to_string()),
+        },
+        "--format" => match &mut parsed.command {
+          Command::Stdout { format, .. } => *format = StdoutFormat::parse(&next_value(&mut args, "--format")?)?,
+          Command::ZeroMq { .. } => return Err("`--format` is only valid for the `stdout` subcommand".to_string()),
+        },
+        "--color" => match &mut parsed.command {
+          Command::Stdout { color, .. } => *color = true,
+          Command::ZeroMq { .. } => return Err("`--color` is only valid for the `stdout` subcommand".to_string()),
         },
         "--codex-dir" => parsed.codex_dir = Some(PathBuf::from(next_value(&mut args, "--codex-dir")?)),
         "--pi-dir" => parsed.pi_dir = Some(PathBuf::from(next_value(&mut args, "--pi-dir")?)),
@@ -163,7 +294,7 @@ impl Args {
         "-h" | "--help" => {
           let help = match parsed.command {
             Command::ZeroMq { .. } => Help::ZeroMq,
-            Command::Stdout => Help::Stdout,
+            Command::Stdout { .. } => Help::Stdout,
           };
           return Ok(ArgsParse::Help(help));
         }
@@ -241,7 +372,7 @@ Usage:
 
 Subcommands:
   zeromq  Publish two-frame ZeroMQ messages
-  stdout  Write AgentEvent JSONL to stdout
+  stdout  Write formatted AgentEvent output to stdout
 
 Run `tokn-session-relay <subcommand> --help` for details."
     ),
@@ -267,12 +398,14 @@ Messages use two frames:
     ),
     Help::Stdout => println!(
       "\
-Write normalized AgentEvent JSONL to stdout.
+Write normalized AgentEvent output to stdout.
 
 Usage:
   tokn-session-relay stdout [options]
 
 Options:
+  --format <format>           Output format: pretty, summary, or json (default: summary)
+  --color                     Add ANSI colors to pretty or summary output
   --codex-dir <path>          Codex session root (default: ~/.codex/sessions)
   --pi-dir <path>             Pi session root (default: ~/.pi/agent/sessions)
   --poll-interval <duration>  Fallback rescan interval, such as 250ms, 2s, or 1m (default: 2s)
@@ -289,10 +422,10 @@ mod tests {
   use std::path::PathBuf;
   use std::time::Duration;
 
-  use tokn_session_core::{AgentEvent, MessageEvent, Phase, Provider, Role};
+  use tokn_session_core::{AgentEvent, MessageEvent, Phase, Provider, Role, SessionStarted};
   use tokn_session_relay::{NewFileReplay, RelayEvent};
 
-  use super::{Args, ArgsParse, Command, write_jsonl_event};
+  use super::{Args, ArgsParse, Command, StdoutFormat, write_jsonl_event, write_stdout_event};
 
   #[test]
   fn parses_zeromq_subcommand_and_shared_options() {
@@ -328,13 +461,63 @@ mod tests {
   }
 
   #[test]
-  fn rejects_zeromq_options_for_stdout() {
+  fn rejects_options_for_the_wrong_subcommand() {
     let result = Args::parse(
       ["stdout", "--bind", "tcp://127.0.0.1:5556"]
         .into_iter()
         .map(str::to_string),
     );
     assert!(result.is_err());
+    let result = Args::parse(["zeromq", "--format", "pretty"].into_iter().map(str::to_string));
+    assert!(result.is_err());
+    let result = Args::parse(["zeromq", "--color"].into_iter().map(str::to_string));
+    assert!(result.is_err());
+  }
+
+  #[test]
+  fn parses_stdout_format_and_color() {
+    let ArgsParse::Run(defaults) = Args::parse(["stdout"].into_iter().map(str::to_string)).unwrap() else {
+      panic!("expected runnable args");
+    };
+    assert_eq!(
+      defaults.command,
+      Command::Stdout {
+        format: StdoutFormat::Summary,
+        color: false,
+      }
+    );
+
+    let ArgsParse::Run(args) = Args::parse(
+      ["stdout", "--format", "pretty", "--color"]
+        .into_iter()
+        .map(str::to_string),
+    )
+    .unwrap() else {
+      panic!("expected runnable args");
+    };
+    assert_eq!(
+      args.command,
+      Command::Stdout {
+        format: StdoutFormat::Pretty,
+        color: true,
+      }
+    );
+
+    let ArgsParse::Run(json) = Args::parse(
+      ["stdout", "--format", "json", "--color"]
+        .into_iter()
+        .map(str::to_string),
+    )
+    .unwrap() else {
+      panic!("expected runnable args");
+    };
+    assert_eq!(
+      json.command,
+      Command::Stdout {
+        format: StdoutFormat::Json,
+        color: true,
+      }
+    );
   }
 
   #[test]
@@ -350,7 +533,65 @@ mod tests {
 
   #[test]
   fn writes_raw_agent_event_jsonl() {
+    let event = message_event();
+    let mut output = RecordingWriter::default();
+    write_jsonl_event(&mut output, &event).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&output.bytes).unwrap();
+    assert_eq!(value["type"], "message");
+    assert_eq!(value["text"], "done");
+    assert!(value.get("topic").is_none());
+    assert_eq!(output.flushes, 1);
+  }
+
+  #[test]
+  fn renders_summary_pretty_and_colorless_json() {
+    let event = message_event();
+
+    let mut summary = RecordingWriter::default();
+    write_stdout_event(&mut summary, &event, StdoutFormat::Summary, false).unwrap();
+    assert_eq!(
+      String::from_utf8(summary.bytes).unwrap(),
+      "pi.session-1 assistant done\n"
+    );
+
+    let mut pretty = RecordingWriter::default();
+    write_stdout_event(&mut pretty, &event, StdoutFormat::Pretty, false).unwrap();
+    assert_eq!(
+      String::from_utf8(pretty.bytes).unwrap(),
+      "pi.session-1 assistant\n  done\n\n"
+    );
+
+    let mut colored = RecordingWriter::default();
+    write_stdout_event(&mut colored, &event, StdoutFormat::Summary, true).unwrap();
+    assert!(String::from_utf8(colored.bytes).unwrap().contains("\u{1b}["));
+
+    let mut json = RecordingWriter::default();
+    write_stdout_event(&mut json, &event, StdoutFormat::Json, true).unwrap();
+    assert!(!String::from_utf8(json.bytes).unwrap().contains("\u{1b}["));
+  }
+
+  #[test]
+  fn pretty_keeps_session_start_events_visible() {
     let event = RelayEvent {
+      path: PathBuf::from("session.jsonl"),
+      topic: "pi.session-1".to_string(),
+      event: AgentEvent::SessionStarted(SessionStarted {
+        provider: Provider::Pi,
+        session_id: "session-1".to_string(),
+        cwd: None,
+        timestamp: None,
+      }),
+    };
+    let mut output = RecordingWriter::default();
+    write_stdout_event(&mut output, &event, StdoutFormat::Pretty, false).unwrap();
+    assert_eq!(
+      String::from_utf8(output.bytes).unwrap(),
+      "pi.session-1 session started session-1\n\n"
+    );
+  }
+
+  fn message_event() -> RelayEvent {
+    RelayEvent {
       path: PathBuf::from("session.jsonl"),
       topic: "pi.session-1".to_string(),
       event: AgentEvent::Message(MessageEvent {
@@ -363,14 +604,7 @@ mod tests {
         text: "done".to_string(),
         timestamp: None,
       }),
-    };
-    let mut output = RecordingWriter::default();
-    write_jsonl_event(&mut output, &event).unwrap();
-    let value: serde_json::Value = serde_json::from_slice(&output.bytes).unwrap();
-    assert_eq!(value["type"], "message");
-    assert_eq!(value["text"], "done");
-    assert!(value.get("topic").is_none());
-    assert_eq!(output.flushes, 1);
+    }
   }
 
   #[derive(Default)]
