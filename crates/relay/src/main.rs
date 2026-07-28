@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use tokn_session_core::Provider;
 use tokn_session_relay::{
-  DEFAULT_POLL_INTERVAL, ProviderRoot, RelayConfig, RelayEvent, SessionRelay, TailUpdate, ZmqPublisher,
+  DEFAULT_NEW_FILE_HISTORY, DEFAULT_POLL_INTERVAL, ProviderRoot, RelayConfig, RelayEvent, SessionRelay, TailUpdate,
+  ZmqPublisher,
 };
 
 const DEFAULT_ENDPOINT: &str = "tcp://127.0.0.1:5556";
@@ -31,14 +32,19 @@ async fn run(args: Args) -> Result<(), String> {
     roots: args.roots()?,
     replay: args.replay,
     poll_interval: args.poll_interval,
+    new_file_history: args.new_file_history,
   };
   let mut relay = SessionRelay::new(config).await?;
   let mut output = match args.command {
     Command::ZeroMq { endpoint } => {
-      eprintln!("publishing Codex/Pi session events on {endpoint}");
-      Output::ZeroMq(ZmqPublisher::bind(&endpoint).await?)
+      let publisher = ZmqPublisher::bind(&endpoint).await?;
+      eprintln!("following Codex/Pi session events via ZeroMQ on {endpoint}");
+      Output::ZeroMq(publisher)
     }
-    Command::Stdout => Output::Stdout(BufWriter::new(std::io::stdout())),
+    Command::Stdout => {
+      eprintln!("following Codex/Pi session events on stdout");
+      Output::Stdout(BufWriter::new(std::io::stdout()))
+    }
   };
 
   loop {
@@ -95,6 +101,7 @@ struct Args {
   pi_dir: Option<PathBuf>,
   replay: bool,
   poll_interval: Duration,
+  new_file_history: usize,
 }
 
 enum ArgsParse {
@@ -130,6 +137,7 @@ impl Args {
       pi_dir: None,
       replay: false,
       poll_interval: DEFAULT_POLL_INTERVAL,
+      new_file_history: DEFAULT_NEW_FILE_HISTORY,
     };
 
     while let Some(arg) = args.next() {
@@ -141,6 +149,11 @@ impl Args {
         "--codex-dir" => parsed.codex_dir = Some(PathBuf::from(next_value(&mut args, "--codex-dir")?)),
         "--pi-dir" => parsed.pi_dir = Some(PathBuf::from(next_value(&mut args, "--pi-dir")?)),
         "--poll-interval" => parsed.poll_interval = parse_duration(&next_value(&mut args, "--poll-interval")?)?,
+        "--new-file-history" => {
+          parsed.new_file_history = next_value(&mut args, "--new-file-history")?
+            .parse()
+            .map_err(|_| "`--new-file-history` requires a non-negative integer".to_string())?
+        }
         "--replay" => parsed.replay = true,
         "-h" | "--help" => {
           let help = match parsed.command {
@@ -230,7 +243,8 @@ Options:
   --bind <endpoint>           PUB endpoint (default: {DEFAULT_ENDPOINT})
   --codex-dir <path>          Codex session root (default: ~/.codex/sessions)
   --pi-dir <path>             Pi session root (default: ~/.pi/agent/sessions)
-  --poll-interval <duration>  Rescan interval, such as 250ms, 2s, or 1m (default: 2s)
+  --poll-interval <duration>  Fallback rescan interval, such as 250ms, 2s, or 1m (default: 2s)
+  --new-file-history <count>  Message history for newly discovered files (default: 3)
   --replay                    Emit existing complete records before following
   -h, --help                  Show this help
 
@@ -248,7 +262,8 @@ Usage:
 Options:
   --codex-dir <path>          Codex session root (default: ~/.codex/sessions)
   --pi-dir <path>             Pi session root (default: ~/.pi/agent/sessions)
-  --poll-interval <duration>  Rescan interval, such as 250ms, 2s, or 1m (default: 2s)
+  --poll-interval <duration>  Fallback rescan interval, such as 250ms, 2s, or 1m (default: 2s)
+  --new-file-history <count>  Message history for newly discovered files (default: 3)
   --replay                    Emit existing complete records before following
   -h, --help                  Show this help"
     ),
@@ -276,6 +291,8 @@ mod tests {
         "--replay",
         "--poll-interval",
         "250ms",
+        "--new-file-history",
+        "5",
       ]
       .into_iter()
       .map(str::to_string),
@@ -291,6 +308,7 @@ mod tests {
     );
     assert!(args.replay);
     assert_eq!(args.poll_interval, Duration::from_millis(250));
+    assert_eq!(args.new_file_history, 5);
   }
 
   #[test]

@@ -10,6 +10,9 @@ use crate::{ProviderRoot, SessionTailer, TailUpdate};
 /// Default interval for recovering from missed filesystem notifications and
 /// discovering roots created after startup.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Default number of recent messages used to anchor a newly discovered
+/// session's event history.
+pub const DEFAULT_NEW_FILE_HISTORY: usize = 3;
 
 #[derive(Clone, Debug)]
 pub struct RelayConfig {
@@ -19,6 +22,9 @@ pub struct RelayConfig {
   pub replay: bool,
   /// Interval for the fallback filesystem rescan.
   pub poll_interval: Duration,
+  /// Number of recent message-anchored events to emit for a newly discovered
+  /// or replaced session file.
+  pub new_file_history: usize,
 }
 
 impl RelayConfig {
@@ -27,6 +33,7 @@ impl RelayConfig {
       roots,
       replay: false,
       poll_interval: DEFAULT_POLL_INTERVAL,
+      new_file_history: DEFAULT_NEW_FILE_HISTORY,
     }
   }
 }
@@ -47,7 +54,7 @@ impl SessionRelay {
       return Err("relay poll interval must be greater than zero".to_string());
     }
 
-    let (tailer, initial) = SessionTailer::initialize(config.roots, config.replay)?;
+    let tailer = SessionTailer::prepare(config.roots, config.new_file_history)?;
     let (wake_tx, wake_rx) = mpsc::unbounded_channel();
     let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
       let result = result.map(|_| ()).map_err(|err| err.to_string());
@@ -60,12 +67,13 @@ impl SessionRelay {
       watched_roots: HashSet::new(),
       wake_rx,
       poll: tokio::time::interval(config.poll_interval),
-      initial: Some(initial),
+      initial: None,
     };
     relay
       .poll
       .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     relay.watch_available_roots()?;
+    relay.initial = Some(relay.tailer.start(config.replay)?);
     Ok(relay)
   }
 
