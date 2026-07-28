@@ -18,6 +18,7 @@ tokn-session append --source opencode --executor "tokn-gateway proxy opencode --
 tokn-session append --source opencode --executor "tokn-gateway proxy opencode --npx --" --continue "next turn"
 tokn-session-relay zeromq
 tokn-session-relay stdout
+cd apps/terminal-pet && bun run start
 ```
 
 The old `tokn-session sessions list/show` shape is intentionally unsupported.
@@ -86,6 +87,26 @@ The reusable relay loop lives in the library as `SessionRelay`. `RelayConfig`
 controls provider roots, new-file replay, and the periodic recovery interval.
 Library consumers call `next_update().await`; notification and scan failures
 that can be retried are returned as warnings in `TailUpdate`.
+
+## Terminal Pet
+
+`apps/terminal-pet` is a Bun/TypeScript prototype that consumes Relay JSONL and
+shows one global terminal companion. It builds the workspace Relay once if
+needed, then spawns `tokn-session-relay stdout --format json`, or accepts an
+existing stream with `--stdin`.
+
+The reducer keeps state per Relay topic, then selects one session using
+`needs_input > blocked > ready > running > idle`. It currently derives these
+states from normalized messages, reasoning, tool calls, errors, goals, and
+preserved input-request events. Codex task start/complete lifecycle records are
+still dropped by the normalizer, so the reducer uses leases and a short ready
+debounce instead of claiming authoritative runtime status.
+
+Rendering uses Kitty graphics where available, the Kitty local-file protocol
+in iTerm2 3.6+, and a truecolor ANSI half-block fallback. `bun run dev` cycles
+through states for art iteration; `bun run check` runs strict TypeScript and
+Bun tests. The checked-in Hachiware frames are explicitly prototype-only fan
+art and must be replaced before publishing or distributing the project.
 
 ## Provider Sources
 
@@ -245,6 +266,8 @@ OpenCode has the first live-output normalizer: `OpenCodeLiveNormalizer` parses `
   golden tests are still missing.
 - The relay uses ZeroMQ `PUB/SUB`, which intentionally has no persistence or
   delivery acknowledgement; subscribers that are disconnected can miss events.
+- The terminal pet cannot distinguish every runtime state authoritatively until
+  provider task lifecycle and interaction events are represented in `AgentEvent`.
 
 ## Useful Smokes
 
@@ -256,6 +279,8 @@ cargo run -p tokn-session-cli -- list --source opencode --limit 1
 cargo run -p tokn-session-cli -- show --source opencode <session-id> --format pretty
 cargo run -p tokn-session-relay -- stdout
 cargo run -p tokn-session-relay -- zeromq
+cd apps/terminal-pet && bun run check
+cd apps/terminal-pet && bun run snapshot
 ```
 
 ## Next Likely Work
@@ -264,4 +289,6 @@ cargo run -p tokn-session-relay -- zeromq
 - Decide whether live stream consumption should live in `client` as callbacks/iterators or in the CLI command path.
 - Extend provider fixture coverage with OpenCode SQLite normalization.
 - Add CLI golden tests for tiny fixture-backed `list` and `show` outputs.
+- Add provider-neutral lifecycle and input-request events to the IR, then remove
+  the terminal pet's corresponding heuristics.
 - Consider splitting stable event IR notes into `docs/event-ir.md` once the IR changes again.
