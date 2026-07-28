@@ -2,8 +2,8 @@
 name = "tokn-codex-protocol"
 version.workspace = true
 edition.workspace = true
+readme = "README.md"
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-
