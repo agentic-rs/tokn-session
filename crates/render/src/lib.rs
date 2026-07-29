@@ -2,8 +2,8 @@ use std::path::Path;
 
 use serde_json::Value;
 use tokn_session_core::{
-  AgentActivity, AgentEvent, LiveSessionEvent, LoadedSession, Phase, Role, SessionRef, SessionSettingsApplied,
-  ToolCallEvent, ToolKind, ToolSummary,
+  AgentActivity, AgentEvent, LiveSessionEvent, LoadedSession, LoadedSessionTree, Phase, Role, SessionHistoryStatus,
+  SessionRef, SessionSettingsApplied, ToolCallEvent, ToolKind, ToolSummary,
 };
 
 pub struct EventDisplay {
@@ -45,6 +45,17 @@ pub fn render_agent_jsonl(events: &[AgentEvent]) -> Result<String, String> {
   Ok(output)
 }
 
+pub fn render_session_jsonl(session: &LoadedSession) -> Result<String, String> {
+  if session.history_status == SessionHistoryStatus::SubagentBodyUnavailable {
+    return Err(format!(
+      "subagent session `{}` body is unavailable because no trigger-turn boundary was recorded",
+      session.reference.id
+    ));
+  }
+
+  render_agent_jsonl(&session.events)
+}
+
 pub fn render_live_event_pretty(event: &LiveSessionEvent) -> String {
   let mut output = String::new();
   match event {
@@ -80,17 +91,100 @@ pub fn render_live_event_pretty(event: &LiveSessionEvent) -> String {
 pub fn render_pretty(session: &LoadedSession) -> String {
   let mut output = String::new();
   output.push_str(&format!("Session {}\n", session.reference.id));
+  if let Some(parent_session_id) = &session.reference.parent_session_id {
+    output.push_str(&format!("parent: {parent_session_id}\n"));
+  }
+  if let Some(agent_path) = &session.reference.agent_path {
+    output.push_str(&format!("agent: {agent_path}\n"));
+  }
+  if let Some(agent_nickname) = &session.reference.agent_nickname {
+    output.push_str(&format!("nickname: {agent_nickname}\n"));
+  }
+  if let Some(agent_role) = &session.reference.agent_role {
+    output.push_str(&format!("role: {agent_role}\n"));
+  }
   output.push_str(&format!("cwd: {}\n", session.reference.cwd.as_deref().unwrap_or("-")));
   output.push_str(&format!(
-    "updated_at: {}\n\n",
+    "updated_at: {}\n",
     session.reference.timestamp.as_deref().unwrap_or("-")
   ));
+  if session.history_status == SessionHistoryStatus::SubagentBodyUnavailable {
+    output.push_str("warning: subagent body unavailable; no trigger-turn boundary was recorded\n");
+  }
+  output.push('\n');
 
   for event in &session.events {
     output.push_str(&render_event_pretty(event));
   }
 
   output
+}
+
+pub fn render_session_tree(tree: &LoadedSessionTree) -> String {
+  let mut output = String::new();
+  output.push_str("Session tree\n");
+  output.push_str("selected ");
+  output.push_str(&session_tree_identity(&tree.session.reference));
+  output.push('\n');
+  for (index, child) in tree.children.iter().enumerate() {
+    render_session_tree_outline(&mut output, child, "", index + 1 == tree.children.len());
+  }
+  output.push('\n');
+  render_session_tree_node(&mut output, tree, 0);
+  output
+}
+
+fn render_session_tree_outline(output: &mut String, tree: &LoadedSessionTree, prefix: &str, is_last: bool) {
+  output.push_str(prefix);
+  output.push_str(if is_last { "└─ " } else { "├─ " });
+  output.push_str(&session_tree_identity(&tree.session.reference));
+  output.push('\n');
+
+  let child_prefix = format!("{prefix}{}", if is_last { "   " } else { "│  " });
+  for (index, child) in tree.children.iter().enumerate() {
+    render_session_tree_outline(output, child, &child_prefix, index + 1 == tree.children.len());
+  }
+}
+
+fn session_tree_identity(reference: &SessionRef) -> String {
+  match (&reference.agent_nickname, &reference.agent_path) {
+    (Some(nickname), Some(path)) => format!("{nickname} ({path}) [{}]", reference.id),
+    (Some(nickname), None) => format!("{nickname} [{}]", reference.id),
+    (None, Some(path)) => format!("{path} [{}]", reference.id),
+    (None, None) => reference.id.clone(),
+  }
+}
+
+fn render_session_tree_node(output: &mut String, tree: &LoadedSessionTree, depth: usize) {
+  if !output.is_empty() && !output.ends_with("\n\n") {
+    output.push('\n');
+  }
+
+  if depth == 0 {
+    output.push_str("=== Selected session ===\n\n");
+  } else if let Some(identity) = tree
+    .session
+    .reference
+    .agent_nickname
+    .as_deref()
+    .or(tree.session.reference.agent_path.as_deref())
+  {
+    output.push_str(&format!("=== Subagent {identity} ===\n\n"));
+  } else if matches!(
+    tree.session.history_status,
+    SessionHistoryStatus::FilteredSubagent | SessionHistoryStatus::SubagentBodyUnavailable
+  ) {
+    output.push_str(&format!("=== Subagent {} ===\n\n", tree.session.reference.id));
+  } else if depth == 1 {
+    output.push_str(&format!("=== Child session {} ===\n\n", tree.session.reference.id));
+  } else {
+    output.push_str(&format!("=== Descendant {} ===\n\n", tree.session.reference.id));
+  }
+  output.push_str(&render_pretty(&tree.session));
+
+  for child in &tree.children {
+    render_session_tree_node(output, child, depth + 1);
+  }
 }
 
 pub fn render_event_pretty(event: &AgentEvent) -> String {
@@ -775,16 +869,134 @@ mod tests {
     assert!(output.contains("native: {\"type\":\"new_native_event\",\"value\":123}\n"));
   }
 
+  #[test]
+  fn render_pretty_shows_subagent_identity() {
+    let mut session = loaded_session(Vec::new());
+    session.reference.parent_session_id = Some("parent".to_string());
+    session.reference.agent_path = Some("/root/researcher".to_string());
+    session.reference.agent_nickname = Some("Hubble".to_string());
+    session.reference.agent_role = Some("explorer".to_string());
+
+    let output = render_pretty(&session);
+
+    assert!(output.contains("parent: parent\n"));
+    assert!(output.contains("agent: /root/researcher\n"));
+    assert!(output.contains("nickname: Hubble\n"));
+    assert!(output.contains("role: explorer\n"));
+  }
+
+  #[test]
+  fn renders_session_tree_as_separate_sections() {
+    let root = loaded_session(Vec::new());
+    let mut child = loaded_session(Vec::new());
+    child.reference.id = "child".to_string();
+    child.reference.parent_session_id = Some("session".to_string());
+    child.reference.agent_path = Some("/root/researcher".to_string());
+    child.reference.agent_nickname = Some("Hubble".to_string());
+    let tree = LoadedSessionTree {
+      session: root,
+      children: vec![LoadedSessionTree {
+        session: child,
+        children: Vec::new(),
+      }],
+    };
+
+    let output = render_session_tree(&tree);
+
+    assert!(output.contains("Session tree\nselected session\n"));
+    assert!(output.contains("└─ Hubble (/root/researcher) [child]\n"));
+    assert!(output.contains("=== Selected session ===\n\nSession session\n"));
+    assert!(output.contains("=== Subagent Hubble ===\n\nSession child\n"));
+    assert!(output.contains("parent: session\n"));
+  }
+
+  #[test]
+  fn uses_provider_neutral_headings_without_agent_identity() {
+    let root = loaded_session(Vec::new());
+    let mut child = loaded_session(Vec::new());
+    child.reference.id = "child".to_string();
+    child.reference.parent_session_id = Some("session".to_string());
+    let mut descendant = loaded_session(Vec::new());
+    descendant.reference.id = "descendant".to_string();
+    descendant.reference.parent_session_id = Some("child".to_string());
+    let tree = LoadedSessionTree {
+      session: root,
+      children: vec![LoadedSessionTree {
+        session: child,
+        children: vec![LoadedSessionTree {
+          session: descendant,
+          children: Vec::new(),
+        }],
+      }],
+    };
+
+    let output = render_session_tree(&tree);
+
+    assert!(output.contains("=== Child session child ===\n\nSession child\n"));
+    assert!(output.contains("=== Descendant descendant ===\n\nSession descendant\n"));
+    assert!(!output.contains("=== Subagent child ==="));
+  }
+
+  #[test]
+  fn uses_subagent_heading_when_filtered_history_proves_the_identity() {
+    let root = loaded_session(Vec::new());
+    let mut child = loaded_session(Vec::new());
+    child.reference.id = "child".to_string();
+    child.reference.parent_session_id = Some("session".to_string());
+    child.history_status = SessionHistoryStatus::FilteredSubagent;
+    let tree = LoadedSessionTree {
+      session: root,
+      children: vec![LoadedSessionTree {
+        session: child,
+        children: Vec::new(),
+      }],
+    };
+
+    let output = render_session_tree(&tree);
+
+    assert!(output.contains("=== Subagent child ===\n\nSession child\n"));
+  }
+
+  #[test]
+  fn warns_and_rejects_jsonl_when_subagent_body_is_unavailable() {
+    let mut session = loaded_session(Vec::new());
+    session.history_status = SessionHistoryStatus::SubagentBodyUnavailable;
+
+    let output = render_pretty(&session);
+    let error = render_session_jsonl(&session).expect_err("unavailable history must not produce misleading jsonl");
+
+    assert!(output.contains("warning: subagent body unavailable; no trigger-turn boundary was recorded\n"));
+    assert_eq!(
+      error,
+      "subagent session `session` body is unavailable because no trigger-turn boundary was recorded"
+    );
+  }
+
+  #[test]
+  fn complete_session_jsonl_keeps_the_agent_event_shape() {
+    let session = loaded_session(vec![agent_activity(Some("/root"))]);
+
+    assert_eq!(
+      render_session_jsonl(&session).expect("complete session should render"),
+      render_agent_jsonl(&session.events).expect("events should render")
+    );
+  }
+
   fn loaded_session(events: Vec<AgentEvent>) -> LoadedSession {
     LoadedSession {
       reference: SessionRef {
         id: "session".to_string(),
+        parent_session_id: None,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
         path: PathBuf::from("session.jsonl"),
         cwd: None,
         timestamp: None,
         message_count: 0,
       },
       events,
+      history_status: SessionHistoryStatus::Complete,
     }
   }
 

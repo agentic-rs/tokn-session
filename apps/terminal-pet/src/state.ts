@@ -17,6 +17,7 @@ export const PET_STATES = [
 ] as const;
 
 export type PetState = typeof PET_STATES[number];
+export type PetOutcome = "completed" | "interrupted";
 
 export interface PetPolicy {
   ready_debounce_ms: number;
@@ -31,7 +32,13 @@ export interface PetPolicy {
 
 export interface PetFocus {
   topic: string;
+  parent_topic?: string;
+  root_topic: string;
+  depth: number;
+  is_provisional: boolean;
   state: PetState;
+  family_state: PetState;
+  family_last_event_at: number;
   state_changed_at: number;
   last_event_at: number;
   label: string;
@@ -42,6 +49,11 @@ export interface PetFocus {
   agent?: string;
   completed_at?: number;
   recently_completed: boolean;
+  outcome?: PetOutcome;
+  descendant_count: number;
+  active_descendant_count: number;
+  urgent_descendant_count: number;
+  recent_descendant_count: number;
 }
 
 export interface PetSnapshot {
@@ -53,11 +65,24 @@ export interface PetSnapshot {
   focus?: PetFocus;
 }
 
+export function effectivePetState(focus: PetFocus): PetState {
+  return focus.depth === 0 ? focus.family_state : focus.state;
+}
+
+export function effectiveStateChangedAt(focus: PetFocus): number {
+  return focus.depth === 0
+    ? focus.family_last_event_at
+    : focus.state_changed_at;
+}
+
 interface SessionActivity {
   topic: string;
   session: RelaySession;
+  parent_topic?: string;
+  is_provisional: boolean;
   last_event_at: number;
   label: string;
+  outcome?: PetOutcome;
   running_until: number;
   ready_after?: number;
   ready_until?: number;
@@ -110,9 +135,12 @@ const STATE_PRIORITY: Record<PetState, number> = {
   needs_input: 4
 };
 
+const MAX_FUTURE_EVENT_SKEW_MS = 5 * 60_000;
+
 export class PetStore {
   readonly policy: PetPolicy;
   readonly sessions = new Map<string, SessionActivity>();
+  readonly seen_agent_activity = new Set<string>();
 
   constructor(policy: Partial<PetPolicy> = {}) {
     this.policy = {
@@ -122,33 +150,63 @@ export class PetStore {
   }
 
   ingest(relay: RelayEvent, nowMs = Date.now()): void {
-    const activity = this.sessions.get(relay.topic) ?? newSessionActivity(relay, nowMs);
-    activity.session = relay.session;
-    activity.last_event_at = nowMs;
-    activity.label = describeEvent(relay.event);
+    const eventAt = eventOccurredAt(relay.event, nowMs);
+    const activity = this.sessions.get(relay.topic)
+      ?? newSessionActivity(relay, eventAt);
+    activity.session = mergeSession(activity.session, relay.session);
+    const resolvedParent = parentTopic(relay.topic, activity.session);
+    activity.parent_topic = relay.session.parent_session_id === undefined
+      ? resolvedParent ?? activity.parent_topic
+      : resolvedParent;
+    activity.is_provisional = false;
     this.#expireLeases(activity, nowMs);
-    this.#applyEvent(activity, relay.event, nowMs);
     this.sessions.set(relay.topic, activity);
+    this.#ensureParent(activity, eventAt);
+
+    if (relay.event.type === "agent_activity") {
+      if (!this.#isDuplicateAgentActivity(activity, relay.event)) {
+        this.#applyAgentActivity(activity, relay.event, eventAt);
+      }
+      return;
+    }
+
+    if (eventAt < activity.last_event_at) {
+      return;
+    }
+    recordActivity(activity, describeEvent(relay.event), eventAt);
+    this.#applyEvent(activity, relay.event, eventAt);
   }
 
   snapshot(nowMs = Date.now()): PetSnapshot {
-    const candidates = [...this.sessions.values()].map((activity) => {
+    const candidates = new Map<string, PetFocus>();
+    for (const activity of this.sessions.values()) {
       this.#expireLeases(activity, nowMs);
-      return this.#focusFor(activity, nowMs);
-    });
-    const active = candidates
+      candidates.set(activity.topic, this.#focusFor(activity, nowMs));
+    }
+    const lineages = resolveLineages(this.sessions);
+    for (const candidate of candidates.values()) {
+      const lineage = lineages.get(candidate.topic);
+      candidate.parent_topic = lineage?.parent_topic;
+      candidate.root_topic = lineage?.root_topic ?? candidate.topic;
+      candidate.depth = lineage?.depth ?? 0;
+    }
+    applyFamilyAggregates(candidates);
+
+    const allCandidates = [...candidates.values()];
+    const active = allCandidates
       .filter((candidate) => candidate.state !== "idle")
       .sort(compareActiveSessions);
-    const recent = candidates
+    const recent = allCandidates
       .filter((candidate) => candidate.state === "idle" && candidate.recently_completed)
       .sort(compareRecentCompletions);
-    const sessions = [...active, ...recent];
-    const focus = sessions[0];
+    const visible = visibleFamilyTopics(candidates, [...active, ...recent]);
+    const sessions = orderVisibleFamilies(candidates, visible);
+    const focus = active[0] ?? recent[0];
     return {
       state: focus?.state ?? "idle",
       state_changed_at: focus?.state_changed_at ?? nowMs,
       active_sessions: active.length,
-      total_sessions: candidates.length,
+      total_sessions: allCandidates.length,
       sessions,
       focus
     };
@@ -164,13 +222,199 @@ export class PetStore {
     activity.completed_at = undefined;
     activity.blocked_after = undefined;
     activity.blocked_until = undefined;
+    activity.outcome = undefined;
+  }
+
+  #ensureParent(activity: SessionActivity, eventAt: number): void {
+    const parent = activity.parent_topic;
+    if (!parent || this.sessions.has(parent)) {
+      return;
+    }
+    const provider = activity.session.provider ?? providerFromTopic(activity.topic);
+    const sessionId = sessionIdFromTopic(parent);
+    this.sessions.set(parent, {
+      topic: parent,
+      session: {
+        provider,
+        session_id: sessionId,
+        agent_path: parentAgentPath(activity.session.agent_path),
+        project: activity.session.project
+      },
+      is_provisional: true,
+      last_event_at: eventAt,
+      label: "Parent session",
+      running_until: eventAt,
+      open_tools: new Map(),
+      pending_interactions: new Map()
+    });
+  }
+
+  #isDuplicateAgentActivity(activity: SessionActivity, event: AgentEvent): boolean {
+    const eventId = asString(event.event_id);
+    if (!eventId) {
+      return false;
+    }
+    const provider = asString(event.provider)
+      ?? activity.session.provider
+      ?? providerFromTopic(activity.topic)
+      ?? "unknown";
+    const key = `${provider}:${eventId}`;
+    if (this.seen_agent_activity.has(key)) {
+      return true;
+    }
+    this.seen_agent_activity.add(key);
+    return false;
+  }
+
+  #applyAgentActivity(source: SessionActivity, event: AgentEvent, eventAt: number): void {
+    const targetSessionId = asString(event.target_session_id);
+    const kind = asString(event.kind)?.toLowerCase();
+    if (!kind) {
+      return;
+    }
+    const provider = asString(event.provider)
+      ?? source.session.provider
+      ?? providerFromTopic(source.topic);
+    if (!provider) {
+      return;
+    }
+    if (!targetSessionId) {
+      this.#applyPathAgentActivity(source, event, provider, kind, eventAt);
+      return;
+    }
+    const targetTopic = `${provider}.${targetSessionId}`;
+    const targetPath = asString(event.target_agent_path);
+    const existing = this.sessions.get(targetTopic);
+    const inferredParent = this.#inferParentTopic(
+      source,
+      targetPath,
+      provider,
+      asString(event.actor_agent_path)
+    );
+
+    if (
+      kind === "started"
+      && !existing
+      && targetPath
+      && inferredParent === undefined
+    ) {
+      return;
+    }
+
+    const target = existing ?? newProvisionalActivity(
+      targetTopic,
+      targetSessionId,
+      provider,
+      source,
+      inferredParent,
+      targetPath,
+      eventAt
+    );
+    target.parent_topic ??= inferredParent;
+    target.session.agent_path ??= targetPath;
+    this.sessions.set(targetTopic, target);
+    if (eventAt < target.last_event_at) {
+      return;
+    }
+    if (kind !== "interacted" || target.outcome === undefined) {
+      recordActivity(target, agentActivityLabel(kind), eventAt);
+    }
+
+    switch (kind) {
+      case "started":
+        this.#markProgress(target, eventAt);
+        return;
+      case "interacted":
+        return;
+      case "interrupted":
+        this.#markInterrupted(target, eventAt);
+        return;
+      default:
+        return;
+    }
+  }
+
+  #applyPathAgentActivity(
+    source: SessionActivity,
+    event: AgentEvent,
+    provider: string,
+    kind: string,
+    eventAt: number
+  ): void {
+    const targetAgentPath = asString(event.target_agent_path);
+    if (targetAgentPath) {
+      const matchingTargets = this
+        .#familyCandidates(source, provider)
+        .filter((candidate) => (
+          effectiveAgentPath(candidate) === normalizeAgentPath(targetAgentPath)
+        ));
+      if (matchingTargets.length === 1) {
+        recordActivity(matchingTargets[0]!, agentActivityLabel(kind), eventAt);
+        return;
+      }
+    }
+
+    const actorAgentPath = asString(event.actor_agent_path);
+    if (
+      actorAgentPath
+      && normalizeAgentPath(actorAgentPath) === effectiveAgentPath(source)
+    ) {
+      recordActivity(source, agentActivityLabel(kind), eventAt);
+    }
+  }
+
+  #inferParentTopic(
+    source: SessionActivity,
+    targetAgentPath: string | undefined,
+    provider: string,
+    actorAgentPath: string | undefined
+  ): string | undefined {
+    if (!targetAgentPath) {
+      return source.topic;
+    }
+
+    const normalizedActorPath = actorAgentPath
+      ? normalizeAgentPath(actorAgentPath)
+      : undefined;
+    const sourceAncestors = activityAncestorTopics(this.sessions, source.topic);
+    let best: SessionActivity | undefined;
+    let bestScore: readonly number[] | undefined;
+    for (const candidate of this.#familyCandidates(source, provider)) {
+      const candidatePath = effectiveAgentPath(candidate);
+      if (!isDescendantAgentPath(candidatePath, targetAgentPath)) {
+        continue;
+      }
+      const score = [
+        Number(normalizedActorPath === candidatePath),
+        candidatePath.length,
+        Number(candidate.topic === source.topic),
+        Number(sourceAncestors.has(candidate.topic))
+      ];
+      if (!bestScore || compareScores(score, bestScore) > 0) {
+        best = candidate;
+        bestScore = score;
+      }
+    }
+    return best?.topic;
+  }
+
+  #familyCandidates(
+    source: SessionActivity,
+    provider: string
+  ): SessionActivity[] {
+    const sourceRoot = activityRootTopic(this.sessions, source.topic);
+    return [...this.sessions.values()].filter((candidate) => (
+      candidateProvider(candidate) === provider
+      && activityRootTopic(this.sessions, candidate.topic) === sourceRoot
+    ));
   }
 
   #applyEvent(activity: SessionActivity, event: AgentEvent, nowMs: number): void {
     switch (event.type) {
       case "session_started":
-        activity.running_until = nowMs;
+        activity.running_until = Math.max(activity.running_until, nowMs);
         activity.completed_at = undefined;
+        activity.outcome = undefined;
         return;
       case "message":
         this.#applyMessage(activity, event, nowMs);
@@ -185,6 +429,7 @@ export class PetStore {
         activity.ready_after = undefined;
         activity.ready_until = undefined;
         activity.completed_at = undefined;
+        activity.outcome = undefined;
         activity.blocked_after = nowMs + this.policy.error_grace_ms;
         activity.blocked_until = activity.blocked_after + this.policy.blocked_lease_ms;
         return;
@@ -192,7 +437,6 @@ export class PetStore {
         this.#applyGoal(activity, event, nowMs);
         return;
       case "agent_activity":
-        this.#markProgress(activity, nowMs);
         return;
       case "unknown":
         this.#applyUnknown(activity, event, nowMs);
@@ -214,6 +458,7 @@ export class PetStore {
       activity.ready_after = nowMs + this.policy.ready_debounce_ms;
       activity.ready_until = activity.ready_after + this.policy.ready_hold_ms;
       activity.completed_at = undefined;
+      activity.outcome = undefined;
       activity.running_until = activity.ready_after;
       return;
     }
@@ -298,6 +543,7 @@ export class PetStore {
     activity.ready_after = undefined;
     activity.ready_until = undefined;
     activity.completed_at = undefined;
+    activity.outcome = undefined;
     activity.blocked_after = undefined;
     activity.blocked_until = undefined;
   }
@@ -310,6 +556,7 @@ export class PetStore {
     activity.ready_after = nowMs;
     activity.ready_until = nowMs + this.policy.ready_hold_ms;
     activity.completed_at = undefined;
+    activity.outcome = undefined;
     activity.running_until = nowMs;
   }
 
@@ -317,6 +564,7 @@ export class PetStore {
     activity.ready_after = undefined;
     activity.ready_until = undefined;
     activity.completed_at = undefined;
+    activity.outcome = undefined;
     activity.blocked_after = nowMs;
     activity.blocked_until = nowMs + this.policy.blocked_lease_ms;
     activity.running_until = nowMs;
@@ -346,6 +594,7 @@ export class PetStore {
     activity.ready_after = undefined;
     activity.ready_until = undefined;
     activity.completed_at = undefined;
+    activity.outcome = undefined;
     activity.blocked_after = undefined;
     activity.blocked_until = undefined;
     activity.running_until = Math.max(activity.running_until, nowMs);
@@ -357,9 +606,17 @@ export class PetStore {
     activity.ready_after = undefined;
     activity.ready_until = undefined;
     activity.completed_at = undefined;
+    activity.outcome = undefined;
     activity.blocked_after = undefined;
     activity.blocked_until = undefined;
     activity.running_until = nowMs;
+  }
+
+  #markInterrupted(activity: SessionActivity, nowMs: number): void {
+    this.#clearTransientState(activity, nowMs);
+    activity.completed_at = nowMs;
+    activity.outcome = "interrupted";
+    activity.label = "Interrupted";
   }
 
   #expireLeases(activity: SessionActivity, nowMs: number): void {
@@ -381,6 +638,7 @@ export class PetStore {
       && activity.pending_interactions.size === 0
     ) {
       activity.completed_at = activity.ready_after;
+      activity.outcome ??= "completed";
     }
     if (activity.ready_until !== undefined && activity.ready_until <= nowMs) {
       activity.ready_after = undefined;
@@ -423,7 +681,13 @@ export class PetStore {
 
     return {
       topic: activity.topic,
+      parent_topic: activity.parent_topic,
+      root_topic: activity.topic,
+      depth: 0,
+      is_provisional: activity.is_provisional,
       state,
+      family_state: state,
+      family_last_event_at: activity.last_event_at,
       state_changed_at: changedAt,
       last_event_at: activity.last_event_at,
       label: activity.label,
@@ -435,7 +699,12 @@ export class PetStore {
         ?? activity.session.agent_path
         ?? undefined,
       completed_at: activity.completed_at,
-      recently_completed: recentlyCompleted
+      recently_completed: recentlyCompleted,
+      outcome: activity.outcome,
+      descendant_count: 0,
+      active_descendant_count: 0,
+      urgent_descendant_count: 0,
+      recent_descendant_count: 0
     };
   }
 }
@@ -470,16 +739,422 @@ function compareTopics(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+interface SessionLineage {
+  parent_topic?: string;
+  root_topic: string;
+  depth: number;
+}
+
+function resolveLineages(
+  sessions: Map<string, SessionActivity>
+): Map<string, SessionLineage> {
+  const resolved = new Map<string, SessionLineage>();
+
+  function resolve(topic: string, visiting: Set<string>): SessionLineage {
+    const cached = resolved.get(topic);
+    if (cached) {
+      return cached;
+    }
+    const activity = sessions.get(topic);
+    const parent = activity?.parent_topic;
+    if (
+      !parent
+      || parent === topic
+      || !sessions.has(parent)
+      || visiting.has(parent)
+    ) {
+      const lineage = {
+        root_topic: topic,
+        depth: 0
+      };
+      resolved.set(topic, lineage);
+      return lineage;
+    }
+    visiting.add(topic);
+    const parentLineage = resolve(parent, visiting);
+    visiting.delete(topic);
+    const lineage = {
+      parent_topic: parent,
+      root_topic: parentLineage.root_topic,
+      depth: parentLineage.depth + 1
+    };
+    resolved.set(topic, lineage);
+    return lineage;
+  }
+
+  for (const topic of sessions.keys()) {
+    resolve(topic, new Set());
+  }
+  return resolved;
+}
+
+function applyFamilyAggregates(candidates: Map<string, PetFocus>): void {
+  const children = childTopics(candidates);
+  const visited = new Set<string>();
+
+  function aggregate(topic: string): PetFocus | undefined {
+    const focus = candidates.get(topic);
+    if (!focus || visited.has(topic)) {
+      return focus;
+    }
+    visited.add(topic);
+    for (const childTopic of children.get(topic) ?? []) {
+      const child = aggregate(childTopic);
+      if (!child) {
+        continue;
+      }
+      focus.descendant_count += 1 + child.descendant_count;
+      focus.active_descendant_count += Number(child.state !== "idle")
+        + child.active_descendant_count;
+      focus.urgent_descendant_count += Number(isUrgentState(child.state))
+        + child.urgent_descendant_count;
+      focus.recent_descendant_count += Number(
+        child.state === "idle" && child.recently_completed
+      ) + child.recent_descendant_count;
+      if (STATE_PRIORITY[child.family_state] > STATE_PRIORITY[focus.family_state]) {
+        focus.family_state = child.family_state;
+      }
+      focus.family_last_event_at = Math.max(
+        focus.family_last_event_at,
+        child.family_last_event_at
+      );
+    }
+    return focus;
+  }
+
+  for (const focus of candidates.values()) {
+    if (focus.parent_topic === undefined) {
+      aggregate(focus.topic);
+    }
+  }
+  for (const focus of candidates.values()) {
+    aggregate(focus.topic);
+  }
+}
+
+function visibleFamilyTopics(
+  candidates: Map<string, PetFocus>,
+  visibleNodes: PetFocus[]
+): Set<string> {
+  const visible = new Set<string>();
+  for (const node of visibleNodes) {
+    let current: PetFocus | undefined = node;
+    const visited = new Set<string>();
+    while (current && !visited.has(current.topic)) {
+      visited.add(current.topic);
+      visible.add(current.topic);
+      current = current.parent_topic
+        ? candidates.get(current.parent_topic)
+        : undefined;
+    }
+  }
+  return visible;
+}
+
+function orderVisibleFamilies(
+  candidates: Map<string, PetFocus>,
+  visible: Set<string>
+): PetFocus[] {
+  if (visible.size === 0) {
+    return [];
+  }
+  const children = childTopics(candidates);
+  const roots = [...visible]
+    .map((topic) => candidates.get(topic))
+    .filter((focus): focus is PetFocus => (
+      focus !== undefined
+      && (focus.parent_topic === undefined || !visible.has(focus.parent_topic))
+    ))
+    .sort(compareFamilyRoots);
+  const ordered: PetFocus[] = [];
+
+  function append(topic: string): void {
+    const focus = candidates.get(topic);
+    if (!focus || !visible.has(topic)) {
+      return;
+    }
+    ordered.push(focus);
+    const visibleChildren = (children.get(topic) ?? [])
+      .map((childTopic) => candidates.get(childTopic))
+      .filter((child): child is PetFocus => child !== undefined && visible.has(child.topic))
+      .sort(compareFamilySiblings);
+    for (const child of visibleChildren) {
+      append(child.topic);
+    }
+  }
+
+  for (const root of roots) {
+    append(root.topic);
+  }
+  return ordered;
+}
+
+function childTopics(candidates: Map<string, PetFocus>): Map<string, string[]> {
+  const children = new Map<string, string[]>();
+  for (const focus of candidates.values()) {
+    if (!focus.parent_topic || !candidates.has(focus.parent_topic)) {
+      continue;
+    }
+    const topics = children.get(focus.parent_topic) ?? [];
+    topics.push(focus.topic);
+    children.set(focus.parent_topic, topics);
+  }
+  return children;
+}
+
+function compareFamilyRoots(
+  left: PetFocus,
+  right: PetFocus
+): number {
+  const priority = STATE_PRIORITY[right.family_state]
+    - STATE_PRIORITY[left.family_state];
+  if (priority !== 0) {
+    return priority;
+  }
+  const activity = right.family_last_event_at - left.family_last_event_at;
+  return activity !== 0 ? activity : compareTopics(left.topic, right.topic);
+}
+
+function compareFamilySiblings(left: PetFocus, right: PetFocus): number {
+  const familyPriority = STATE_PRIORITY[right.family_state]
+    - STATE_PRIORITY[left.family_state];
+  if (familyPriority !== 0) {
+    return familyPriority;
+  }
+  const leftVisibleState = visibleStatePriority(left);
+  const rightVisibleState = visibleStatePriority(right);
+  if (leftVisibleState !== rightVisibleState) {
+    return rightVisibleState - leftVisibleState;
+  }
+  if (left.state !== "idle" && right.state !== "idle") {
+    return compareActiveSessions(left, right);
+  }
+  if (left.recently_completed && right.recently_completed) {
+    return compareRecentCompletions(left, right);
+  }
+  const recency = right.last_event_at - left.last_event_at;
+  return recency !== 0 ? recency : compareTopics(left.topic, right.topic);
+}
+
+function visibleStatePriority(focus: PetFocus): number {
+  if (focus.state !== "idle") {
+    return 2;
+  }
+  if (focus.recently_completed) {
+    return 1;
+  }
+  return 0;
+}
+
+function isUrgentState(state: PetState): boolean {
+  return state === "needs_input" || state === "blocked";
+}
+
 function newSessionActivity(relay: RelayEvent, nowMs: number): SessionActivity {
   return {
     topic: relay.topic,
     session: relay.session,
+    parent_topic: parentTopic(relay.topic, relay.session),
+    is_provisional: false,
     last_event_at: nowMs,
-    label: describeEvent(relay.event),
+    label: relay.event.type === "agent_activity"
+      ? "Session observed"
+      : describeEvent(relay.event),
     running_until: nowMs,
     open_tools: new Map(),
     pending_interactions: new Map()
   };
+}
+
+function newProvisionalActivity(
+  topic: string,
+  sessionId: string,
+  provider: string,
+  source: SessionActivity,
+  parent: string | undefined,
+  agentPath: string | undefined,
+  eventAt: number
+): SessionActivity {
+  return {
+    topic,
+    parent_topic: parent,
+    is_provisional: true,
+    session: {
+      provider,
+      session_id: sessionId,
+      parent_session_id: parent ? sessionIdFromTopic(parent) : undefined,
+      agent_path: agentPath,
+      cwd: source.session.cwd,
+      project: source.session.project
+    },
+    last_event_at: eventAt,
+    label: "Agent activity",
+    running_until: eventAt,
+    open_tools: new Map(),
+    pending_interactions: new Map()
+  };
+}
+
+function mergeSession(
+  previous: RelaySession,
+  incoming: RelaySession
+): RelaySession {
+  return {
+    ...previous,
+    ...incoming,
+    provider: incoming.provider ?? previous.provider,
+    parent_session_id: incoming.parent_session_id === undefined
+      ? previous.parent_session_id
+      : incoming.parent_session_id,
+    agent_path: incoming.agent_path ?? previous.agent_path,
+    agent_nickname: incoming.agent_nickname ?? previous.agent_nickname,
+    agent_role: incoming.agent_role ?? previous.agent_role,
+    title: incoming.title ?? previous.title,
+    cwd: incoming.cwd ?? previous.cwd,
+    project: incoming.project ?? previous.project
+  };
+}
+
+function parentTopic(
+  topic: string,
+  session: RelaySession
+): string | undefined {
+  const parentSessionId = session.parent_session_id ?? undefined;
+  const provider = session.provider ?? providerFromTopic(topic);
+  return parentSessionId && provider
+    ? `${provider}.${parentSessionId}`
+    : undefined;
+}
+
+function providerFromTopic(topic: string): string | undefined {
+  const separator = topic.indexOf(".");
+  return separator > 0 ? topic.slice(0, separator) : undefined;
+}
+
+function sessionIdFromTopic(topic: string): string {
+  const separator = topic.indexOf(".");
+  return separator >= 0 ? topic.slice(separator + 1) : topic;
+}
+
+function parentAgentPath(agentPath: string | null | undefined): string | undefined {
+  if (!agentPath) {
+    return undefined;
+  }
+  const normalized = agentPath.replace(/\/+$/, "");
+  const separator = normalized.lastIndexOf("/");
+  if (separator <= 0) {
+    return undefined;
+  }
+  return normalized.slice(0, separator) || "/";
+}
+
+function effectiveAgentPath(activity: SessionActivity): string {
+  const agentPath = activity.session.agent_path;
+  if (agentPath) {
+    return normalizeAgentPath(agentPath);
+  }
+  return activity.parent_topic === undefined ? "/root" : "";
+}
+
+function isDescendantAgentPath(parent: string, target: string): boolean {
+  const normalizedParent = normalizeAgentPath(parent);
+  const normalizedTarget = normalizeAgentPath(target);
+  return normalizedParent.length > 0
+    && normalizedTarget.startsWith(`${normalizedParent}/`);
+}
+
+function candidateProvider(activity: SessionActivity): string | undefined {
+  return activity.session.provider ?? providerFromTopic(activity.topic);
+}
+
+function activityRootTopic(
+  sessions: Map<string, SessionActivity>,
+  topic: string
+): string {
+  let current = topic;
+  const visited = new Set<string>();
+  while (!visited.has(current)) {
+    visited.add(current);
+    const parent = sessions.get(current)?.parent_topic;
+    if (!parent || !sessions.has(parent)) {
+      return current;
+    }
+    current = parent;
+  }
+  return topic;
+}
+
+function activityAncestorTopics(
+  sessions: Map<string, SessionActivity>,
+  topic: string
+): Set<string> {
+  const ancestors = new Set<string>();
+  let current: string | undefined = topic;
+  while (current && !ancestors.has(current)) {
+    ancestors.add(current);
+    current = sessions.get(current)?.parent_topic;
+  }
+  return ancestors;
+}
+
+function compareScores(
+  left: readonly number[],
+  right: readonly number[]
+): number {
+  const length = Math.max(left.length, right.length);
+  for (let index = 0; index < length; index += 1) {
+    const difference = (left[index] ?? 0) - (right[index] ?? 0);
+    if (difference !== 0) {
+      return difference;
+    }
+  }
+  return 0;
+}
+
+function normalizeAgentPath(path: string): string {
+  return path.replace(/\/+$/, "") || "/";
+}
+
+function agentActivityLabel(kind: string): string {
+  switch (kind) {
+    case "started":
+      return "Agent started";
+    case "interacted":
+      return "Agent interaction";
+    case "interrupted":
+      return "Interrupted";
+    default:
+      return `Agent ${kind}`;
+  }
+}
+
+function recordActivity(
+  activity: SessionActivity,
+  label: string,
+  eventAt: number
+): void {
+  if (eventAt < activity.last_event_at) {
+    return;
+  }
+  activity.last_event_at = eventAt;
+  activity.label = label;
+}
+
+function eventOccurredAt(event: AgentEvent, receivedAt: number): number {
+  const occurredAt = asNumber(event.occurred_at_ms);
+  const timestamp = asString(event.timestamp);
+  const timestampAt = timestamp ? Date.parse(timestamp) : Number.NaN;
+  for (const candidate of [occurredAt, timestampAt]) {
+    if (
+      candidate !== undefined
+      && Number.isFinite(candidate)
+      && candidate >= 0
+      && candidate <= receivedAt + MAX_FUTURE_EVENT_SKEW_MS
+    ) {
+      return candidate;
+    }
+  }
+  return receivedAt;
 }
 
 export function describeEvent(event: AgentEvent): string {

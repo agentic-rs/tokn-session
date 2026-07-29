@@ -11,6 +11,7 @@ Implemented CLI:
 ```sh
 tokn-session list --source codex --limit 5
 tokn-session show --source opencode <session-id> --format pretty
+tokn-session show --source codex <session-id> --scope tree
 tokn-session show --source pi <session-id> --format jsonl
 tokn-session browse --source codex <session-id>
 tokn-session create --source opencode --executor "tokn-gateway proxy opencode --npx --" "create a todo app"
@@ -102,16 +103,26 @@ builds the workspace Relay once if needed, then spawns
 `tokn-session-relay stdout --format json`, or accepts an existing stream with
 `--stdin`.
 
-The reducer keeps state per Relay topic and returns every active session using
+The reducer keeps a session graph keyed by Relay topic. Root tasks are rendered
+as project-labelled families, with active and recent subagents nested beneath
+them by `parent_session_id`. Provisional child rows appear as soon as a parent
+reports `agent_activity.started` and reconcile when the child's own Relay topic
+arrives. Child urgency bubbles into the root summary while automatic focus
+stays on the actionable child. `interacted` is only an annotation;
+`interrupted` becomes a recent Interrupted outcome rather than falsely showing
+Blocked. Stable agent activity is deduplicated by provider and event id, and
+provider occurrence times prevent replayed old activity from looking current.
+
+Within each family, state still uses
 `needs_input > blocked > ready > running > idle`, followed by idle sessions
-that were inferred Ready in the last five minutes. The highest-priority entry
-drives the large pet in automatic mode. Up/Down or `j`/`k` selects another
-session by topic, `a` restores automatic focus, and `c` acknowledges the
-selected notification. Responsive text rows keep concurrent and recent
-sessions visible; overflow windows around a manual selection so it cannot
-disappear off-screen. Session labels prefer `project_name`, then folder name,
-repository name, and the legacy inferred name. Wide terminals show the art and
-roster side by side, while narrow terminals become roster-only.
+that were inferred Ready or Interrupted in the last five minutes. Up/Down or
+`j`/`k` selects another session by topic, `a` restores automatic focus, and `c`
+acknowledges the selected notification. Responsive text rows keep concurrent
+and recent sessions visible; overflow windows around a manual selection so it
+cannot disappear off-screen. Root labels prefer `project_name`, then folder
+name, repository name, and the legacy inferred name. Child labels prefer agent
+nickname, then agent path. Wide terminals show the art and roster side by
+side, while narrow terminals become roster-only.
 
 States currently derive from normalized messages, reasoning, tool calls,
 errors, goals, and preserved input-request events. Codex task start/complete
@@ -133,6 +144,25 @@ art and must be replaced before publishing or distributing the project.
 - Codex reads JSONL from `~/.codex/sessions` and `~/.codex/archived_sessions` unless `--session-dir` is passed.
 - OpenCode reads SQLite from `~/.local/share/opencode/opencode.db` unless `--session-dir` is passed.
 - OpenCode opens its database with an immutable read-only SQLite URI so viewing sessions does not require writing sidecar files.
+
+`SessionRef` carries optional `parent_session_id`, `agent_path`,
+`agent_nickname`, and `agent_role`. Codex takes owning identity only from the
+first valid `session_meta`, because subagent rollouts can contain copied parent
+headers. Pi resolves `parentSession` paths to parent IDs, and OpenCode uses its
+session `parent_id`.
+
+`tokn-session show` defaults to `--scope self`. `--scope tree` discovers
+descendants, prints a compact hierarchy, and then renders every session in a
+separate section. Tree output is currently pretty-only; self-scoped JSONL keeps
+the existing event-only format. Tree discovery uses header-only relationship
+scans, including the provider's global roots when the selected session is an
+explicit file path. Historical Codex thread-spawn rollouts omit inherited parent
+bootstrap history and begin at the explicit trigger-turn boundary. Other
+parented Codex sessions, such as guardian work, retain their body from the start.
+If an older thread-spawn rollout has no trustworthy boundary, pretty output
+warns that its body is unavailable and JSONL output fails instead of attributing
+parent work to the child. Tree sections remain separate rather than merging
+timestamps into a single timeline.
 
 ## Event IR Status
 

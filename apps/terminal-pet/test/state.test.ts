@@ -86,6 +86,33 @@ describe("PetStore", () => {
     expect(store.snapshot(60).state).toBe("ready");
   });
 
+  test("does not let an older assistant finish override newer progress", () => {
+    const store = new PetStore(policy);
+    const progress = relayEvent({
+      type: "reasoning",
+      phase: "delta",
+      text: "newer work",
+      occurred_at_ms: 100
+    });
+    store.ingest(progress, 100);
+    const staleFinish = relayEvent({
+      type: "message",
+      role: "assistant",
+      phase: "finished",
+      text: "older finish",
+      occurred_at_ms: 50
+    });
+    staleFinish.session.agent_nickname = "Merged metadata";
+    store.ingest(staleFinish, 110);
+
+    expect(store.snapshot(150).focus).toMatchObject({
+      state: "running",
+      label: "Thinking",
+      agent: "Merged metadata",
+      last_event_at: 100
+    });
+  });
+
   test("turns a stable error into blocked but cancels it on progress", () => {
     const store = new PetStore(policy);
     store.ingest(relayEvent({
@@ -170,6 +197,447 @@ describe("PetStore", () => {
       "codex.ready",
       "codex.running"
     ]);
+  });
+
+  test("creates a provisional child and keeps agent activity off the parent", () => {
+    const store = new PetStore(policy);
+    store.ingest(agentActivity("root", {
+      event_id: "spawn-1",
+      kind: "started",
+      target_session_id: "child",
+      target_agent_path: "/root/researcher",
+      occurred_at_ms: 0
+    }), 0);
+
+    const snapshot = store.snapshot(1);
+    expect(snapshot.active_sessions).toBe(1);
+    expect(snapshot.focus).toMatchObject({
+      topic: "codex.child",
+      state: "running",
+      parent_topic: "codex.root",
+      root_topic: "codex.root",
+      depth: 1,
+      is_provisional: true
+    });
+    expect(snapshot.sessions.map((session) => session.topic)).toEqual([
+      "codex.root",
+      "codex.child"
+    ]);
+    expect(snapshot.sessions[0]).toMatchObject({
+      state: "idle",
+      family_state: "running",
+      descendant_count: 1,
+      active_descendant_count: 1
+    });
+  });
+
+  test("keeps inferred children inside the emitting root family", () => {
+    const store = new PetStore(policy);
+    store.ingest(relayEvent({
+      type: "reasoning",
+      phase: "delta"
+    }, "codex.root-a"), 0);
+    store.ingest(relayEvent({
+      type: "reasoning",
+      phase: "delta"
+    }, "codex.root-b"), 0);
+    store.ingest(agentActivity("root-b", {
+      event_id: "spawn-b",
+      kind: "started",
+      target_session_id: "child-b",
+      target_agent_path: "/root/researcher",
+      occurred_at_ms: 10
+    }), 10);
+
+    expect(store.snapshot(11).sessions.find(
+      (session) => session.topic === "codex.child-b"
+    )).toMatchObject({
+      parent_topic: "codex.root-b",
+      root_topic: "codex.root-b"
+    });
+  });
+
+  test("does not infer a child under a different provider root", () => {
+    const store = new PetStore(policy);
+    store.ingest(relayEvent({
+      type: "reasoning",
+      phase: "delta"
+    }, "pi.root-pi"), 0);
+    store.ingest(relayEvent({
+      type: "reasoning",
+      phase: "delta"
+    }, "codex.root-codex"), 0);
+    store.ingest(agentActivity("root-codex", {
+      event_id: "spawn-codex",
+      kind: "started",
+      target_session_id: "child-codex",
+      target_agent_path: "/root/researcher",
+      occurred_at_ms: 10
+    }), 10);
+
+    expect(store.snapshot(11).sessions.find(
+      (session) => session.topic === "codex.child-codex"
+    )).toMatchObject({
+      parent_topic: "codex.root-codex",
+      root_topic: "codex.root-codex"
+    });
+  });
+
+  test("reconciles a provisional child with its own Relay session", () => {
+    const store = new PetStore(policy);
+    store.ingest(agentActivity("root", {
+      event_id: "spawn-1",
+      kind: "started",
+      target_session_id: "child",
+      target_agent_path: "/root/researcher",
+      occurred_at_ms: 0
+    }), 0);
+    const child = relayEvent({
+      type: "reasoning",
+      phase: "delta",
+      text: "checking"
+    }, "codex.child");
+    child.session.parent_session_id = "root";
+    child.session.agent_path = "/root/researcher";
+    child.session.agent_nickname = "Avicenna";
+    store.ingest(child, 10);
+
+    const snapshot = store.snapshot(11);
+    expect(snapshot.total_sessions).toBe(2);
+    expect(snapshot.focus).toMatchObject({
+      topic: "codex.child",
+      agent: "Avicenna",
+      is_provisional: false,
+      parent_topic: "codex.root",
+      root_topic: "codex.root",
+      depth: 1
+    });
+  });
+
+  test("treats interaction as a target annotation without extending work", () => {
+    const store = new PetStore(policy);
+    store.ingest(agentActivity("root", {
+      event_id: "spawn-1",
+      kind: "started",
+      target_session_id: "child",
+      target_agent_path: "/root/researcher",
+      occurred_at_ms: 0
+    }), 0);
+    store.ingest(agentActivity("root", {
+      event_id: "interaction-1",
+      kind: "interacted",
+      target_session_id: "child",
+      target_agent_path: "/root/researcher",
+      occurred_at_ms: 90
+    }), 90);
+
+    expect(store.snapshot(95).focus).toMatchObject({
+      topic: "codex.child",
+      state: "running",
+      label: "Agent interaction"
+    });
+    const expired = store.snapshot(101);
+    expect(expired.active_sessions).toBe(0);
+    expect(expired.sessions).toEqual([]);
+    expect(expired.total_sessions).toBe(2);
+  });
+
+  test("routes target-less agent messages by an exact known agent path", () => {
+    const store = new PetStore(policy);
+    store.ingest(agentActivity("root", {
+      event_id: "spawn-1",
+      kind: "started",
+      target_session_id: "child",
+      target_agent_path: "/root/researcher",
+      occurred_at_ms: 0
+    }), 0);
+    store.ingest(agentActivity("root", {
+      event_id: "message-1",
+      kind: "messaged",
+      actor_agent_path: "/root",
+      target_agent_path: "/root/researcher",
+      occurred_at_ms: 90
+    }), 90);
+
+    expect(store.snapshot(95).focus).toMatchObject({
+      topic: "codex.child",
+      state: "running",
+      label: "Agent messaged",
+      last_event_at: 90
+    });
+    expect(store.snapshot(101).sessions).toEqual([]);
+  });
+
+  test("routes target-less activity only within the source family", () => {
+    const store = new PetStore(policy);
+    const childA = relayEvent({
+      type: "reasoning",
+      phase: "delta",
+      text: "family a"
+    }, "codex.child-a");
+    childA.session.parent_session_id = "root-a";
+    childA.session.agent_path = "/root/researcher";
+    store.ingest(childA, 0);
+    const childB = relayEvent({
+      type: "reasoning",
+      phase: "delta",
+      text: "family b"
+    }, "codex.child-b");
+    childB.session.parent_session_id = "root-b";
+    childB.session.agent_path = "/root/researcher";
+    store.ingest(childB, 0);
+    store.ingest(agentActivity("root-b", {
+      event_id: "interaction-b",
+      kind: "interacted",
+      target_agent_path: "/root/researcher",
+      actor_agent_path: "/root",
+      occurred_at_ms: 10
+    }), 10);
+
+    const sessions = store.snapshot(11).sessions;
+    expect(sessions.find((session) => session.topic === "codex.child-a")?.label)
+      .toBe("Thinking");
+    expect(sessions.find((session) => session.topic === "codex.child-b")?.label)
+      .toBe("Agent interaction");
+  });
+
+  test("routes target-less messages to their source only when the actor matches", () => {
+    const store = new PetStore(policy);
+    store.ingest(relayEvent({
+      type: "reasoning",
+      phase: "delta",
+      text: "root work",
+      occurred_at_ms: 0
+    }, "codex.root"), 0);
+    store.ingest(agentActivity("root", {
+      event_id: "root-message",
+      kind: "messaged",
+      actor_agent_path: "/root",
+      target_agent_path: "/root/not-known",
+      occurred_at_ms: 90
+    }), 90);
+
+    expect(store.snapshot(95).focus).toMatchObject({
+      topic: "codex.root",
+      label: "Agent messaged",
+      last_event_at: 90
+    });
+    expect(store.snapshot(101).sessions).toEqual([]);
+  });
+
+  test("ignores copied target-less messages whose actor is not the source", () => {
+    const store = new PetStore(policy);
+    const childProgress = relayEvent({
+      type: "reasoning",
+      phase: "delta",
+      text: "child work",
+      occurred_at_ms: 0
+    }, "codex.child");
+    childProgress.session.parent_session_id = "root";
+    childProgress.session.agent_path = "/root/researcher";
+    store.ingest(childProgress, 0);
+    const copiedParentMessage = agentActivity("child", {
+      event_id: "copied-message",
+      kind: "messaged",
+      actor_agent_path: "/root",
+      target_agent_path: "/root/not-known",
+      occurred_at_ms: 50
+    });
+    copiedParentMessage.session.parent_session_id = "root";
+    copiedParentMessage.session.agent_path = "/root/researcher";
+    store.ingest(copiedParentMessage, 50);
+
+    expect(store.snapshot(51).focus).toMatchObject({
+      topic: "codex.child",
+      label: "Thinking",
+      last_event_at: 0
+    });
+    expect(store.snapshot(101).sessions).toEqual([]);
+  });
+
+  test("keeps a detached provisional node's parent fields consistent", () => {
+    const store = new PetStore(policy);
+    store.ingest(agentActivity("root", {
+      event_id: "detached-interrupt",
+      kind: "interrupted",
+      target_session_id: "detached",
+      target_agent_path: "/detached/agent",
+      occurred_at_ms: 10
+    }), 10);
+
+    const detached = store.sessions.get("codex.detached");
+    expect(detached?.parent_topic).toBeUndefined();
+    expect(detached?.session.parent_session_id).toBeUndefined();
+    expect(store.snapshot(11).focus).toMatchObject({
+      topic: "codex.detached",
+      root_topic: "codex.detached",
+      depth: 0,
+      outcome: "interrupted"
+    });
+  });
+
+  test("shows interruption as recent child work without claiming blocked", () => {
+    const store = new PetStore(policy);
+    store.ingest(agentActivity("root", {
+      event_id: "spawn-1",
+      kind: "started",
+      target_session_id: "child",
+      target_agent_path: "/root/researcher",
+      occurred_at_ms: 0
+    }), 0);
+    store.ingest(agentActivity("root", {
+      event_id: "interrupt-1",
+      kind: "interrupted",
+      target_session_id: "child",
+      target_agent_path: "/root/researcher",
+      occurred_at_ms: 50
+    }), 50);
+
+    const snapshot = store.snapshot(51);
+    expect(snapshot.active_sessions).toBe(0);
+    expect(snapshot.focus).toMatchObject({
+      topic: "codex.child",
+      state: "idle",
+      label: "Interrupted",
+      outcome: "interrupted",
+      completed_at: 50,
+      recently_completed: true
+    });
+    expect(snapshot.sessions[0]).toMatchObject({
+      topic: "codex.root",
+      family_state: "idle",
+      recent_descendant_count: 1
+    });
+  });
+
+  test("keeps nested agents in family preorder and bubbles urgency", () => {
+    const store = new PetStore(policy);
+    store.ingest(agentActivity("root", {
+      event_id: "spawn-child",
+      kind: "started",
+      target_session_id: "child",
+      target_agent_path: "/root/researcher",
+      occurred_at_ms: 0
+    }), 0);
+    const childStart = relayEvent({
+      type: "agent_activity",
+      provider: "codex",
+      event_id: "spawn-grandchild",
+      kind: "started",
+      target_session_id: "grandchild",
+      target_agent_path: "/root/researcher/reviewer",
+      occurred_at_ms: 10
+    }, "codex.child");
+    childStart.session.parent_session_id = "root";
+    childStart.session.agent_path = "/root/researcher";
+    store.ingest(childStart, 10);
+    const needsInput = relayEvent({
+      type: "unknown",
+      native_type: "event_msg.request_user_input",
+      native: { id: "question-1" }
+    }, "codex.grandchild");
+    needsInput.session.parent_session_id = "child";
+    needsInput.session.agent_path = "/root/researcher/reviewer";
+    store.ingest(needsInput, 20);
+
+    const snapshot = store.snapshot(21);
+    expect(snapshot.sessions.map((session) => [
+      session.topic,
+      session.depth
+    ])).toEqual([
+      ["codex.root", 0],
+      ["codex.child", 1],
+      ["codex.grandchild", 2]
+    ]);
+    expect(snapshot.focus).toMatchObject({
+      topic: "codex.grandchild",
+      state: "needs_input",
+      root_topic: "codex.root"
+    });
+    expect(snapshot.sessions[0]).toMatchObject({
+      state: "idle",
+      family_state: "needs_input",
+      descendant_count: 2,
+      active_descendant_count: 2,
+      urgent_descendant_count: 1
+    });
+  });
+
+  test("orders an urgent nested branch before a running sibling", () => {
+    const store = new PetStore(policy);
+    const urgentBranch = relayEvent({
+      type: "session_started"
+    }, "codex.urgent-branch");
+    urgentBranch.session.parent_session_id = "root";
+    urgentBranch.session.agent_path = "/root/urgent";
+    store.ingest(urgentBranch, 0);
+    const urgentLeaf = relayEvent({
+      type: "unknown",
+      native_type: "event_msg.request_user_input",
+      native: { id: "question-1" }
+    }, "codex.urgent-leaf");
+    urgentLeaf.session.parent_session_id = "urgent-branch";
+    urgentLeaf.session.agent_path = "/root/urgent/reviewer";
+    store.ingest(urgentLeaf, 10);
+    const runningSibling = relayEvent({
+      type: "reasoning",
+      phase: "delta",
+      text: "working"
+    }, "codex.running-sibling");
+    runningSibling.session.parent_session_id = "root";
+    runningSibling.session.agent_path = "/root/running";
+    store.ingest(runningSibling, 10);
+
+    expect(store.snapshot(11).sessions.map((session) => session.topic)).toEqual([
+      "codex.root",
+      "codex.urgent-branch",
+      "codex.urgent-leaf",
+      "codex.running-sibling"
+    ]);
+  });
+
+  test("deduplicates copied agent activity by provider and event id", () => {
+    const store = new PetStore(policy);
+    store.ingest(agentActivity("root", {
+      event_id: "spawn-1",
+      kind: "started",
+      target_session_id: "child",
+      target_agent_path: "/root/researcher",
+      occurred_at_ms: 0
+    }), 0);
+    store.ingest(agentActivity("root", {
+      event_id: "spawn-1",
+      kind: "started",
+      target_session_id: "child",
+      target_agent_path: "/root/researcher",
+      occurred_at_ms: 90
+    }), 90);
+
+    expect(store.snapshot(101).sessions).toEqual([]);
+    expect(store.snapshot(101).total_sessions).toBe(2);
+  });
+
+  test("uses provider event times so replayed starts do not look live", () => {
+    const store = new PetStore(policy);
+    store.ingest(agentActivity("root", {
+      event_id: "old-spawn",
+      kind: "started",
+      target_session_id: "child",
+      target_agent_path: "/root/researcher",
+      occurred_at_ms: 100
+    }), 1_000);
+    store.ingest(agentActivity("root", {
+      event_id: "old-spawn-timestamp",
+      kind: "started",
+      target_session_id: "child-from-timestamp",
+      target_agent_path: "/root/reviewer",
+      timestamp: "1970-01-01T00:00:00.100Z"
+    }), 1_000);
+
+    const snapshot = store.snapshot(1_000);
+    expect(snapshot.active_sessions).toBe(0);
+    expect(snapshot.sessions).toEqual([]);
+    expect(snapshot.total_sessions).toBe(3);
   });
 
   test("prefers explicit project, folder, repository, then legacy names", () => {
@@ -359,3 +827,22 @@ describe("PetStore", () => {
     expect(snapshot.total_sessions).toBe(1);
   });
 });
+
+function agentActivity(
+  sourceSessionId: string,
+  event: {
+    event_id: string;
+    kind: "started" | "interacted" | "interrupted" | "messaged";
+    target_session_id?: string;
+    target_agent_path?: string;
+    actor_agent_path?: string;
+    occurred_at_ms?: number;
+    timestamp?: string;
+  }
+) {
+  return relayEvent({
+    type: "agent_activity",
+    provider: "codex",
+    ...event
+  }, `codex.${sourceSessionId}`);
+}

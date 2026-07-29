@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { loadPetArt } from "../src/art";
+import { focusSnapshot } from "../src/navigation";
 import { renderScreen } from "../src/renderer";
 import type { PetFocus, PetSnapshot } from "../src/state";
 
@@ -30,7 +31,7 @@ describe("renderer", () => {
     expect(output).toContain("SESSION ROSTER");
     expect(output).toContain("ACTIVE 1");
     expect(output).toContain("● Running");
-    expect(output).toContain("llm-router_2/root");
+    expect(output).toContain("llm-router_2");
     expect(output).toContain("exec_command: cargo test");
     expect(output).not.toContain("\u001b");
 
@@ -90,12 +91,241 @@ describe("renderer", () => {
     const output = screen.lines.join("\n");
 
     expect(output).toContain("ACTIVE 2");
-    expect(output).toContain("RECENT READY 1");
+    expect(output).toContain("RECENT 1");
     expect(output).toContain("? Needs input");
     expect(output).toContain("Running provider tests");
     expect(output).toContain("✓ Ready");
     expect(output).toContain("Updated Relay docs");
     expect(output).toContain("1 recent");
+  });
+
+  test("renders each root as a project family with indented agents", async () => {
+    const art = await loadPetArt();
+    const root = petFocus({
+      topic: "codex.root",
+      session_id: "root",
+      state: "idle",
+      family_state: "running",
+      family_last_event_at: 9_000,
+      root_topic: "codex.root",
+      project_label: "llm-router_2",
+      agent: "root",
+      label: "Waiting for agents",
+      descendant_count: 2,
+      active_descendant_count: 1,
+      recent_descendant_count: 1
+    });
+    const worker = petFocus({
+      topic: "codex.worker",
+      session_id: "worker",
+      root_topic: root.topic,
+      parent_topic: root.topic,
+      depth: 1,
+      agent: "Zeno",
+      label: "Reviewing the protocol"
+    });
+    const recent = petFocus({
+      topic: "codex.recent-child",
+      session_id: "recent",
+      root_topic: root.topic,
+      parent_topic: root.topic,
+      depth: 1,
+      state: "idle",
+      family_state: "idle",
+      agent: "/root/docs",
+      label: "Updated documentation",
+      completed_at: 5_000,
+      recently_completed: true,
+      outcome: "completed"
+    });
+    const snapshot = petSnapshot([root, worker, recent]);
+    snapshot.focus = worker;
+    snapshot.state = worker.state;
+
+    const output = renderScreen(snapshot, art.running.ansi, {
+      source_label: "test"
+    }, {
+      columns: 100,
+      rows: 24,
+      color: false,
+      image_protocol: "ansi",
+      name: "Hachiware",
+      now_ms: 10_000
+    }).lines.join("\n");
+
+    expect(output).toContain("ACTIVE 1");
+    expect(output).toContain("llm-router_2 · root");
+    expect(output).toContain("2 agents · 1 active");
+    expect(screenLine(output, "2 agents · 1 active")).toContain("· now");
+    expect(output).toContain("↳ Zeno · worker");
+    expect(output).toContain("↳ root/docs · recent");
+    expect(output).not.toContain("llm-router_2/Zeno");
+  });
+
+  test("keeps focus on an urgent child while surfacing urgency on its root", async () => {
+    const art = await loadPetArt();
+    const root = petFocus({
+      topic: "codex.root",
+      session_id: "root",
+      state: "idle",
+      family_state: "needs_input",
+      root_topic: "codex.root",
+      descendant_count: 1,
+      active_descendant_count: 1,
+      urgent_descendant_count: 1
+    });
+    const child = petFocus({
+      topic: "codex.reviewer",
+      session_id: "reviewer",
+      root_topic: root.topic,
+      parent_topic: root.topic,
+      depth: 1,
+      state: "needs_input",
+      family_state: "needs_input",
+      agent: "Reviewer",
+      label: "Approval required"
+    });
+    const snapshot = petSnapshot([root, child]);
+    snapshot.focus = child;
+    snapshot.state = child.state;
+
+    const screen = renderScreen(snapshot, art.waiting.ansi, {
+      source_label: "test"
+    }, {
+      columns: 100,
+      rows: 24,
+      color: false,
+      image_protocol: "ansi",
+      name: "Hachiware",
+      now_ms: 0
+    });
+    const output = screen.lines.join("\n");
+    const childLine = screen.lines.find((line) => line.includes("Approval required"));
+    const rootLine = screen.lines.find((line) => line.includes("1 urgent"));
+
+    expect(output).toContain("ACTIVE 1");
+    expect(rootLine).toContain("? Needs input · tokn-agent");
+    expect(rootLine).not.toContain("› ? Needs input");
+    expect(childLine).toContain("› ? Needs input · ↳ Reviewer");
+  });
+
+  test("uses family state and timing when a root is manually focused", async () => {
+    const art = await loadPetArt();
+    const root = petFocus({
+      topic: "codex.root",
+      session_id: "root",
+      state: "idle",
+      family_state: "needs_input",
+      family_last_event_at: 5_000,
+      root_topic: "codex.root",
+      label: "Waiting for agents",
+      descendant_count: 1,
+      active_descendant_count: 1,
+      urgent_descendant_count: 1
+    });
+    const child = petFocus({
+      topic: "codex.reviewer",
+      session_id: "reviewer",
+      root_topic: root.topic,
+      parent_topic: root.topic,
+      depth: 1,
+      state: "needs_input",
+      family_state: "needs_input",
+      last_event_at: 5_000,
+      family_last_event_at: 5_000,
+      agent: "Reviewer",
+      label: "Approval required"
+    });
+    const snapshot = focusSnapshot(petSnapshot([root, child]), root.topic);
+    const screen = renderScreen(snapshot, art.waiting.ansi, {
+      source_label: "test",
+      focus_mode: "manual"
+    }, {
+      columns: 100,
+      rows: 24,
+      color: false,
+      image_protocol: "ansi",
+      name: "Hachiware",
+      now_ms: 10_000
+    });
+    const output = screen.lines.join("\n");
+    const rootLine = screen.lines.find((line) => line.includes("1 urgent"));
+    const childLine = screen.lines.find((line) => line.includes("Approval required"));
+
+    expect(snapshot.state).toBe("needs_input");
+    expect(snapshot.state_changed_at).toBe(5_000);
+    expect(output).toContain("? Needs input");
+    expect(rootLine).toContain("› ? Needs input · tokn-agent");
+    expect(rootLine).toContain("· 5s");
+    expect(childLine).not.toContain("› ? Needs input");
+  });
+
+  test("keeps completed and interrupted children in their root family", async () => {
+    const art = await loadPetArt();
+    const root = petFocus({
+      topic: "codex.root",
+      session_id: "root",
+      state: "idle",
+      family_state: "idle",
+      root_topic: "codex.root",
+      descendant_count: 2,
+      recent_descendant_count: 2
+    });
+    const completed = petFocus({
+      topic: "codex.completed",
+      session_id: "complete",
+      root_topic: root.topic,
+      parent_topic: root.topic,
+      depth: 1,
+      state: "idle",
+      family_state: "idle",
+      agent: "Writer",
+      label: "Finished release notes",
+      completed_at: 8_000,
+      recently_completed: true,
+      outcome: "completed"
+    });
+    const interrupted = petFocus({
+      topic: "codex.interrupted",
+      session_id: "stopped",
+      root_topic: root.topic,
+      parent_topic: root.topic,
+      depth: 1,
+      state: "idle",
+      family_state: "idle",
+      agent: "Reviewer",
+      label: "Interrupted",
+      completed_at: 7_000,
+      recently_completed: true,
+      outcome: "interrupted"
+    });
+
+    const snapshot = petSnapshot([root, completed, interrupted]);
+    snapshot.focus = interrupted;
+    snapshot.state = interrupted.state;
+    const output = renderScreen(
+      snapshot,
+      art.ready.ansi,
+      {
+        source_label: "test"
+      },
+      {
+        columns: 100,
+        rows: 24,
+        color: false,
+        image_protocol: "ansi",
+        name: "Hachiware",
+        now_ms: 10_000
+      }
+    ).lines.join("\n");
+
+    expect(output).toContain("RECENT 2");
+    expect(output).toContain("2 agents · 2 recent");
+    expect(output).toContain("✓ Ready · ↳ Writer");
+    expect(output).toContain("× Interrupted · ↳ Reviewer");
+    expect(output.match(/× Interrupted/g)).toHaveLength(2);
+    expect(output).not.toContain("! Blocked · ↳ Reviewer");
+    expect(output).not.toContain("✓ Ready recently");
   });
 
   test("uses one image anchor alongside the wide roster", async () => {
@@ -384,16 +614,28 @@ describe("renderer", () => {
 });
 
 function petFocus(overrides: Partial<PetFocus> = {}): PetFocus {
+  const topic = overrides.topic ?? "codex.session-1";
+  const state = overrides.state ?? "running";
+  const lastEventAt = overrides.last_event_at ?? 0;
   return {
-    topic: "codex.session-1",
-    state: "running",
+    topic,
+    state,
     state_changed_at: 0,
-    last_event_at: 0,
+    last_event_at: lastEventAt,
     label: "Thinking",
     provider: "codex",
     project_label: "tokn-agent",
     session_id: "session-1",
     agent: "root",
+    root_topic: overrides.root_topic ?? topic,
+    depth: 0,
+    is_provisional: false,
+    family_state: overrides.family_state ?? state,
+    family_last_event_at: overrides.family_last_event_at ?? lastEventAt,
+    descendant_count: 0,
+    active_descendant_count: 0,
+    urgent_descendant_count: 0,
+    recent_descendant_count: 0,
     recently_completed: false,
     ...overrides
   };
@@ -409,4 +651,8 @@ function petSnapshot(sessions: PetFocus[], totalSessions = sessions.length): Pet
     sessions,
     focus
   };
+}
+
+function screenLine(output: string, content: string): string {
+  return output.split("\n").find((line) => line.includes(content)) ?? "";
 }

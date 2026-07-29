@@ -1,7 +1,12 @@
 import type { PixelFrame } from "./art";
 import type { ImageAnchor, ImageProtocol } from "./image_protocol";
 import type { JsonlStats } from "./jsonl";
-import type { PetFocus, PetSnapshot, PetState } from "./state";
+import {
+  effectivePetState,
+  type PetFocus,
+  type PetSnapshot,
+  type PetState
+} from "./state";
 
 const RESET = "\u001b[0m";
 const DIM = "\u001b[2m";
@@ -71,6 +76,13 @@ interface SessionWindow {
   hidden_before: number;
   hidden_after: number;
   hidden_urgent: number;
+}
+
+interface SessionFamily {
+  root: PetFocus;
+  sessions: PetFocus[];
+  active_count: number;
+  recent_count: number;
 }
 
 export function renderScreen(
@@ -294,12 +306,37 @@ function rosterLines(
   nowMs: number,
   color: boolean
 ): string[] {
-  const active = snapshot.sessions.filter((session) => session.state !== "idle");
-  const recent = recentSessions(snapshot);
+  const families = sessionFamilies(snapshot);
+  const activeFamilies = families.filter((family) => (
+    family.active_count > 0 || family.root.family_state !== "idle"
+  ));
+  const recentFamilies = families.filter((family) => (
+    family.active_count === 0
+    && family.root.family_state === "idle"
+    && family.recent_count > 0
+  ));
   const full: RosterLine[] = [];
 
-  appendRosterGroup(full, "ACTIVE", active, snapshot.focus?.topic, width, nowMs, color);
-  appendRosterGroup(full, "RECENT READY", recent, snapshot.focus?.topic, width, nowMs, color);
+  appendRosterGroup(
+    full,
+    "ACTIVE",
+    activeFamilies.flatMap((family) => family.sessions),
+    activeFamilies.reduce((count, family) => count + family.active_count, 0),
+    snapshot.focus?.topic,
+    width,
+    nowMs,
+    color
+  );
+  appendRosterGroup(
+    full,
+    "RECENT",
+    recentFamilies.flatMap((family) => family.sessions),
+    recentFamilies.reduce((count, family) => count + family.recent_count, 0),
+    snapshot.focus?.topic,
+    width,
+    nowMs,
+    color
+  );
 
   if (full.length === 0) {
     return [dim(truncate("No active or recent sessions", width), color)];
@@ -334,6 +371,30 @@ function rosterLines(
     )),
     dim(truncate(overflowLine(window), width), color)
   ];
+}
+
+function sessionFamilies(snapshot: PetSnapshot): SessionFamily[] {
+  const families = new Map<string, PetFocus[]>();
+  for (const session of snapshot.sessions) {
+    const family = families.get(session.root_topic);
+    if (family) {
+      family.push(session);
+    } else {
+      families.set(session.root_topic, [session]);
+    }
+  }
+
+  return [...families.entries()].map(([rootTopic, sessions]) => {
+    const root = sessions.find((session) => session.topic === rootTopic)
+      ?? sessions.find((session) => session.depth === 0)
+      ?? sessions[0]!;
+    return {
+      root,
+      sessions,
+      active_count: sessions.filter((session) => session.state !== "idle").length,
+      recent_count: sessions.filter(isRecentlyCompleted).length
+    };
+  });
 }
 
 function sessionWindow(
@@ -395,6 +456,7 @@ function appendRosterGroup(
   target: RosterLine[],
   name: string,
   sessions: PetFocus[],
+  count: number,
   focusTopic: string | undefined,
   width: number,
   nowMs: number,
@@ -404,7 +466,7 @@ function appendRosterGroup(
     return;
   }
   target.push({
-    line: dim(truncate(`${name} ${sessions.length}`, width), color)
+    line: dim(truncate(`${name} ${count}`, width), color)
   });
   for (const session of sessions) {
     target.push({
@@ -420,22 +482,33 @@ function sessionLine(
   nowMs: number,
   color: boolean
 ): string {
-  const isRecent = session.state === "idle" && session.recently_completed;
-  const displayState = isRecent ? "ready" : session.state;
+  const rowState = effectivePetState(session);
+  const isRecent = rowState === "idle" && session.recently_completed;
+  const isInterrupted = isRecent && session.outcome === "interrupted";
+  const displayState = isRecent && !isInterrupted ? "ready" : rowState;
   const marker = session.topic === focusTopic ? "›" : " ";
-  const glyph = isRecent ? "✓" : STATUS_GLYPH[session.state];
-  const status = isRecent ? "Ready" : STATUS_LABEL[session.state];
-  const timestamp = isRecent
-    ? session.completed_at ?? session.last_event_at
+  const glyph = isInterrupted ? "×" : isRecent ? "✓" : STATUS_GLYPH[rowState];
+  const status = isInterrupted ? "Interrupted" : isRecent ? "Ready" : STATUS_LABEL[rowState];
+  const lastEventAt = session.depth === 0
+    ? session.family_last_event_at
     : session.last_event_at;
+  const timestamp = isRecent
+    ? session.completed_at ?? lastEventAt
+    : lastEventAt;
   const age = formatAge(Math.max(0, nowMs - timestamp));
   const prefix = width >= 32
     ? `${marker} ${glyph} ${status} · `
     : `${marker} ${glyph} `;
+  const indent = session.depth > 0
+    ? `${"  ".repeat(Math.min(session.depth - 1, 4))}↳ `
+    : "";
   const suffix = ` · ${age}`;
   const separator = " · ";
   const separatorWidth = Bun.stringWidth(separator);
-  const available = width - Bun.stringWidth(prefix) - Bun.stringWidth(suffix);
+  const available = width
+    - Bun.stringWidth(prefix)
+    - Bun.stringWidth(indent)
+    - Bun.stringWidth(suffix);
   if (available < separatorWidth + 2) {
     const compact = [
       `${marker} ${glyph} ${age}`,
@@ -454,9 +527,10 @@ function sessionLine(
   const activityWidth = Math.max(1, contentWidth - identityWidth);
   const plain = [
     prefix,
+    indent,
     truncate(sessionIdentity(session), identityWidth),
     separator,
-    truncate(session.label, activityWidth),
+    truncate(sessionActivity(session), activityWidth),
     suffix
   ].join("");
   return colorize(truncate(plain, width), color, STATUS_COLOR[displayState]);
@@ -467,10 +541,14 @@ function focusStatusLine(
   fallbackState: PetState,
   color: boolean
 ): string {
-  if (focus?.state === "idle" && focus.recently_completed) {
+  const state = focus ? effectivePetState(focus) : fallbackState;
+  if (focus && state === "idle" && focus.recently_completed) {
+    if (focus.outcome === "interrupted") {
+      return colorize(`${BOLD}× Interrupted${RESET}`, color, STATUS_COLOR.idle);
+    }
     return colorize(`${BOLD}✓ Ready recently${RESET}`, color, STATUS_COLOR.ready);
   }
-  return statusLine(focus?.state ?? fallbackState, color);
+  return statusLine(state, color);
 }
 
 function statusLine(state: PetState, color: boolean): string {
@@ -494,14 +572,34 @@ function sessionIdentity(session: PetFocus): string {
   const shortId = session.session_id.length <= 8
     ? session.session_id
     : session.session_id.slice(0, 8);
-  const projectAgent = [
-    session.project_label,
-    normalizeAgent(session.agent)
-  ].filter((value): value is string => Boolean(value)).join("/");
-  const identity = session.project_label
-    ? projectAgent
-    : session.title || projectAgent || session.provider || "session";
+  const agent = normalizeAgent(session.agent);
+  const identity = session.depth > 0
+    ? agent || session.title || session.provider || "agent"
+    : session.project_label || session.title || session.provider || "session";
   return `${identity} · ${shortId}`;
+}
+
+function sessionActivity(session: PetFocus): string {
+  if (session.depth !== 0 || session.descendant_count === 0) {
+    return session.label;
+  }
+
+  const parts = [formatCount(session.descendant_count, "agent")];
+  if (session.urgent_descendant_count > 0) {
+    parts.push(`${session.urgent_descendant_count} urgent`);
+  } else if (session.active_descendant_count > 0) {
+    parts.push(`${session.active_descendant_count} active`);
+  } else if (session.recent_descendant_count > 0) {
+    parts.push(`${session.recent_descendant_count} recent`);
+  }
+  if (session.state !== "idle") {
+    parts.push(session.label);
+  }
+  return parts.join(" · ");
+}
+
+function formatCount(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
 }
 
 function normalizeAgent(agent: string | undefined): string | undefined {
@@ -510,9 +608,11 @@ function normalizeAgent(agent: string | undefined): string | undefined {
 }
 
 function recentSessions(snapshot: PetSnapshot): PetFocus[] {
-  return snapshot.sessions.filter(
-    (session) => session.state === "idle" && session.recently_completed
-  );
+  return snapshot.sessions.filter(isRecentlyCompleted);
+}
+
+function isRecentlyCompleted(session: PetFocus): boolean {
+  return session.state === "idle" && session.recently_completed;
 }
 
 function activityLine(snapshot: PetSnapshot, meta: RenderMeta): string {

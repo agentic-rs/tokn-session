@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::event::PiSessionLine;
 use crate::normalize::PiNormalizer;
-use tokn_session_core::{LoadedSession, SessionRef};
+use tokn_session_core::{LoadedSession, SessionHistoryStatus, SessionRef};
 
 pub struct PiSessionSource {
   session_dir: Option<PathBuf>,
@@ -16,13 +16,21 @@ impl PiSessionSource {
   }
 
   pub fn list_sessions(&self) -> Result<Vec<SessionRef>, String> {
+    self.list_session_refs(inspect_session)
+  }
+
+  pub fn list_session_relations(&self) -> Result<Vec<SessionRef>, String> {
+    self.list_session_refs(inspect_session_header)
+  }
+
+  fn list_session_refs(&self, inspect: fn(&Path) -> Result<SessionRef, String>) -> Result<Vec<SessionRef>, String> {
     let mut sessions = Vec::new();
     let root = self.root()?;
     collect_jsonl_files(&root, &mut sessions)?;
 
     let mut refs = Vec::new();
     for path in sessions {
-      if let Ok(reference) = inspect_session(&path) {
+      if let Ok(reference) = inspect(&path) {
         refs.push(reference);
       }
     }
@@ -32,6 +40,10 @@ impl PiSessionSource {
 
   pub fn load_session(&self, id_or_path: &str) -> Result<LoadedSession, String> {
     let path = self.resolve_session(id_or_path)?;
+    self.load_session_path(&path)
+  }
+
+  pub fn load_session_path(&self, path: &Path) -> Result<LoadedSession, String> {
     let reference = inspect_session(&path)?;
     let file = File::open(&path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
     let reader = BufReader::new(file);
@@ -48,7 +60,11 @@ impl PiSessionSource {
       events.extend(normalizer.normalize(event));
     }
 
-    Ok(LoadedSession { reference, events })
+    Ok(LoadedSession {
+      reference,
+      events,
+      history_status: SessionHistoryStatus::Complete,
+    })
   }
 
   fn resolve_session(&self, id_or_path: &str) -> Result<PathBuf, String> {
@@ -98,11 +114,9 @@ fn collect_jsonl_files(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<(), Strin
 }
 
 fn inspect_session(path: &Path) -> Result<SessionRef, String> {
+  let mut reference = inspect_session_header(path)?;
   let file = File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
   let reader = BufReader::new(file);
-  let mut id = session_id_from_path(path);
-  let mut cwd = None;
-  let mut timestamp = None;
   let mut message_count = 0;
 
   for line in reader.lines() {
@@ -112,29 +126,81 @@ fn inspect_session(path: &Path) -> Result<SessionRef, String> {
     }
     let value: serde_json::Value =
       serde_json::from_str(&line).map_err(|err| format!("invalid pi jsonl at {}: {err}", path.display()))?;
-    match value.get("type").and_then(|value| value.as_str()) {
-      Some("session") => {
-        if let Some(value) = value.get("id").and_then(|value| value.as_str()) {
-          id = value.to_string();
-        }
-        cwd = value.get("cwd").and_then(|value| value.as_str()).map(str::to_string);
-        timestamp = value
-          .get("timestamp")
-          .and_then(|value| value.as_str())
-          .map(str::to_string);
-      }
-      Some("message") => message_count += 1,
-      _ => {}
+    if value.get("type").and_then(|value| value.as_str()) == Some("message") {
+      message_count += 1;
     }
   }
 
-  Ok(SessionRef {
-    id,
+  reference.message_count = message_count;
+  Ok(reference)
+}
+
+fn inspect_session_header(path: &Path) -> Result<SessionRef, String> {
+  let file = File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+  let reader = BufReader::new(file);
+  let mut reference = SessionRef {
+    id: session_id_from_path(path),
+    parent_session_id: None,
+    agent_path: None,
+    agent_nickname: None,
+    agent_role: None,
     path: path.to_path_buf(),
-    cwd,
-    timestamp,
-    message_count,
-  })
+    cwd: None,
+    timestamp: None,
+    message_count: 0,
+  };
+
+  for line in reader.lines() {
+    let line = line.map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    if line.trim().is_empty() {
+      continue;
+    }
+    let value: serde_json::Value =
+      serde_json::from_str(&line).map_err(|err| format!("invalid pi jsonl at {}: {err}", path.display()))?;
+    if value.get("type").and_then(|value| value.as_str()) != Some("session") {
+      continue;
+    }
+
+    if let Some(value) = value.get("id").and_then(|value| value.as_str()) {
+      reference.id = value.to_string();
+    }
+    reference.parent_session_id = value
+      .get("parentSession")
+      .and_then(|value| value.as_str())
+      .map(|parent| resolve_parent_session_id(path, parent));
+    reference.cwd = value.get("cwd").and_then(|value| value.as_str()).map(str::to_string);
+    reference.timestamp = value
+      .get("timestamp")
+      .and_then(|value| value.as_str())
+      .map(str::to_string);
+    break;
+  }
+
+  Ok(reference)
+}
+
+fn resolve_parent_session_id(session_path: &Path, parent: &str) -> String {
+  let parent_path = PathBuf::from(parent);
+  let parent_path = if parent_path.is_absolute() {
+    parent_path
+  } else {
+    session_path
+      .parent()
+      .map(|directory| directory.join(&parent_path))
+      .unwrap_or(parent_path)
+  };
+
+  let parent_id = File::open(&parent_path).ok().and_then(|file| {
+    BufReader::new(file).lines().map_while(Result::ok).find_map(|line| {
+      let value: serde_json::Value = serde_json::from_str(&line).ok()?;
+      if value.get("type").and_then(|value| value.as_str()) != Some("session") {
+        return None;
+      }
+      value.get("id").and_then(|value| value.as_str()).map(str::to_string)
+    })
+  });
+
+  parent_id.unwrap_or_else(|| session_id_from_path(&parent_path))
 }
 
 fn session_id_from_path(path: &Path) -> String {
@@ -143,4 +209,34 @@ fn session_id_from_path(path: &Path) -> String {
     .and_then(|value| value.to_str())
     .and_then(|stem| stem.rsplit_once('_').map(|(_, id)| id.to_string()))
     .unwrap_or_else(|| path.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn resolves_parent_session_path_to_parent_id() {
+    let reference = inspect_session(&fixtures_dir().join("tree_child.jsonl")).expect("fixture should be inspectable");
+
+    assert_eq!(reference.id, "pi-tree-child");
+    assert_eq!(reference.parent_session_id.as_deref(), Some("pi-tree-root"));
+  }
+
+  #[test]
+  fn relation_scan_reads_parent_without_counting_the_body() {
+    let source = PiSessionSource::new(Some(fixtures_dir()));
+    let references = source.list_session_relations().expect("fixture relations should load");
+    let reference = references
+      .iter()
+      .find(|reference| reference.id == "pi-tree-child")
+      .expect("tree child should be discovered");
+
+    assert_eq!(reference.parent_session_id.as_deref(), Some("pi-tree-root"));
+    assert_eq!(reference.message_count, 0);
+  }
+
+  fn fixtures_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
+  }
 }

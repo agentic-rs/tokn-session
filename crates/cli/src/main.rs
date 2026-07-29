@@ -1,10 +1,10 @@
 mod args;
 mod browser;
 
-use args::{AppendTarget, Command, Format};
+use args::{AppendTarget, Command, Format, ShowScope};
 use browser::{browse_session, browse_sessions};
 use tokn_session_client::{AgentClient, AppendAction, AppendSessionRequest, CreateSessionRequest};
-use tokn_session_render::{render_agent_jsonl, render_pretty, render_session_list};
+use tokn_session_render::{render_pretty, render_session_jsonl, render_session_list, render_session_tree};
 
 fn main() {
   if let Err(err) = run() {
@@ -33,12 +33,21 @@ fn run() -> Result<(), String> {
       source,
       session,
       format,
+      scope,
       session_dir,
     } => {
-      let loaded = AgentClient::load_session(source, session_dir, &session)?;
-      match format {
-        Format::Pretty => print!("{}", render_pretty(&loaded)),
-        Format::Jsonl => print!("{}", render_agent_jsonl(&loaded.events)?),
+      match scope {
+        ShowScope::SelfOnly => {
+          let loaded = AgentClient::load_session(source, session_dir, &session)?;
+          match format {
+            Format::Pretty => print!("{}", render_pretty(&loaded)),
+            Format::Jsonl => print!("{}", render_session_jsonl(&loaded)?),
+          }
+        }
+        ShowScope::Tree => {
+          let loaded = AgentClient::load_session_tree(source, session_dir, &session)?;
+          print!("{}", render_session_tree(&loaded));
+        }
       }
       Ok(())
     }

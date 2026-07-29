@@ -4,6 +4,7 @@ use serde_json::Value;
 #[derive(Debug)]
 pub struct OpenCodeSessionRow {
   pub id: String,
+  pub parent_id: Option<String>,
   pub directory: Option<String>,
   pub model: Option<Value>,
   pub time_created: Option<i64>,
