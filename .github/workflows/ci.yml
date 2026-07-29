@@ -62,3 +62,9 @@ jobs:
         run: |
           bun install --frozen-lockfile
           bun run check
+
+      - name: Check pet supervisor
+        working-directory: apps/pet
+        run: |
+          bun install --frozen-lockfile
+          bun run check

@@ -1,22 +1,18 @@
 {
-  "name": "@tokn/discord-pet",
+  "name": "@tokn/pet",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "exports": {
-    "./config": "./src/config.ts",
-    "./discord": "./src/discord.ts",
-    "./pet": "./src/pet.ts",
-    "./protocol": "./src/protocol.ts",
-    "./relay": "./src/relay.ts"
-  },
   "scripts": {
     "start": "bun src/main.ts",
-    "login": "bun src/main.ts login",
     "test": "bun test",
     "test:watch": "bun test --watch",
     "typecheck": "tsc --noEmit",
     "check": "bun run typecheck && bun test"
+  },
+  "dependencies": {
+    "@tokn/discord-pet": "file:../discord-pet",
+    "@tokn/terminal-pet": "file:../terminal-pet"
   },
   "devDependencies": {
     "@types/bun": "^1.3.13",

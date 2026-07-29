@@ -1,0 +1,10 @@
+version: 1
+
+workers:
+  terminal:
+    type: terminal
+    protocol: ansi
+    color: false
+
+rules:
+  - forward_to: [terminal]

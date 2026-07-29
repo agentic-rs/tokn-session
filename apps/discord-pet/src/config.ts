@@ -1,6 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, extname, join, resolve } from "node:path";
 
 import { asObject } from "./protocol";
 import { writeFileAtomically } from "./storage";
@@ -24,7 +24,13 @@ export function defaultConfigPath(): string {
 }
 
 export function statePath(configPath: string): string {
-  return join(dirname(resolve(configPath)), "discord-state.json");
+  const resolved = resolve(configPath);
+  const extension = extname(resolved);
+  const stem = basename(resolved, extension);
+  const filename = stem === "discord"
+    ? "discord-state.json"
+    : `${stem}-state.json`;
+  return join(dirname(resolved), filename);
 }
 
 export async function loadConfig(path: string): Promise<DiscordConfig> {

@@ -86,10 +86,12 @@ bun run start -- --codex-dir /path/to/codex --pi-dir /path/to/pi
 bun run start -- --config /path/to/discord.yaml
 ```
 
-Thread mappings are stored beside the configuration in `discord-state.json`,
-so later turns continue in the same Discord thread after a restart. Long
-messages are split using Discord's UTF-16 limits, all mentions are disabled,
-and transient API errors and rate limits are retried.
+Thread mappings are stored beside the configuration, so later turns continue
+in the same Discord thread after a restart. The default `discord.yaml` uses
+`discord-state.json`; named configs such as `discord-team.yaml` use
+`discord-team-state.json`. Long messages are split using Discord's UTF-16
+limits, all mentions are disabled, and transient API errors and rate limits
+are retried.
 
 ## Verify
 

@@ -107,6 +107,9 @@ describe("config", () => {
 
   test("keeps state beside a custom config", () => {
     expect(statePath("/tmp/pet/custom.yaml")).toBe(
+      "/tmp/pet/custom-state.json"
+    );
+    expect(statePath("/tmp/pet/discord.yaml")).toBe(
       "/tmp/pet/discord-state.json"
     );
   });

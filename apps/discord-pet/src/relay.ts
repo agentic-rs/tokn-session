@@ -8,6 +8,8 @@ export interface RelayOptions {
   relay_bin?: string;
   codex_dir?: string;
   pi_dir?: string;
+  signal?: AbortSignal;
+  diagnostics?: "inherit" | "discard";
 }
 
 interface RelayChild {
@@ -31,10 +33,18 @@ export async function followRelay(
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
   process.once("SIGHUP", stop);
+  options.signal?.addEventListener("abort", stop, { once: true });
+  if (options.signal?.aborted) {
+    stop();
+  }
 
   try {
     const diagnostics = child
-      ? copyDiagnostics(child.process.stderr, abort.signal)
+      ? copyDiagnostics(
+        child.process.stderr,
+        abort.signal,
+        options.diagnostics ?? "inherit"
+      )
       : Promise.resolve();
     const decoder = new JsonlDecoder(parseRelayEvent);
     await consumeJsonl(stream, decoder, onEvent, abort.signal);
@@ -56,6 +66,7 @@ export async function followRelay(
     process.off("SIGINT", stop);
     process.off("SIGTERM", stop);
     process.off("SIGHUP", stop);
+    options.signal?.removeEventListener("abort", stop);
     if (child?.process.exitCode === null) {
       await Promise.race([child.process.exited, Bun.sleep(1_000)]);
       if (child.process.exitCode === null) {
@@ -116,7 +127,8 @@ function spawnRelay(options: RelayOptions): RelayChild {
 
 async function copyDiagnostics(
   stream: ReadableStream<Uint8Array>,
-  signal: AbortSignal
+  signal: AbortSignal,
+  mode: "inherit" | "discard"
 ): Promise<void> {
   const reader = stream.getReader();
   const cancel = (): void => {
@@ -129,7 +141,9 @@ async function copyDiagnostics(
       if (result.done) {
         return;
       }
-      process.stderr.write(result.value);
+      if (mode === "inherit") {
+        process.stderr.write(result.value);
+      }
     }
   } finally {
     signal.removeEventListener("abort", cancel);
