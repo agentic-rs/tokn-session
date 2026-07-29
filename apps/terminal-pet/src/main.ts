@@ -13,7 +13,13 @@ import { loadPetArt, selectPose } from "./art";
 import { consumeJsonl, JsonlDecoder } from "./jsonl";
 import { parseRelayEvent, type RelayEvent } from "./protocol";
 import { renderScreen, type RenderMeta } from "./renderer";
-import { PET_STATES, PetStore, type PetSnapshot, type PetState } from "./state";
+import {
+  PET_STATES,
+  PetStore,
+  type PetFocus,
+  type PetSnapshot,
+  type PetState
+} from "./state";
 import { TerminalSurface } from "./terminal";
 
 type RunMode = "relay" | "stdin" | "demo" | "snapshot";
@@ -95,7 +101,8 @@ async function runInteractive(runOptions: Options): Promise<void> {
       rows: process.stdout.rows ?? 24,
       color: runOptions.color,
       image_protocol: imageProtocol,
-      name: runOptions.name
+      name: runOptions.name,
+      now_ms: nowMs
     });
     surface.render(screen.lines);
     if (screen.image_anchor) {
@@ -205,6 +212,9 @@ async function runInteractive(runOptions: Options): Promise<void> {
         await child.process.exited;
       }
     }
+    if (meta.diagnostic) {
+      process.stderr.write(`${sanitizeDiagnostic(meta.diagnostic)}\n`);
+    }
     process.exitCode = exitCode;
   }
 }
@@ -283,7 +293,8 @@ function writeSnapshot(runOptions: Options): void {
     rows: 22,
     color: runOptions.color,
     image_protocol: "ansi",
-    name: runOptions.name
+    name: runOptions.name,
+    now_ms: nowMs
   });
   const output = trimBlankLines(screen.lines).join("\n");
   process.stdout.write(`${output}\n`);
@@ -305,22 +316,64 @@ function demoSnapshot(startedAt: number, nowMs: number): PetSnapshot {
 }
 
 function syntheticSnapshot(state: PetState, stateChangedAt: number): PetSnapshot {
-  return {
+  const completedAt = state === "ready"
+    ? stateChangedAt
+    : undefined;
+  const primary: PetFocus = {
+    topic: "codex.demo",
     state,
     state_changed_at: stateChangedAt,
-    active_sessions: state === "idle" ? 0 : 1,
-    total_sessions: 1,
-    focus: {
-      topic: "codex.demo",
-      state,
-      state_changed_at: stateChangedAt,
-      last_event_at: stateChangedAt,
-      label: demoLabel(state),
-      provider: "codex",
-      project: "tokn-agent",
-      session_id: "demo",
-      agent: "root"
-    }
+    last_event_at: stateChangedAt,
+    label: demoLabel(state),
+    provider: "codex",
+    project: "tokn-agent",
+    title: "Terminal pet roster",
+    session_id: "demo",
+    agent: "root",
+    completed_at: completedAt,
+    recently_completed: completedAt !== undefined
+  };
+  const recent: PetFocus = {
+    topic: "codex.recent",
+    state: "idle",
+    state_changed_at: stateChangedAt - 45_000,
+    last_event_at: stateChangedAt - 45_000,
+    label: "Updated the Relay documentation",
+    provider: "codex",
+    project: "tokn-agent",
+    title: "Document Relay events",
+    session_id: "recent",
+    agent: "docs",
+    completed_at: stateChangedAt - 45_000,
+    recently_completed: true
+  };
+  const sessions = state === "idle"
+    ? [recent]
+    : [
+        primary,
+        {
+          topic: "pi.worker",
+          state: "running",
+          state_changed_at: stateChangedAt - 8_000,
+          last_event_at: stateChangedAt - 1_000,
+          label: "Running the provider test suite",
+          provider: "pi",
+          project: "tokn-agent",
+          title: "Verify Pi sessions",
+          session_id: "worker",
+          agent: "worker",
+          recently_completed: false
+        } satisfies PetFocus,
+        recent
+      ];
+  const focus = state === "idle" ? recent : primary;
+  return {
+    state: focus.state,
+    state_changed_at: focus.state_changed_at,
+    active_sessions: state === "idle" ? 0 : 2,
+    total_sessions: 3,
+    sessions,
+    focus
   };
 }
 
@@ -442,4 +495,12 @@ function trimBlankLines(lines: string[]): string[] {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function sanitizeDiagnostic(value: string): string {
+  return Bun
+    .stripANSI(value)
+    .replaceAll(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "")
+    .replaceAll(/\s+/g, " ")
+    .trim();
 }

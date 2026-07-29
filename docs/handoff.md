@@ -91,16 +91,26 @@ that can be retried are returned as warnings in `TailUpdate`.
 ## Terminal Pet
 
 `apps/terminal-pet` is a Bun/TypeScript prototype that consumes Relay JSONL and
-shows one global terminal companion. It builds the workspace Relay once if
-needed, then spawns `tokn-session-relay stdout --format json`, or accepts an
-existing stream with `--stdin`.
+shows one graphical terminal companion beside a multi-session roster. It
+builds the workspace Relay once if needed, then spawns
+`tokn-session-relay stdout --format json`, or accepts an existing stream with
+`--stdin`.
 
-The reducer keeps state per Relay topic, then selects one session using
-`needs_input > blocked > ready > running > idle`. It currently derives these
-states from normalized messages, reasoning, tool calls, errors, goals, and
-preserved input-request events. Codex task start/complete lifecycle records are
-still dropped by the normalizer, so the reducer uses leases and a short ready
-debounce instead of claiming authoritative runtime status.
+The reducer keeps state per Relay topic and returns every active session using
+`needs_input > blocked > ready > running > idle`, followed by idle sessions
+that were inferred Ready in the last five minutes. The highest-priority entry
+drives the large pet; responsive text rows keep concurrent and recent sessions
+visible, with an explicit `+N more` row when the terminal cannot fit them all.
+Wide terminals show the art and roster side by side, while narrow terminals
+become roster-only.
+
+States currently derive from normalized messages, reasoning, tool calls,
+errors, goals, and preserved input-request events. Codex task start/complete
+lifecycle records are still dropped by the normalizer, so the reducer uses
+leases and a short ready debounce instead of claiming authoritative runtime
+status. The recent-Ready roster is explicitly an observed-run heuristic, not an
+authoritative completion log. It includes only work seen while the pet is
+running because Relay seeds existing session files from their snapshotted EOF.
 
 Rendering uses Kitty graphics where available, the Kitty local-file protocol
 in iTerm2 3.6+, and a truecolor ANSI half-block fallback. `bun run dev` cycles

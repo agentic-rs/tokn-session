@@ -21,6 +21,7 @@ export type PetState = typeof PET_STATES[number];
 export interface PetPolicy {
   ready_debounce_ms: number;
   ready_hold_ms: number;
+  recent_completion_ms: number;
   error_grace_ms: number;
   running_lease_ms: number;
   open_tool_lease_ms: number;
@@ -36,8 +37,11 @@ export interface PetFocus {
   label: string;
   provider?: string;
   project?: string;
+  title?: string;
   session_id: string;
   agent?: string;
+  completed_at?: number;
+  recently_completed: boolean;
 }
 
 export interface PetSnapshot {
@@ -45,6 +49,7 @@ export interface PetSnapshot {
   state_changed_at: number;
   active_sessions: number;
   total_sessions: number;
+  sessions: PetFocus[];
   focus?: PetFocus;
 }
 
@@ -56,6 +61,7 @@ interface SessionActivity {
   running_until: number;
   ready_after?: number;
   ready_until?: number;
+  completed_at?: number;
   blocked_after?: number;
   blocked_until?: number;
   open_tools: Map<string, number>;
@@ -65,6 +71,7 @@ interface SessionActivity {
 const DEFAULT_POLICY: PetPolicy = {
   ready_debounce_ms: 750,
   ready_hold_ms: 30_000,
+  recent_completion_ms: 5 * 60_000,
   error_grace_ms: 1_500,
   running_lease_ms: 3 * 60_000,
   open_tool_lease_ms: 30 * 60_000,
@@ -129,36 +136,34 @@ export class PetStore {
       this.#expireLeases(activity, nowMs);
       return this.#focusFor(activity, nowMs);
     });
-    candidates.sort((left, right) => {
-      const priority = STATE_PRIORITY[right.state] - STATE_PRIORITY[left.state];
-      return priority !== 0
-        ? priority
-        : right.state_changed_at - left.state_changed_at;
-    });
-
-    const focus = candidates[0];
-    const activeSessions = candidates.filter((candidate) => candidate.state !== "idle").length;
+    const active = candidates
+      .filter((candidate) => candidate.state !== "idle")
+      .sort(compareActiveSessions);
+    const recent = candidates
+      .filter((candidate) => candidate.state === "idle" && candidate.recently_completed)
+      .sort(compareRecentCompletions);
+    const sessions = [...active, ...recent];
+    const focus = sessions[0];
     return {
       state: focus?.state ?? "idle",
       state_changed_at: focus?.state_changed_at ?? nowMs,
-      active_sessions: activeSessions,
+      active_sessions: active.length,
       total_sessions: candidates.length,
+      sessions,
       focus
     };
   }
 
   acknowledge(topic?: string): void {
-    const nowMs = Date.now();
     const targets = topic
       ? [this.sessions.get(topic)].filter((value): value is SessionActivity => Boolean(value))
       : [...this.sessions.values()];
     for (const activity of targets) {
       activity.ready_after = undefined;
       activity.ready_until = undefined;
+      activity.completed_at = undefined;
       activity.blocked_after = undefined;
       activity.blocked_until = undefined;
-      activity.pending_interactions.clear();
-      activity.running_until = Math.min(activity.running_until, nowMs);
     }
   }
 
@@ -166,6 +171,7 @@ export class PetStore {
     switch (event.type) {
       case "session_started":
         activity.running_until = nowMs;
+        activity.completed_at = undefined;
         return;
       case "message":
         this.#applyMessage(activity, event, nowMs);
@@ -179,6 +185,7 @@ export class PetStore {
       case "error":
         activity.ready_after = undefined;
         activity.ready_until = undefined;
+        activity.completed_at = undefined;
         activity.blocked_after = nowMs + this.policy.error_grace_ms;
         activity.blocked_until = activity.blocked_after + this.policy.blocked_lease_ms;
         return;
@@ -205,9 +212,9 @@ export class PetStore {
     if (role === "assistant" && phase === "finished") {
       activity.blocked_after = undefined;
       activity.blocked_until = undefined;
-      activity.pending_interactions.clear();
       activity.ready_after = nowMs + this.policy.ready_debounce_ms;
       activity.ready_until = activity.ready_after + this.policy.ready_hold_ms;
+      activity.completed_at = undefined;
       activity.running_until = activity.ready_after;
       return;
     }
@@ -291,9 +298,9 @@ export class PetStore {
     activity.running_until = nowMs + this.policy.running_lease_ms;
     activity.ready_after = undefined;
     activity.ready_until = undefined;
+    activity.completed_at = undefined;
     activity.blocked_after = undefined;
     activity.blocked_until = undefined;
-    activity.pending_interactions.clear();
   }
 
   #markReady(activity: SessionActivity, nowMs: number): void {
@@ -303,12 +310,14 @@ export class PetStore {
     activity.blocked_until = undefined;
     activity.ready_after = nowMs;
     activity.ready_until = nowMs + this.policy.ready_hold_ms;
+    activity.completed_at = undefined;
     activity.running_until = nowMs;
   }
 
   #markBlocked(activity: SessionActivity, nowMs: number): void {
     activity.ready_after = undefined;
     activity.ready_until = undefined;
+    activity.completed_at = undefined;
     activity.blocked_after = nowMs;
     activity.blocked_until = nowMs + this.policy.blocked_lease_ms;
     activity.running_until = nowMs;
@@ -337,6 +346,7 @@ export class PetStore {
     activity.pending_interactions.set(interactionKey, nowMs + lease);
     activity.ready_after = undefined;
     activity.ready_until = undefined;
+    activity.completed_at = undefined;
     activity.blocked_after = undefined;
     activity.blocked_until = undefined;
     activity.running_until = Math.max(activity.running_until, nowMs);
@@ -347,6 +357,7 @@ export class PetStore {
     activity.pending_interactions.clear();
     activity.ready_after = undefined;
     activity.ready_until = undefined;
+    activity.completed_at = undefined;
     activity.blocked_after = undefined;
     activity.blocked_until = undefined;
     activity.running_until = nowMs;
@@ -362,6 +373,15 @@ export class PetStore {
       if (expiresAt <= nowMs) {
         activity.pending_interactions.delete(key);
       }
+    }
+    if (
+      activity.completed_at === undefined
+      && activity.ready_after !== undefined
+      && activity.ready_after <= nowMs
+      && activity.open_tools.size === 0
+      && activity.pending_interactions.size === 0
+    ) {
+      activity.completed_at = activity.ready_after;
     }
     if (activity.ready_until !== undefined && activity.ready_until <= nowMs) {
       activity.ready_after = undefined;
@@ -399,6 +419,8 @@ export class PetStore {
     } else if (activity.open_tools.size > 0 || activity.running_until > nowMs) {
       state = "running";
     }
+    const recentlyCompleted = activity.completed_at !== undefined
+      && nowMs < activity.completed_at + this.policy.recent_completion_ms;
 
     return {
       topic: activity.topic,
@@ -408,12 +430,37 @@ export class PetStore {
       label: activity.label,
       provider: activity.session.provider,
       project: activity.session.project?.name ?? undefined,
+      title: activity.session.title ?? undefined,
       session_id: activity.session.session_id,
       agent: activity.session.agent_nickname
         ?? activity.session.agent_path
-        ?? undefined
+        ?? undefined,
+      completed_at: activity.completed_at,
+      recently_completed: recentlyCompleted
     };
   }
+}
+
+function compareActiveSessions(left: PetFocus, right: PetFocus): number {
+  const priority = STATE_PRIORITY[right.state] - STATE_PRIORITY[left.state];
+  if (priority !== 0) {
+    return priority;
+  }
+  const stateRecency = right.state_changed_at - left.state_changed_at;
+  if (stateRecency !== 0) {
+    return stateRecency;
+  }
+  const eventRecency = right.last_event_at - left.last_event_at;
+  return eventRecency !== 0 ? eventRecency : compareTopics(left.topic, right.topic);
+}
+
+function compareRecentCompletions(left: PetFocus, right: PetFocus): number {
+  const recency = (right.completed_at ?? 0) - (left.completed_at ?? 0);
+  return recency !== 0 ? recency : compareTopics(left.topic, right.topic);
+}
+
+function compareTopics(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function newSessionActivity(relay: RelayEvent, nowMs: number): SessionActivity {

@@ -11,8 +11,11 @@ It follows the Codex pet state vocabulary:
 - `blocked`
 - `idle` when no current state lease is active
 
-The pet keeps one state per Relay topic, then displays the highest-priority
-session. Priority is `needs_input`, `blocked`, `ready`, then `running`.
+The pet keeps one state per Relay topic. Its roster shows every active session
+that fits, followed by sessions inferred Ready during the last five minutes.
+The highest-priority session still drives the large pet and appears first.
+Priority is `needs_input`, `blocked`, `ready`, then `running`; overflow is
+reported as a `+N more` row instead of silently disappearing.
 
 ## Run
 
@@ -45,7 +48,8 @@ bun run dev
 bun run snapshot
 ```
 
-`dev` cycles through every state and reloads when TypeScript changes.
+`dev` cycles through every state with multiple active and recent demo sessions,
+then reloads when TypeScript changes.
 
 ## Rendering
 
@@ -53,6 +57,11 @@ The app automatically uses Kitty graphics in Kitty, Ghostty, and WezTerm, and
 the Kitty local-file protocol in iTerm2 3.6 or newer. It falls back to truecolor
 ANSI half-block pixels elsewhere. Image output is disabled inside tmux and
 Zellij; the explicit Kitty overrides do not bypass that safety fallback.
+
+Wide terminals use one graphical pet beside the session roster. Narrow
+terminals suppress the artwork and spend the available rows on the roster.
+Each row includes a state glyph, session identity, latest activity, and age, so
+the display remains useful without color.
 
 Override detection with:
 
@@ -68,6 +77,13 @@ Relay does not yet normalize Codex `task_started` and `task_complete` records,
 so this prototype derives status from messages, tool calls, reasoning, errors,
 goals, and preserved input-request events. The reducer is deliberately isolated
 in `src/state.ts` so explicit lifecycle events can replace those heuristics.
+
+Recently Ready work stays in the roster for five minutes, or until `c`
+acknowledges the focused notification. This is observed-run history, not an
+authoritative provider completion log: an assistant message finishing or a
+goal reporting completion is used as a fallback signal. Relay starts existing
+files at their snapshotted EOF, so the pet does not reconstruct earlier
+completion history at startup.
 
 ## Artwork
 
