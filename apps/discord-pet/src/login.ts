@@ -45,7 +45,10 @@ export async function login(
     ?? new DiscordClient(config.bot_token);
   process.stdout.write("\nValidating the bot token and destination with Discord…\n");
   const username = await client.validateDestination(config.guild_id, config.channel_id);
-  await saveConfig(configPath, config);
+  await saveConfig(configPath, {
+    ...config,
+    bot_username: username
+  });
   process.stdout.write(`Authenticated as @${username}.\n`);
   process.stdout.write(`Saved protected configuration to ${configPath}.\n`);
 }

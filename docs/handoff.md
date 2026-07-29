@@ -120,8 +120,9 @@ first walks through Guild Install and waits for the bot to appear in the server,
 then prints where to obtain the bot token and Discord IDs. It hides token input,
 asks before replacing an existing file, validates that the authenticated bot
 can access the channel and that the channel belongs to the configured guild,
-then writes the YAML with owner-only permissions. `--config` overrides its
-destination.
+then writes the YAML with owner-only permissions. The validated identity is
+also recorded as optional `bot_username`; configs created before that field
+remain valid. `--config` overrides the destination.
 
 Existing files start at their snapshotted EOF. Newly discovered files use the
 relay's three-message replay window so the first prompt is not missed. See

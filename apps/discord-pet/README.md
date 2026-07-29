@@ -38,7 +38,11 @@ The resulting file has this shape:
 bot_token: "replace-with-the-bot-token"
 guild_id: "123456789012345678"
 channel_id: "234567890123456789"
+bot_username: "validated-bot-name"
 ```
+
+`bot_username` records the identity returned by Discord during login. Older
+configuration files without it remain valid.
 
 Use a custom location when needed:
 

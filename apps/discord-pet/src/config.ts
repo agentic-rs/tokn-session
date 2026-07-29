@@ -9,12 +9,14 @@ export interface DiscordConfig {
   bot_token: string;
   guild_id: string;
   channel_id: string;
+  bot_username?: string;
 }
 
 const CONFIG_FIELDS = new Set([
   "bot_token",
   "guild_id",
-  "channel_id"
+  "channel_id",
+  "bot_username"
 ]);
 
 export function defaultConfigPath(): string {
@@ -51,11 +53,14 @@ export function parseConfig(value: unknown): DiscordConfig {
   if (unknownFields.length > 0) {
     throw new Error(`Discord pet config contains unknown field \`${unknownFields[0]}\``);
   }
-  const config = {
+  const config: DiscordConfig = {
     bot_token: stringField(record.bot_token, "bot_token"),
     guild_id: stringField(record.guild_id, "guild_id"),
     channel_id: stringField(record.channel_id, "channel_id")
   };
+  if (record.bot_username !== undefined) {
+    config.bot_username = stringField(record.bot_username, "bot_username");
+  }
   validateConfig(config);
   return config;
 }
@@ -66,16 +71,22 @@ export function validateConfig(config: DiscordConfig): void {
   }
   validateSnowflake("guild_id", config.guild_id);
   validateSnowflake("channel_id", config.channel_id);
+  if (config.bot_username !== undefined && config.bot_username.length === 0) {
+    throw new Error("Discord pet config `bot_username` must not be empty");
+  }
 }
 
 export async function saveConfig(path: string, config: DiscordConfig): Promise<void> {
   validateConfig(config);
-  const yaml = [
+  const lines = [
     `bot_token: ${JSON.stringify(config.bot_token)}`,
     `guild_id: ${JSON.stringify(config.guild_id)}`,
-    `channel_id: ${JSON.stringify(config.channel_id)}`,
-    ""
-  ].join("\n");
+    `channel_id: ${JSON.stringify(config.channel_id)}`
+  ];
+  if (config.bot_username !== undefined) {
+    lines.push(`bot_username: ${JSON.stringify(config.bot_username)}`);
+  }
+  const yaml = [...lines, ""].join("\n");
   await writeFileAtomically(path, yaml);
 }
 

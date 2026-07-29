@@ -56,15 +56,20 @@ describe("config", () => {
     await saveConfig(path, {
       bot_token: "secret:#token",
       guild_id: "123",
-      channel_id: "456"
+      channel_id: "456",
+      bot_username: "session-pet"
     });
 
     expect(await loadConfig(path)).toEqual({
       bot_token: "secret:#token",
       guild_id: "123",
-      channel_id: "456"
+      channel_id: "456",
+      bot_username: "session-pet"
     });
     expect(await readFile(path, "utf8")).toContain("bot_token:");
+    expect(await readFile(path, "utf8")).toContain(
+      'bot_username: "session-pet"'
+    );
     if (process.platform !== "win32") {
       expect((await stat(path)).mode & 0o777).toBe(0o600);
     }
@@ -86,6 +91,18 @@ describe("config", () => {
     });
 
     expect((await stat(path)).mode & 0o777).toBe(0o600);
+  });
+
+  test("keeps bot_username optional for older configs", async () => {
+    expect(parseConfig({
+      bot_token: "secret",
+      guild_id: "123",
+      channel_id: "456"
+    })).toEqual({
+      bot_token: "secret",
+      guild_id: "123",
+      channel_id: "456"
+    });
   });
 
   test("keeps state beside a custom config", () => {

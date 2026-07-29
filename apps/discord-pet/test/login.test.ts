@@ -70,7 +70,8 @@ describe("login", () => {
     expect(await loadConfig(path)).toEqual({
       bot_token: "secret",
       guild_id: "123",
-      channel_id: "456"
+      channel_id: "456",
+      bot_username: "pet"
     });
   });
 });
