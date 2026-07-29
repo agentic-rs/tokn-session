@@ -99,6 +99,128 @@ describe("renderer", () => {
     expect(output).toContain("1 recent");
   });
 
+  test("aligns roster columns across status and text widths", async () => {
+    const art = await loadPetArt();
+    const root = petFocus({
+      topic: "codex.root",
+      session_id: "root",
+      state: "idle",
+      family_state: "needs_input",
+      root_topic: "codex.root",
+      descendant_count: 5,
+      active_descendant_count: 3,
+      urgent_descendant_count: 2,
+      recent_descendant_count: 2
+    });
+    const children = [
+      petFocus({
+        topic: "codex.runner",
+        session_id: "runner",
+        root_topic: root.topic,
+        parent_topic: root.topic,
+        depth: 1,
+        agent: "Runner",
+        label: "Running task",
+        last_event_at: 10_000
+      }),
+      petFocus({
+        topic: "codex.approver",
+        session_id: "approver",
+        root_topic: root.topic,
+        parent_topic: root.topic,
+        depth: 1,
+        state: "needs_input",
+        family_state: "needs_input",
+        agent: "Approver",
+        label: "Approval required",
+        last_event_at: 1_000
+      }),
+      petFocus({
+        topic: "codex.blocker",
+        session_id: "blocker",
+        root_topic: root.topic,
+        parent_topic: root.topic,
+        depth: 1,
+        state: "blocked",
+        family_state: "blocked",
+        agent: "Blocker",
+        label: "Blocked on dependency",
+        last_event_at: -5_000
+      }),
+      petFocus({
+        topic: "codex.writer",
+        session_id: "writer",
+        root_topic: root.topic,
+        parent_topic: root.topic,
+        depth: 1,
+        state: "idle",
+        family_state: "idle",
+        agent: "作家",
+        label: "Release notes written",
+        completed_at: 0,
+        recently_completed: true,
+        outcome: "completed"
+      }),
+      petFocus({
+        topic: "codex.reviewer",
+        session_id: "reviewer",
+        root_topic: root.topic,
+        parent_topic: root.topic,
+        depth: 1,
+        state: "idle",
+        family_state: "idle",
+        agent: "Reviewer",
+        label: "Review stopped",
+        completed_at: -110_000,
+        recently_completed: true,
+        outcome: "interrupted"
+      })
+    ];
+    const snapshot = petSnapshot([root, ...children]);
+    snapshot.focus = children[0];
+    const screen = renderScreen(snapshot, art.running.ansi, {
+      source_label: "test"
+    }, {
+      columns: 120,
+      rows: 24,
+      color: true,
+      image_protocol: "ansi",
+      name: "Hachiware",
+      now_ms: 10_000
+    });
+
+    const identityColumns = [
+      "tokn-agent · root",
+      "↳ Runner",
+      "↳ Approver",
+      "↳ Blocker",
+      "↳ 作家",
+      "↳ Reviewer"
+    ].map((identity) => screenColumn(screen.lines, identity));
+    const activityColumns = [
+      "5 agents · 2 urgent",
+      "Running task",
+      "Approval required",
+      "Blocked on dependency",
+      "Release notes written",
+      "Review stopped"
+    ].map((activity) => screenColumn(screen.lines, activity));
+    const rowEndColumns = [
+      "tokn-agent · root",
+      "↳ Runner",
+      "↳ Approver",
+      "↳ Blocker",
+      "↳ 作家",
+      "↳ Reviewer"
+    ].map((identity) => screenEndColumn(screen.lines, identity));
+
+    expect(new Set(identityColumns).size).toBe(1);
+    expect(new Set(activityColumns).size).toBe(1);
+    expect(new Set(rowEndColumns).size).toBe(1);
+    expect(screen.lines.join("\n")).toContain("\u001b");
+    expect(screen.lines.every((line) => Bun.stringWidth(line) <= 120)).toBe(true);
+  });
+
   test("renders each root as a project family with indented agents", async () => {
     const art = await loadPetArt();
     const root = petFocus({
@@ -321,10 +443,10 @@ describe("renderer", () => {
 
     expect(output).toContain("RECENT 2");
     expect(output).toContain("2 agents · 2 recent");
-    expect(output).toContain("✓ Ready · ↳ Writer");
+    expect(output).toMatch(/✓ Ready\s+· ↳ Writer/);
     expect(output).toContain("× Interrupted · ↳ Reviewer");
     expect(output.match(/× Interrupted/g)).toHaveLength(2);
-    expect(output).not.toContain("! Blocked · ↳ Reviewer");
+    expect(output).not.toContain("! Blocked");
     expect(output).not.toContain("✓ Ready recently");
   });
 
@@ -655,4 +777,20 @@ function petSnapshot(sessions: PetFocus[], totalSessions = sessions.length): Pet
 
 function screenLine(output: string, content: string): string {
   return output.split("\n").find((line) => line.includes(content)) ?? "";
+}
+
+function screenColumn(lines: string[], content: string): number {
+  const line = lines
+    .map((candidate) => Bun.stripANSI(candidate))
+    .find((candidate) => candidate.includes(content));
+  expect(line).toBeDefined();
+  return Bun.stringWidth(line!.slice(0, line!.indexOf(content)));
+}
+
+function screenEndColumn(lines: string[], content: string): number {
+  const line = lines
+    .map((candidate) => Bun.stripANSI(candidate))
+    .find((candidate) => candidate.includes(content));
+  expect(line).toBeDefined();
+  return Bun.stringWidth(line!.trimEnd());
 }
