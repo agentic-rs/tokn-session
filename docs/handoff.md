@@ -99,10 +99,12 @@ builds the workspace Relay once if needed, then spawns
 The reducer keeps state per Relay topic and returns every active session using
 `needs_input > blocked > ready > running > idle`, followed by idle sessions
 that were inferred Ready in the last five minutes. The highest-priority entry
-drives the large pet; responsive text rows keep concurrent and recent sessions
-visible, with an explicit `+N more` row when the terminal cannot fit them all.
-Wide terminals show the art and roster side by side, while narrow terminals
-become roster-only.
+drives the large pet in automatic mode. Up/Down or `j`/`k` selects another
+session by topic, `a` restores automatic focus, and `c` acknowledges the
+selected notification. Responsive text rows keep concurrent and recent
+sessions visible; overflow windows around a manual selection so it cannot
+disappear off-screen. Wide terminals show the art and roster side by side,
+while narrow terminals become roster-only.
 
 States currently derive from normalized messages, reasoning, tool calls,
 errors, goals, and preserved input-request events. Codex task start/complete

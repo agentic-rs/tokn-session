@@ -39,6 +39,8 @@ export interface RenderMeta {
   source_label: string;
   diagnostic?: string;
   stats?: JsonlStats;
+  control_mode?: "relay" | "demo" | "signal_only" | "none";
+  focus_mode?: "auto" | "manual";
 }
 
 export interface RenderOptions {
@@ -62,6 +64,13 @@ interface RenderBody {
 
 interface RosterLine {
   line: string;
+}
+
+interface SessionWindow {
+  sessions: PetFocus[];
+  hidden_before: number;
+  hidden_after: number;
+  hidden_urgent: number;
 }
 
 export function renderScreen(
@@ -187,7 +196,7 @@ function renderWide(
     contentWidth
   ));
   lines.push(padRight(
-    dim(truncate("q quit  ·  c clear focused notification", contentWidth), options.color),
+    dim(truncate(controlLine(meta), contentWidth), options.color),
     contentWidth
   ));
 
@@ -229,10 +238,7 @@ function renderList(
     ));
   }
   lines.push(dim(truncate(activityLine(snapshot, meta), contentWidth), options.color));
-  lines.push(dim(
-    truncate("q quit  ·  c clear focused notification", contentWidth),
-    options.color
-  ));
+  lines.push(dim(truncate(controlLine(meta), contentWidth), options.color));
   return { lines };
 }
 
@@ -244,7 +250,18 @@ function renderTiny(
   const contentWidth = Math.max(1, options.columns);
   const recent = recentSessions(snapshot).length;
   const focus = snapshot.focus;
-  const summary = `${options.name} · ${snapshot.active_sessions}a · ${recent}r`;
+  const hiddenUrgent = snapshot.sessions.filter((session) => (
+    session.topic !== focus?.topic && isUrgent(session)
+  )).length;
+  const summaryParts: string[] = [];
+  if (hiddenUrgent > 0) {
+    summaryParts.push(`! ${hiddenUrgent} urgent hidden`);
+  }
+  if (meta.focus_mode === "manual") {
+    summaryParts.push("focus MANUAL");
+  }
+  summaryParts.push(options.name, `${snapshot.active_sessions}a`, `${recent}r`);
+  const summary = summaryParts.join(" · ");
   const lines = [
     colorize(`${BOLD}${truncate(summary, contentWidth)}${RESET}`, options.color),
     focus
@@ -300,21 +317,78 @@ function rosterLines(
     ));
   }
   if (maxRows <= 1) {
-    return [dim(truncate(`… +${snapshot.sessions.length} more`, width), color)];
+    const focus = snapshot.focus ?? snapshot.sessions[0];
+    return focus
+      ? [sessionLine(focus, snapshot.focus?.topic, width, nowMs, color)]
+      : [];
   }
 
-  const visible = snapshot.sessions.slice(0, maxRows - 1);
-  const hidden = Math.max(0, snapshot.sessions.length - visible.length);
+  const window = sessionWindow(snapshot, maxRows - 1);
   return [
-    ...visible.map((session) => sessionLine(
+    ...window.sessions.map((session) => sessionLine(
       session,
       snapshot.focus?.topic,
       width,
       nowMs,
       color
     )),
-    dim(truncate(`… +${hidden} more`, width), color)
+    dim(truncate(overflowLine(window), width), color)
   ];
+}
+
+function sessionWindow(
+  snapshot: PetSnapshot,
+  limit: number
+): SessionWindow {
+  const focusIndex = snapshot.focus
+    ? snapshot.sessions.findIndex((session) => session.topic === snapshot.focus?.topic)
+    : -1;
+  const desiredStart = focusIndex < 0
+    ? 0
+    : focusIndex - Math.floor(limit / 2);
+  const maxStart = Math.max(0, snapshot.sessions.length - limit);
+  const start = Math.max(0, Math.min(desiredStart, maxStart));
+  const sessions = snapshot.sessions.slice(start, start + limit);
+  const hidden = [
+    ...snapshot.sessions.slice(0, start),
+    ...snapshot.sessions.slice(start + sessions.length)
+  ];
+  return {
+    sessions,
+    hidden_before: start,
+    hidden_after: Math.max(0, snapshot.sessions.length - start - sessions.length),
+    hidden_urgent: hidden.filter(isUrgent).length
+  };
+}
+
+function overflowLine(window: SessionWindow): string {
+  const prefix = window.hidden_urgent > 0
+    ? `! ${window.hidden_urgent} urgent hidden · `
+    : "";
+  if (window.hidden_before > 0 && window.hidden_after > 0) {
+    return `${prefix}… ${window.hidden_before} more above · ${window.hidden_after} below`;
+  }
+  if (window.hidden_before > 0) {
+    return `${prefix}… ${window.hidden_before} more above`;
+  }
+  return `${prefix}… +${window.hidden_after} more`;
+}
+
+function controlLine(meta: RenderMeta): string {
+  const mode = meta.control_mode ?? "relay";
+  if (mode === "none") {
+    return "Snapshot · no interactive controls";
+  }
+  if (mode === "signal_only") {
+    return "Ctrl-C quit · keyboard controls unavailable";
+  }
+  const focus = `focus ${(meta.focus_mode ?? "auto").toUpperCase()}`;
+  const clear = mode === "relay" ? " · c clear" : "";
+  return `${focus} · ↑/↓ select · a auto${clear} · q/Esc quit`;
+}
+
+function isUrgent(session: PetFocus): boolean {
+  return session.state === "needs_input" || session.state === "blocked";
 }
 
 function appendRosterGroup(

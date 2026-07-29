@@ -293,6 +293,75 @@ describe("renderer", () => {
       expect(screen.lines.every((line) => Bun.stringWidth(line) <= columns)).toBe(true);
     }
   });
+
+  test("keeps a manually focused session visible through overflow", async () => {
+    const art = await loadPetArt();
+    const sessions = Array.from({ length: 8 }, (_, index) => petFocus({
+      topic: `codex.session-${index}`,
+      session_id: `session-${index}`,
+      label: `Task ${index}`,
+      state: index === 0 ? "needs_input" : "running"
+    }));
+    const snapshot = petSnapshot(sessions, 8);
+    snapshot.focus = sessions.at(-1);
+    snapshot.state = snapshot.focus?.state ?? "idle";
+    snapshot.state_changed_at = snapshot.focus?.state_changed_at ?? 0;
+    const screen = renderScreen(snapshot, art.running.ansi, {
+      source_label: "test",
+      focus_mode: "manual"
+    }, {
+      columns: 30,
+      rows: 8,
+      color: false,
+      image_protocol: "ansi",
+      name: "Hachiware",
+      now_ms: 0
+    });
+    const tiny = renderScreen(snapshot, art.running.ansi, {
+      source_label: "test",
+      focus_mode: "manual"
+    }, {
+      columns: 80,
+      rows: 4,
+      color: false,
+      image_protocol: "ansi",
+      name: "Hachiware",
+      now_ms: 0
+    });
+    const output = screen.lines.join("\n");
+    const tinyOutput = tiny.lines.join("\n");
+
+    expect(output).toContain("Task 7");
+    expect(output).toContain("1 urgent hidden");
+    expect(output).toContain("focus MANUAL");
+    expect(tinyOutput).toContain("Task 7");
+    expect(tinyOutput).toContain("1 urgent hidden");
+    expect(tinyOutput).toContain("focus MANUAL");
+  });
+
+  test("does not advertise keyboard controls when input is unavailable", async () => {
+    const art = await loadPetArt();
+    const screen = renderScreen(
+      petSnapshot([petFocus()]),
+      art.running.ansi,
+      {
+        source_label: "stdin",
+        control_mode: "signal_only"
+      },
+      {
+        columns: 80,
+        rows: 20,
+        color: false,
+        image_protocol: "ansi",
+        name: "Hachiware",
+        now_ms: 0
+      }
+    );
+    const output = screen.lines.join("\n");
+
+    expect(output).toContain("keyboard controls unavailable");
+    expect(output).not.toContain("↑/↓ select");
+  });
 });
 
 function petFocus(overrides: Partial<PetFocus> = {}): PetFocus {

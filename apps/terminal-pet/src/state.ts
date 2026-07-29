@@ -154,17 +154,16 @@ export class PetStore {
     };
   }
 
-  acknowledge(topic?: string): void {
-    const targets = topic
-      ? [this.sessions.get(topic)].filter((value): value is SessionActivity => Boolean(value))
-      : [...this.sessions.values()];
-    for (const activity of targets) {
-      activity.ready_after = undefined;
-      activity.ready_until = undefined;
-      activity.completed_at = undefined;
-      activity.blocked_after = undefined;
-      activity.blocked_until = undefined;
+  acknowledge(topic: string): void {
+    const activity = this.sessions.get(topic);
+    if (!activity) {
+      return;
     }
+    activity.ready_after = undefined;
+    activity.ready_until = undefined;
+    activity.completed_at = undefined;
+    activity.blocked_after = undefined;
+    activity.blocked_until = undefined;
   }
 
   #applyEvent(activity: SessionActivity, event: AgentEvent, nowMs: number): void {

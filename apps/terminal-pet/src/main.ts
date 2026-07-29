@@ -9,8 +9,10 @@ import {
   resolveImageProtocol,
   type ImageProtocolOption
 } from "./image_protocol";
+import { TerminalKeyDecoder, type PetKeyAction } from "./keys";
 import { loadPetArt, selectPose } from "./art";
 import { consumeJsonl, JsonlDecoder } from "./jsonl";
+import { focusSnapshot, moveFocusTopic, type FocusDirection } from "./navigation";
 import { parseRelayEvent, type RelayEvent } from "./protocol";
 import { renderScreen, type RenderMeta } from "./renderer";
 import {
@@ -23,6 +25,8 @@ import {
 import { TerminalSurface } from "./terminal";
 
 type RunMode = "relay" | "stdin" | "demo" | "snapshot";
+
+const KEY_SEQUENCE_TIMEOUT_MS = 50;
 
 interface Options {
   mode: RunMode;
@@ -59,15 +63,23 @@ async function runInteractive(runOptions: Options): Promise<void> {
       ? "demo"
       : runOptions.mode === "stdin"
         ? "stdin"
+        : "relay",
+    control_mode: runOptions.mode === "stdin" || !process.stdin.isTTY
+      ? "signal_only"
+      : runOptions.mode === "demo"
+        ? "demo"
         : "relay"
   };
   const startedAt = Date.now();
   const sourceAbort = new AbortController();
+  const keyDecoder = new TerminalKeyDecoder();
 
   let child: RelayChild | undefined;
   let stopped = false;
   let exitCode = 0;
   let frameTimer: ReturnType<typeof setInterval> | undefined;
+  let keyFlushTimer: ReturnType<typeof setTimeout> | undefined;
+  let selectedTopic: string | undefined;
   let resolveStopped: (() => void) | undefined;
   const stoppedPromise = new Promise<void>((resolvePromise) => {
     resolveStopped = resolvePromise;
@@ -79,6 +91,10 @@ async function runInteractive(runOptions: Options): Promise<void> {
     }
     stopped = true;
     exitCode = code;
+    if (keyFlushTimer) {
+      clearTimeout(keyFlushTimer);
+      keyFlushTimer = undefined;
+    }
     if (diagnostic) {
       meta.diagnostic = diagnostic;
       render();
@@ -87,15 +103,29 @@ async function runInteractive(runOptions: Options): Promise<void> {
     resolveStopped?.();
   };
 
+  const baseSnapshot = (nowMs: number): PetSnapshot => runOptions.mode === "demo"
+    ? demoSnapshot(startedAt, nowMs)
+    : store.snapshot(nowMs);
+
+  const snapshotAt = (nowMs: number): PetSnapshot => {
+    const snapshot = baseSnapshot(nowMs);
+    if (
+      selectedTopic
+      && !snapshot.sessions.some((session) => session.topic === selectedTopic)
+    ) {
+      selectedTopic = undefined;
+    }
+    return focusSnapshot(snapshot, selectedTopic);
+  };
+
   const render = (): void => {
     const nowMs = Date.now();
-    const snapshot = runOptions.mode === "demo"
-      ? demoSnapshot(startedAt, nowMs)
-      : store.snapshot(nowMs);
+    const snapshot = snapshotAt(nowMs);
     const pose = selectPose(snapshot.state, snapshot.state_changed_at, nowMs);
     const screen = renderScreen(snapshot, art[pose].ansi, {
       ...meta,
-      stats: decoder.stats
+      stats: decoder.stats,
+      focus_mode: selectedTopic ? "manual" : "auto"
     }, {
       columns: process.stdout.columns ?? 80,
       rows: process.stdout.rows ?? 24,
@@ -113,20 +143,63 @@ async function runInteractive(runOptions: Options): Promise<void> {
   };
 
   const onResize = (): void => {
+    if (stopped) {
+      return;
+    }
     process.stdout.write(imageController.clear());
     surface.invalidate();
     render();
   };
   const onSignal = (): void => stop(0);
-  const onKey = (chunk: Buffer): void => {
-    for (const byte of chunk) {
-      if (byte === 3 || byte === 27 || byte === 113) {
-        stop(0);
-      } else if (byte === 99) {
-        const focus = store.snapshot().focus;
-        store.acknowledge(focus?.topic);
-        render();
+  const moveFocus = (direction: FocusDirection): void => {
+    const snapshot = baseSnapshot(Date.now());
+    selectedTopic = moveFocusTopic(snapshot, selectedTopic, direction);
+    render();
+  };
+  const dispatchActions = (actions: PetKeyAction[]): void => {
+    for (const action of actions) {
+      switch (action) {
+        case "quit":
+          stop(0);
+          return;
+        case "acknowledge":
+          {
+            const topic = snapshotAt(Date.now()).focus?.topic;
+            if (topic) {
+              store.acknowledge(topic);
+              render();
+            }
+          }
+          break;
+        case "select_next":
+          moveFocus("next");
+          break;
+        case "select_previous":
+          moveFocus("previous");
+          break;
+        case "auto_focus":
+          selectedTopic = undefined;
+          render();
+          break;
       }
+    }
+  };
+  const onKey = (chunk: Buffer): void => {
+    if (stopped) {
+      return;
+    }
+    if (keyFlushTimer) {
+      clearTimeout(keyFlushTimer);
+      keyFlushTimer = undefined;
+    }
+    dispatchActions(keyDecoder.push(chunk));
+    if (!stopped && keyDecoder.has_pending_sequence) {
+      keyFlushTimer = setTimeout(() => {
+        keyFlushTimer = undefined;
+        if (!stopped) {
+          dispatchActions(keyDecoder.flush());
+        }
+      }, KEY_SEQUENCE_TIMEOUT_MS);
     }
   };
 
@@ -152,8 +225,10 @@ async function runInteractive(runOptions: Options): Promise<void> {
         Bun.stdin.stream(),
         decoder,
         (event) => {
-          store.ingest(event);
-          render();
+          if (!stopped) {
+            store.ingest(event);
+            render();
+          }
         },
         sourceAbort.signal
       )
@@ -168,8 +243,10 @@ async function runInteractive(runOptions: Options): Promise<void> {
           child.stream,
           decoder,
           (event) => {
-            store.ingest(event);
-            render();
+            if (!stopped) {
+              store.ingest(event);
+              render();
+            }
           },
           sourceAbort.signal
         )
@@ -189,6 +266,9 @@ async function runInteractive(runOptions: Options): Promise<void> {
     sourceAbort.abort();
     if (frameTimer) {
       clearInterval(frameTimer);
+    }
+    if (keyFlushTimer) {
+      clearTimeout(keyFlushTimer);
     }
     process.stdout.off("resize", onResize);
     process.off("SIGINT", onSignal);
@@ -287,7 +367,8 @@ function writeSnapshot(runOptions: Options): void {
   const snapshot = syntheticSnapshot(state, nowMs);
   const pose = selectPose(state, nowMs, nowMs);
   const screen = renderScreen(snapshot, art[pose].ansi, {
-    source_label: "snapshot"
+    source_label: "snapshot",
+    control_mode: "none"
   }, {
     columns: 64,
     rows: 22,
@@ -478,8 +559,9 @@ Options:
   --no-color              Disable truecolor output
   -h, --help              Show this help
 
-Without --stdin, the pet builds Relay if needed and spawns its binary so stdin
-remains available for q, Escape, and c.`;
+Without --stdin, the pet builds Relay if needed and spawns its binary. Use
+Up/Down or j/k to select a session, a for automatic focus, c to clear its
+notification, and q or Escape to quit.`;
 }
 
 function trimBlankLines(lines: string[]): string[] {

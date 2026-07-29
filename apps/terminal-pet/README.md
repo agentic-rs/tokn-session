@@ -13,9 +13,11 @@ It follows the Codex pet state vocabulary:
 
 The pet keeps one state per Relay topic. Its roster shows every active session
 that fits, followed by sessions inferred Ready during the last five minutes.
-The highest-priority session still drives the large pet and appears first.
-Priority is `needs_input`, `blocked`, `ready`, then `running`; overflow is
-reported as a `+N more` row instead of silently disappearing.
+The highest-priority session drives the large pet in automatic mode. Priority
+is `needs_input`, `blocked`, `ready`, then `running`; overflow is reported
+explicitly instead of silently disappearing. A manually selected session
+remains visible when the roster overflows and drives the pet until automatic
+focus is restored.
 
 ## Run
 
@@ -27,10 +29,12 @@ bun run start
 ```
 
 By default the app builds the workspace Relay once if needed, then spawns the
-resulting binary. This keeps stdin available for `q`, Escape, and `c`:
+resulting binary. This keeps stdin available for keyboard controls:
 
 - `q` or Escape quits and stops the child Relay.
-- `c` clears the focused notification.
+- Up/Down or `j`/`k` selects a session, including recently completed work.
+- `a` returns to automatic highest-priority focus.
+- `c` clears the selected session's notification.
 
 To consume an existing JSONL pipeline:
 
