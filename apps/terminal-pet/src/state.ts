@@ -451,8 +451,9 @@ export class PetStore {
 
   #applyMessage(activity: SessionActivity, event: AgentEvent, nowMs: number): void {
     const role = asString(event.role);
+    const delivery = asString(event.delivery);
     const phase = asString(event.phase);
-    if (role === "assistant" && phase === "finished") {
+    if (role === "assistant" && delivery !== "commentary" && phase === "finished") {
       activity.blocked_after = undefined;
       activity.blocked_until = undefined;
       activity.ready_after = nowMs + this.policy.ready_debounce_ms;

@@ -616,7 +616,7 @@ mod tests {
   use std::path::PathBuf;
   use std::time::Duration;
 
-  use tokn_session_core::{AgentEvent, MessageEvent, Phase, Provider, Role, SessionStarted};
+  use tokn_session_core::{AgentEvent, MessageDelivery, MessageEvent, Phase, Provider, Role, SessionStarted};
   use tokn_session_relay::{NewFileReplay, ProjectContext, RelayEvent, SessionContext};
 
   use super::{Args, ArgsParse, Command, StdoutFormat, write_jsonl_event, write_stdout_event};
@@ -877,6 +877,7 @@ mod tests {
         message_id: Some("message-1".to_string()),
         parent_id: Some("parent-1".to_string()),
         role: Role::Assistant,
+        delivery: MessageDelivery::Final,
         phase: Phase::Finished,
         text: "done".to_string(),
         timestamp: Some("2026-01-01T00:00:01Z".to_string()),

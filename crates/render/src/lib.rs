@@ -584,8 +584,8 @@ mod tests {
 
   use serde_json::json;
   use tokn_session_core::{
-    AgentActivity, AgentEvent, GoalUpdated, LoadedSession, MessageEvent, Provider, ProviderChanged, ReasoningEvent,
-    SessionRef, SessionSettingsApplied, UnknownEvent,
+    AgentActivity, AgentEvent, GoalUpdated, LoadedSession, MessageDelivery, MessageEvent, Provider, ProviderChanged,
+    ReasoningEvent, SessionRef, SessionSettingsApplied, UnknownEvent,
   };
 
   use super::*;
@@ -655,6 +655,7 @@ mod tests {
       message_id: None,
       parent_id: None,
       role: Role::Assistant,
+      delivery: MessageDelivery::Final,
       phase: Phase::Finished,
       text: "first line\nsecond line".to_string(),
       timestamp: None,
