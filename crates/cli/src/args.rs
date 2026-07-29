@@ -18,6 +18,7 @@ pub enum Command {
     source: Source,
     session: String,
     format: Format,
+    scope: ShowScope,
     session_dir: Option<PathBuf>,
   },
   Browse {
@@ -52,6 +53,12 @@ pub enum Format {
   Jsonl,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShowScope {
+  SelfOnly,
+  Tree,
+}
+
 pub fn parse(args: Vec<String>) -> Result<Cli, String> {
   if args.is_empty() {
     return Err(help());
@@ -67,9 +74,11 @@ pub fn parse(args: Vec<String>) -> Result<Cli, String> {
         executor: _,
         cwd: _,
         append_target,
+        scope,
         positionals,
       } = parse_options(&args[1..])?;
       reject_append_target("list", append_target)?;
+      reject_show_scope("list", scope)?;
       if !positionals.is_empty() {
         return Err("list does not accept positional arguments".to_string());
       }
@@ -90,9 +99,14 @@ pub fn parse(args: Vec<String>) -> Result<Cli, String> {
         executor: _,
         cwd: _,
         append_target,
+        scope,
         mut positionals,
       } = parse_options(&args[1..])?;
       reject_append_target("show", append_target)?;
+      let scope = scope.unwrap_or(ShowScope::SelfOnly);
+      if matches!((scope, format), (ShowScope::Tree, Format::Jsonl)) {
+        return Err("show --scope tree currently supports only --format pretty".to_string());
+      }
       if positionals.len() != 1 {
         return Err("show requires exactly one session id or path".to_string());
       }
@@ -101,6 +115,7 @@ pub fn parse(args: Vec<String>) -> Result<Cli, String> {
           source,
           session: positionals.remove(0),
           format,
+          scope,
           session_dir,
         },
       })
@@ -114,9 +129,11 @@ pub fn parse(args: Vec<String>) -> Result<Cli, String> {
         executor: _,
         cwd: _,
         append_target,
+        scope,
         mut positionals,
       } = parse_options(&args[1..])?;
       reject_append_target("browse", append_target)?;
+      reject_show_scope("browse", scope)?;
       if positionals.len() > 1 {
         return Err("browse accepts at most one session id or path".to_string());
       }
@@ -137,9 +154,11 @@ pub fn parse(args: Vec<String>) -> Result<Cli, String> {
         executor,
         cwd,
         append_target,
+        scope,
         mut positionals,
       } = parse_options(&args[1..])?;
       reject_append_target("create", append_target)?;
+      reject_show_scope("create", scope)?;
       if positionals.len() != 1 {
         return Err("create requires exactly one prompt".to_string());
       }
@@ -161,8 +180,10 @@ pub fn parse(args: Vec<String>) -> Result<Cli, String> {
         executor,
         cwd,
         append_target,
+        scope,
         mut positionals,
       } = parse_options(&args[1..])?;
+      reject_show_scope("append", scope)?;
       if positionals.len() != 1 {
         return Err("append requires exactly one prompt".to_string());
       }
@@ -190,6 +211,7 @@ struct Options {
   executor: Option<String>,
   cwd: Option<PathBuf>,
   append_target: Option<AppendTarget>,
+  scope: Option<ShowScope>,
   positionals: Vec<String>,
 }
 
@@ -201,6 +223,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
   let mut executor = None;
   let mut cwd = None;
   let mut append_target = None;
+  let mut scope = None;
   let mut positionals = Vec::new();
   let mut index = 0;
 
@@ -258,6 +281,11 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
           .ok_or_else(|| "--session requires a value".to_string())?;
         append_target = Some(AppendTarget::Session(value.to_string()));
       }
+      "--scope" => {
+        index += 1;
+        let value = args.get(index).ok_or_else(|| "--scope requires a value".to_string())?;
+        scope = Some(parse_show_scope(value)?);
+      }
       "--help" | "-h" => return Err(help()),
       value if value.starts_with('-') => return Err(format!("unknown option `{value}`")),
       value => positionals.push(value.to_string()),
@@ -273,6 +301,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
     executor,
     cwd,
     append_target,
+    scope,
     positionals,
   })
 }
@@ -303,13 +332,109 @@ fn parse_format(value: &str) -> Result<Format, String> {
   }
 }
 
+fn parse_show_scope(value: &str) -> Result<ShowScope, String> {
+  match value {
+    "self" => Ok(ShowScope::SelfOnly),
+    "tree" => Ok(ShowScope::Tree),
+    _ => Err(format!("unknown show scope `{value}`")),
+  }
+}
+
+fn reject_show_scope(command: &str, scope: Option<ShowScope>) -> Result<(), String> {
+  if scope.is_some() {
+    return Err(format!("--scope is only valid for show, not {command}"));
+  }
+  Ok(())
+}
+
 fn help() -> String {
   "usage:
   tokn-session list [--source pi|codex|opencode] [--session-dir <dir>]
   tokn-session list [--source pi|codex|opencode] [--limit <n>]
-  tokn-session show [--source pi|codex|opencode] [--format pretty|jsonl] [--session-dir <dir>] <session-id-or-path>
+  tokn-session show [--source pi|codex|opencode] [--format pretty|jsonl] [--scope self|tree] [--session-dir <dir>] <session-id-or-path>
   tokn-session browse [--source pi|codex|opencode] [--session-dir <dir>] [session-id-or-path]
   tokn-session create [--source pi|codex|opencode] [--executor <command>] [--cwd <dir>] <prompt>
   tokn-session append [--source pi|codex|opencode] [--executor <command>] [--cwd <dir>] (--continue|--session <id>) <prompt>"
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn show_defaults_to_self_scope() {
+    let cli = parse(vec!["show".to_string(), "session".to_string()]).expect("show should parse");
+
+    assert!(matches!(
+      cli.command,
+      Command::Show {
+        scope: ShowScope::SelfOnly,
+        ..
+      }
+    ));
+  }
+
+  #[test]
+  fn show_accepts_tree_scope_for_pretty_output() {
+    let cli = parse(vec![
+      "show".to_string(),
+      "--scope".to_string(),
+      "tree".to_string(),
+      "session".to_string(),
+    ])
+    .expect("tree show should parse");
+
+    assert!(matches!(
+      cli.command,
+      Command::Show {
+        scope: ShowScope::Tree,
+        format: Format::Pretty,
+        ..
+      }
+    ));
+  }
+
+  #[test]
+  fn tree_scope_rejects_ambiguous_jsonl_output() {
+    let error = parse(vec![
+      "show".to_string(),
+      "--scope".to_string(),
+      "tree".to_string(),
+      "--format".to_string(),
+      "jsonl".to_string(),
+      "session".to_string(),
+    ])
+    .expect_err("tree jsonl should be rejected");
+
+    assert_eq!(error, "show --scope tree currently supports only --format pretty");
+  }
+
+  #[test]
+  fn self_scope_keeps_jsonl_available() {
+    let cli = parse(vec![
+      "show".to_string(),
+      "--format".to_string(),
+      "jsonl".to_string(),
+      "session".to_string(),
+    ])
+    .expect("self jsonl should parse");
+
+    assert!(matches!(
+      cli.command,
+      Command::Show {
+        scope: ShowScope::SelfOnly,
+        format: Format::Jsonl,
+        ..
+      }
+    ));
+  }
+
+  #[test]
+  fn scope_is_rejected_outside_show() {
+    let error = parse(vec!["list".to_string(), "--scope".to_string(), "self".to_string()])
+      .expect_err("list scope should be rejected");
+
+    assert_eq!(error, "--scope is only valid for show, not list");
+  }
 }

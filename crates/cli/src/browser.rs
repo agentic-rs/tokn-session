@@ -11,10 +11,11 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use tokn_session_core::{AgentEvent, LoadedSession, SessionRef};
+use tokn_session_core::{AgentEvent, LoadedSession, SessionHistoryStatus, SessionRef};
 use tokn_session_render::{EventDisplay, display_event};
 
 pub fn browse_session(session: &LoadedSession) -> Result<(), String> {
+  ensure_browsable_history(session)?;
   let mut terminal = BrowserTerminal::enter()?;
   let result = EventBrowser::new(session).run(&mut terminal.terminal);
   terminal.leave()?;
@@ -117,6 +118,7 @@ impl SessionBrowser {
         SessionBrowserAction::Quit => return Ok(()),
         SessionBrowserAction::Open(id) => {
           let loaded = load_session(&id)?;
+          ensure_browsable_history(&loaded)?;
           EventBrowser::new(&loaded).run(terminal)?;
         }
       }
@@ -456,6 +458,16 @@ impl From<EventDisplay> for EventRow {
   }
 }
 
+fn ensure_browsable_history(session: &LoadedSession) -> Result<(), String> {
+  if session.history_status == SessionHistoryStatus::SubagentBodyUnavailable {
+    return Err(format!(
+      "subagent session `{}` body is unavailable because no trigger-turn boundary was recorded",
+      session.reference.id
+    ));
+  }
+  Ok(())
+}
+
 fn truncate(value: &str, max: usize) -> String {
   let mut output = String::new();
   for character in value.chars().take(max) {
@@ -466,6 +478,8 @@ fn truncate(value: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+  use std::path::PathBuf;
+
   use super::*;
 
   #[test]
@@ -486,6 +500,30 @@ mod tests {
 
     assert_eq!(browser.scroll, 1);
     assert!(browser.selected_header_offset() < 3);
+  }
+
+  #[test]
+  fn unavailable_subagent_history_is_not_browsed_as_an_empty_session() {
+    let session = LoadedSession {
+      reference: SessionRef {
+        id: "child".to_string(),
+        parent_session_id: Some("parent".to_string()),
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+        path: PathBuf::from("child.jsonl"),
+        cwd: None,
+        timestamp: None,
+        message_count: 0,
+      },
+      events: Vec::new(),
+      history_status: SessionHistoryStatus::SubagentBodyUnavailable,
+    };
+
+    assert_eq!(
+      ensure_browsable_history(&session).expect_err("unavailable body should be rejected"),
+      "subagent session `child` body is unavailable because no trigger-turn boundary was recorded"
+    );
   }
 
   fn test_row(summary: &str, detail: &str) -> EventRow {

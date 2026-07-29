@@ -400,23 +400,62 @@ function syntheticSnapshot(state: PetState, stateChangedAt: number): PetSnapshot
   const completedAt = state === "ready"
     ? stateChangedAt
     : undefined;
-  const primary: PetFocus = {
+  const root: PetFocus = {
     topic: "codex.demo",
-    state,
+    root_topic: "codex.demo",
+    depth: 0,
+    is_provisional: false,
+    state: "idle",
+    family_state: state,
+    family_last_event_at: stateChangedAt,
     state_changed_at: stateChangedAt,
     last_event_at: stateChangedAt,
-    label: demoLabel(state),
+    label: state === "idle" ? "No active agents" : "Coordinating subagents",
     provider: "codex",
     project_label: "tokn-agent",
     title: "Terminal pet roster",
     session_id: "demo",
     agent: "root",
+    recently_completed: false,
+    descendant_count: state === "idle" ? 1 : 2,
+    active_descendant_count: state === "idle" ? 0 : 1,
+    urgent_descendant_count: state === "needs_input" || state === "blocked" ? 1 : 0,
+    recent_descendant_count: 1
+  };
+  const worker: PetFocus = {
+    topic: "codex.worker",
+    parent_topic: root.topic,
+    root_topic: root.topic,
+    depth: 1,
+    is_provisional: false,
+    state,
+    family_state: state,
+    family_last_event_at: stateChangedAt,
+    state_changed_at: stateChangedAt,
+    last_event_at: stateChangedAt,
+    label: demoLabel(state),
+    provider: "codex",
+    project_label: "tokn-agent",
+    title: "Improve session show",
+    session_id: "worker",
+    agent: "Avicenna",
     completed_at: completedAt,
-    recently_completed: completedAt !== undefined
+    recently_completed: completedAt !== undefined,
+    outcome: completedAt === undefined ? undefined : "completed",
+    descendant_count: 0,
+    active_descendant_count: 0,
+    urgent_descendant_count: 0,
+    recent_descendant_count: 0
   };
   const recent: PetFocus = {
     topic: "codex.recent",
+    parent_topic: root.topic,
+    root_topic: root.topic,
+    depth: 1,
+    is_provisional: false,
     state: "idle",
+    family_state: "idle",
+    family_last_event_at: stateChangedAt - 45_000,
     state_changed_at: stateChangedAt - 45_000,
     last_event_at: stateChangedAt - 45_000,
     label: "Updated the Relay documentation",
@@ -424,34 +463,23 @@ function syntheticSnapshot(state: PetState, stateChangedAt: number): PetSnapshot
     project_label: "tokn-agent",
     title: "Document Relay events",
     session_id: "recent",
-    agent: "docs",
+    agent: "Meitner",
     completed_at: stateChangedAt - 45_000,
-    recently_completed: true
+    recently_completed: true,
+    outcome: "completed",
+    descendant_count: 0,
+    active_descendant_count: 0,
+    urgent_descendant_count: 0,
+    recent_descendant_count: 0
   };
   const sessions = state === "idle"
-    ? [recent]
-    : [
-        primary,
-        {
-          topic: "pi.worker",
-          state: "running",
-          state_changed_at: stateChangedAt - 8_000,
-          last_event_at: stateChangedAt - 1_000,
-          label: "Running the provider test suite",
-          provider: "pi",
-          project_label: "tokn-agent",
-          title: "Verify Pi sessions",
-          session_id: "worker",
-          agent: "worker",
-          recently_completed: false
-        } satisfies PetFocus,
-        recent
-      ];
-  const focus = state === "idle" ? recent : primary;
+    ? [root, recent]
+    : [root, worker, recent];
+  const focus = state === "idle" ? recent : worker;
   return {
     state: focus.state,
     state_changed_at: focus.state_changed_at,
-    active_sessions: state === "idle" ? 0 : 2,
+    active_sessions: state === "idle" ? 0 : 1,
     total_sessions: 3,
     sessions,
     focus

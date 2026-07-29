@@ -1,4 +1,8 @@
-import type { PetSnapshot } from "./state";
+import {
+  effectivePetState,
+  effectiveStateChangedAt,
+  type PetSnapshot
+} from "./state";
 
 export type FocusDirection = "next" | "previous";
 
@@ -15,8 +19,8 @@ export function focusSnapshot(
   }
   return {
     ...snapshot,
-    state: focus.state,
-    state_changed_at: focus.state_changed_at,
+    state: effectivePetState(focus),
+    state_changed_at: effectiveStateChangedAt(focus),
     focus
   };
 }

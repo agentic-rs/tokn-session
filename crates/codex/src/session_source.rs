@@ -3,8 +3,8 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use crate::event::CodexLine;
-use crate::normalize::CodexNormalizer;
-use tokn_session_core::{LoadedSession, SessionRef};
+use crate::normalize::{CodexHistoryBoundary, CodexNormalizer};
+use tokn_session_core::{LoadedSession, SessionHistoryStatus, SessionRef};
 
 pub struct CodexSessionSource {
   session_dir: Option<PathBuf>,
@@ -16,6 +16,14 @@ impl CodexSessionSource {
   }
 
   pub fn list_sessions(&self) -> Result<Vec<SessionRef>, String> {
+    self.list_session_refs(inspect_session)
+  }
+
+  pub fn list_session_relations(&self) -> Result<Vec<SessionRef>, String> {
+    self.list_session_refs(inspect_session_header)
+  }
+
+  fn list_session_refs(&self, inspect: fn(&Path) -> Result<SessionRef, String>) -> Result<Vec<SessionRef>, String> {
     let mut paths = Vec::new();
     for root in self.roots()? {
       collect_jsonl_files(&root, &mut paths)?;
@@ -23,7 +31,7 @@ impl CodexSessionSource {
 
     let mut refs = Vec::new();
     for path in paths {
-      if let Ok(reference) = inspect_session(&path) {
+      if let Ok(reference) = inspect(&path) {
         refs.push(reference);
       }
     }
@@ -33,10 +41,14 @@ impl CodexSessionSource {
 
   pub fn load_session(&self, id_or_path: &str) -> Result<LoadedSession, String> {
     let path = self.resolve_session(id_or_path)?;
+    self.load_session_path(&path)
+  }
+
+  pub fn load_session_path(&self, path: &Path) -> Result<LoadedSession, String> {
     let reference = inspect_session(&path)?;
     let file = File::open(&path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
     let reader = BufReader::new(file);
-    let mut normalizer = CodexNormalizer::new();
+    let mut normalizer = CodexNormalizer::new_historical();
     let mut events = Vec::new();
 
     for (index, line) in reader.lines().enumerate() {
@@ -49,7 +61,11 @@ impl CodexSessionSource {
       events.extend(normalizer.normalize(event));
     }
 
-    Ok(LoadedSession { reference, events })
+    Ok(LoadedSession {
+      reference,
+      events,
+      history_status: normalizer.history_status(),
+    })
   }
 
   fn resolve_session(&self, id_or_path: &str) -> Result<PathBuf, String> {
@@ -100,69 +116,116 @@ fn collect_jsonl_files(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<(), Strin
 }
 
 fn inspect_session(path: &Path) -> Result<SessionRef, String> {
+  let mut reference = inspect_session_header(path)?;
   let file = File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
   let reader = BufReader::new(file);
-  let mut id = session_id_from_path(path);
-  let mut cwd = None;
-  let mut timestamp = None;
   let mut message_count = 0;
+  let mut history_boundary = CodexHistoryBoundary::new();
 
   for line in reader.lines() {
     let line = line.map_err(|err| format!("failed to read {}: {err}", path.display()))?;
     if line.trim().is_empty() {
       continue;
     }
-    let value: serde_json::Value =
+    let parsed_line: CodexLine =
       serde_json::from_str(&line).map_err(|err| format!("invalid codex jsonl at {}: {err}", path.display()))?;
-    let line_timestamp = value
-      .get("timestamp")
-      .and_then(|value| value.as_str())
-      .map(str::to_string);
-    match value.get("type").and_then(|value| value.as_str()) {
-      Some("session_meta") => {
-        if let Some(payload) = value.get("payload") {
-          if let Some(value) = payload.get("id").and_then(|value| value.as_str()) {
-            id = value.to_string();
-          }
-          cwd = payload.get("cwd").and_then(|value| value.as_str()).map(str::to_string);
-          timestamp = payload
-            .get("timestamp")
-            .and_then(|value| value.as_str())
-            .map(str::to_string)
-            .or(line_timestamp);
-        }
-      }
-      Some("response_item") => {
-        if let Some(payload) = value.get("payload") {
-          let is_message = payload.get("type").and_then(|value| value.as_str()) == Some("message");
-          let is_display_role = payload
-            .get("role")
-            .and_then(|value| value.as_str())
-            .is_some_and(|role| role == "assistant");
-          if is_message && is_display_role {
-            message_count += 1;
-          }
-        }
-      }
-      Some("event_msg") => match value
-        .get("payload")
-        .and_then(|payload| payload.get("type"))
-        .and_then(|value| value.as_str())
-      {
-        Some("user_message") => message_count += 1,
-        _ => {}
-      },
-      _ => {}
+    let value = parsed_line.native();
+    let counts_as_message = counts_as_display_message(value);
+
+    let accepted = history_boundary.accepts(parsed_line.item());
+    if history_boundary.status() == SessionHistoryStatus::SubagentBodyUnavailable {
+      message_count = 0;
+    }
+    if accepted && counts_as_message {
+      message_count += 1;
     }
   }
 
-  Ok(SessionRef {
-    id,
+  reference.message_count = message_count;
+  Ok(reference)
+}
+
+fn inspect_session_header(path: &Path) -> Result<SessionRef, String> {
+  let file = File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+  let reader = BufReader::new(file);
+  let mut reference = SessionRef {
+    id: session_id_from_path(path),
+    parent_session_id: None,
+    agent_path: None,
+    agent_nickname: None,
+    agent_role: None,
     path: path.to_path_buf(),
-    cwd,
-    timestamp,
-    message_count,
-  })
+    cwd: None,
+    timestamp: None,
+    message_count: 0,
+  };
+
+  for line in reader.lines() {
+    let line = line.map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    if line.trim().is_empty() {
+      continue;
+    }
+    let parsed_line: CodexLine =
+      serde_json::from_str(&line).map_err(|err| format!("invalid codex jsonl at {}: {err}", path.display()))?;
+    let value = parsed_line.native();
+    if value.get("type").and_then(|value| value.as_str()) != Some("session_meta") {
+      continue;
+    }
+    let Some(payload) = value.get("payload") else {
+      break;
+    };
+
+    if let Some(value) = payload.get("id").and_then(|value| value.as_str()) {
+      reference.id = value.to_string();
+    }
+    reference.parent_session_id = first_string_field(payload, &["parent_thread_id", "forked_from_id"]);
+    let thread_spawn = payload
+      .get("source")
+      .and_then(|source| source.get("subagent"))
+      .and_then(|subagent| subagent.get("thread_spawn"));
+    reference.agent_path = string_field(payload, "agent_path")
+      .or_else(|| thread_spawn.and_then(|thread_spawn| string_field(thread_spawn, "agent_path")));
+    reference.agent_nickname = string_field(payload, "agent_nickname")
+      .or_else(|| thread_spawn.and_then(|thread_spawn| string_field(thread_spawn, "agent_nickname")));
+    reference.agent_role = first_string_field(payload, &["agent_role", "agent_type"]).or_else(|| {
+      thread_spawn.and_then(|thread_spawn| first_string_field(thread_spawn, &["agent_role", "agent_type"]))
+    });
+    reference.cwd = string_field(payload, "cwd");
+    reference.timestamp = string_field(payload, "timestamp").or_else(|| {
+      value
+        .get("timestamp")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+    });
+    break;
+  }
+
+  Ok(reference)
+}
+
+fn counts_as_display_message(value: &serde_json::Value) -> bool {
+  match value.get("type").and_then(|value| value.as_str()) {
+    Some("response_item") => value.get("payload").is_some_and(|payload| {
+      payload.get("type").and_then(|value| value.as_str()) == Some("message")
+        && payload.get("role").and_then(|value| value.as_str()) == Some("assistant")
+    }),
+    Some("event_msg") => {
+      value
+        .get("payload")
+        .and_then(|payload| payload.get("type"))
+        .and_then(|value| value.as_str())
+        == Some("user_message")
+    }
+    _ => false,
+  }
+}
+
+fn string_field(value: &serde_json::Value, field: &str) -> Option<String> {
+  value.get(field).and_then(|value| value.as_str()).map(str::to_string)
+}
+
+fn first_string_field(value: &serde_json::Value, fields: &[&str]) -> Option<String> {
+  fields.iter().find_map(|field| string_field(value, field))
 }
 
 fn session_id_from_path(path: &Path) -> String {
@@ -171,4 +234,103 @@ fn session_id_from_path(path: &Path) -> String {
     .and_then(|value| value.to_str())
     .and_then(|stem| stem.rsplit_once('-').map(|(_, id)| id.to_string()))
     .unwrap_or_else(|| path.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use tokn_session_core::AgentEvent;
+
+  #[test]
+  fn first_session_meta_owns_subagent_identity() {
+    let reference = inspect_session(&fixtures_dir().join("tree_child.jsonl")).expect("fixture should be inspectable");
+
+    assert_eq!(reference.id, "tree-child");
+    assert_eq!(reference.parent_session_id.as_deref(), Some("tree-root"));
+    assert_eq!(reference.agent_path.as_deref(), Some("/root/researcher"));
+    assert_eq!(reference.agent_nickname.as_deref(), Some("Hubble"));
+    assert_eq!(reference.agent_role.as_deref(), Some("explorer"));
+    assert_eq!(reference.timestamp.as_deref(), Some("2026-07-29T00:01:00Z"));
+    assert_eq!(reference.message_count, 1);
+  }
+
+  #[test]
+  fn relation_scan_reads_identity_without_counting_the_body() {
+    let source = CodexSessionSource::new(Some(fixtures_dir()));
+    let references = source.list_session_relations().expect("fixture relations should load");
+    let reference = references
+      .iter()
+      .find(|reference| reference.id == "tree-child")
+      .expect("tree child should be discovered");
+
+    assert_eq!(reference.parent_session_id.as_deref(), Some("tree-root"));
+    assert_eq!(reference.agent_path.as_deref(), Some("/root/researcher"));
+    assert_eq!(reference.message_count, 0);
+  }
+
+  #[test]
+  fn loads_only_owned_subagent_history_after_the_trigger_boundary() {
+    let source = CodexSessionSource::new(Some(fixtures_dir()));
+    let loaded = source
+      .load_session_path(&fixtures_dir().join("tree_child.jsonl"))
+      .expect("child session should load from its selected path");
+
+    assert_eq!(loaded.reference.id, "tree-child");
+    assert_eq!(loaded.reference.parent_session_id.as_deref(), Some("tree-root"));
+    assert_eq!(loaded.reference.message_count, 1);
+    assert_eq!(loaded.history_status, SessionHistoryStatus::FilteredSubagent);
+    let messages: Vec<_> = loaded
+      .events
+      .iter()
+      .filter_map(|event| match event {
+        AgentEvent::Message(event) => Some(event.text.as_str()),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(messages, vec!["child result"]);
+    assert!(loaded.events.iter().any(
+      |event| matches!(event, AgentEvent::AgentActivity(event) if event.target_agent_path.as_deref() == Some("/root/researcher"))
+    ));
+  }
+
+  #[test]
+  fn reports_subagent_body_unavailable_without_a_trigger_boundary() {
+    let source = CodexSessionSource::new(Some(fixtures_dir()));
+    let loaded = source
+      .load_session_path(&fixtures_dir().join("tree_child_no_boundary.jsonl"))
+      .expect("incomplete child session should still load");
+
+    assert_eq!(loaded.reference.message_count, 0);
+    assert_eq!(loaded.history_status, SessionHistoryStatus::SubagentBodyUnavailable);
+    assert_eq!(loaded.events.len(), 1);
+    assert!(matches!(
+      &loaded.events[0],
+      AgentEvent::SessionStarted(event) if event.session_id == "tree-child-no-boundary"
+    ));
+  }
+
+  #[test]
+  fn keeps_non_thread_spawn_subagent_history_without_a_boundary() {
+    let source = CodexSessionSource::new(Some(fixtures_dir()));
+    let loaded = source
+      .load_session_path(&fixtures_dir().join("tree_guardian.jsonl"))
+      .expect("guardian session should load");
+
+    assert_eq!(loaded.reference.parent_session_id.as_deref(), Some("guardian-parent"));
+    assert_eq!(loaded.reference.message_count, 2);
+    assert_eq!(loaded.history_status, SessionHistoryStatus::Complete);
+    let messages: Vec<_> = loaded
+      .events
+      .iter()
+      .filter_map(|event| match event {
+        AgentEvent::Message(event) => Some(event.text.as_str()),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(messages, vec!["review this action", "allow"]);
+  }
+
+  fn fixtures_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
+  }
 }

@@ -5,24 +5,113 @@ use tokn_codex_protocol::{
 };
 use tokn_session_core::{
   AgentActivity, AgentEvent, ErrorEvent, GoalUpdated, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent,
-  Role, SessionSettingsApplied, SessionStarted, ToolCallEvent, ToolKind, ToolSummary, UnknownEvent, patch_summary,
-  tool_kind_for_name, tool_kind_for_optional_name, tool_summary_for_input, tool_summary_for_io,
+  Role, SessionHistoryStatus, SessionSettingsApplied, SessionStarted, ToolCallEvent, ToolKind, ToolSummary,
+  UnknownEvent, patch_summary, tool_kind_for_name, tool_kind_for_optional_name, tool_summary_for_input,
+  tool_summary_for_io,
 };
 
 use crate::event::CodexLine;
 
 pub struct CodexNormalizer {
   session_id: Option<String>,
+  history_boundary: Option<CodexHistoryBoundary>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodexHistoryState {
+  BeforeOwner,
+  Root,
+  AwaitingSubagentBody,
+  SubagentBody,
+}
+
+pub(crate) struct CodexHistoryBoundary {
+  state: CodexHistoryState,
+}
+
+impl CodexHistoryBoundary {
+  pub(crate) fn new() -> Self {
+    Self {
+      state: CodexHistoryState::BeforeOwner,
+    }
+  }
+
+  pub(crate) fn accepts(&mut self, item: &RolloutItem) -> bool {
+    match self.state {
+      CodexHistoryState::BeforeOwner => {
+        if let RolloutItem::SessionMeta(item) = item {
+          self.state = if requires_thread_spawn_boundary(item) {
+            CodexHistoryState::AwaitingSubagentBody
+          } else {
+            CodexHistoryState::Root
+          };
+        }
+        true
+      }
+      CodexHistoryState::Root | CodexHistoryState::SubagentBody => !matches!(item, RolloutItem::SessionMeta(_)),
+      CodexHistoryState::AwaitingSubagentBody => match item {
+        RolloutItem::InterAgentCommunicationMetadata(item) if item.trigger_turn == Some(true) => {
+          self.state = CodexHistoryState::SubagentBody;
+          false
+        }
+        RolloutItem::InterAgentCommunication(item) if item.trigger_turn == Some(true) => {
+          self.state = CodexHistoryState::SubagentBody;
+          true
+        }
+        _ => false,
+      },
+    }
+  }
+
+  pub(crate) fn status(&self) -> SessionHistoryStatus {
+    match self.state {
+      CodexHistoryState::AwaitingSubagentBody => SessionHistoryStatus::SubagentBodyUnavailable,
+      CodexHistoryState::SubagentBody => SessionHistoryStatus::FilteredSubagent,
+      CodexHistoryState::BeforeOwner | CodexHistoryState::Root => SessionHistoryStatus::Complete,
+    }
+  }
 }
 
 impl CodexNormalizer {
   pub fn new() -> Self {
-    Self { session_id: None }
+    Self {
+      session_id: None,
+      history_boundary: None,
+    }
+  }
+
+  pub fn new_historical() -> Self {
+    Self {
+      session_id: None,
+      history_boundary: Some(CodexHistoryBoundary::new()),
+    }
   }
 
   pub fn normalize(&mut self, line: CodexLine) -> Vec<AgentEvent> {
     let timestamp = line.timestamp().map(str::to_string);
-    match line.into_item() {
+    let item = line.into_item();
+
+    if self
+      .history_boundary
+      .as_mut()
+      .is_some_and(|boundary| !boundary.accepts(&item))
+    {
+      return Vec::new();
+    }
+
+    self.normalize_item(item, timestamp)
+  }
+
+  pub fn history_status(&self) -> SessionHistoryStatus {
+    self
+      .history_boundary
+      .as_ref()
+      .map(CodexHistoryBoundary::status)
+      .unwrap_or(SessionHistoryStatus::Complete)
+  }
+
+  fn normalize_item(&mut self, item: RolloutItem, timestamp: Option<String>) -> Vec<AgentEvent> {
+    match item {
       RolloutItem::SessionMeta(item) => self.normalize_session_meta(item, timestamp),
       RolloutItem::ResponseItem(item) => normalize_response_item(self.session_id.clone(), item, timestamp),
       RolloutItem::InterAgentCommunication(item) => {
@@ -75,6 +164,17 @@ impl CodexNormalizer {
 
     events
   }
+}
+
+fn requires_thread_spawn_boundary(item: &SessionMetaItem) -> bool {
+  item.source.as_ref().is_some_and(|source| match source {
+    Value::Object(source) => source
+      .get("subagent")
+      .and_then(|subagent| subagent.get("thread_spawn"))
+      .is_some(),
+    Value::String(source) => source.starts_with("subagent_thread_spawn"),
+    _ => false,
+  }) || item.extra.get("subagent_source").and_then(Value::as_str) == Some("thread_spawn")
 }
 
 fn normalize_response_item(
@@ -946,6 +1046,19 @@ mod tests {
       .collect()
   }
 
+  fn normalize_historical_fixture(input: &str) -> (Vec<AgentEvent>, SessionHistoryStatus) {
+    let mut normalizer = CodexNormalizer::new_historical();
+    let events = input
+      .lines()
+      .filter(|line| !line.trim().is_empty())
+      .flat_map(|line| {
+        let line: CodexLine = serde_json::from_str(line).expect("fixture line should parse");
+        normalizer.normalize(line)
+      })
+      .collect();
+    (events, normalizer.history_status())
+  }
+
   #[test]
   fn normalizes_basic_fixture_events() {
     let events = normalize_fixture(include_str!("../fixtures/basic_session.jsonl"));
@@ -1035,5 +1148,34 @@ mod tests {
     assert!(
       matches!(&events[1], AgentEvent::AgentActivity(event) if event.target_session_id.as_deref() == Some("root-session"))
     );
+  }
+
+  #[test]
+  fn default_normalizer_keeps_streaming_subagent_events_without_a_historical_boundary() {
+    let events = normalize_fixture(
+      r#"{"type":"session_meta","payload":{"id":"child-session","parent_thread_id":"root-session"}}
+{"type":"response_item","payload":{"type":"message","id":"child-message","role":"assistant","content":[{"type":"output_text","text":"live child result"}],"phase":"final"}}"#,
+    );
+
+    assert_eq!(events.len(), 2);
+    assert!(matches!(&events[0], AgentEvent::SessionStarted(event) if event.session_id == "child-session"));
+    assert!(matches!(&events[1], AgentEvent::Message(event) if event.text == "live child result"));
+  }
+
+  #[test]
+  fn historical_normalizer_starts_subagent_body_at_a_legacy_trigger_boundary() {
+    let (events, status) = normalize_historical_fixture(
+      r#"{"type":"session_meta","payload":{"id":"child-session","parent_thread_id":"root-session","source":{"subagent":{"thread_spawn":{"parent_thread_id":"root-session","depth":1,"agent_path":"/root/child"}}}}}
+{"type":"event_msg","payload":{"type":"user_message","message":"copied parent request"}}
+{"type":"inter_agent_communication","payload":{"id":"queued","author":"/root","recipient":"/root/child","content":"queued","trigger_turn":false}}
+{"type":"inter_agent_communication","payload":{"id":"trigger","author":"/root","recipient":"/root/child","content":"start","trigger_turn":true}}
+{"type":"response_item","payload":{"type":"message","id":"child-message","role":"assistant","content":[{"type":"output_text","text":"owned child result"}],"phase":"final"}}"#,
+    );
+
+    assert_eq!(status, SessionHistoryStatus::FilteredSubagent);
+    assert_eq!(events.len(), 3);
+    assert!(matches!(&events[0], AgentEvent::SessionStarted(event) if event.session_id == "child-session"));
+    assert!(matches!(&events[1], AgentEvent::AgentActivity(event) if event.event_id.as_deref() == Some("trigger")));
+    assert!(matches!(&events[2], AgentEvent::Message(event) if event.text == "owned child result"));
   }
 }

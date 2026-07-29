@@ -4,7 +4,7 @@ use crate::event::{OpenCodeMessage, OpenCodeMessageRow, OpenCodePart, OpenCodePa
 use crate::normalize::OpenCodeNormalizer;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::Value;
-use tokn_session_core::{LoadedSession, SessionRef};
+use tokn_session_core::{LoadedSession, SessionHistoryStatus, SessionRef};
 
 pub struct OpenCodeSessionSource {
   session_dir: Option<PathBuf>,
@@ -19,20 +19,21 @@ impl OpenCodeSessionSource {
     let connection = self.connect()?;
     let mut statement = connection
       .prepare(
-        "select id, directory, model, time_created, time_updated
+        "select id, parent_id, directory, model, time_created, time_updated
          from session
          order by time_created desc, id desc",
       )
       .map_err(|err| format!("failed to prepare opencode session query: {err}"))?;
     let rows = statement
       .query_map([], |row| {
-        let model: Option<String> = row.get(2)?;
+        let model: Option<String> = row.get(3)?;
         Ok(OpenCodeSessionRow {
           id: row.get(0)?,
-          directory: row.get(1)?,
+          parent_id: row.get(1)?,
+          directory: row.get(2)?,
           model: parse_optional_json(model),
-          time_created: row.get(3)?,
-          time_updated: row.get(4)?,
+          time_created: row.get(4)?,
+          time_updated: row.get(5)?,
         })
       })
       .map_err(|err| format!("failed to query opencode sessions: {err}"))?;
@@ -43,6 +44,10 @@ impl OpenCodeSessionSource {
       let message_count = message_count(&connection, &row.id)?;
       sessions.push(SessionRef {
         id: row.id,
+        parent_session_id: row.parent_id,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
         path: self.database_path()?,
         cwd: row.directory,
         timestamp: timestamp(row.time_updated.or(row.time_created)),
@@ -54,11 +59,23 @@ impl OpenCodeSessionSource {
 
   pub fn load_session(&self, id_or_path: &str) -> Result<LoadedSession, String> {
     let (database_path, session_id) = self.resolve_session(id_or_path)?;
+    self.load_session_from_database(database_path, &session_id)
+  }
+
+  pub fn load_session_exact(&self, session_id: &str) -> Result<LoadedSession, String> {
+    self.load_session_from_database(self.database_path()?, session_id)
+  }
+
+  fn load_session_from_database(&self, database_path: PathBuf, session_id: &str) -> Result<LoadedSession, String> {
     let connection = connect_database(&database_path)?;
     let session = load_session_row(&connection, &session_id)?
-      .ok_or_else(|| format!("no opencode session found for `{id_or_path}`"))?;
+      .ok_or_else(|| format!("no opencode session found for `{session_id}`"))?;
     let reference = SessionRef {
       id: session.id.clone(),
+      parent_session_id: session.parent_id.clone(),
+      agent_path: None,
+      agent_nickname: None,
+      agent_role: None,
       path: database_path,
       cwd: session.directory.clone(),
       timestamp: timestamp(session.time_updated.or(session.time_created)),
@@ -71,7 +88,11 @@ impl OpenCodeSessionSource {
       events.extend(normalizer.normalize_message(message));
     }
 
-    Ok(LoadedSession { reference, events })
+    Ok(LoadedSession {
+      reference,
+      events,
+      history_status: SessionHistoryStatus::Complete,
+    })
   }
 
   fn resolve_session(&self, id_or_path: &str) -> Result<(PathBuf, String), String> {
@@ -141,16 +162,17 @@ fn sqlite_uri_path(path: &Path) -> String {
 fn load_session_row(connection: &Connection, session_id: &str) -> Result<Option<OpenCodeSessionRow>, String> {
   connection
     .query_row(
-      "select id, directory, model, time_created, time_updated from session where id = ?1",
+      "select id, parent_id, directory, model, time_created, time_updated from session where id = ?1",
       params![session_id],
       |row| {
-        let model: Option<String> = row.get(2)?;
+        let model: Option<String> = row.get(3)?;
         Ok(OpenCodeSessionRow {
           id: row.get(0)?,
-          directory: row.get(1)?,
+          parent_id: row.get(1)?,
+          directory: row.get(2)?,
           model: parse_optional_json(model),
-          time_created: row.get(3)?,
-          time_updated: row.get(4)?,
+          time_created: row.get(4)?,
+          time_updated: row.get(5)?,
         })
       },
     )
