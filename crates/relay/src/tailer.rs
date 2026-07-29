@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::SystemTime;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -10,7 +12,10 @@ use tokn_session_core::{AgentEvent, Provider};
 use tokn_session_pi::{event::PiSessionLine, normalize::PiNormalizer};
 
 use crate::context::session_id_from_path;
+use crate::project::ProjectCatalog;
 use crate::{NewFileReplay, SessionContext};
+
+type SharedProjectCatalog = Arc<RwLock<ProjectCatalog>>;
 
 #[derive(Clone, Debug)]
 pub struct ProviderRoot {
@@ -42,6 +47,9 @@ pub struct SessionTailer {
   roots: Vec<ProviderRoot>,
   files: HashMap<PathBuf, FileState>,
   new_file_replay: NewFileReplay,
+  project_catalog: SharedProjectCatalog,
+  project_catalog_source: Option<ProjectCatalogSource>,
+  project_catalog_warning: Option<String>,
 }
 
 impl SessionTailer {
@@ -52,20 +60,31 @@ impl SessionTailer {
   }
 
   pub(crate) fn prepare(roots: Vec<ProviderRoot>, new_file_replay: NewFileReplay) -> Result<Self, String> {
+    let (project_catalog, project_catalog_source, project_catalog_warning) = load_project_catalog(&roots);
+    let project_catalog = Arc::new(RwLock::new(project_catalog));
     let mut tailer = Self {
       roots,
       files: HashMap::new(),
       new_file_replay,
+      project_catalog,
+      project_catalog_source,
+      project_catalog_warning,
     };
     let paths = tailer.discover_paths()?;
     for (path, provider) in paths {
-      tailer.files.insert(path.clone(), FileState::open(path, provider)?);
+      tailer.files.insert(
+        path.clone(),
+        FileState::open(path, provider, Arc::clone(&tailer.project_catalog))?,
+      );
     }
     Ok(tailer)
   }
 
   pub(crate) fn start(&mut self) -> Result<TailUpdate, String> {
     let mut update = TailUpdate::default();
+    if let Some(warning) = self.project_catalog_warning.take() {
+      update.warnings.push(warning);
+    }
     let new_file_replay = self.new_file_replay;
     for state in self.files.values_mut() {
       let mode = if state.matches_initial_snapshot()? {
@@ -82,6 +101,7 @@ impl SessionTailer {
   pub fn scan(&mut self) -> Result<TailUpdate, String> {
     let discovered = self.discover_paths()?;
     let mut update = TailUpdate::default();
+    self.refresh_project_catalog(&mut update);
 
     for (path, provider) in discovered {
       if !self.files.contains_key(&path) {
@@ -109,6 +129,8 @@ impl SessionTailer {
   }
 
   pub fn scan_paths(&mut self, changed_paths: HashSet<PathBuf>) -> Result<TailUpdate, String> {
+    let mut update = TailUpdate::default();
+    self.refresh_project_catalog(&mut update);
     let mut candidates = HashMap::new();
     let mut changed_directories = Vec::new();
 
@@ -137,7 +159,6 @@ impl SessionTailer {
       });
     }
 
-    let mut update = TailUpdate::default();
     for (path, provider) in candidates {
       self.scan_file(path, provider, &mut update)?;
     }
@@ -171,7 +192,7 @@ impl SessionTailer {
     mode: InitialRead,
     update: &mut TailUpdate,
   ) -> Result<(), String> {
-    let mut state = FileState::open(path.clone(), provider)?;
+    let mut state = FileState::open(path.clone(), provider, Arc::clone(&self.project_catalog))?;
     let initial = read_initial(&mut state, mode)?;
     update.append(initial);
     self.files.insert(path, state);
@@ -194,6 +215,24 @@ impl SessionTailer {
       .filter(|root| path.starts_with(&root.path))
       .max_by_key(|root| root.path.components().count())
       .map(|root| root.provider)
+  }
+
+  fn refresh_project_catalog(&mut self, update: &mut TailUpdate) {
+    let Some(source) = &mut self.project_catalog_source else {
+      return;
+    };
+    let Some(result) = source.load_if_changed() else {
+      return;
+    };
+    match result {
+      Ok(catalog) => {
+        *self
+          .project_catalog
+          .write()
+          .unwrap_or_else(|poisoned| poisoned.into_inner()) = catalog;
+      }
+      Err(error) => update.warnings.push(error),
+    }
   }
 }
 
@@ -231,10 +270,11 @@ struct FileState {
   pending: Vec<u8>,
   normalizer: SessionNormalizer,
   context: SessionContext,
+  project_catalog: SharedProjectCatalog,
 }
 
 impl FileState {
-  fn open(path: PathBuf, provider: Provider) -> Result<Self, String> {
+  fn open(path: PathBuf, provider: Provider, project_catalog: SharedProjectCatalog) -> Result<Self, String> {
     let metadata = std::fs::metadata(&path).map_err(|err| format!("failed to inspect {}: {err}", path.display()))?;
     let context = SessionContext::from_path(provider, &path);
     Ok(Self {
@@ -246,6 +286,7 @@ impl FileState {
       pending: Vec::new(),
       normalizer: SessionNormalizer::new(provider),
       context,
+      project_catalog,
     })
   }
 
@@ -256,6 +297,10 @@ impl FileState {
     let mut reader = BufReader::new(file);
     let mut line = String::new();
     let mut update = TailUpdate::default();
+    let project_catalog = self
+      .project_catalog
+      .read()
+      .unwrap_or_else(|poisoned| poisoned.into_inner());
     for _ in 0..MAX_SESSION_HEADER_LINES {
       line.clear();
       let bytes = reader
@@ -266,7 +311,7 @@ impl FileState {
       }
       match self
         .normalizer
-        .normalize_line(line.trim_end_matches(['\r', '\n']), &mut self.context)
+        .normalize_line(line.trim_end_matches(['\r', '\n']), &mut self.context, &project_catalog)
       {
         Ok(events)
           if events
@@ -337,6 +382,10 @@ impl FileState {
 
     let complete = self.pending.drain(..complete_length).collect::<Vec<_>>();
     let mut update = TailUpdate::default();
+    let project_catalog = self
+      .project_catalog
+      .read()
+      .unwrap_or_else(|poisoned| poisoned.into_inner());
     for raw_line in complete.split(|byte| *byte == b'\n') {
       let line = match std::str::from_utf8(raw_line) {
         Ok(line) if !line.trim().is_empty() => line,
@@ -349,7 +398,10 @@ impl FileState {
         }
       };
 
-      match self.normalizer.normalize_line(line, &mut self.context) {
+      match self
+        .normalizer
+        .normalize_line(line, &mut self.context, &project_catalog)
+      {
         Ok(events) if should_publish => {
           update.events.extend(events.into_iter().map(|event| RelayEvent {
             topic: event_topic(self.provider, &self.path, &event),
@@ -442,9 +494,17 @@ impl SessionNormalizer {
     }
   }
 
-  fn normalize_line(&mut self, line: &str, context: &mut SessionContext) -> Result<Vec<AgentEvent>, String> {
+  fn normalize_line(
+    &mut self,
+    line: &str,
+    context: &mut SessionContext,
+    project_catalog: &ProjectCatalog,
+  ) -> Result<Vec<AgentEvent>, String> {
     let value: Value = serde_json::from_str(line).map_err(|err| format!("invalid session JSONL: {err}"))?;
     context.update(&value);
+    if matches!(context.provider, Provider::Codex) {
+      context.resolve_project_name(project_catalog);
+    }
 
     match self {
       Self::Codex(normalizer) => {
@@ -457,6 +517,65 @@ impl SessionNormalizer {
       }
     }
   }
+}
+
+fn load_project_catalog(roots: &[ProviderRoot]) -> (ProjectCatalog, Option<ProjectCatalogSource>, Option<String>) {
+  let Some(path) = roots
+    .iter()
+    .find(|root| matches!(root.provider, Provider::Codex))
+    .and_then(|root| root.path.parent())
+    .map(|codex_home| codex_home.join(".codex-global-state.json"))
+  else {
+    return (ProjectCatalog::default(), None, None);
+  };
+  let mut source = ProjectCatalogSource {
+    path,
+    observed_version: None,
+  };
+  match source.load_if_changed() {
+    Some(Ok(catalog)) => (catalog, Some(source), None),
+    Some(Err(error)) => (ProjectCatalog::default(), Some(source), Some(error)),
+    None => (ProjectCatalog::default(), Some(source), None),
+  }
+}
+
+struct ProjectCatalogSource {
+  path: PathBuf,
+  observed_version: Option<CatalogFileVersion>,
+}
+
+impl ProjectCatalogSource {
+  fn load_if_changed(&mut self) -> Option<Result<ProjectCatalog, String>> {
+    let metadata = match std::fs::metadata(&self.path) {
+      Ok(metadata) => metadata,
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        return self.observed_version.take().map(|_| Ok(ProjectCatalog::default()));
+      }
+      Err(error) => {
+        return Some(Err(format!(
+          "failed to inspect Codex Desktop project catalog {}: {error}",
+          self.path.display()
+        )));
+      }
+    };
+    let version = CatalogFileVersion {
+      identity: file_identity(&metadata),
+      length: metadata.len(),
+      modified: metadata.modified().ok(),
+    };
+    if self.observed_version == Some(version) {
+      return None;
+    }
+    self.observed_version = Some(version);
+    Some(ProjectCatalog::load(&self.path))
+  }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CatalogFileVersion {
+  identity: FileIdentity,
+  length: u64,
+  modified: Option<SystemTime>,
 }
 
 fn event_topic(provider: Provider, path: &Path, event: &AgentEvent) -> String {
@@ -926,7 +1045,10 @@ mod tests {
       Some("https://github.com/agentic-rs/tokn-session.git")
     );
     assert_eq!(project.name.as_deref(), Some("tokn-session"));
+    assert_eq!(project.project_name, None);
     assert_eq!(project.folder.as_deref(), Some("/tmp/worktree"));
+    assert_eq!(project.folder_name.as_deref(), Some("worktree"));
+    assert_eq!(project.repository_name.as_deref(), Some("tokn-session"));
     assert_eq!(project.branch.as_deref(), Some("main"));
     assert_eq!(project.commit_hash.as_deref(), Some("abcdef123456"));
     let AgentEvent::SessionSettingsApplied(settings) = &update.events[0].event else {
@@ -938,6 +1060,198 @@ mod tests {
     };
     assert_eq!(message.text, "hello");
     assert_eq!(message.session_id.as_deref(), Some("codex-session"));
+  }
+
+  #[test]
+  fn adds_desktop_project_folder_and_repository_names_to_codex_events() {
+    let fixture = TempDir::new().unwrap();
+    let sessions = fixture.path().join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    std::fs::write(
+      fixture.path().join(".codex-global-state.json"),
+      r#"{
+        "local-projects": {
+          "project-id": {
+            "id": "project-id",
+            "name": "llm-router_2",
+            "rootPaths": ["/workspace/llm-router"]
+          }
+        },
+        "thread-project-assignments": {
+          "root-session": {
+            "projectKind": "local",
+            "projectId": "project-id",
+            "cwd": "/workspace/llm-router"
+          }
+        }
+      }"#,
+    )
+    .unwrap();
+    let path = sessions.join("rollout-session-fixture.jsonl");
+    std::fs::write(
+      &path,
+      concat!(
+        "{\"timestamp\":\"2026-06-04T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{",
+        "\"id\":\"child-session\",",
+        "\"parent_thread_id\":\"root-session\",",
+        "\"timestamp\":\"2026-06-04T00:00:00Z\",",
+        "\"cwd\":\"/workspace/llm-router\",",
+        "\"git\":{\"repository_url\":\"https://github.com/agentic-rs/tokn\"}",
+        "}}\n",
+      ),
+    )
+    .unwrap();
+
+    let (mut tailer, initial) = SessionTailer::initialize(
+      vec![ProviderRoot::new(Provider::Codex, sessions)],
+      NewFileReplay::Messages(3),
+    )
+    .unwrap();
+    assert!(initial.events.is_empty());
+    assert!(initial.warnings.is_empty());
+
+    append(
+      &path,
+      "{\"timestamp\":\"2026-06-04T00:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hello\"}}\n",
+    );
+    let update = tailer.scan_paths(HashSet::from([path])).unwrap();
+    assert_eq!(update.events.len(), 1);
+    let project = update.events[0].session.project.as_ref().unwrap();
+    assert_eq!(project.name.as_deref(), Some("tokn"));
+    assert_eq!(project.project_name.as_deref(), Some("llm-router_2"));
+    assert_eq!(project.folder.as_deref(), Some("/workspace/llm-router"));
+    assert_eq!(project.folder_name.as_deref(), Some("llm-router"));
+    assert_eq!(project.repository_name.as_deref(), Some("tokn"));
+    assert_eq!(
+      project.repository_url.as_deref(),
+      Some("https://github.com/agentic-rs/tokn")
+    );
+  }
+
+  #[test]
+  fn reports_an_invalid_desktop_project_catalog_without_stopping() {
+    let fixture = TempDir::new().unwrap();
+    let sessions = fixture.path().join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    std::fs::write(fixture.path().join(".codex-global-state.json"), "{not json").unwrap();
+
+    let (_, initial) = SessionTailer::initialize(
+      vec![ProviderRoot::new(Provider::Codex, sessions)],
+      NewFileReplay::Messages(3),
+    )
+    .unwrap();
+
+    assert!(initial.events.is_empty());
+    assert_eq!(initial.warnings.len(), 1);
+    assert!(initial.warnings[0].contains("Codex Desktop project catalog"));
+  }
+
+  #[test]
+  fn reloads_desktop_project_catalog_after_startup() {
+    let fixture = TempDir::new().unwrap();
+    let sessions = fixture.path().join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let path = sessions.join("rollout-session-fixture.jsonl");
+    std::fs::write(
+      &path,
+      concat!(
+        "{\"timestamp\":\"2026-06-04T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{",
+        "\"id\":\"child-session\",",
+        "\"parent_thread_id\":\"root-session\",",
+        "\"cwd\":\"/workspace/llm-router\"",
+        "}}\n",
+      ),
+    )
+    .unwrap();
+    let (mut tailer, initial) = SessionTailer::initialize(
+      vec![ProviderRoot::new(Provider::Codex, sessions)],
+      NewFileReplay::Messages(3),
+    )
+    .unwrap();
+    assert!(initial.warnings.is_empty());
+
+    let state_path = fixture.path().join(".codex-global-state.json");
+    std::fs::write(
+      &state_path,
+      r#"{
+        "local-projects": {
+          "project-id": {
+            "name": "llm-router_2",
+            "rootPaths": ["/workspace/llm-router"]
+          }
+        },
+        "thread-project-assignments": {
+          "root-session": {
+            "projectKind": "local",
+            "projectId": "project-id"
+          }
+        }
+      }"#,
+    )
+    .unwrap();
+    append(
+      &path,
+      "{\"timestamp\":\"2026-06-04T00:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"first\"}}\n",
+    );
+    let first = tailer.scan_paths(HashSet::from([path.clone()])).unwrap();
+    assert_eq!(
+      first.events[0]
+        .session
+        .project
+        .as_ref()
+        .and_then(|project| project.project_name.as_deref()),
+      Some("llm-router_2")
+    );
+
+    let replacement = fixture.path().join("replacement-state.json");
+    std::fs::write(
+      &replacement,
+      r#"{
+        "local-projects": {
+          "project-id": {
+            "name": "llm-router-renamed",
+            "rootPaths": ["/workspace/llm-router"]
+          }
+        },
+        "thread-project-assignments": {
+          "root-session": {
+            "projectKind": "local",
+            "projectId": "project-id"
+          }
+        }
+      }"#,
+    )
+    .unwrap();
+    std::fs::remove_file(&state_path).unwrap();
+    std::fs::rename(replacement, &state_path).unwrap();
+    append(
+      &path,
+      "{\"timestamp\":\"2026-06-04T00:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"second\"}}\n",
+    );
+    let second = tailer.scan_paths(HashSet::from([path.clone()])).unwrap();
+    assert_eq!(
+      second.events[0]
+        .session
+        .project
+        .as_ref()
+        .and_then(|project| project.project_name.as_deref()),
+      Some("llm-router-renamed")
+    );
+
+    std::fs::remove_file(&state_path).unwrap();
+    append(
+      &path,
+      "{\"timestamp\":\"2026-06-04T00:00:03Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"third\"}}\n",
+    );
+    let third = tailer.scan_paths(HashSet::from([path])).unwrap();
+    assert_eq!(
+      third.events[0]
+        .session
+        .project
+        .as_ref()
+        .and_then(|project| project.project_name.as_deref()),
+      None
+    );
   }
 
   #[test]

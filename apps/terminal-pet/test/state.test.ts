@@ -172,6 +172,72 @@ describe("PetStore", () => {
     ]);
   });
 
+  test("prefers explicit project, folder, repository, then legacy names", () => {
+    const store = new PetStore(policy);
+    const cases = [
+      {
+        topic: "codex.project",
+        project: {
+          name: "tokn",
+          project_name: "llm-router_2",
+          folder: "/worktrees/59e1/llm-router",
+          folder_name: "llm-router",
+          repository_name: "tokn"
+        },
+        expected: "llm-router_2"
+      },
+      {
+        topic: "codex.folder",
+        project: {
+          name: "legacy",
+          project_name: null,
+          folder: "/worktrees/59e1/llm-router",
+          folder_name: "llm-router",
+          repository_name: "tokn"
+        },
+        expected: "llm-router"
+      },
+      {
+        topic: "codex.repository",
+        project: {
+          name: "legacy",
+          project_name: null,
+          folder: "/worktrees/59e1/llm-router",
+          folder_name: null,
+          repository_name: "tokn"
+        },
+        expected: "tokn"
+      },
+      {
+        topic: "codex.legacy",
+        project: {
+          name: "legacy-project",
+          folder: "/work/legacy-project"
+        },
+        expected: "legacy-project"
+      }
+    ] as const;
+
+    for (const item of cases) {
+      const relay = relayEvent({
+        type: "reasoning",
+        phase: "delta"
+      }, item.topic);
+      relay.session.project = item.project;
+      store.ingest(relay, 0);
+    }
+
+    const names = new Map(
+      store.snapshot(1).sessions.map((session) => [
+        session.topic,
+        session.project_label
+      ])
+    );
+    for (const item of cases) {
+      expect(names.get(item.topic)).toBe(item.expected);
+    }
+  });
+
   test("keeps recoverable tool errors in running", () => {
     const store = new PetStore(policy);
     store.ingest(relayEvent({

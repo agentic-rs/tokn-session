@@ -9,7 +9,9 @@ describe("renderer", () => {
     const art = await loadPetArt();
     const running = petFocus({
       topic: "codex.session-1",
-      label: "exec_command: cargo test"
+      label: "exec_command: cargo test",
+      project_label: "llm-router_2",
+      title: "A title that must not hide the GUI project"
     });
     const snapshot = petSnapshot([running]);
     const screen = renderScreen(snapshot, art.running.ansi, {
@@ -28,9 +30,26 @@ describe("renderer", () => {
     expect(output).toContain("SESSION ROSTER");
     expect(output).toContain("ACTIVE 1");
     expect(output).toContain("● Running");
-    expect(output).toContain("tokn-agent/root");
+    expect(output).toContain("llm-router_2/root");
     expect(output).toContain("exec_command: cargo test");
     expect(output).not.toContain("\u001b");
+
+    const titled = petFocus({
+      project_label: undefined,
+      title: "Investigate Relay",
+      agent: "Zeno"
+    });
+    const titledOutput = renderScreen(petSnapshot([titled]), art.running.ansi, {
+      source_label: "test"
+    }, {
+      columns: 100,
+      rows: 24,
+      color: false,
+      image_protocol: "ansi",
+      name: "Hachiware",
+      now_ms: 0
+    }).lines.join("\n");
+    expect(titledOutput).toContain("Investigate Relay");
   });
 
   test("shows concurrent sessions and recently ready work", async () => {
@@ -195,7 +214,7 @@ describe("renderer", () => {
   test("keeps diagnostics and provider identity in constrained layouts", async () => {
     const art = await loadPetArt();
     const running = petFocus({
-      project: undefined,
+      project_label: undefined,
       agent: undefined,
       title: undefined
     });
@@ -372,7 +391,7 @@ function petFocus(overrides: Partial<PetFocus> = {}): PetFocus {
     last_event_at: 0,
     label: "Thinking",
     provider: "codex",
-    project: "tokn-agent",
+    project_label: "tokn-agent",
     session_id: "session-1",
     agent: "root",
     recently_completed: false,

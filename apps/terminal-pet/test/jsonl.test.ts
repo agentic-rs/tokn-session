@@ -36,6 +36,36 @@ describe("JsonlDecoder", () => {
     expect(decoder.finish()).toHaveLength(1);
   });
 
+  test("preserves distinct project, folder, and repository names", () => {
+    const decoder = new JsonlDecoder(parseRelayEvent);
+    const enriched = JSON.stringify({
+      topic: "codex.session-1",
+      session: {
+        session_id: "session-1",
+        project: {
+          name: "tokn",
+          project_name: "llm-router_2",
+          folder: "/worktrees/59e1/llm-router",
+          folder_name: "llm-router",
+          repository_name: "tokn"
+        }
+      },
+      event: {
+        type: "reasoning"
+      }
+    });
+
+    const values = decoder.push(encoder.encode(`${enriched}\n`));
+
+    expect(values[0]?.session.project).toEqual({
+      name: "tokn",
+      project_name: "llm-router_2",
+      folder: "/worktrees/59e1/llm-router",
+      folder_name: "llm-router",
+      repository_name: "tokn"
+    });
+  });
+
   test("counts invalid JSON and invalid RelayEvent shapes", () => {
     const decoder = new JsonlDecoder(parseRelayEvent);
     const values = decoder.push(encoder.encode("{bad}\n{}\n\n"));

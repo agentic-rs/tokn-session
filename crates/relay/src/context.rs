@@ -4,11 +4,17 @@ use serde::Serialize;
 use serde_json::Value;
 use tokn_session_core::Provider;
 
-#[derive(Clone, Debug, Serialize)]
+use crate::project::ProjectCatalog;
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[non_exhaustive]
 pub struct ProjectContext {
   pub id: Option<String>,
   pub name: Option<String>,
+  pub project_name: Option<String>,
   pub folder: Option<String>,
+  pub folder_name: Option<String>,
+  pub repository_name: Option<String>,
   pub repository_url: Option<String>,
   pub branch: Option<String>,
   pub commit_hash: Option<String>,
@@ -49,6 +55,17 @@ impl SessionContext {
       Provider::Codex => self.update_codex(value),
       Provider::Pi => self.update_pi(value),
       Provider::OpenCode => {}
+    }
+  }
+
+  pub(crate) fn resolve_project_name(&mut self, projects: &ProjectCatalog) {
+    let project_name = projects
+      .resolve(&self.session_id, self.parent_session_id.as_deref(), self.cwd.as_deref())
+      .map(|identity| identity.name);
+    if project_name.is_some() {
+      self.project.get_or_insert_with(empty_project_context).project_name = project_name;
+    } else if let Some(project) = &mut self.project {
+      project.project_name = None;
     }
   }
 
@@ -122,10 +139,9 @@ impl SessionContext {
 fn project_context(cwd: Option<&str>, git: Option<&Value>) -> Option<ProjectContext> {
   let repository_url = git.and_then(|git| string_field(git, "repository_url"));
   let folder = cwd.map(str::to_string);
-  let name = repository_url
-    .as_deref()
-    .and_then(project_name_from_repository)
-    .or_else(|| cwd.and_then(project_name_from_folder));
+  let folder_name = cwd.and_then(project_name_from_folder);
+  let repository_name = repository_url.as_deref().and_then(project_name_from_repository);
+  let name = repository_name.clone().or_else(|| folder_name.clone());
   let branch = git.and_then(|git| string_field(git, "branch"));
   let commit_hash = git.and_then(|git| string_field(git, "commit_hash"));
 
@@ -136,11 +152,28 @@ fn project_context(cwd: Option<&str>, git: Option<&Value>) -> Option<ProjectCont
   Some(ProjectContext {
     id: repository_url.clone(),
     name,
+    project_name: None,
     folder,
+    folder_name,
+    repository_name,
     repository_url,
     branch,
     commit_hash,
   })
+}
+
+fn empty_project_context() -> ProjectContext {
+  ProjectContext {
+    id: None,
+    name: None,
+    project_name: None,
+    folder: None,
+    folder_name: None,
+    repository_name: None,
+    repository_url: None,
+    branch: None,
+    commit_hash: None,
+  }
 }
 
 fn project_name_from_repository(repository_url: &str) -> Option<String> {
@@ -224,7 +257,10 @@ mod tests {
     assert_eq!(context.started_at.as_deref(), Some("2026-06-04T00:00:00Z"));
     let project = context.project.unwrap();
     assert_eq!(project.name.as_deref(), Some("tokn-session"));
+    assert_eq!(project.project_name, None);
     assert_eq!(project.folder.as_deref(), Some("/tmp/worktree"));
+    assert_eq!(project.folder_name.as_deref(), Some("worktree"));
+    assert_eq!(project.repository_name.as_deref(), Some("tokn-session"));
   }
 
   #[test]
