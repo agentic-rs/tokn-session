@@ -177,12 +177,7 @@ fn human_event_prefix(event: &RelayEvent, show_agent_path: bool) -> String {
   if let Some(timestamp) = event_timestamp(&event.event).and_then(display_timestamp) {
     parts.push(timestamp);
   }
-  if let Some(project) = event
-    .session
-    .project
-    .as_ref()
-    .and_then(|project| project.name.as_deref())
-  {
+  if let Some(project) = event.session.project.as_ref().and_then(display_project_name) {
     parts.push(project.to_string());
   }
   parts.push(format!(
@@ -227,11 +222,18 @@ fn render_session_context(event: &RelayEvent, color: bool) -> String {
   append_context_line(&mut output, "started", context.started_at.as_deref(), color);
 
   if let Some(project) = &context.project {
-    append_context_line(&mut output, "project", project.name.as_deref(), color);
+    append_context_line(&mut output, "project_name", project.project_name.as_deref(), color);
+    append_context_line(&mut output, "folder_name", project.folder_name.as_deref(), color);
     append_context_line(&mut output, "folder", project.folder.as_deref(), color);
     if context.cwd.as_deref() != project.folder.as_deref() {
       append_context_line(&mut output, "cwd", context.cwd.as_deref(), color);
     }
+    append_context_line(
+      &mut output,
+      "repository_name",
+      project.repository_name.as_deref(),
+      color,
+    );
     append_context_line(&mut output, "repository", project.repository_url.as_deref(), color);
     append_context_line(&mut output, "branch", project.branch.as_deref(), color);
     append_context_line(&mut output, "commit", project.commit_hash.as_deref(), color);
@@ -244,6 +246,15 @@ fn render_session_context(event: &RelayEvent, color: bool) -> String {
 
 fn visible_agent_path(event: &RelayEvent) -> Option<&str> {
   event.session.agent_path.as_deref().filter(|path| *path != "/root")
+}
+
+fn display_project_name(project: &tokn_session_relay::ProjectContext) -> Option<&str> {
+  project
+    .project_name
+    .as_deref()
+    .or(project.folder_name.as_deref())
+    .or(project.repository_name.as_deref())
+    .or(project.name.as_deref())
 }
 
 fn append_context_line(output: &mut String, label: &str, value: Option<&str>, color: bool) {
@@ -722,6 +733,9 @@ mod tests {
     let value: serde_json::Value = serde_json::from_slice(&output.bytes).unwrap();
     assert_eq!(value["topic"], "pi.session-1");
     assert_eq!(value["session"]["project"]["name"], "project");
+    assert_eq!(value["session"]["project"]["project_name"], "project");
+    assert_eq!(value["session"]["project"]["folder_name"], "project");
+    assert!(value["session"]["project"]["repository_name"].is_null());
     assert!(value["session"]["agent_path"].is_null());
     assert_eq!(value["event"]["type"], "message");
     assert_eq!(value["event"]["text"], "done");
@@ -746,7 +760,8 @@ mod tests {
       concat!(
         "session pi/session-1\n",
         "  started 2026-01-01T00:00:00Z\n",
-        "  project project\n",
+        "  project_name project\n",
+        "  folder_name project\n",
         "  folder /tmp/project\n",
         "\n",
         "00:00:01 project pi/session-1 #message-1 ←#parent-1 assistant\n",
@@ -762,6 +777,26 @@ mod tests {
     let mut json = RecordingWriter::default();
     write_stdout_event(&mut json, &event, StdoutFormat::Json, true, false).unwrap();
     assert!(!String::from_utf8(json.bytes).unwrap().contains("\u{1b}["));
+  }
+
+  #[test]
+  fn pretty_does_not_label_a_folder_fallback_as_project_name() {
+    let mut event = message_event();
+    event.session.project.as_mut().unwrap().project_name = None;
+
+    let mut summary = RecordingWriter::default();
+    write_stdout_event(&mut summary, &event, StdoutFormat::Summary, false, false).unwrap();
+    assert!(
+      String::from_utf8(summary.bytes)
+        .unwrap()
+        .starts_with("00:00:01 project ")
+    );
+
+    let mut pretty = RecordingWriter::default();
+    write_stdout_event(&mut pretty, &event, StdoutFormat::Pretty, false, true).unwrap();
+    let output = String::from_utf8(pretty.bytes).unwrap();
+    assert!(!output.contains("  project_name "));
+    assert!(output.contains("  folder_name project\n"));
   }
 
   #[test]
@@ -850,6 +885,12 @@ mod tests {
   }
 
   fn session_context() -> SessionContext {
+    let mut project = ProjectContext::default();
+    project.name = Some("project".to_string());
+    project.project_name = Some("project".to_string());
+    project.folder = Some("/tmp/project".to_string());
+    project.folder_name = Some("project".to_string());
+
     SessionContext {
       provider: Provider::Pi,
       session_id: "session-1".to_string(),
@@ -860,14 +901,7 @@ mod tests {
       title: None,
       cwd: Some("/tmp/project".to_string()),
       started_at: Some("2026-01-01T00:00:00Z".to_string()),
-      project: Some(ProjectContext {
-        id: None,
-        name: Some("project".to_string()),
-        folder: Some("/tmp/project".to_string()),
-        repository_url: None,
-        branch: None,
-        commit_hash: None,
-      }),
+      project: Some(project),
     }
   }
 

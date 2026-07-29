@@ -11,7 +11,10 @@ export interface RelaySession {
   cwd?: string | null;
   project?: {
     name?: string | null;
+    project_name?: string | null;
     folder?: string | null;
+    folder_name?: string | null;
+    repository_name?: string | null;
   } | null;
 }
 
@@ -93,6 +96,9 @@ function parseProject(value: unknown): RelaySession["project"] {
   }
   return {
     name: asNullableString(project.name),
-    folder: asNullableString(project.folder)
+    project_name: asNullableString(project.project_name),
+    folder: asNullableString(project.folder),
+    folder_name: asNullableString(project.folder_name),
+    repository_name: asNullableString(project.repository_name)
   };
 }

@@ -12,8 +12,11 @@ export function relayEvent(
       session_id: topic.split(".").slice(1).join("."),
       agent_path: "/root",
       project: {
-        name: "tokn-agent",
-        folder: "/tmp/tokn-agent"
+        name: "tokn-session",
+        project_name: "tokn-agent",
+        folder: "/tmp/tokn-agent",
+        folder_name: "tokn-agent",
+        repository_name: "tokn-session"
       }
     },
     event

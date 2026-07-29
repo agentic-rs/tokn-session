@@ -51,12 +51,12 @@ while `--replay-all` emits every complete record. These replay options only
 apply to files discovered or replaced after startup.
 
 `stdout` supports `--format pretty|summary|json` and defaults to `summary`.
-Human-readable formats include the event timestamp, inferred project name,
-abbreviated session id, and message id/parent when available. Pretty output
-also prints the full session context before the first event observed for each
-session. `--color` adds ANSI color to human output. JSON remains colorless
-`RelayEvent` JSONL even when `--color` is present. Every format flushes after
-each event, and diagnostics remain on stderr.
+Human-readable formats include the event timestamp, Codex Desktop project name
+when available, abbreviated session id, and message id/parent when available.
+Pretty output also prints the full session context before the first event
+observed for each session. `--color` adds ANSI color to human output. JSON
+remains colorless `RelayEvent` JSONL even when `--color` is present. Every
+format flushes after each event, and diagnostics remain on stderr.
 
 `zeromq` binds `tcp://127.0.0.1:5556` by default. Each publication is a two-frame
 ZeroMQ message:
@@ -66,13 +66,19 @@ ZeroMQ message:
 
 `RelayEvent` wraps the normalized `AgentEvent` with the source path, topic, and
 `SessionContext`. Context includes session id, optional parent/title, cwd and
-start time, optional agent path/nickname/role, plus project name/folder. Codex
-session metadata also contributes repository URL, branch, and commit when
-present. Agent metadata comes only from the first session header, including its
+start time, optional agent path/nickname/role, plus a project object. That
+object carries the distinct `project_name`, `folder_name`, and
+`repository_name` fields as well as the existing folder path, repository URL,
+branch, commit, and compatibility `name`. For Codex sessions, `project_name`
+comes from Codex Desktop's optional `.codex-global-state.json`: direct thread
+assignment wins, then parent-thread assignment, then the longest matching
+workspace root. Relay reloads this catalog when the file changes. Missing or
+malformed Desktop metadata does not stop Relay.
+`folder_name` comes from the cwd basename and `repository_name` from the Git
+remote. Agent metadata comes only from the first session header, including its
 thread-spawn source when needed. Missing paths remain null for root and
-subagent sessions; the relay does not derive `/root`. Project name is display
-metadata inferred from the repository URL or cwd basename; title is never
-invented when the provider file does not contain one.
+subagent sessions; the relay does not derive `/root`. Title is never invented
+when the provider file does not contain one.
 
 Pretty session context shows `agent_path` only when it is present and not
 `/root`. Summary lines include the same paths as `agent=<path>`. JSON preserves
@@ -103,8 +109,9 @@ drives the large pet in automatic mode. Up/Down or `j`/`k` selects another
 session by topic, `a` restores automatic focus, and `c` acknowledges the
 selected notification. Responsive text rows keep concurrent and recent
 sessions visible; overflow windows around a manual selection so it cannot
-disappear off-screen. Wide terminals show the art and roster side by side,
-while narrow terminals become roster-only.
+disappear off-screen. Session labels prefer `project_name`, then folder name,
+repository name, and the legacy inferred name. Wide terminals show the art and
+roster side by side, while narrow terminals become roster-only.
 
 States currently derive from normalized messages, reasoning, tool calls,
 errors, goals, and preserved input-request events. Codex task start/complete

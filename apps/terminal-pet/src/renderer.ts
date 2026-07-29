@@ -484,7 +484,7 @@ function contextLine(focus: PetFocus | undefined): string {
   }
   const values = [
     focus.provider,
-    focus.project,
+    focus.project_label,
     normalizeAgent(focus.agent)
   ].filter((value): value is string => Boolean(value));
   return values.join(" · ");
@@ -495,13 +495,12 @@ function sessionIdentity(session: PetFocus): string {
     ? session.session_id
     : session.session_id.slice(0, 8);
   const projectAgent = [
-    session.project,
+    session.project_label,
     normalizeAgent(session.agent)
   ].filter((value): value is string => Boolean(value)).join("/");
-  const identity = session.title
-    || projectAgent
-    || session.provider
-    || "session";
+  const identity = session.project_label
+    ? projectAgent
+    : session.title || projectAgent || session.provider || "session";
   return `${identity} · ${shortId}`;
 }
 

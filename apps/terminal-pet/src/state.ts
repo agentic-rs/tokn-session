@@ -36,7 +36,7 @@ export interface PetFocus {
   last_event_at: number;
   label: string;
   provider?: string;
-  project?: string;
+  project_label?: string;
   title?: string;
   session_id: string;
   agent?: string;
@@ -428,7 +428,7 @@ export class PetStore {
       last_event_at: activity.last_event_at,
       label: activity.label,
       provider: activity.session.provider,
-      project: activity.session.project?.name ?? undefined,
+      project_label: displayProjectName(activity.session.project),
       title: activity.session.title ?? undefined,
       session_id: activity.session.session_id,
       agent: activity.session.agent_nickname
@@ -438,6 +438,14 @@ export class PetStore {
       recently_completed: recentlyCompleted
     };
   }
+}
+
+function displayProjectName(project: RelaySession["project"]): string | undefined {
+  return project?.project_name
+    ?? project?.folder_name
+    ?? project?.repository_name
+    ?? project?.name
+    ?? undefined;
 }
 
 function compareActiveSessions(left: PetFocus, right: PetFocus): number {

@@ -65,7 +65,9 @@ Zellij; the explicit Kitty overrides do not bypass that safety fallback.
 Wide terminals use one graphical pet beside the session roster. Narrow
 terminals suppress the artwork and spend the available rows on the roster.
 Each row includes a state glyph, session identity, latest activity, and age, so
-the display remains useful without color.
+the display remains useful without color. Project identity prefers the Codex
+Desktop `project_name`, then `folder_name`, `repository_name`, and the legacy
+inferred Relay name.
 
 Override detection with:
 

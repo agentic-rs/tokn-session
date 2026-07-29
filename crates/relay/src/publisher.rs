@@ -77,7 +77,10 @@ mod tests {
           project: Some(ProjectContext {
             id: None,
             name: Some("project".to_string()),
+            project_name: Some("project".to_string()),
             folder: Some("/tmp/project".to_string()),
+            folder_name: Some("project".to_string()),
+            repository_name: None,
             repository_url: None,
             branch: None,
             commit_hash: None,
@@ -97,6 +100,9 @@ mod tests {
     let payload: serde_json::Value = serde_json::from_slice(message.get(1).unwrap()).unwrap();
     assert_eq!(payload["topic"], "pi.session-1");
     assert_eq!(payload["session"]["project"]["name"], "project");
+    assert_eq!(payload["session"]["project"]["project_name"], "project");
+    assert_eq!(payload["session"]["project"]["folder_name"], "project");
+    assert!(payload["session"]["project"]["repository_name"].is_null());
     assert!(payload["session"]["agent_path"].is_null());
     assert_eq!(payload["event"]["type"], "message");
     assert_eq!(payload["event"]["session_id"], "session-1");
