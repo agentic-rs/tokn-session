@@ -306,6 +306,8 @@ function rosterLines(
   nowMs: number,
   color: boolean
 ): string[] {
+  const statusWidth = rosterStatusWidth(snapshot.sessions);
+  const ageWidth = rosterAgeWidth(snapshot.sessions, nowMs);
   const families = sessionFamilies(snapshot);
   const activeFamilies = families.filter((family) => (
     family.active_count > 0 || family.root.family_state !== "idle"
@@ -325,7 +327,9 @@ function rosterLines(
     snapshot.focus?.topic,
     width,
     nowMs,
-    color
+    color,
+    statusWidth,
+    ageWidth
   );
   appendRosterGroup(
     full,
@@ -335,7 +339,9 @@ function rosterLines(
     snapshot.focus?.topic,
     width,
     nowMs,
-    color
+    color,
+    statusWidth,
+    ageWidth
   );
 
   if (full.length === 0) {
@@ -350,13 +356,25 @@ function rosterLines(
       snapshot.focus?.topic,
       width,
       nowMs,
-      color
+      color,
+      statusWidth,
+      ageWidth
     ));
   }
   if (maxRows <= 1) {
     const focus = snapshot.focus ?? snapshot.sessions[0];
     return focus
-      ? [sessionLine(focus, snapshot.focus?.topic, width, nowMs, color)]
+      ? [
+          sessionLine(
+            focus,
+            snapshot.focus?.topic,
+            width,
+            nowMs,
+            color,
+            statusWidth,
+            ageWidth
+          )
+        ]
       : [];
   }
 
@@ -367,7 +385,9 @@ function rosterLines(
       snapshot.focus?.topic,
       width,
       nowMs,
-      color
+      color,
+      statusWidth,
+      ageWidth
     )),
     dim(truncate(overflowLine(window), width), color)
   ];
@@ -460,7 +480,9 @@ function appendRosterGroup(
   focusTopic: string | undefined,
   width: number,
   nowMs: number,
-  color: boolean
+  color: boolean,
+  statusWidth: number,
+  ageWidth: number
 ): void {
   if (sessions.length === 0) {
     return;
@@ -470,7 +492,15 @@ function appendRosterGroup(
   });
   for (const session of sessions) {
     target.push({
-      line: sessionLine(session, focusTopic, width, nowMs, color)
+      line: sessionLine(
+        session,
+        focusTopic,
+        width,
+        nowMs,
+        color,
+        statusWidth,
+        ageWidth
+      )
     });
   }
 }
@@ -480,7 +510,9 @@ function sessionLine(
   focusTopic: string | undefined,
   width: number,
   nowMs: number,
-  color: boolean
+  color: boolean,
+  statusWidth = 0,
+  ageWidth = 0
 ): string {
   const rowState = effectivePetState(session);
   const isRecent = rowState === "idle" && session.recently_completed;
@@ -488,26 +520,20 @@ function sessionLine(
   const displayState = isRecent && !isInterrupted ? "ready" : rowState;
   const marker = session.topic === focusTopic ? "›" : " ";
   const glyph = isInterrupted ? "×" : isRecent ? "✓" : STATUS_GLYPH[rowState];
-  const status = isInterrupted ? "Interrupted" : isRecent ? "Ready" : STATUS_LABEL[rowState];
-  const lastEventAt = session.depth === 0
-    ? session.family_last_event_at
-    : session.last_event_at;
-  const timestamp = isRecent
-    ? session.completed_at ?? lastEventAt
-    : lastEventAt;
-  const age = formatAge(Math.max(0, nowMs - timestamp));
+  const status = sessionStatusLabel(session);
+  const age = sessionAge(session, nowMs);
+  const alignedStatus = padRight(
+    status,
+    Math.max(statusWidth, Bun.stringWidth(status))
+  );
   const prefix = width >= 32
-    ? `${marker} ${glyph} ${status} · `
+    ? `${marker} ${glyph} ${alignedStatus} · `
     : `${marker} ${glyph} `;
-  const indent = session.depth > 0
-    ? `${"  ".repeat(Math.min(session.depth - 1, 4))}↳ `
-    : "";
-  const suffix = ` · ${age}`;
+  const suffix = ` · ${padLeft(age, Math.max(ageWidth, Bun.stringWidth(age)))}`;
   const separator = " · ";
   const separatorWidth = Bun.stringWidth(separator);
   const available = width
     - Bun.stringWidth(prefix)
-    - Bun.stringWidth(indent)
     - Bun.stringWidth(suffix);
   if (available < separatorWidth + 2) {
     const compact = [
@@ -522,18 +548,64 @@ function sessionLine(
     );
   }
   const contentWidth = Math.max(1, available - separatorWidth);
-  const identityRatio = width < 32 ? 0.25 : 0.47;
-  const identityWidth = Math.max(1, Math.floor(contentWidth * identityRatio));
+  const identityRatio = width < 32 ? 0.25 : 0.5;
+  const identityWidth = Math.max(
+    1,
+    width < 32
+      ? Math.floor(contentWidth * identityRatio)
+      : Math.ceil(contentWidth * identityRatio)
+  );
   const activityWidth = Math.max(1, contentWidth - identityWidth);
+  const identity = indentedSessionIdentity(session, identityWidth);
   const plain = [
     prefix,
-    indent,
-    truncate(sessionIdentity(session), identityWidth),
+    padRight(identity, identityWidth),
     separator,
-    truncate(sessionActivity(session), activityWidth),
+    padRight(truncate(sessionActivity(session), activityWidth), activityWidth),
     suffix
   ].join("");
-  return colorize(truncate(plain, width), color, STATUS_COLOR[displayState]);
+  return colorize(plain, color, STATUS_COLOR[displayState]);
+}
+
+function rosterStatusWidth(sessions: PetFocus[]): number {
+  return sessions.reduce((width, session) => (
+    Math.max(width, Bun.stringWidth(sessionStatusLabel(session)))
+  ), 0);
+}
+
+function rosterAgeWidth(sessions: PetFocus[], nowMs: number): number {
+  return sessions.reduce((width, session) => (
+    Math.max(width, Bun.stringWidth(sessionAge(session, nowMs)))
+  ), 0);
+}
+
+function sessionStatusLabel(session: PetFocus): string {
+  const rowState = effectivePetState(session);
+  if (rowState === "idle" && session.recently_completed) {
+    return session.outcome === "interrupted" ? "Interrupted" : "Ready";
+  }
+  return STATUS_LABEL[rowState];
+}
+
+function sessionAge(session: PetFocus, nowMs: number): string {
+  const lastEventAt = session.depth === 0
+    ? session.family_last_event_at
+    : session.last_event_at;
+  const timestamp = effectivePetState(session) === "idle" && session.recently_completed
+    ? session.completed_at ?? lastEventAt
+    : lastEventAt;
+  return formatAge(Math.max(0, nowMs - timestamp));
+}
+
+function indentedSessionIdentity(session: PetFocus, width: number): string {
+  const indent = session.depth > 0
+    ? `${"  ".repeat(Math.min(session.depth - 1, 4))}↳ `
+    : "";
+  const indentWidth = Bun.stringWidth(indent);
+  if (indentWidth >= width) {
+    return truncate(indent.trimStart(), width);
+  }
+  return `${indent}${truncate(sessionIdentity(session), width - indentWidth)}`;
 }
 
 function focusStatusLine(
@@ -681,6 +753,14 @@ function padRight(value: string, width: number): string {
     return visibleWidth === width ? value : truncate(Bun.stripANSI(value), width);
   }
   return `${value}${" ".repeat(width - visibleWidth)}`;
+}
+
+function padLeft(value: string, width: number): string {
+  const visibleWidth = Bun.stringWidth(value);
+  if (visibleWidth >= width) {
+    return visibleWidth === width ? value : truncate(Bun.stripANSI(value), width);
+  }
+  return `${" ".repeat(width - visibleWidth)}${value}`;
 }
 
 function center(value: string, width: number): string {
