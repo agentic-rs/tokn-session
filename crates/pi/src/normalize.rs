@@ -2,8 +2,8 @@ use serde_json::Value;
 
 use crate::event::{PiContentBlock, PiMessage, PiMessageItem, PiSessionItem, PiSessionLine, PiUserContent};
 use tokn_session_core::{
-  AgentEvent, ErrorEvent, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role, SessionStarted,
-  ToolCallEvent, UnknownEvent, tool_kind_for_name, tool_summary_for_input,
+  AgentEvent, ErrorEvent, MessageDelivery, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role,
+  SessionStarted, ToolCallEvent, UnknownEvent, tool_kind_for_name, tool_summary_for_input,
 };
 
 pub struct PiNormalizer {
@@ -361,6 +361,10 @@ fn message_event(
     message_id: meta.id.clone(),
     parent_id: meta.parent_id.clone(),
     role,
+    delivery: match role {
+      Role::Assistant => MessageDelivery::Final,
+      _ => MessageDelivery::Unspecified,
+    },
     phase: Phase::Finished,
     text,
     timestamp,
@@ -455,7 +459,7 @@ mod tests {
       matches!(&events[5], AgentEvent::ToolCall(event) if event.tool_call_id.as_deref() == Some("call-1") && matches!(event.tool_kind, ToolKind::FileRead))
     );
     assert!(
-      matches!(&events[6], AgentEvent::Message(event) if matches!(event.role, Role::Assistant) && event.text == "done")
+      matches!(&events[6], AgentEvent::Message(event) if matches!(event.role, Role::Assistant) && matches!(event.delivery, MessageDelivery::Final) && event.text == "done")
     );
     assert!(
       matches!(&events[7], AgentEvent::ToolCall(event) if event.tool_call_id.as_deref() == Some("call-1") && event.is_error == Some(false))

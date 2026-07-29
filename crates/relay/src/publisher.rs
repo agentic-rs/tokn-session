@@ -34,7 +34,7 @@ mod tests {
   use std::time::Duration;
 
   use tempfile::TempDir;
-  use tokn_session_core::{AgentEvent, MessageEvent, Phase, Provider, Role};
+  use tokn_session_core::{AgentEvent, MessageDelivery, MessageEvent, Phase, Provider, Role};
   use zeromq::{Socket, SocketRecv, SubSocket};
 
   use super::ZmqPublisher;
@@ -56,6 +56,7 @@ mod tests {
       message_id: Some("message-1".to_string()),
       parent_id: None,
       role: Role::Assistant,
+      delivery: MessageDelivery::Final,
       phase: Phase::Finished,
       text: "done".to_string(),
       timestamp: None,
@@ -106,6 +107,7 @@ mod tests {
     assert!(payload["session"]["agent_path"].is_null());
     assert_eq!(payload["event"]["type"], "message");
     assert_eq!(payload["event"]["session_id"], "session-1");
+    assert_eq!(payload["event"]["delivery"], "final");
     assert_eq!(payload["event"]["text"], "done");
   }
 }

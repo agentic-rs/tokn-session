@@ -19,6 +19,7 @@ tokn-session append --source opencode --executor "tokn-gateway proxy opencode --
 tokn-session append --source opencode --executor "tokn-gateway proxy opencode --npx --" --continue "next turn"
 tokn-session-relay zeromq
 tokn-session-relay stdout
+tokn-discord-pet
 cd apps/terminal-pet && bun run start
 ```
 
@@ -95,6 +96,26 @@ controls provider roots, new-file replay, and the periodic recovery interval.
 Library consumers call `next_update().await`; notification and scan failures
 that can be retried are returned as warnings in `TailUpdate`.
 
+## Discord Pet
+
+`tokn-discord-pet` uses the reusable relay loop to mirror root Codex and Pi
+conversations into Discord. It reads `~/.tokn/pet/discord.yaml`, validates the
+bot and configured guild/channel through Discord's REST API, and creates one
+public thread per root session. It publishes root user messages and final
+assistant messages only. Commentary, reasoning, tools, and child sessions are
+ignored.
+
+The YAML contains `bot_token`, `guild_id`, and `channel_id`. Thread mappings are
+persisted beside it in `discord-state.json`, so later turns continue in the same
+thread after a process restart. Discord embeds are split against the platform's
+UTF-16 length accounting, mentions are disabled, transient requests and rate
+limits are retried, and the token is never logged. The bot needs no privileged
+intents.
+
+Existing files start at their snapshotted EOF. Newly discovered files use the
+relay's three-message replay window so the first prompt is not missed. See
+`crates/discord-pet/README.md` for setup and permissions.
+
 ## Terminal Pet
 
 `apps/terminal-pet` is a Bun/TypeScript prototype that consumes Relay JSONL and
@@ -131,6 +152,8 @@ leases and a short ready debounce instead of claiming authoritative runtime
 status. The recent-Ready roster is explicitly an observed-run heuristic, not an
 authoritative completion log. It includes only work seen while the pet is
 running because Relay seeds existing session files from their snapshotted EOF.
+Codex commentary messages count as progress rather than completion now that the
+normalized message delivery is preserved.
 
 Rendering uses Kitty graphics where available, the Kitty local-file protocol
 in iTerm2 3.6+, and a truecolor ANSI half-block fallback. `bun run dev` cycles
@@ -194,6 +217,11 @@ Current event families include:
 - `tool_call`
 - `error`
 - `unknown`
+
+Messages carry an orthogonal `delivery` field: `commentary`, `final`, or
+`unspecified`. Codex preserves the provider's response phase. Pi and OpenCode
+assistant text is final because those persisted message records do not expose a
+separate commentary channel. User and other messages use `unspecified`.
 
 Tool calls now carry semantic display metadata:
 
@@ -328,6 +356,7 @@ cargo run -p tokn-session-cli -- list --source opencode --limit 1
 cargo run -p tokn-session-cli -- show --source opencode <session-id> --format pretty
 cargo run -p tokn-session-relay -- stdout
 cargo run -p tokn-session-relay -- zeromq
+cargo run -p tokn-discord-pet -- --help
 cd apps/terminal-pet && bun run check
 cd apps/terminal-pet && bun run snapshot
 ```

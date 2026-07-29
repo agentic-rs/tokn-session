@@ -4,8 +4,8 @@ use crate::event::{
 };
 use serde_json::{Value, json};
 use tokn_session_core::{
-  AgentEvent, ErrorEvent, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role, SessionStarted,
-  ToolCallEvent, UnknownEvent, tool_kind_for_optional_name, tool_summary_for_io,
+  AgentEvent, ErrorEvent, MessageDelivery, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role,
+  SessionStarted, ToolCallEvent, UnknownEvent, tool_kind_for_optional_name, tool_summary_for_io,
 };
 
 pub struct OpenCodeNormalizer {
@@ -72,6 +72,7 @@ impl OpenCodeNormalizer {
             message_id: Some(row.id),
             parent_id: row.data.parent_id,
             role: open_code_role(row.data.role),
+            delivery: MessageDelivery::Unspecified,
             phase: Phase::Finished,
             text,
             timestamp: timestamp(row.time_created),
@@ -147,6 +148,7 @@ impl OpenCodeNormalizer {
         message_id: Some(message_id.to_string()),
         parent_id: parent_id.clone(),
         role: Role::Assistant,
+        delivery: MessageDelivery::Final,
         phase: Phase::Finished,
         text,
         timestamp: timestamp(part.time_created),

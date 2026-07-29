@@ -4,9 +4,9 @@ use tokn_codex_protocol::{
   ResponseItem, RolloutItem, SessionMetaItem, UnknownItem,
 };
 use tokn_session_core::{
-  AgentActivity, AgentEvent, ErrorEvent, GoalUpdated, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent,
-  Role, SessionHistoryStatus, SessionSettingsApplied, SessionStarted, ToolCallEvent, ToolKind, ToolSummary,
-  UnknownEvent, patch_summary, tool_kind_for_name, tool_kind_for_optional_name, tool_summary_for_input,
+  AgentActivity, AgentEvent, ErrorEvent, GoalUpdated, MessageDelivery, MessageEvent, Phase, Provider, ProviderChanged,
+  ReasoningEvent, Role, SessionHistoryStatus, SessionSettingsApplied, SessionStarted, ToolCallEvent, ToolKind,
+  ToolSummary, UnknownEvent, patch_summary, tool_kind_for_name, tool_kind_for_optional_name, tool_summary_for_input,
   tool_summary_for_io,
 };
 
@@ -340,6 +340,7 @@ fn normalize_message(session_id: Option<String>, item: MessageItem, timestamp: O
   if role != "assistant" {
     return Vec::new();
   }
+  let delivery = codex_message_delivery(item.phase.as_deref());
 
   let text = content_text(&item.content);
   if text.is_empty() {
@@ -357,6 +358,7 @@ fn normalize_message(session_id: Option<String>, item: MessageItem, timestamp: O
     message_id: item.id,
     parent_id: None,
     role: codex_role(role),
+    delivery,
     phase: Phase::Finished,
     text,
     timestamp,
@@ -905,6 +907,7 @@ fn message_event(
     message_id,
     parent_id: None,
     role,
+    delivery: MessageDelivery::Unspecified,
     phase,
     text,
     timestamp,
@@ -954,6 +957,14 @@ fn codex_role(role: &str) -> Role {
     "system" | "developer" => Role::System,
     "tool" => Role::Tool,
     _ => Role::Unknown,
+  }
+}
+
+fn codex_message_delivery(phase: Option<&str>) -> MessageDelivery {
+  match phase {
+    Some("commentary") => MessageDelivery::Commentary,
+    Some("final") => MessageDelivery::Final,
+    _ => MessageDelivery::Unspecified,
   }
 }
 
@@ -1133,6 +1144,18 @@ mod tests {
       event.native.as_ref().and_then(|value| value.get("answer")),
       Some(&json!(42))
     );
+  }
+
+  #[test]
+  fn preserves_assistant_message_delivery() {
+    let events = normalize_fixture(
+      r#"{"type":"session_meta","payload":{"id":"session-1"}}
+{"type":"response_item","payload":{"type":"message","id":"commentary","role":"assistant","content":[{"type":"output_text","text":"working"}],"phase":"commentary"}}
+{"type":"response_item","payload":{"type":"message","id":"final","role":"assistant","content":[{"type":"output_text","text":"done"}],"phase":"final"}}"#,
+    );
+
+    assert!(matches!(&events[1], AgentEvent::Message(event) if matches!(event.delivery, MessageDelivery::Commentary)));
+    assert!(matches!(&events[2], AgentEvent::Message(event) if matches!(event.delivery, MessageDelivery::Final)));
   }
 
   #[test]

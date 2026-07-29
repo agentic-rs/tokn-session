@@ -53,6 +53,19 @@ describe("PetStore", () => {
     expect(store.snapshot(91).sessions[0]?.completed_at).toBeUndefined();
   });
 
+  test("treats finished commentary as progress rather than completion", () => {
+    const store = new PetStore(policy);
+    store.ingest(relayEvent({
+      type: "message",
+      role: "assistant",
+      delivery: "commentary",
+      phase: "finished",
+      text: "still working"
+    }), 0);
+
+    expect(store.snapshot(20).state).toBe("running");
+  });
+
   test("does not report ready while a tool remains open", () => {
     const store = new PetStore(policy);
     store.ingest(relayEvent({

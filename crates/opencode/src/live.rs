@@ -1,7 +1,8 @@
 use serde::Deserialize;
 use serde_json::Value;
 use tokn_session_core::{
-  AgentEvent, ErrorEvent, LiveSessionEvent, MessageEvent, Phase, Provider, ReasoningEvent, Role, UnknownEvent,
+  AgentEvent, ErrorEvent, LiveSessionEvent, MessageDelivery, MessageEvent, Phase, Provider, ReasoningEvent, Role,
+  UnknownEvent,
 };
 
 use crate::event::OpenCodeToolState;
@@ -105,6 +106,7 @@ fn text_event(session_id: Option<String>, raw_timestamp: Option<i64>, part: Open
       message_id: message_id.or(id),
       parent_id: None,
       role: Role::Assistant,
+      delivery: MessageDelivery::Final,
       phase: Phase::Finished,
       text,
       timestamp: timestamp(raw_timestamp),
@@ -177,7 +179,7 @@ fn error_message(value: Value) -> String {
 
 #[cfg(test)]
 mod tests {
-  use tokn_session_core::{AgentEvent, LiveSessionEvent, ToolSummary};
+  use tokn_session_core::{AgentEvent, LiveSessionEvent, MessageDelivery, ToolSummary};
 
   use super::OpenCodeLiveNormalizer;
 
@@ -194,6 +196,7 @@ mod tests {
     };
     assert_eq!(message.session_id.as_deref(), Some("ses_123"));
     assert_eq!(message.message_id.as_deref(), Some("msg_1"));
+    assert!(matches!(message.delivery, MessageDelivery::Final));
     assert_eq!(message.text, "done");
     assert_eq!(message.timestamp.as_deref(), Some("1710000000000"));
   }

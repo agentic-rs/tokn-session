@@ -62,6 +62,7 @@ pub struct MessageEvent {
   pub message_id: Option<String>,
   pub parent_id: Option<String>,
   pub role: Role,
+  pub delivery: MessageDelivery,
   pub phase: Phase,
   pub text: String,
   pub timestamp: Option<String>,
@@ -157,6 +158,14 @@ pub enum Role {
   System,
   Tool,
   Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDelivery {
+  Commentary,
+  Final,
+  Unspecified,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]

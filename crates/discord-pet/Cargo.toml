@@ -1,0 +1,16 @@
+[package]
+name = "tokn-discord-pet"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+tokio.workspace = true
+tokn-session-core.workspace = true
+tokn-session-relay.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
