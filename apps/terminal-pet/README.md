@@ -28,8 +28,9 @@ bun install
 bun run start
 ```
 
-By default the app builds the workspace Relay once if needed, then spawns the
-resulting binary. This keeps stdin available for keyboard controls:
+By default the app runs an incremental workspace Relay build, then spawns the
+resulting binary. This keeps the normalizer current while leaving stdin
+available for keyboard controls:
 
 - `q` or Escape quits and stops the child Relay.
 - Up/Down or `j`/`k` selects a session, including recently completed work.

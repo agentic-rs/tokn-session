@@ -65,7 +65,7 @@ The bot needs these permissions in the target text channel:
 bun run start
 ```
 
-The app builds the workspace Relay once if needed, then spawns:
+The app runs an incremental workspace Relay build, then spawns:
 
 ```sh
 tokn-session-relay stdout --format json

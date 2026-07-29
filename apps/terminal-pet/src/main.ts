@@ -1,6 +1,5 @@
 #!/usr/bin/env bun
 
-import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
 import {
@@ -307,7 +306,7 @@ function spawnRelay(runOptions: Options): RelayChild {
     "debug",
     process.platform === "win32" ? "tokn-session-relay.exe" : "tokn-session-relay"
   );
-  if (!runOptions.relay_bin && !existsSync(workspaceBinary)) {
+  if (!runOptions.relay_bin) {
     const build = Bun.spawnSync({
       cmd: ["cargo", "build", "-q", "-p", "tokn-session-relay"],
       cwd: workspaceRoot,

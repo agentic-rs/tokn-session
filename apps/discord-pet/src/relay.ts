@@ -1,4 +1,3 @@
-import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
 import { consumeJsonl, JsonlDecoder } from "./jsonl";
@@ -77,7 +76,7 @@ function spawnRelay(options: RelayOptions): RelayChild {
       ? "tokn-session-relay.exe"
       : "tokn-session-relay"
   );
-  if (!options.relay_bin && !existsSync(workspaceBinary)) {
+  if (!options.relay_bin) {
     const build = Bun.spawnSync({
       cmd: ["cargo", "build", "-q", "-p", "tokn-session-relay"],
       cwd: workspaceRoot,

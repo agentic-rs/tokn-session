@@ -100,8 +100,8 @@ that can be retried are returned as warnings in `TailUpdate`.
 ## Discord Pet
 
 `apps/discord-pet` is a Bun/TypeScript application that consumes Relay JSONL
-and mirrors root Codex and Pi conversations into Discord. By default it builds
-the workspace Relay once if needed and spawns
+and mirrors root Codex and Pi conversations into Discord. By default it runs
+an incremental workspace Relay build and spawns
 `tokn-session-relay stdout --format json`; `--stdin` consumes an existing
 pipeline instead. It reads `~/.tokn/pet/discord.yaml`, validates the bot and
 configured guild/channel through Discord's REST API, and creates one public
@@ -131,8 +131,8 @@ relay's three-message replay window so the first prompt is not missed. See
 ## Terminal Pet
 
 `apps/terminal-pet` is a Bun/TypeScript prototype that consumes Relay JSONL and
-shows one graphical terminal companion beside a multi-session roster. It
-builds the workspace Relay once if needed, then spawns
+shows one graphical terminal companion beside a multi-session roster. It runs
+an incremental workspace Relay build, then spawns
 `tokn-session-relay stdout --format json`, or accepts an existing stream with
 `--stdin`.
 
