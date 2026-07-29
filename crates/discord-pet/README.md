@@ -13,7 +13,18 @@ session replays a small tail so its first user message is not missed.
 
 ## Configuration
 
-Create `~/.tokn/pet/discord.yaml`:
+Run the interactive login:
+
+```sh
+cargo run -p tokn-discord-pet -- login
+```
+
+It explains where to obtain each value, hides the bot token while typing,
+validates the bot and destination with Discord, and saves the configuration
+with owner-only permissions. If the file already exists, login asks before
+replacing it.
+
+The resulting `~/.tokn/pet/discord.yaml` has this shape:
 
 ```yaml
 bot_token: "replace-with-the-bot-token"
@@ -26,6 +37,11 @@ Protect the token:
 ```sh
 chmod 600 ~/.tokn/pet/discord.yaml
 ```
+
+Manual creation remains supported, but `login` is preferred because invalid
+credentials are rejected before anything is saved. Use
+`tokn-discord-pet login --config /path/to/discord.yaml` to configure a
+non-default path.
 
 The configured bot needs these permissions in the target text channel:
 

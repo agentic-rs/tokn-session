@@ -19,6 +19,7 @@ tokn-session append --source opencode --executor "tokn-gateway proxy opencode --
 tokn-session append --source opencode --executor "tokn-gateway proxy opencode --npx --" --continue "next turn"
 tokn-session-relay zeromq
 tokn-session-relay stdout
+tokn-discord-pet login
 tokn-discord-pet
 cd apps/terminal-pet && bun run start
 ```
@@ -111,6 +112,11 @@ thread after a process restart. Discord embeds are split against the platform's
 UTF-16 length accounting, mentions are disabled, transient requests and rate
 limits are retried, and the token is never logged. The bot needs no privileged
 intents.
+
+`tokn-discord-pet login` is the preferred configuration path. It prints where
+to obtain the bot token and Discord IDs, hides token input, asks before replacing
+an existing file, validates the bot and channel/guild pairing, then writes the
+YAML with owner-only permissions. `--config` overrides its destination.
 
 Existing files start at their snapshotted EOF. Newly discovered files use the
 relay's three-message replay window so the first prompt is not missed. See
@@ -356,6 +362,7 @@ cargo run -p tokn-session-cli -- list --source opencode --limit 1
 cargo run -p tokn-session-cli -- show --source opencode <session-id> --format pretty
 cargo run -p tokn-session-relay -- stdout
 cargo run -p tokn-session-relay -- zeromq
+cargo run -p tokn-discord-pet -- login --help
 cargo run -p tokn-discord-pet -- --help
 cd apps/terminal-pet && bun run check
 cd apps/terminal-pet && bun run snapshot
