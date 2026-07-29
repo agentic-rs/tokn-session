@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "exports": {
+    "./worker": "./src/worker.ts"
+  },
   "scripts": {
     "start": "bun src/main.ts",
     "dev": "bun --watch src/main.ts -- --demo",

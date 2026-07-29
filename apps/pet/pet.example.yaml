@@ -1,0 +1,30 @@
+version: 1
+
+workers:
+  terminal:
+    type: terminal
+
+  discord_volty:
+    type: discord
+    config: ~/.tokn/pet/discord.yaml
+
+rules:
+  # Terminal receives the complete Relay event stream so it can infer state.
+  - forward_to: [terminal]
+
+  # Discord receives root user prompts from repositories named volty*.
+  - forward_to: [discord_volty]
+    when:
+      root_only: true
+      repository_names: ["volty*"]
+      event_types: [message]
+      roles: [user]
+
+  # Discord receives root final answers from repositories named volty*.
+  - forward_to: [discord_volty]
+    when:
+      root_only: true
+      repository_names: ["volty*"]
+      event_types: [message]
+      roles: [assistant]
+      deliveries: [final]

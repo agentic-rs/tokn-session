@@ -21,6 +21,7 @@ tokn-session-relay zeromq
 tokn-session-relay stdout
 cd apps/discord-pet && bun run login
 cd apps/discord-pet && bun run start
+cd apps/pet && bun run start
 cd apps/terminal-pet && bun run start
 ```
 
@@ -109,8 +110,9 @@ thread per root session. It publishes root user messages and final assistant
 messages only. Commentary, reasoning, tools, and child sessions are ignored.
 
 The YAML contains `bot_token`, `guild_id`, and `channel_id`. Thread mappings are
-persisted beside it in `discord-state.json`, so later turns continue in the same
-thread after a process restart. Discord embeds are split against the platform's
+persisted beside it, so later turns continue in the same thread after a process
+restart. The default config uses `discord-state.json`; named configs derive
+distinct state filenames. Discord embeds are split against the platform's
 UTF-16 length accounting, mentions are disabled, transient requests and rate
 limits are retried, and the token is never logged. The bot needs no privileged
 intents.
@@ -127,6 +129,27 @@ remain valid. `--config` overrides the destination.
 Existing files start at their snapshotted EOF. Newly discovered files use the
 relay's three-message replay window so the first prompt is not missed. See
 `apps/discord-pet/README.md` for setup and permissions.
+
+## Pet Supervisor
+
+`apps/pet` is the high-level Bun supervisor. It owns one Relay stream, evaluates
+declarative fan-out rules, and delivers matching `RelayEvent`s to bounded,
+serial queues for in-process async worker objects. Downstream workers are not
+subprocesses. The initial worker types are terminal and Discord; multiple named
+Discord workers may each reference a different credential/channel YAML and use
+independent persistent thread maps.
+
+The checked-in `pet.example.yaml` sends the complete Relay stream to terminal
+so its state inference retains tool, reasoning, error, and lifecycle context.
+It sends root user messages and final assistant messages to `discord_volty`
+only when `SessionContext.project.repository_name` matches the case-insensitive
+glob `volty*`. Rules fan out, AND fields inside one `when`, OR values inside
+arrays, deduplicate targets, and drop events with no match.
+
+Workers expose `start`, `handle`, and `stop`. A failure handling one event is
+reported without poisoning later queue work. The default per-worker capacity is
+256; full queues backpressure Relay consumption rather than dropping events.
+Terminal `q`/Escape aborts the shared source and shuts every worker down.
 
 ## Terminal Pet
 
@@ -362,7 +385,7 @@ OpenCode has the first live-output normalizer: `OpenCodeLiveNormalizer` parses `
 ## Useful Smokes
 
 GitHub Actions CI runs Rust formatting, workspace check/test, the CLI build,
-and both Bun app check suites on pushes to `main` and pull requests.
+and all three Bun app check suites on pushes to `main` and pull requests.
 
 ```sh
 cargo run -p tokn-session-cli -- list --source codex --limit 1
@@ -373,6 +396,8 @@ cargo run -p tokn-session-relay -- zeromq
 cd apps/discord-pet && bun run check
 cd apps/discord-pet && bun run start -- --help
 cd apps/discord-pet && bun run login -- --help
+cd apps/pet && bun run check
+cd apps/pet && bun run start -- --help
 cd apps/terminal-pet && bun run check
 cd apps/terminal-pet && bun run snapshot
 ```
