@@ -17,10 +17,20 @@ bun install
 bun run login
 ```
 
-Login explains where to obtain the bot token, server ID, and channel ID. It
-hides the token while typing, validates the bot and destination through
-Discord, and writes `~/.tokn/pet/discord.yaml` with owner-only permissions.
-It asks before replacing an existing configuration.
+Login first walks through installing the application to the target server and
+waits until the bot appears in the server member list. It then explains where
+to obtain the bot token, server ID, and channel ID, hides the token while
+typing, validates the installed bot and destination through Discord, and writes
+`~/.tokn/pet/discord.yaml` with owner-only permissions. It asks before
+replacing an existing configuration.
+
+The installation phase uses the Developer Portal's **Installation** page:
+
+1. Enable **Guild Install**.
+2. Select **Discord Provided Link**.
+3. Add the `bot` scope to the Guild Install defaults.
+4. Grant the permissions listed below and save the changes.
+5. Open the install link, choose **Add to server**, and select your server.
 
 The resulting file has this shape:
 

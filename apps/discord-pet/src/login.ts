@@ -20,9 +20,9 @@ export async function login(
   configPath: string,
   dependencies: LoginDependencies = {}
 ): Promise<void> {
-  process.stdout.write(`${setupNote(configPath)}\n`);
   const prompter = dependencies.prompter ?? terminalPrompter;
   const configExists = dependencies.config_exists ?? pathExists;
+  process.stdout.write("Discord pet login\n\n");
   if (
     await configExists(configPath)
     && !await prompter.confirm("Replace the existing configuration? [y/N]: ")
@@ -31,6 +31,11 @@ export async function login(
     return;
   }
 
+  process.stdout.write(`${installationNote()}\n\n`);
+  await prompter.text(
+    "Press Enter after the bot appears in your server member list: "
+  );
+  process.stdout.write(`\n${credentialNote(configPath)}\n\n`);
   const config: DiscordConfig = {
     bot_token: (await prompter.secret("Bot token (hidden): ")).trim(),
     guild_id: (await prompter.text("Server ID: ")).trim(),
@@ -48,18 +53,44 @@ export async function login(
 export function setupNote(configPath: string): string {
   return `Discord pet login
 
-Before continuing:
+${installationNote()}
+
+${credentialNote(configPath)}`;
+}
+
+export function installationNote(): string {
+  return `Step 1: Install the bot before entering credentials
+
+  1. Open https://discord.com/developers/applications
+     and select your application.
+  2. Open Installation:
+     - Enable Guild Install under Installation Contexts.
+     - Select Discord Provided Link under Install Link.
+     - Under Default Install Settings → Guild Install, add the bot scope.
+     - Grant only: View Channels, Send Messages, Create Public Threads,
+       Send Messages in Threads, Read Message History, and Embed Links.
+     - Save Changes.
+  3. Copy and open the Install Link, choose Add to server, and select the
+     server that contains the target channel.
+  4. Confirm the bot appears in the server member list. If the target channel
+     has permission overrides, make sure the bot can access that channel.
+
+Installing to a server requires Manage Server permission.
+No privileged Discord intents are required.`;
+}
+
+export function credentialNote(configPath: string): string {
+  return `Step 2: Enter and validate credentials
+
   1. Bot token
-     Discord Developer Portal → your application → Bot → Reset Token.
+     Developer Portal → your application → Bot → Reset Token.
   2. Server and channel IDs
      Discord → User Settings → Advanced → enable Developer Mode.
      Right-click the server and target text channel, then choose Copy ID.
-  3. Install the bot in that server and grant the target channel:
-     View Channel, Send Messages, Create Public Threads,
-     Send Messages in Threads, Read Message History, and Embed Links.
 
-No privileged Discord intents are required.
-The credentials will be validated before they are saved to:
+Login uses the token to authenticate as the bot, then checks that the installed
+bot can access the selected channel and that the channel belongs to the server.
+The credentials are saved only after those checks pass:
   ${configPath}`;
 }
 

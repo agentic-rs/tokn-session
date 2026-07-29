@@ -116,8 +116,10 @@ limits are retried, and the token is never logged. The bot needs no privileged
 intents.
 
 `bun run login` from `apps/discord-pet` is the preferred configuration path. It
-prints where to obtain the bot token and Discord IDs, hides token input, asks
-before replacing an existing file, validates the bot and channel/guild pairing,
+first walks through Guild Install and waits for the bot to appear in the server,
+then prints where to obtain the bot token and Discord IDs. It hides token input,
+asks before replacing an existing file, validates that the authenticated bot
+can access the channel and that the channel belongs to the configured guild,
 then writes the YAML with owner-only permissions. `--config` overrides its
 destination.
 
