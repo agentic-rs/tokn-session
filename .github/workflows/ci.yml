@@ -37,3 +37,28 @@ jobs:
 
       - name: Build CLI
         run: cargo build -p tokn-session-cli
+
+  bun-apps:
+    name: Bun apps
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+
+      - name: Check Discord pet
+        working-directory: apps/discord-pet
+        run: |
+          bun install --frozen-lockfile
+          bun run check
+
+      - name: Check terminal pet
+        working-directory: apps/terminal-pet
+        run: |
+          bun install --frozen-lockfile
+          bun run check
