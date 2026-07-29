@@ -963,7 +963,7 @@ fn codex_role(role: &str) -> Role {
 fn codex_message_delivery(phase: Option<&str>) -> MessageDelivery {
   match phase {
     Some("commentary") => MessageDelivery::Commentary,
-    Some("final") => MessageDelivery::Final,
+    Some("final") | Some("final_answer") => MessageDelivery::Final,
     _ => MessageDelivery::Unspecified,
   }
 }
@@ -1151,11 +1151,13 @@ mod tests {
     let events = normalize_fixture(
       r#"{"type":"session_meta","payload":{"id":"session-1"}}
 {"type":"response_item","payload":{"type":"message","id":"commentary","role":"assistant","content":[{"type":"output_text","text":"working"}],"phase":"commentary"}}
-{"type":"response_item","payload":{"type":"message","id":"final","role":"assistant","content":[{"type":"output_text","text":"done"}],"phase":"final"}}"#,
+{"type":"response_item","payload":{"type":"message","id":"final","role":"assistant","content":[{"type":"output_text","text":"done"}],"phase":"final"}}
+{"type":"response_item","payload":{"type":"message","id":"final-answer","role":"assistant","content":[{"type":"output_text","text":"current done"}],"phase":"final_answer"}}"#,
     );
 
     assert!(matches!(&events[1], AgentEvent::Message(event) if matches!(event.delivery, MessageDelivery::Commentary)));
     assert!(matches!(&events[2], AgentEvent::Message(event) if matches!(event.delivery, MessageDelivery::Final)));
+    assert!(matches!(&events[3], AgentEvent::Message(event) if matches!(event.delivery, MessageDelivery::Final)));
   }
 
   #[test]

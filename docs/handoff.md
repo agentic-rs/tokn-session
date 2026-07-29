@@ -233,7 +233,8 @@ Current event families include:
 Messages carry an orthogonal `delivery` field: `commentary`, `final`, or
 `unspecified`. Codex preserves the provider's response phase. Pi and OpenCode
 assistant text is final because those persisted message records do not expose a
-separate commentary channel. User and other messages use `unspecified`.
+separate commentary channel. Current Codex `final_answer` and legacy `final`
+phases both normalize to `final`; user and other messages use `unspecified`.
 
 Tool calls now carry semantic display metadata:
 
