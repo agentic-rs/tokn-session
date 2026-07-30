@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use crate::event::{OpenCodeMessage, OpenCodeMessageRow, OpenCodePart, OpenCodePartRow, OpenCodeSessionRow};
 use crate::normalize::OpenCodeNormalizer;
+use crate::row::{OpenCodeMessageRow, OpenCodePartRow, OpenCodeSessionRow};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
-use serde_json::Value;
+use tokn_opencode_protocol::v1::{MessageData, PartData, SessionModel};
 use tokn_session_core::{LoadedSession, SessionHistoryStatus, SessionRef};
 
 pub struct OpenCodeSessionSource {
@@ -31,7 +31,7 @@ impl OpenCodeSessionSource {
           id: row.get(0)?,
           parent_id: row.get(1)?,
           directory: row.get(2)?,
-          model: parse_optional_json(model),
+          model: parse_optional_model(model),
           time_created: row.get(4)?,
           time_updated: row.get(5)?,
         })
@@ -68,7 +68,7 @@ impl OpenCodeSessionSource {
 
   fn load_session_from_database(&self, database_path: PathBuf, session_id: &str) -> Result<LoadedSession, String> {
     let connection = connect_database(&database_path)?;
-    let session = load_session_row(&connection, &session_id)?
+    let session = load_session_row(&connection, session_id)?
       .ok_or_else(|| format!("no opencode session found for `{session_id}`"))?;
     let reference = SessionRef {
       id: session.id.clone(),
@@ -170,7 +170,7 @@ fn load_session_row(connection: &Connection, session_id: &str) -> Result<Option<
           id: row.get(0)?,
           parent_id: row.get(1)?,
           directory: row.get(2)?,
-          model: parse_optional_json(model),
+          model: parse_optional_model(model),
           time_created: row.get(4)?,
           time_updated: row.get(5)?,
         })
@@ -199,7 +199,7 @@ fn load_messages(connection: &Connection, session_id: &str) -> Result<Vec<OpenCo
   let mut messages = Vec::new();
   for row in rows {
     let (id, time_created, data) = row.map_err(|err| format!("failed to read opencode message row: {err}"))?;
-    let data: OpenCodeMessage =
+    let data: MessageData =
       serde_json::from_str(&data).map_err(|err| format!("invalid opencode message `{id}`: {err}"))?;
     let parts = load_parts(connection, session_id, &id)?;
     messages.push(OpenCodeMessageRow {
@@ -231,9 +231,8 @@ fn load_parts(connection: &Connection, session_id: &str, message_id: &str) -> Re
   let mut parts = Vec::new();
   for row in rows {
     let (id, time_created, data) = row.map_err(|err| format!("failed to read opencode part row: {err}"))?;
-    let data: OpenCodePart =
-      serde_json::from_str(&data).map_err(|err| format!("invalid opencode part `{id}`: {err}"))?;
-    parts.push(OpenCodePartRow { time_created, data });
+    let data: PartData = serde_json::from_str(&data).map_err(|err| format!("invalid opencode part `{id}`: {err}"))?;
+    parts.push(OpenCodePartRow { id, time_created, data });
   }
   Ok(parts)
 }
@@ -249,10 +248,77 @@ fn message_count(connection: &Connection, session_id: &str) -> Result<usize, Str
     .map_err(|err| format!("failed to count opencode messages for `{session_id}`: {err}"))
 }
 
-fn parse_optional_json(value: Option<String>) -> Option<Value> {
+fn parse_optional_model(value: Option<String>) -> Option<SessionModel> {
   value.and_then(|value| serde_json::from_str(&value).ok())
 }
 
 fn timestamp(value: Option<i64>) -> Option<String> {
   value.map(|value| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+  use rusqlite::{Connection, params};
+  use tokn_opencode_protocol::v1::{MessageItem, PartItem};
+
+  use super::load_messages;
+
+  #[test]
+  fn loads_unknown_payloads_without_aborting_the_session() {
+    let connection = Connection::open_in_memory().expect("database should open");
+    connection
+      .execute_batch(
+        "create table message (
+           id text primary key,
+           session_id text not null,
+           time_created integer,
+           data text not null
+         );
+         create table part (
+           id text primary key,
+           message_id text not null,
+           session_id text not null,
+           time_created integer,
+           data text not null
+         );",
+      )
+      .expect("fixture schema should be created");
+    connection
+      .execute(
+        "insert into message (id, session_id, time_created, data)
+         values (?1, ?2, ?3, ?4)",
+        params![
+          "msg_1",
+          "ses_1",
+          1_i64,
+          r#"{"role":"future-role","payload":{"answer":42}}"#
+        ],
+      )
+      .expect("message fixture should insert");
+    connection
+      .execute(
+        "insert into part (id, message_id, session_id, time_created, data)
+         values (?1, ?2, ?3, ?4, ?5)",
+        params![
+          "prt_1",
+          "msg_1",
+          "ses_1",
+          2_i64,
+          r#"{"type":"future-part","answer":42}"#
+        ],
+      )
+      .expect("part fixture should insert");
+
+    let messages = load_messages(&connection, "ses_1").expect("unknown payloads should remain loadable");
+    assert_eq!(messages.len(), 1);
+    assert!(matches!(
+      messages[0].data.item(),
+      MessageItem::Unknown(item) if item.native_type.as_deref() == Some("future-role")
+    ));
+    assert_eq!(messages[0].parts[0].id, "prt_1");
+    assert!(matches!(
+      messages[0].parts[0].data.item(),
+      PartItem::Unknown(item) if item.native_type.as_deref() == Some("future-part")
+    ));
+  }
 }

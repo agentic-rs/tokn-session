@@ -1,0 +1,119 @@
+[
+  {
+    "type": "snapshot",
+    "snapshot": "snap_1"
+  },
+  {
+    "type": "patch",
+    "hash": "abc123",
+    "files": [
+      "README.md"
+    ]
+  },
+  {
+    "id": "prt_text",
+    "sessionID": "ses_example",
+    "messageID": "msg_example",
+    "type": "text",
+    "text": "hello",
+    "time": {
+      "start": 1710000000000,
+      "end": 1710000000001
+    },
+    "future_field": "preserved"
+  },
+  {
+    "type": "reasoning",
+    "text": "checking",
+    "time": {
+      "start": 1710000000000,
+      "end": 1710000000001
+    },
+    "metadata": {
+      "signature": "sig"
+    }
+  },
+  {
+    "type": "file",
+    "mime": "text/plain",
+    "filename": "notes.txt",
+    "url": "data:text/plain;base64,bm90ZXM="
+  },
+  {
+    "type": "agent",
+    "name": "reviewer",
+    "source": {
+      "value": "@reviewer",
+      "start": 0,
+      "end": 9
+    }
+  },
+  {
+    "type": "compaction",
+    "auto": true,
+    "tail_start_id": "msg_tail"
+  },
+  {
+    "type": "subtask",
+    "prompt": "Review the change",
+    "description": "Code review",
+    "agent": "reviewer",
+    "model": {
+      "providerID": "openai",
+      "modelID": "gpt-5"
+    }
+  },
+  {
+    "type": "retry",
+    "attempt": 2,
+    "error": {
+      "name": "APIError",
+      "data": {
+        "message": "retry"
+      }
+    },
+    "time": {
+      "created": 1710000000002
+    }
+  },
+  {
+    "type": "step-start",
+    "snapshot": "snap_before"
+  },
+  {
+    "type": "step-finish",
+    "reason": "stop",
+    "snapshot": "snap_after",
+    "cost": 0.5,
+    "tokens": {
+      "total": 30,
+      "input": 10,
+      "output": 15,
+      "reasoning": 5,
+      "cache": {
+        "read": 2,
+        "write": 1
+      }
+    }
+  },
+  {
+    "type": "tool",
+    "tool": "bash",
+    "callID": "call_1",
+    "state": {
+      "status": "completed",
+      "input": {
+        "command": "cargo test"
+      },
+      "output": "ok",
+      "title": "Run tests",
+      "metadata": {
+        "exit": 0
+      },
+      "time": {
+        "start": 1710000000000,
+        "end": 1710000000001
+      }
+    }
+  }
+]
