@@ -160,7 +160,8 @@ pub struct MessageModel {
   pub extra: ExtraFields,
 }
 
-/// The JSON value stored in the session table's `model` column.
+/// The JSON value stored in OpenCode's optional `session.model` column.
+/// Database versions without that column keep model selection in messages.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct SessionModel {
   #[serde(default)]

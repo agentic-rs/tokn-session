@@ -202,6 +202,7 @@ art and must be replaced before publishing or distributing the project.
 - Codex reads JSONL from `~/.codex/sessions` and `~/.codex/archived_sessions` unless `--session-dir` is passed.
 - OpenCode reads SQLite from `~/.local/share/opencode/opencode.db` unless `--session-dir` is passed.
 - OpenCode opens its database with an immutable read-only SQLite URI so viewing sessions does not require writing sidecar files.
+- OpenCode accepts schemas both with and without the optional `session.model` column.
 
 `SessionRef` carries optional `parent_session_id`, `agent_path`,
 `agent_nickname`, and `agent_role`. Codex takes owning identity only from the
