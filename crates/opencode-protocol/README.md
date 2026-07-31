@@ -10,6 +10,14 @@ The crate deliberately does not contain SQLite queries, row identity, session
 assembly, or normalization into `AgentEvent`. Those remain responsibilities of
 `tokn-session-opencode`.
 
+## Install
+
+```toml
+[dependencies]
+tokn-opencode-protocol = "0.1"
+serde_json = "1"
+```
+
 ## Design
 
 - Decode a native JSON value before selecting a typed view.
@@ -49,3 +57,44 @@ match part.item() {
 
 # Ok::<(), serde_json::Error>(())
 ```
+
+To parse JSONL emitted by `opencode run --format json`, use the `run` module:
+
+```rust
+use tokn_opencode_protocol::run::{RunEvent, RunLine};
+
+let line: RunLine = serde_json::from_str(
+  r#"{
+    "type": "text",
+    "sessionID": "ses_example",
+    "timestamp": 1710000000000,
+    "part": {"type": "text", "text": "done"}
+  }"#,
+)?;
+
+let RunEvent::Text(part) = line.event() else {
+  unreachable!();
+};
+assert_eq!(part.text, "done");
+
+# Ok::<(), serde_json::Error>(())
+```
+
+## Compatibility
+
+This crate follows persisted OpenCode data and `opencode run` output, not a
+stable upstream API. OpenCode can add payload shapes independently. Unknown
+tags and added fields remain inspectable through typed unknown values and the
+original decoded JSON. "Lossless" refers to JSON structure; it does not
+preserve source whitespace, duplicate object keys, or original number spelling.
+To retain a complete envelope, serialize `MessageData`, `PartData`, or
+`RunLine`, or use `native()`; serializing a nested typed item alone is not an
+envelope round trip.
+
+## License
+
+Licensed under the [MIT License](LICENSE).
+
+## Repository
+
+<https://github.com/agentic-rs/tokn-session>

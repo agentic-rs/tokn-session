@@ -1,9 +1,4 @@
-//! Tolerant wire types for persisted Pi session JSONL.
-//!
-//! This crate models the session-file protocol consumed by `tokn-session`. It
-//! keeps stable fields typed, retains volatile extension data as JSON, and
-//! preserves unknown records so newer Pi versions cannot make a session
-//! unreadable solely by adding a record, message role, or content-block type.
+#![doc = include_str!("../README.md")]
 
 mod session;
 

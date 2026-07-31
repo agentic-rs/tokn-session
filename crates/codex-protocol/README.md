@@ -1,12 +1,23 @@
 # tokn-codex-protocol
 
-`tokn-codex-protocol` provides tolerant wire types for persisted Codex rollout
-JSONL files.
+`tokn-codex-protocol` provides tolerant, lossless Rust wire types for persisted
+Codex rollout JSONL files.
 
-It is maintained by the `tokn-session` project because the published
-`codex-protocol` crate can lag behind the rollout records written by current
-Codex clients. This crate models only the file format that session readers
-need; it does not mirror Codex's internal Rust API.
+It is maintained by the `tokn-session` project and models only the file format
+that session readers need; it does not mirror Codex's internal Rust API.
+
+## Install
+
+```toml
+[dependencies]
+tokn-codex-protocol = "0.1"
+serde_json = "1"
+```
+
+## Usage
+
+Deserialize one JSONL record at a time. The typed view is available through
+`item()`, while `native()` retains the complete decoded JSON value.
 
 ## Design
 
@@ -87,6 +98,16 @@ assert_eq!(message.recipient.as_deref(), Some("/root/reviewer"));
 therefore represented as a lossless tagged value rather than an exhaustive
 enum.
 
+## Compatibility
+
+This crate follows persisted rollout files, not a stable upstream Codex API.
+Codex can add fields and record types independently. Unknown tags and added
+fields remain available through the typed unknown values and the original
+decoded JSON. "Lossless" refers to JSON structure; it does not preserve source
+whitespace, duplicate object keys, or original number spelling.
+To retain the complete envelope, serialize `RolloutLine` or use `native()`;
+serializing a nested typed item alone is not an envelope round trip.
+
 ## Non-goals
 
 - Codex app-server request and notification types
@@ -112,3 +133,11 @@ When a new rollout shape appears:
 Future provider-specific protocol crates can follow the same narrow,
 lossless-decoding approach without introducing a shared lowest common
 denominator wire format.
+
+## License
+
+Licensed under the [MIT License](LICENSE).
+
+## Repository
+
+<https://github.com/agentic-rs/tokn-session>

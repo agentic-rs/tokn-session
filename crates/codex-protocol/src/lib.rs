@@ -1,9 +1,4 @@
-//! Tolerant wire types for persisted Codex rollout JSONL.
-//!
-//! This crate models the session-file protocol consumed by `tokn-session`. It
-//! intentionally does not mirror Codex's internal Rust API. Stable fields are
-//! typed, volatile subtrees remain JSON values, and unknown records retain
-//! their original tags and payloads.
+#![doc = include_str!("../README.md")]
 
 mod rollout;
 

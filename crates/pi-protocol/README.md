@@ -9,6 +9,14 @@ It types stable session fields, keeps extension-owned and fast-changing
 subtrees as `serde_json::Value`, and preserves the original JSON for every
 session line.
 
+## Install
+
+```toml
+[dependencies]
+tokn-pi-protocol = "0.1"
+serde_json = "1"
+```
+
 ## Why this crate exists
 
 Pi can add session-entry types, message roles, and content blocks independently
@@ -21,6 +29,9 @@ when any one of those shapes changes. This crate instead:
 - serializes `PiSessionLine` back to the unchanged native record
 
 ## Usage
+
+Deserialize one JSONL record at a time. The typed view is available through
+`item()`, while `native()` retains the complete decoded JSON value.
 
 ```rust
 use tokn_pi_protocol::{PiSessionItem, PiSessionLine};
@@ -61,9 +72,28 @@ match line.item() {
 Normalization into the provider-neutral `AgentEvent` IR remains the
 responsibility of `tokn-session-pi`.
 
+## Compatibility
+
+This crate follows persisted Pi session files, not Pi's complete TypeScript
+API. Pi can add record, message-role, and content-block shapes independently.
+Unknown tags and added fields remain inspectable through the typed unknown
+values and the original decoded JSON. "Lossless" refers to JSON structure; it
+does not preserve source whitespace, duplicate object keys, or original number
+spelling.
+To retain the complete envelope, serialize `PiSessionLine` or use `native()`;
+serializing a nested typed item alone is not an envelope round trip.
+
 ## Maintenance
 
 Use `vendor/pi` and representative historical session files as the schema
 sources. Add stable fields when consumers need them, keep provider- or
 extension-specific payloads as JSON, and add regression tests whenever a new
 shape is observed.
+
+## License
+
+Licensed under the [MIT License](LICENSE).
+
+## Repository
+
+<https://github.com/agentic-rs/tokn-session>

@@ -1,10 +1,4 @@
-//! Tolerant wire types for OpenCode's persisted V1 JSON payloads and
-//! `opencode run --format json` JSONL.
-//!
-//! Stable fields are typed, volatile subtrees remain JSON values, and every
-//! top-level payload retains its original JSON representation. Unknown tags
-//! and malformed known variants therefore remain inspectable rather than
-//! making an otherwise valid session unreadable.
+#![doc = include_str!("../README.md")]
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
