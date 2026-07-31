@@ -201,7 +201,7 @@ art and must be replaced before publishing or distributing the project.
 - Pi reads JSONL from `~/.pi/agent/sessions` unless `--session-dir` is passed.
 - Codex reads JSONL from `~/.codex/sessions` and `~/.codex/archived_sessions` unless `--session-dir` is passed.
 - OpenCode reads SQLite from `~/.local/share/opencode/opencode.db` unless `--session-dir` is passed.
-- OpenCode opens its database with an immutable read-only SQLite URI so viewing sessions does not require writing sidecar files.
+- OpenCode opens its database with a WAL-aware read-only SQLite URI so active WAL data is visible without application writes; if that cannot open, it falls back to immutable read-only mode. Viewing sessions never runs migrations.
 - OpenCode validates the required `session`, `message`, and `part` tables and columns, then detects optional session columns from the actual SQLite schema.
 - OpenCode accepts schemas both with and without the optional `session.model` column; it never runs migrations against the user database.
 
