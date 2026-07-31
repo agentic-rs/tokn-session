@@ -39,11 +39,14 @@ async fn run(args: Args) -> Result<(), String> {
   let mut output = match args.command {
     Command::ZeroMq { endpoint } => {
       let publisher = ZmqPublisher::bind(&endpoint).await?;
-      eprintln!("following Codex/Pi session events via ZeroMQ on {endpoint}");
+      eprintln!("following Codex/Pi/OpenCode session events via ZeroMQ on {endpoint}");
       Output::ZeroMq(publisher)
     }
     Command::Stdout { format, color } => {
-      eprintln!("following Codex/Pi session events on stdout ({})", format.name());
+      eprintln!(
+        "following Codex/Pi/OpenCode session events on stdout ({})",
+        format.name()
+      );
       Output::Stdout {
         writer: BufWriter::new(std::io::stdout()),
         format,
@@ -185,10 +188,8 @@ fn human_event_prefix(event: &RelayEvent, show_agent_path: bool) -> String {
     provider_name(event.session.provider),
     abbreviate_id(&event.session.session_id)
   ));
-  if show_agent_path {
-    if let Some(agent_path) = visible_agent_path(event) {
-      parts.push(format!("agent={agent_path}"));
-    }
+  if show_agent_path && let Some(agent_path) = visible_agent_path(event) {
+    parts.push(format!("agent={agent_path}"));
   }
   if let Some(message_id) = event_message_id(&event.event) {
     parts.push(format!("#{}", abbreviate_id(message_id)));
@@ -412,6 +413,7 @@ struct Args {
   command: Command,
   codex_dir: Option<PathBuf>,
   pi_dir: Option<PathBuf>,
+  opencode_dir: Option<PathBuf>,
   poll_interval: Duration,
   new_file_replay: NewFileReplay,
 }
@@ -450,6 +452,7 @@ impl Args {
       },
       codex_dir: None,
       pi_dir: None,
+      opencode_dir: None,
       poll_interval: DEFAULT_POLL_INTERVAL,
       new_file_replay: NewFileReplay::Messages(DEFAULT_REPLAY_MESSAGES),
     };
@@ -471,6 +474,7 @@ impl Args {
         },
         "--codex-dir" => parsed.codex_dir = Some(PathBuf::from(next_value(&mut args, "--codex-dir")?)),
         "--pi-dir" => parsed.pi_dir = Some(PathBuf::from(next_value(&mut args, "--pi-dir")?)),
+        "--opencode-dir" => parsed.opencode_dir = Some(PathBuf::from(next_value(&mut args, "--opencode-dir")?)),
         "--poll-interval" => parsed.poll_interval = parse_duration(&next_value(&mut args, "--poll-interval")?)?,
         "--replay-all" => {
           set_replay_option(&mut replay_option_seen)?;
@@ -502,9 +506,11 @@ impl Args {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let codex = resolve_root(&self.codex_dir, home.as_deref(), ".codex/sessions")?;
     let pi = resolve_root(&self.pi_dir, home.as_deref(), ".pi/agent/sessions")?;
+    let opencode = resolve_root(&self.opencode_dir, home.as_deref(), ".local/share/opencode")?;
     Ok(vec![
       ProviderRoot::new(Provider::Codex, codex),
       ProviderRoot::new(Provider::Pi, pi),
+      ProviderRoot::new(Provider::OpenCode, opencode),
     ])
   }
 }
@@ -559,7 +565,7 @@ fn print_help(help: Help) {
   match help {
     Help::Root => println!(
       "\
-Follow Codex and Pi session files and emit normalized events.
+Follow Codex and Pi session files plus OpenCode's SQLite database, and emit normalized events.
 
 Usage:
   tokn-session-relay <subcommand> [options]
@@ -581,6 +587,7 @@ Options:
   --bind <endpoint>           PUB endpoint (default: {DEFAULT_ENDPOINT})
   --codex-dir <path>          Codex session root (default: ~/.codex/sessions)
   --pi-dir <path>             Pi session root (default: ~/.pi/agent/sessions)
+  --opencode-dir <path>       OpenCode data directory or database (default: ~/.local/share/opencode)
   --poll-interval <duration>  Fallback rescan interval, such as 250ms, 2s, or 1m (default: 2s)
   --replay=<count>            Messages replayed for a newly discovered file (default: 3)
   --replay-all                Replay all records for a newly discovered file
@@ -602,6 +609,7 @@ Options:
   --color                     Add ANSI colors to pretty or summary output
   --codex-dir <path>          Codex session root (default: ~/.codex/sessions)
   --pi-dir <path>             Pi session root (default: ~/.pi/agent/sessions)
+  --opencode-dir <path>       OpenCode data directory or database (default: ~/.local/share/opencode)
   --poll-interval <duration>  Fallback rescan interval, such as 250ms, 2s, or 1m (default: 2s)
   --replay=<count>            Messages replayed for a newly discovered file (default: 3)
   --replay-all                Replay all records for a newly discovered file
@@ -628,6 +636,8 @@ mod tests {
         "zeromq",
         "--bind",
         "ipc:///tmp/relay.sock",
+        "--opencode-dir",
+        "/tmp/opencode.db",
         "--replay=5",
         "--poll-interval",
         "250ms",
@@ -646,6 +656,7 @@ mod tests {
     );
     assert_eq!(args.poll_interval, Duration::from_millis(250));
     assert_eq!(args.new_file_replay, NewFileReplay::Messages(5));
+    assert_eq!(args.opencode_dir, Some(PathBuf::from("/tmp/opencode.db")));
   }
 
   #[test]

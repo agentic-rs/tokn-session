@@ -8,7 +8,8 @@ use std::time::SystemTime;
 use serde::Serialize;
 use serde_json::Value;
 use tokn_session_codex::{event::CodexLine, normalize::CodexNormalizer};
-use tokn_session_core::{AgentEvent, Provider};
+use tokn_session_core::{AgentEvent, LoadedSession, Provider};
+use tokn_session_opencode::OpenCodeSessionSource;
 use tokn_session_pi::{event::PiSessionLine, normalize::PiNormalizer};
 
 use crate::context::session_id_from_path;
@@ -46,6 +47,7 @@ pub struct TailUpdate {
 pub struct SessionTailer {
   roots: Vec<ProviderRoot>,
   files: HashMap<PathBuf, FileState>,
+  opencode: HashMap<PathBuf, OpenCodeState>,
   new_file_replay: NewFileReplay,
   project_catalog: SharedProjectCatalog,
   project_catalog_source: Option<ProjectCatalogSource>,
@@ -65,11 +67,19 @@ impl SessionTailer {
     let mut tailer = Self {
       roots,
       files: HashMap::new(),
+      opencode: HashMap::new(),
       new_file_replay,
       project_catalog,
       project_catalog_source,
       project_catalog_warning,
     };
+    for root in &tailer.roots {
+      if matches!(root.provider, Provider::OpenCode) {
+        tailer
+          .opencode
+          .insert(root.path.clone(), OpenCodeState::new(root.path.clone()));
+      }
+    }
     let paths = tailer.discover_paths()?;
     for (path, provider) in paths {
       tailer.files.insert(
@@ -94,6 +104,9 @@ impl SessionTailer {
       };
       let initial = read_initial(state, mode)?;
       update.append(initial);
+    }
+    for state in self.opencode.values_mut() {
+      update.append(state.scan(false, self.new_file_replay)?);
     }
     Ok(update)
   }
@@ -125,6 +138,10 @@ impl SessionTailer {
       update.append(appended);
     }
 
+    for state in self.opencode.values_mut() {
+      update.append(state.scan(true, self.new_file_replay)?);
+    }
+
     Ok(update)
   }
 
@@ -133,11 +150,18 @@ impl SessionTailer {
     self.refresh_project_catalog(&mut update);
     let mut candidates = HashMap::new();
     let mut changed_directories = Vec::new();
+    let mut changed_opencode = HashSet::new();
 
     for path in changed_paths {
       let Some(provider) = self.provider_for_path(&path) else {
         continue;
       };
+      if matches!(provider, Provider::OpenCode) {
+        if let Some(root) = self.open_code_root_for_path(&path) {
+          changed_opencode.insert(root);
+        }
+        continue;
+      }
       if path.is_dir() {
         changed_directories.push(path.clone());
         let mut seen = HashSet::new();
@@ -161,6 +185,11 @@ impl SessionTailer {
 
     for (path, provider) in candidates {
       self.scan_file(path, provider, &mut update)?;
+    }
+    for path in changed_opencode {
+      if let Some(state) = self.opencode.get_mut(&path) {
+        update.append(state.scan(true, self.new_file_replay)?);
+      }
     }
     Ok(update)
   }
@@ -203,7 +232,9 @@ impl SessionTailer {
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
     for root in &self.roots {
-      collect_jsonl_files(&root.path, root.provider, &mut seen, &mut paths)?;
+      if !matches!(root.provider, Provider::OpenCode) {
+        collect_jsonl_files(&root.path, root.provider, &mut seen, &mut paths)?;
+      }
     }
     Ok(paths)
   }
@@ -215,6 +246,15 @@ impl SessionTailer {
       .filter(|root| path.starts_with(&root.path))
       .max_by_key(|root| root.path.components().count())
       .map(|root| root.provider)
+  }
+
+  fn open_code_root_for_path(&self, path: &Path) -> Option<PathBuf> {
+    self
+      .roots
+      .iter()
+      .filter(|root| matches!(root.provider, Provider::OpenCode) && path.starts_with(&root.path))
+      .max_by_key(|root| root.path.components().count())
+      .map(|root| root.path.clone())
   }
 
   fn refresh_project_catalog(&mut self, update: &mut TailUpdate) {
@@ -259,6 +299,97 @@ impl TailUpdate {
     self.events.append(&mut other.events);
     self.warnings.append(&mut other.warnings);
   }
+}
+
+struct OpenCodeState {
+  root_path: PathBuf,
+  source: OpenCodeSessionSource,
+  sessions: HashMap<String, OpenCodeSessionState>,
+}
+
+struct OpenCodeSessionState {
+  fingerprints: Vec<String>,
+}
+
+impl OpenCodeState {
+  fn new(root_path: PathBuf) -> Self {
+    Self {
+      source: OpenCodeSessionSource::new(Some(root_path.clone())),
+      root_path,
+      sessions: HashMap::new(),
+    }
+  }
+
+  fn scan(&mut self, publish_new_sessions: bool, replay: NewFileReplay) -> Result<TailUpdate, String> {
+    if !self.database_exists() {
+      return Ok(TailUpdate::default());
+    }
+
+    let references = self.source.list_sessions()?;
+    let mut seen = HashSet::new();
+    let mut update = TailUpdate::default();
+    for reference in references {
+      let session_id = reference.id.clone();
+      seen.insert(session_id.clone());
+      let loaded = self.source.load_session_exact(&session_id)?;
+      let fingerprints = loaded.events.iter().map(event_fingerprint).collect::<Vec<_>>();
+      let context = SessionContext::from_session_ref(&loaded.reference);
+      let events = relay_events_from_loaded(loaded, &context, &fingerprints, self.sessions.get(&session_id));
+
+      match self.sessions.get(&session_id) {
+        None if publish_new_sessions => {
+          let mut events = events;
+          apply_replay_policy(&mut events, replay);
+          update.events.extend(events);
+        }
+        Some(_) if publish_new_sessions => {
+          update.events.extend(events);
+        }
+        _ => {}
+      }
+
+      self.sessions.insert(session_id, OpenCodeSessionState { fingerprints });
+    }
+    self.sessions.retain(|session_id, _| seen.contains(session_id));
+    Ok(update)
+  }
+
+  fn database_exists(&self) -> bool {
+    if self.root_path.is_dir() {
+      self.root_path.join("opencode.db").is_file()
+    } else {
+      self.root_path.is_file()
+    }
+  }
+}
+
+fn relay_events_from_loaded(
+  loaded: LoadedSession,
+  context: &SessionContext,
+  fingerprints: &[String],
+  previous: Option<&OpenCodeSessionState>,
+) -> Vec<RelayEvent> {
+  let path = loaded.reference.path.clone();
+  loaded
+    .events
+    .into_iter()
+    .enumerate()
+    .filter_map(|(index, event)| {
+      let changed = previous
+        .and_then(|previous| previous.fingerprints.get(index))
+        .is_none_or(|fingerprint| fingerprint != &fingerprints[index]);
+      changed.then(|| RelayEvent {
+        topic: event_topic(Provider::OpenCode, &path, &event),
+        path: path.clone(),
+        session: context.clone(),
+        event,
+      })
+    })
+    .collect()
+}
+
+fn event_fingerprint(event: &AgentEvent) -> String {
+  serde_json::to_string(event).unwrap_or_else(|_| format!("{event:?}"))
 }
 
 struct FileState {
@@ -680,6 +811,7 @@ mod tests {
   use std::fs::OpenOptions;
   use std::io::Write;
 
+  use rusqlite::{Connection, params};
   use tempfile::TempDir;
   use tokn_session_core::{AgentEvent, Provider};
 
@@ -1283,6 +1415,140 @@ mod tests {
     let update = tailer.scan_paths(HashSet::from([path])).unwrap();
     assert_eq!(update.events.len(), 2);
     assert!(update.events.iter().all(|event| event.topic == "pi.new-session"));
+  }
+
+  #[test]
+  fn tails_opencode_database_updates() {
+    let fixture = TempDir::new().unwrap();
+    let database = fixture.path().join("opencode.db");
+    let connection = Connection::open(&database).unwrap();
+    connection
+      .execute_batch(
+        "pragma journal_mode = wal;
+         create table session (
+           id text primary key,
+           parent_id text,
+           directory text not null,
+           time_created integer not null,
+           time_updated integer not null
+         );
+         create table message (
+           id text primary key,
+           session_id text not null,
+           time_created integer,
+           data text not null
+         );
+         create table part (
+           id text primary key,
+           message_id text not null,
+           session_id text not null,
+           time_created integer,
+           data text not null
+         );",
+      )
+      .unwrap();
+    drop(connection);
+
+    let (mut tailer, initial) = SessionTailer::initialize(
+      vec![ProviderRoot::new(Provider::OpenCode, database.clone())],
+      NewFileReplay::Messages(3),
+    )
+    .unwrap();
+    assert!(initial.events.is_empty());
+
+    let connection = Connection::open(&database).unwrap();
+    connection
+      .execute(
+        "insert into session (id, parent_id, directory, time_created, time_updated) values (?1, null, ?2, ?3, ?4)",
+        params!["ses_1", "/tmp/opencode", 1, 2],
+      )
+      .unwrap();
+    insert_opencode_message(&connection, "msg_user", "ses_1", 1, r#"{"role":"user"}"#);
+    insert_opencode_part(
+      &connection,
+      "part_user",
+      "msg_user",
+      "ses_1",
+      1,
+      r#"{"type":"text","text":"hello"}"#,
+    );
+
+    let first = tailer.scan().unwrap();
+    assert_eq!(first.events.len(), 2);
+    assert!(first.events.iter().all(|event| event.topic == "opencode.ses_1"));
+    assert!(
+      first
+        .events
+        .iter()
+        .any(|event| matches!(event.event, AgentEvent::SessionStarted(_)))
+    );
+    assert!(
+      first
+        .events
+        .iter()
+        .any(|event| matches!(event.event, AgentEvent::Message(_)))
+    );
+
+    insert_opencode_message(
+      &connection,
+      "msg_assistant",
+      "ses_1",
+      3,
+      r#"{"role":"assistant","parentID":"msg_user"}"#,
+    );
+    insert_opencode_part(
+      &connection,
+      "part_assistant",
+      "msg_assistant",
+      "ses_1",
+      3,
+      r#"{"type":"text","text":"world"}"#,
+    );
+
+    let second = tailer.scan().unwrap();
+    assert_eq!(second.events.len(), 1);
+    let AgentEvent::Message(message) = &second.events[0].event else {
+      panic!("expected assistant message");
+    };
+    assert_eq!(message.text, "world");
+
+    connection
+      .execute(
+        "update part set data = ?1 where id = ?2",
+        params![r#"{"type":"text","text":"updated"}"#, "part_assistant"],
+      )
+      .unwrap();
+    let third = tailer.scan().unwrap();
+    assert_eq!(third.events.len(), 1);
+    let AgentEvent::Message(message) = &third.events[0].event else {
+      panic!("expected updated assistant message");
+    };
+    assert_eq!(message.text, "updated");
+  }
+
+  fn insert_opencode_message(connection: &Connection, id: &str, session_id: &str, time_created: i64, data: &str) {
+    connection
+      .execute(
+        "insert into message (id, session_id, time_created, data) values (?1, ?2, ?3, ?4)",
+        params![id, session_id, time_created, data],
+      )
+      .unwrap();
+  }
+
+  fn insert_opencode_part(
+    connection: &Connection,
+    id: &str,
+    message_id: &str,
+    session_id: &str,
+    time_created: i64,
+    data: &str,
+  ) {
+    connection
+      .execute(
+        "insert into part (id, message_id, session_id, time_created, data) values (?1, ?2, ?3, ?4, ?5)",
+        params![id, message_id, session_id, time_created, data],
+      )
+      .unwrap();
   }
 
   fn append(path: &std::path::Path, value: &str) {

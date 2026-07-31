@@ -29,19 +29,20 @@ The old `tokn-session sessions list/show` shape is intentionally unsupported.
 
 ## Session Relay
 
-`tokn-session-relay` follows active Codex and Pi JSONL session trees. It requires
-an output subcommand:
+`tokn-session-relay` follows active Codex and Pi JSONL session trees plus the
+OpenCode SQLite database. It requires an output subcommand:
 
 ```sh
 tokn-session-relay zeromq --bind tcp://127.0.0.1:5556
 tokn-session-relay stdout --format summary
 ```
 
-Both modes watch `~/.codex/sessions` and `~/.pi/agent/sessions` by default and
-seed existing files from their session header before following from the
-snapshotted EOF. Their historical bodies are not replayed. `--codex-dir`,
-`--pi-dir`, `--poll-interval`, `--replay=<count>`, and `--replay-all` are shared
-options.
+Both modes watch `~/.codex/sessions`, `~/.pi/agent/sessions`, and
+`~/.local/share/opencode/opencode.db` by default. Existing JSONL files seed
+their session header before following from the snapshotted EOF, while existing
+OpenCode sessions are snapshotted without replay. `--codex-dir`, `--pi-dir`,
+`--opencode-dir` (a data directory or database path), `--poll-interval`,
+`--replay=<count>`, and `--replay-all` are shared options.
 
 Native filesystem watching is registered between the initial file snapshot and
 the EOF-seeding pass, so appends during startup remain visible. The periodic
@@ -65,7 +66,7 @@ format flushes after each event, and diagnostics remain on stderr.
 `zeromq` binds `tcp://127.0.0.1:5556` by default. Each publication is a two-frame
 ZeroMQ message:
 
-1. `codex.<session_id>` or `pi.<session_id>` topic
+1. `codex.<session_id>`, `pi.<session_id>`, or `opencode.<session_id>` topic
 2. serialized `RelayEvent` JSON
 
 `RelayEvent` wraps the normalized `AgentEvent` with the source path, topic, and
@@ -91,7 +92,11 @@ the recorded value unchanged, including null or an explicit `/root`.
 The relay publishes all normalized events, including reasoning, tool calls,
 errors, lifecycle events, and unknown provider-native shapes. It buffers partial
 JSONL records, discovers newly created files, handles truncation/replacement,
-and combines native filesystem notifications with a periodic rescan.
+and combines native filesystem notifications with a periodic rescan. OpenCode
+sessions are reloaded when the database changes; new sessions use the replay
+window, while changed or newly appended message/part events are emitted once.
+The database is opened read-only with WAL visibility and an immutable fallback;
+the relay never runs provider migrations.
 
 The reusable relay loop lives in the library as `SessionRelay`. `RelayConfig`
 controls provider roots, new-file replay, and the periodic recovery interval.
