@@ -1348,12 +1348,14 @@ name = "tokn-session-relay"
 version = "0.1.0"
 dependencies = [
  "notify",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tokn-session-codex",
  "tokn-session-core",
+ "tokn-session-opencode",
  "tokn-session-pi",
  "tokn-session-render",
  "zeromq",

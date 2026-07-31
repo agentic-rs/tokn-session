@@ -2,7 +2,7 @@ use std::path::Path;
 
 use serde::Serialize;
 use serde_json::Value;
-use tokn_session_core::Provider;
+use tokn_session_core::{Provider, SessionRef};
 
 use crate::project::ProjectCatalog;
 
@@ -47,6 +47,22 @@ impl SessionContext {
       cwd: None,
       started_at: None,
       project: None,
+    }
+  }
+
+  pub(crate) fn from_session_ref(reference: &SessionRef) -> Self {
+    let project = project_context(reference.cwd.as_deref(), None);
+    Self {
+      provider: Provider::OpenCode,
+      session_id: reference.id.clone(),
+      parent_session_id: reference.parent_session_id.clone(),
+      agent_path: reference.agent_path.clone(),
+      agent_nickname: reference.agent_nickname.clone(),
+      agent_role: reference.agent_role.clone(),
+      title: None,
+      cwd: reference.cwd.clone(),
+      started_at: reference.timestamp.clone(),
+      project,
     }
   }
 

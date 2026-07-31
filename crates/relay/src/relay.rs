@@ -154,9 +154,14 @@ impl SessionRelay {
       if !root.path.exists() || self.watched_roots.contains(&root.path) {
         continue;
       }
+      let mode = if root.path.is_dir() {
+        RecursiveMode::Recursive
+      } else {
+        RecursiveMode::NonRecursive
+      };
       self
         .watcher
-        .watch(&root.path, RecursiveMode::Recursive)
+        .watch(&root.path, mode)
         .map_err(|err| format!("failed to watch {}: {err}", root.path.display()))?;
       self.watched_roots.insert(root.path.clone());
     }
@@ -175,6 +180,7 @@ mod tests {
   use std::io::Write;
   use std::time::Duration;
 
+  use rusqlite::{Connection, params};
   use tempfile::TempDir;
   use tokn_session_core::{AgentEvent, Provider};
 
@@ -256,5 +262,138 @@ mod tests {
     let mut config = RelayConfig::new(Vec::new());
     config.poll_interval = Duration::ZERO;
     assert!(SessionRelay::new(config).await.is_err());
+  }
+
+  #[tokio::test]
+  async fn follows_opencode_database_sessions_and_part_updates() {
+    let fixture = TempDir::new().unwrap();
+    let database = fixture.path().join("opencode.db");
+    let connection = Connection::open(&database).unwrap();
+    connection
+      .execute_batch(
+        "pragma journal_mode = wal;
+         create table session (
+           id text primary key,
+           parent_id text,
+           directory text not null,
+           time_created integer not null,
+           time_updated integer not null
+         );
+         create table message (
+           id text primary key,
+           session_id text not null,
+           time_created integer,
+           data text not null
+         );
+         create table part (
+           id text primary key,
+           message_id text not null,
+           session_id text not null,
+           time_created integer,
+           data text not null
+         );",
+      )
+      .unwrap();
+    drop(connection);
+    let mut config = RelayConfig::new(vec![ProviderRoot::new(Provider::OpenCode, database.clone())]);
+    config.poll_interval = Duration::from_millis(10);
+    let mut relay = SessionRelay::new(config).await.unwrap();
+    assert!(relay.next_update().await.unwrap().events.is_empty());
+
+    let connection = Connection::open(&database).unwrap();
+    insert_session(&connection, "ses_1", 1, 2);
+    insert_message(&connection, "msg_user", "ses_1", 1, r#"{"role":"user"}"#);
+    insert_part(
+      &connection,
+      "part_user",
+      "msg_user",
+      "ses_1",
+      1,
+      r#"{"type":"text","text":"hello"}"#,
+    );
+    let first = wait_for_events(&mut relay).await;
+    assert_eq!(first.len(), 2);
+    assert!(first.iter().all(|event| event.topic == "opencode.ses_1"));
+    assert!(
+      first
+        .iter()
+        .any(|event| matches!(event.event, AgentEvent::SessionStarted(_)))
+    );
+    assert!(first.iter().any(|event| matches!(event.event, AgentEvent::Message(_))));
+
+    insert_message(
+      &connection,
+      "msg_assistant",
+      "ses_1",
+      3,
+      r#"{"role":"assistant","parentID":"msg_user"}"#,
+    );
+    insert_part(
+      &connection,
+      "part_assistant",
+      "msg_assistant",
+      "ses_1",
+      3,
+      r#"{"type":"text","text":"world"}"#,
+    );
+    let second = wait_for_events(&mut relay).await;
+    assert_eq!(second.len(), 1);
+    let AgentEvent::Message(message) = &second[0].event else {
+      panic!("expected assistant message");
+    };
+    assert_eq!(message.text, "world");
+
+    connection
+      .execute(
+        "update part set data = ?1 where id = ?2",
+        params![r#"{"type":"text","text":"updated"}"#, "part_assistant"],
+      )
+      .unwrap();
+    let third = wait_for_events(&mut relay).await;
+    assert_eq!(third.len(), 1);
+    let AgentEvent::Message(message) = &third[0].event else {
+      panic!("expected updated assistant message");
+    };
+    assert_eq!(message.text, "updated");
+  }
+
+  async fn wait_for_events(relay: &mut SessionRelay) -> Vec<crate::RelayEvent> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+      loop {
+        let update = relay.next_update().await.unwrap();
+        if !update.events.is_empty() {
+          break update.events;
+        }
+      }
+    })
+    .await
+    .expect("relay timed out")
+  }
+
+  fn insert_session(connection: &Connection, id: &str, time_created: i64, time_updated: i64) {
+    connection
+      .execute(
+        "insert into session (id, parent_id, directory, time_created, time_updated) values (?1, null, ?2, ?3, ?4)",
+        params![id, "/tmp/opencode", time_created, time_updated],
+      )
+      .unwrap();
+  }
+
+  fn insert_message(connection: &Connection, id: &str, session_id: &str, time_created: i64, data: &str) {
+    connection
+      .execute(
+        "insert into message (id, session_id, time_created, data) values (?1, ?2, ?3, ?4)",
+        params![id, session_id, time_created, data],
+      )
+      .unwrap();
+  }
+
+  fn insert_part(connection: &Connection, id: &str, message_id: &str, session_id: &str, time_created: i64, data: &str) {
+    connection
+      .execute(
+        "insert into part (id, message_id, session_id, time_created, data) values (?1, ?2, ?3, ?4, ?5)",
+        params![id, message_id, session_id, time_created, data],
+      )
+      .unwrap();
   }
 }
