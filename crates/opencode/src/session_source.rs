@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::normalize::OpenCodeNormalizer;
 use crate::row::{OpenCodeMessageRow, OpenCodePartRow, OpenCodeSessionRow};
+use crate::schema::OpenCodeCapabilities;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use tokn_opencode_protocol::v1::{MessageData, PartData, SessionModel};
 use tokn_session_core::{LoadedSession, SessionHistoryStatus, SessionRef};
@@ -16,7 +17,7 @@ impl OpenCodeSessionSource {
   }
 
   pub fn list_sessions(&self) -> Result<Vec<SessionRef>, String> {
-    let connection = self.connect()?;
+    let (connection, _) = self.connect()?;
     let mut statement = connection
       .prepare(
         "select id, parent_id, directory, time_created, time_updated
@@ -67,7 +68,8 @@ impl OpenCodeSessionSource {
 
   fn load_session_from_database(&self, database_path: PathBuf, session_id: &str) -> Result<LoadedSession, String> {
     let connection = connect_database(&database_path)?;
-    let session = load_session_row(&connection, session_id)?
+    let capabilities = OpenCodeCapabilities::detect(&connection)?;
+    let session = load_session_row(&connection, capabilities, session_id)?
       .ok_or_else(|| format!("no opencode session found for `{session_id}`"))?;
     let reference = SessionRef {
       id: session.id.clone(),
@@ -115,8 +117,10 @@ impl OpenCodeSessionSource {
     }
   }
 
-  fn connect(&self) -> Result<Connection, String> {
-    connect_database(&self.database_path()?)
+  fn connect(&self) -> Result<(Connection, OpenCodeCapabilities), String> {
+    let connection = connect_database(&self.database_path()?)?;
+    let capabilities = OpenCodeCapabilities::detect(&connection)?;
+    Ok((connection, capabilities))
   }
 
   fn database_path(&self) -> Result<PathBuf, String> {
@@ -158,11 +162,17 @@ fn sqlite_uri_path(path: &Path) -> String {
     .collect()
 }
 
-fn load_session_row(connection: &Connection, session_id: &str) -> Result<Option<OpenCodeSessionRow>, String> {
-  let session_projection = session_projection(connection)?;
+fn load_session_row(
+  connection: &Connection,
+  capabilities: OpenCodeCapabilities,
+  session_id: &str,
+) -> Result<Option<OpenCodeSessionRow>, String> {
   connection
     .query_row(
-      &format!("select {session_projection} from session where id = ?1"),
+      &format!(
+        "select {} from session where id = ?1",
+        capabilities.session_projection()
+      ),
       params![session_id],
       read_session_row,
     )
@@ -180,26 +190,6 @@ fn read_session_row(row: &Row<'_>) -> rusqlite::Result<OpenCodeSessionRow> {
     time_created: row.get(4)?,
     time_updated: row.get(5)?,
   })
-}
-
-fn session_projection(connection: &Connection) -> Result<&'static str, String> {
-  let has_model = connection
-    .query_row(
-      "select exists(
-         select 1
-         from pragma_table_info('session')
-         where name = 'model'
-       )",
-      [],
-      |row| row.get::<_, bool>(0),
-    )
-    .map_err(|err| format!("failed to inspect opencode session schema: {err}"))?;
-
-  if has_model {
-    Ok("id, parent_id, directory, model, time_created, time_updated")
-  } else {
-    Ok("id, parent_id, directory, null as model, time_created, time_updated")
-  }
 }
 
 fn load_messages(connection: &Connection, session_id: &str) -> Result<Vec<OpenCodeMessageRow>, String> {
@@ -284,6 +274,8 @@ mod tests {
   use tempfile::tempdir;
   use tokn_opencode_protocol::v1::{MessageItem, PartItem};
   use tokn_session_core::AgentEvent;
+
+  use crate::schema::OpenCodeCapabilities;
 
   use super::{OpenCodeSessionSource, load_messages, load_session_row};
 
@@ -374,6 +366,19 @@ mod tests {
            time_created integer not null,
            time_updated integer not null
          );
+         create table message (
+           id text primary key,
+           session_id text not null,
+           time_created integer,
+           data text not null
+         );
+         create table part (
+           id text primary key,
+           message_id text not null,
+           session_id text not null,
+           time_created integer,
+           data text not null
+         );
          insert into session (
            id, parent_id, directory, model, time_created, time_updated
          ) values (
@@ -387,7 +392,8 @@ mod tests {
       )
       .expect("fixture schema with model should be created");
 
-    let session = load_session_row(&connection, "ses_with_model")
+    let capabilities = OpenCodeCapabilities::detect(&connection).expect("schema with model should be detected");
+    let session = load_session_row(&connection, capabilities, "ses_with_model")
       .expect("schema with model should remain loadable")
       .expect("fixture session should exist");
     let model = session.model.expect("session model should be preserved");
