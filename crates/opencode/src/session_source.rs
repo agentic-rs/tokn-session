@@ -143,9 +143,20 @@ impl OpenCodeSessionSource {
 }
 
 fn connect_database(path: &Path) -> Result<Connection, String> {
-  let uri = format!("file:{}?mode=ro&immutable=1", sqlite_uri_path(path));
-  Connection::open_with_flags(&uri, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI)
-    .map_err(|err| format!("failed to open opencode database {}: {err}", path.display()))
+  let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
+  let uri = format!("file:{}?mode=ro", sqlite_uri_path(path));
+  match Connection::open_with_flags(&uri, flags) {
+    Ok(connection) => Ok(connection),
+    Err(read_only_error) => {
+      let immutable_uri = format!("file:{}?mode=ro&immutable=1", sqlite_uri_path(path));
+      Connection::open_with_flags(&immutable_uri, flags).map_err(|immutable_error| {
+        format!(
+          "failed to open opencode database {} read-only ({read_only_error}); immutable fallback also failed ({immutable_error})",
+          path.display()
+        )
+      })
+    }
+  }
 }
 
 fn sqlite_uri_path(path: &Path) -> String {
@@ -286,7 +297,8 @@ mod tests {
     let connection = Connection::open(&database_path).expect("database should open");
     connection
       .execute_batch(
-        r#"create table session (
+        r#"pragma journal_mode = wal;
+         create table session (
            id text primary key,
            parent_id text,
            directory text not null,
@@ -330,7 +342,6 @@ mod tests {
          );"#,
       )
       .expect("fixture schema without model should be created");
-    drop(connection);
 
     let source = OpenCodeSessionSource::new(Some(database_path));
     let sessions = source
