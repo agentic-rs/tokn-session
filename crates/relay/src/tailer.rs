@@ -811,6 +811,7 @@ mod tests {
   use std::fs::OpenOptions;
   use std::io::Write;
 
+  use rusqlite::{Connection, params};
   use tempfile::TempDir;
   use tokn_session_core::{AgentEvent, Provider};
 
@@ -1414,6 +1415,140 @@ mod tests {
     let update = tailer.scan_paths(HashSet::from([path])).unwrap();
     assert_eq!(update.events.len(), 2);
     assert!(update.events.iter().all(|event| event.topic == "pi.new-session"));
+  }
+
+  #[test]
+  fn tails_opencode_database_updates() {
+    let fixture = TempDir::new().unwrap();
+    let database = fixture.path().join("opencode.db");
+    let connection = Connection::open(&database).unwrap();
+    connection
+      .execute_batch(
+        "pragma journal_mode = wal;
+         create table session (
+           id text primary key,
+           parent_id text,
+           directory text not null,
+           time_created integer not null,
+           time_updated integer not null
+         );
+         create table message (
+           id text primary key,
+           session_id text not null,
+           time_created integer,
+           data text not null
+         );
+         create table part (
+           id text primary key,
+           message_id text not null,
+           session_id text not null,
+           time_created integer,
+           data text not null
+         );",
+      )
+      .unwrap();
+    drop(connection);
+
+    let (mut tailer, initial) = SessionTailer::initialize(
+      vec![ProviderRoot::new(Provider::OpenCode, database.clone())],
+      NewFileReplay::Messages(3),
+    )
+    .unwrap();
+    assert!(initial.events.is_empty());
+
+    let connection = Connection::open(&database).unwrap();
+    connection
+      .execute(
+        "insert into session (id, parent_id, directory, time_created, time_updated) values (?1, null, ?2, ?3, ?4)",
+        params!["ses_1", "/tmp/opencode", 1, 2],
+      )
+      .unwrap();
+    insert_opencode_message(&connection, "msg_user", "ses_1", 1, r#"{"role":"user"}"#);
+    insert_opencode_part(
+      &connection,
+      "part_user",
+      "msg_user",
+      "ses_1",
+      1,
+      r#"{"type":"text","text":"hello"}"#,
+    );
+
+    let first = tailer.scan().unwrap();
+    assert_eq!(first.events.len(), 2);
+    assert!(first.events.iter().all(|event| event.topic == "opencode.ses_1"));
+    assert!(
+      first
+        .events
+        .iter()
+        .any(|event| matches!(event.event, AgentEvent::SessionStarted(_)))
+    );
+    assert!(
+      first
+        .events
+        .iter()
+        .any(|event| matches!(event.event, AgentEvent::Message(_)))
+    );
+
+    insert_opencode_message(
+      &connection,
+      "msg_assistant",
+      "ses_1",
+      3,
+      r#"{"role":"assistant","parentID":"msg_user"}"#,
+    );
+    insert_opencode_part(
+      &connection,
+      "part_assistant",
+      "msg_assistant",
+      "ses_1",
+      3,
+      r#"{"type":"text","text":"world"}"#,
+    );
+
+    let second = tailer.scan().unwrap();
+    assert_eq!(second.events.len(), 1);
+    let AgentEvent::Message(message) = &second.events[0].event else {
+      panic!("expected assistant message");
+    };
+    assert_eq!(message.text, "world");
+
+    connection
+      .execute(
+        "update part set data = ?1 where id = ?2",
+        params![r#"{"type":"text","text":"updated"}"#, "part_assistant"],
+      )
+      .unwrap();
+    let third = tailer.scan().unwrap();
+    assert_eq!(third.events.len(), 1);
+    let AgentEvent::Message(message) = &third.events[0].event else {
+      panic!("expected updated assistant message");
+    };
+    assert_eq!(message.text, "updated");
+  }
+
+  fn insert_opencode_message(connection: &Connection, id: &str, session_id: &str, time_created: i64, data: &str) {
+    connection
+      .execute(
+        "insert into message (id, session_id, time_created, data) values (?1, ?2, ?3, ?4)",
+        params![id, session_id, time_created, data],
+      )
+      .unwrap();
+  }
+
+  fn insert_opencode_part(
+    connection: &Connection,
+    id: &str,
+    message_id: &str,
+    session_id: &str,
+    time_created: i64,
+    data: &str,
+  ) {
+    connection
+      .execute(
+        "insert into part (id, message_id, session_id, time_created, data) values (?1, ?2, ?3, ?4, ?5)",
+        params![id, message_id, session_id, time_created, data],
+      )
+      .unwrap();
   }
 
   fn append(path: &std::path::Path, value: &str) {
