@@ -1,0 +1,52 @@
+[
+  {
+    "status": "pending",
+    "input": {
+      "command": "cargo test"
+    },
+    "raw": "{\"command\":\"cargo test\"}"
+  },
+  {
+    "status": "running",
+    "input": {
+      "command": "cargo test"
+    },
+    "title": "Run tests",
+    "metadata": {
+      "progress": 0.5
+    },
+    "time": {
+      "start": 1710000000000
+    }
+  },
+  {
+    "status": "completed",
+    "input": {
+      "command": "cargo test"
+    },
+    "output": "ok",
+    "title": "Run tests",
+    "metadata": {
+      "exit": 0
+    },
+    "time": {
+      "start": 1710000000000,
+      "end": 1710000000001
+    }
+  },
+  {
+    "status": "error",
+    "input": {
+      "command": "cargo test"
+    },
+    "raw": "{\"command\":\"cargo test\"}",
+    "error": "failed",
+    "metadata": {
+      "exit": 1
+    },
+    "time": {
+      "start": 1710000000000,
+      "end": 1710000000001
+    }
+  }
+]

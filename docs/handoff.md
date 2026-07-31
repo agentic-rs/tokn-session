@@ -202,6 +202,8 @@ art and must be replaced before publishing or distributing the project.
 - Codex reads JSONL from `~/.codex/sessions` and `~/.codex/archived_sessions` unless `--session-dir` is passed.
 - OpenCode reads SQLite from `~/.local/share/opencode/opencode.db` unless `--session-dir` is passed.
 - OpenCode opens its database with an immutable read-only SQLite URI so viewing sessions does not require writing sidecar files.
+- OpenCode validates the required `session`, `message`, and `part` tables and columns, then detects optional session columns from the actual SQLite schema.
+- OpenCode accepts schemas both with and without the optional `session.model` column; it never runs migrations against the user database.
 
 `SessionRef` carries optional `parent_session_id`, `agent_path`,
 `agent_nickname`, and `agent_role`. Codex takes owning identity only from the
@@ -239,6 +241,14 @@ Persisted Pi session wire types similarly live in `tokn-pi-protocol`.
 Top-level entries, nested message roles, and content blocks all fall back to
 lossless unknown values when Pi adds or changes a shape. `tokn-session-pi`
 owns their normalization into `AgentEvent`.
+
+OpenCode wire types live in `tokn-opencode-protocol`. Its `v1` module models
+the JSON payloads stored in the SQLite `message.data` and `part.data` columns,
+while `run` models JSONL from `opencode run --format json`. Both decode through
+native-JSON-first wrappers: unknown tags and malformed known variants remain
+inspectable instead of preventing the rest of a session from loading. The
+OpenCode source crate still owns SQLite queries, relational row identity, and
+normalization into `AgentEvent`.
 
 Current event families include:
 
@@ -323,7 +333,15 @@ Current browser keys:
 
 - OpenCode shell tools with nonzero `metadata.exit` are marked as errors even when OpenCode records the tool state as completed.
 - Tool kind classification and summary extraction live in `crates/core`; provider normalizers should use the shared helpers where possible.
-- OpenCode support currently uses the legacy-compatible `message` and `part` tables seen in local data, not the newer `session_message` projection.
+- OpenCode support currently uses the V1 `message` and `part` tables seen in
+  local data, not the newer `session_message` projection. The newer table
+  exists locally but is empty, and upstream has repeatedly reset its
+  projections, so it is not yet treated as an authoritative history source.
+- OpenCode V1 message roles, part types, nested tool states, and run-envelope
+  types are decoded by `tokn-opencode-protocol`. Unknown and malformed shapes
+  preserve their complete native JSON. The adapter retains SQLite row IDs and
+  uses a part row ID as the fallback tool-call ID for historical records that
+  lack `callID`.
 - Pi native JSONL parsing uses `tokn-pi-protocol`. Unknown message roles such
   as historical `bashExecution` records remain visible without preventing the
   rest of the session from loading.
@@ -375,8 +393,9 @@ OpenCode has the first live-output normalizer: `OpenCodeLiveNormalizer` parses `
 ## Known Gaps
 
 - No `attach` command yet.
-- Codex and Pi have normalization fixtures. OpenCode provider fixtures and CLI
-  golden tests are still missing.
+- Codex and Pi have normalization fixtures. OpenCode now has wire-format
+  fixtures plus adapter/source regression tests; full SQLite-backed CLI golden
+  tests are still missing.
 - The relay uses ZeroMQ `PUB/SUB`, which intentionally has no persistence or
   delivery acknowledgement; subscribers that are disconnected can miss events.
 - The terminal pet cannot distinguish every runtime state authoritatively until

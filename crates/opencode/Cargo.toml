@@ -5,6 +5,9 @@ edition.workspace = true
 
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }
-serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+tokn-opencode-protocol.workspace = true
 tokn-session-core.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

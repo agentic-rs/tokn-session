@@ -1267,6 +1267,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokn-opencode-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "tokn-pi-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1319,8 +1327,9 @@ name = "tokn-session-opencode"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
- "serde",
  "serde_json",
+ "tempfile",
+ "tokn-opencode-protocol",
  "tokn-session-core",
 ]
 

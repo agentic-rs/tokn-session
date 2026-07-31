@@ -1,6 +1,7 @@
-mod event;
 mod live;
 mod normalize;
+mod row;
+mod schema;
 mod session_source;
 
 pub use live::OpenCodeLiveNormalizer;

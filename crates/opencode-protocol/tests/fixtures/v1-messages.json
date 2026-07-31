@@ -1,0 +1,45 @@
+[
+  {
+    "role": "user",
+    "time": {
+      "created": 1710000000000
+    },
+    "agent": "build",
+    "model": {
+      "providerID": "openai",
+      "modelID": "gpt-5",
+      "variant": "high"
+    },
+    "summary": {
+      "title": "Example"
+    },
+    "future_field": true
+  },
+  {
+    "role": "assistant",
+    "parentID": "msg_parent",
+    "modelID": "gpt-5",
+    "providerID": "openai",
+    "mode": "build",
+    "agent": "build",
+    "path": {
+      "cwd": "/tmp/project",
+      "root": "/tmp/project"
+    },
+    "cost": 0.25,
+    "tokens": {
+      "input": 10,
+      "output": 20,
+      "reasoning": 5,
+      "cache": {
+        "read": 2,
+        "write": 1
+      }
+    },
+    "time": {
+      "created": 1710000000001,
+      "completed": 1710000000002
+    },
+    "finish": "stop"
+  }
+]
