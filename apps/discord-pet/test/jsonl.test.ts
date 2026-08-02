@@ -23,4 +23,26 @@ describe("Relay JSONL", () => {
 
     expect(decoder.stats.malformed_lines).toBe(2);
   });
+
+  test("preserves the session path and cwd for terminal input", () => {
+    const parsed = parseRelayEvent({
+      path: "/tmp/pi/session.jsonl",
+      topic: "pi.session-1",
+      session: {
+        provider: "pi",
+        session_id: "session-1",
+        cwd: "/tmp/project"
+      },
+      event: { type: "message" }
+    });
+
+    expect(parsed).toMatchObject({
+      path: "/tmp/pi/session.jsonl",
+      session: {
+        provider: "pi",
+        session_id: "session-1",
+        cwd: "/tmp/project"
+      }
+    });
+  });
 });
