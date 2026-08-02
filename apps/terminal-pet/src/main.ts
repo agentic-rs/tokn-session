@@ -15,6 +15,11 @@ import { focusSnapshot, moveFocusTopic, type FocusDirection } from "./navigation
 import { parseRelayEvent, type RelayEvent } from "./protocol";
 import { renderScreen, type RenderMeta } from "./renderer";
 import {
+  PiInputBroker,
+  TerminalInputEditor,
+  type TerminalInputEvent
+} from "./input";
+import {
   PET_STATES,
   PetStore,
   type PetFocus,
@@ -72,6 +77,8 @@ async function runInteractive(runOptions: Options): Promise<void> {
   const startedAt = Date.now();
   const sourceAbort = new AbortController();
   const keyDecoder = new TerminalKeyDecoder();
+  const inputEditor = new TerminalInputEditor();
+  const piInput = new PiInputBroker();
 
   let child: RelayChild | undefined;
   let stopped = false;
@@ -79,6 +86,7 @@ async function runInteractive(runOptions: Options): Promise<void> {
   let frameTimer: ReturnType<typeof setInterval> | undefined;
   let keyFlushTimer: ReturnType<typeof setTimeout> | undefined;
   let selectedTopic: string | undefined;
+  let inputTopic: string | undefined;
   let resolveStopped: (() => void) | undefined;
   const stoppedPromise = new Promise<void>((resolvePromise) => {
     resolveStopped = resolvePromise;
@@ -94,6 +102,8 @@ async function runInteractive(runOptions: Options): Promise<void> {
       clearTimeout(keyFlushTimer);
       keyFlushTimer = undefined;
     }
+    inputEditor.cancel();
+    inputTopic = undefined;
     if (diagnostic) {
       meta.diagnostic = diagnostic;
       render();
@@ -124,7 +134,9 @@ async function runInteractive(runOptions: Options): Promise<void> {
     const screen = renderScreen(snapshot, art[pose].ansi, {
       ...meta,
       stats: decoder.stats,
-      focus_mode: selectedTopic ? "manual" : "auto"
+      focus_mode: selectedTopic ? "manual" : "auto",
+      input_active: inputEditor.active,
+      input_line: inputEditor.active ? inputEditor.value : undefined
     }, {
       columns: process.stdout.columns ?? 80,
       rows: process.stdout.rows ?? 24,
@@ -151,9 +163,82 @@ async function runInteractive(runOptions: Options): Promise<void> {
   };
   const onSignal = (): void => stop(0);
   const moveFocus = (direction: FocusDirection): void => {
+    if (inputEditor.active) {
+      return;
+    }
     const snapshot = baseSnapshot(Date.now());
     selectedTopic = moveFocusTopic(snapshot, selectedTopic, direction);
     render();
+  };
+  const beginInput = (): void => {
+    if (runOptions.mode !== "relay") {
+      meta.input_status = "input requires live Relay mode";
+      render();
+      return;
+    }
+    const focus = snapshotAt(Date.now()).focus;
+    if (!focus) {
+      meta.input_status = "no session is selected";
+      render();
+      return;
+    }
+    const provider = focus.provider ?? focus.topic.split(".", 1)[0];
+    if (provider?.toLowerCase() !== "pi") {
+      meta.input_status = "terminal input currently supports Pi sessions only";
+      render();
+      return;
+    }
+    inputTopic = focus.topic;
+    meta.input_status = undefined;
+    meta.diagnostic = undefined;
+    inputEditor.begin();
+    render();
+  };
+  const handleInputEvents = (events: TerminalInputEvent[]): void => {
+    for (const event of events) {
+      switch (event.type) {
+        case "changed":
+          render();
+          break;
+        case "cancelled":
+          inputTopic = undefined;
+          meta.input_status = undefined;
+          render();
+          break;
+        case "submitted": {
+          const topic = inputTopic;
+          inputTopic = undefined;
+          if (event.text.trim().length === 0) {
+            meta.input_status = "message cannot be empty";
+            render();
+            break;
+          }
+          meta.input_status = "sending input to Pi…";
+          render();
+          if (!topic) {
+            meta.input_status = "no session is selected";
+            render();
+            break;
+          }
+          void piInput.submit(topic, event.text).then(
+            () => {
+              if (!stopped) {
+                meta.input_status = "Pi input sent";
+                render();
+              }
+            },
+            (error: unknown) => {
+              if (!stopped) {
+                meta.input_status = undefined;
+                meta.diagnostic = errorMessage(error);
+                render();
+              }
+            }
+          );
+          break;
+        }
+      }
+    }
   };
   const dispatchActions = (actions: PetKeyAction[]): void => {
     for (const action of actions) {
@@ -180,6 +265,9 @@ async function runInteractive(runOptions: Options): Promise<void> {
           selectedTopic = undefined;
           render();
           break;
+        case "begin_input":
+          beginInput();
+          break;
       }
     }
   };
@@ -191,8 +279,14 @@ async function runInteractive(runOptions: Options): Promise<void> {
       clearTimeout(keyFlushTimer);
       keyFlushTimer = undefined;
     }
-    dispatchActions(keyDecoder.push(chunk));
-    if (!stopped && keyDecoder.has_pending_sequence) {
+    for (let index = 0; index < chunk.length && !stopped; index += 1) {
+      if (inputEditor.active) {
+        handleInputEvents(inputEditor.feed(chunk.subarray(index)));
+        break;
+      }
+      dispatchActions(keyDecoder.push(chunk.subarray(index, index + 1)));
+    }
+    if (!stopped && !inputEditor.active && keyDecoder.has_pending_sequence) {
       keyFlushTimer = setTimeout(() => {
         keyFlushTimer = undefined;
         if (!stopped) {
@@ -225,6 +319,7 @@ async function runInteractive(runOptions: Options): Promise<void> {
         decoder,
         (event) => {
           if (!stopped) {
+            piInput.observe(event);
             store.ingest(event);
             render();
           }
@@ -243,6 +338,7 @@ async function runInteractive(runOptions: Options): Promise<void> {
           decoder,
           (event) => {
             if (!stopped) {
+              piInput.observe(event);
               store.ingest(event);
               render();
             }

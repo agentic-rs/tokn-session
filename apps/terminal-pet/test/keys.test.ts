@@ -14,14 +14,16 @@ describe("TerminalKeyDecoder", () => {
       0x63,
       0x6a,
       0x6b,
-      0x61
+      0x61,
+      0x0d
     ))).toEqual([
       "quit",
       "quit",
       "acknowledge",
       "select_next",
       "select_previous",
-      "auto_focus"
+      "auto_focus",
+      "begin_input"
     ]);
     expect(decoder.has_pending_sequence).toBe(false);
   });

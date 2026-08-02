@@ -177,8 +177,14 @@ provider occurrence times prevent replayed old activity from looking current.
 Within each family, state still uses
 `needs_input > blocked > ready > running > idle`, followed by idle sessions
 that were inferred Ready or Interrupted in the last five minutes. Up/Down or
-`j`/`k` selects another session by topic, `a` restores automatic focus, and `c`
-acknowledges the selected notification. Responsive text rows keep concurrent
+`j`/`k` selects another session by topic, `a` restores automatic focus, and
+`Enter` opens a composer for the focused session. A second `Enter` submits the
+message and `Escape` cancels it. Input is currently Pi-only: the terminal
+records the observed Relay path for each Pi topic and starts
+`pi --mode json --session <path> --print` with the prompt on stdin. Pi writes
+the session JSONL and Relay remains the only event/display source. Non-Pi or
+unobserved sessions remain read-only. `c` acknowledges the selected
+notification. Responsive text rows keep concurrent
 and recent sessions visible; overflow windows around a manual selection so it
 cannot disappear off-screen. Root labels prefer `project_name`, then folder
 name, repository name, and the legacy inferred name. Child labels prefer agent

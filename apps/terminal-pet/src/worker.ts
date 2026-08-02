@@ -10,6 +10,11 @@ import type { RelayEvent } from "./protocol";
 import { renderScreen, type RenderMeta } from "./renderer";
 import { PetStore, type PetSnapshot } from "./state";
 import { TerminalSurface } from "./terminal";
+import {
+  PiInputBroker,
+  TerminalInputEditor,
+  type TerminalInputEvent
+} from "./input";
 
 const KEY_SEQUENCE_TIMEOUT_MS = 50;
 
@@ -32,12 +37,15 @@ export class TerminalPetWorker {
   readonly #meta: RenderMeta;
   readonly #name: string;
   readonly #onQuit: () => void;
+  readonly #inputEditor = new TerminalInputEditor();
+  readonly #piInput = new PiInputBroker();
   readonly #store = new PetStore();
   readonly #surface = new TerminalSurface();
 
   #frameTimer?: ReturnType<typeof setInterval>;
   #keyFlushTimer?: ReturnType<typeof setTimeout>;
   #rawMode = false;
+  #inputTopic?: string;
   #selectedTopic?: string;
   #started = false;
 
@@ -86,6 +94,7 @@ export class TerminalPetWorker {
     if (!this.#started) {
       throw new Error("terminal pet worker is not started");
     }
+    this.#piInput.observe(event);
     this.#store.ingest(event);
     this.#render();
   }
@@ -103,6 +112,8 @@ export class TerminalPetWorker {
       clearTimeout(this.#keyFlushTimer);
       this.#keyFlushTimer = undefined;
     }
+    this.#inputEditor.cancel();
+    this.#inputTopic = undefined;
     process.stdout.off("resize", this.#onResize);
     process.stdin.off("data", this.#onKey);
     if (this.#rawMode) {
@@ -131,8 +142,14 @@ export class TerminalPetWorker {
       clearTimeout(this.#keyFlushTimer);
       this.#keyFlushTimer = undefined;
     }
-    this.#dispatchActions(this.#keyDecoder.push(chunk));
-    if (this.#started && this.#keyDecoder.has_pending_sequence) {
+    for (let index = 0; index < chunk.length && this.#started; index += 1) {
+      if (this.#inputEditor.active) {
+        this.#handleInputEvents(this.#inputEditor.feed(chunk.subarray(index)));
+        break;
+      }
+      this.#dispatchActions(this.#keyDecoder.push(chunk.subarray(index, index + 1)));
+    }
+    if (this.#started && !this.#inputEditor.active && this.#keyDecoder.has_pending_sequence) {
       this.#keyFlushTimer = setTimeout(() => {
         this.#keyFlushTimer = undefined;
         if (this.#started) {
@@ -164,7 +181,9 @@ export class TerminalPetWorker {
     const pose = selectPose(snapshot.state, snapshot.state_changed_at, nowMs);
     const screen = renderScreen(snapshot, this.#art[pose].ansi, {
       ...this.#meta,
-      focus_mode: this.#selectedTopic ? "manual" : "auto"
+      focus_mode: this.#selectedTopic ? "manual" : "auto",
+      input_active: this.#inputEditor.active,
+      input_line: this.#inputEditor.active ? this.#inputEditor.value : undefined
     }, {
       columns: process.stdout.columns ?? 80,
       rows: process.stdout.rows ?? 24,
@@ -182,12 +201,84 @@ export class TerminalPetWorker {
   }
 
   #moveFocus(direction: FocusDirection): void {
+    if (this.#inputEditor.active) {
+      return;
+    }
     this.#selectedTopic = moveFocusTopic(
       this.#store.snapshot(Date.now()),
       this.#selectedTopic,
       direction
     );
     this.#render();
+  }
+
+  #beginInput(): void {
+    const focus = this.#snapshot(Date.now()).focus;
+    if (!focus) {
+      this.#meta.input_status = "no session is selected";
+      this.#render();
+      return;
+    }
+    const provider = focus.provider ?? focus.topic.split(".", 1)[0];
+    if (provider?.toLowerCase() !== "pi") {
+      this.#meta.input_status = "terminal input currently supports Pi sessions only";
+      this.#render();
+      return;
+    }
+    this.#inputTopic = focus.topic;
+    this.#meta.input_status = undefined;
+    this.#meta.diagnostic = undefined;
+    this.#inputEditor.begin();
+    this.#render();
+  }
+
+  #handleInputEvents(events: TerminalInputEvent[]): void {
+    for (const event of events) {
+      switch (event.type) {
+        case "changed":
+          this.#render();
+          break;
+        case "cancelled":
+          this.#inputTopic = undefined;
+          this.#meta.input_status = undefined;
+          this.#render();
+          break;
+        case "submitted": {
+          const topic = this.#inputTopic;
+          this.#inputTopic = undefined;
+          if (event.text.trim().length === 0) {
+            this.#meta.input_status = "message cannot be empty";
+            this.#render();
+            break;
+          }
+          this.#meta.input_status = "sending input to Pi…";
+          this.#render();
+          if (!topic) {
+            this.#meta.input_status = "no session is selected";
+            this.#render();
+            break;
+          }
+          void this.#piInput.submit(topic, event.text).then(
+            () => {
+              if (this.#started) {
+                this.#meta.input_status = "Pi input sent";
+                this.#render();
+              }
+            },
+            (error: unknown) => {
+              if (this.#started) {
+                this.#meta.input_status = undefined;
+                this.#meta.diagnostic = error instanceof Error
+                  ? error.message
+                  : String(error);
+                this.#render();
+              }
+            }
+          );
+          break;
+        }
+      }
+    }
   }
 
   #dispatchActions(actions: PetKeyAction[]): void {
@@ -213,6 +304,9 @@ export class TerminalPetWorker {
         case "auto_focus":
           this.#selectedTopic = undefined;
           this.#render();
+          break;
+        case "begin_input":
+          this.#beginInput();
           break;
       }
     }

@@ -36,6 +36,14 @@ available for keyboard controls:
 - Up/Down or `j`/`k` selects a session, including recently completed work.
 - `a` returns to automatic highest-priority focus.
 - `c` clears the selected session's notification.
+- `Enter` opens a composer for the focused Pi session; type a message and press
+  `Enter` again to submit it, or press `Escape` to cancel.
+
+Input is currently Pi-only. The pet remembers the observed Relay path for the
+focused session and starts `pi --mode json --session <path> --print` with the
+message on stdin. Pi's JSONL session file remains the source of truth; the
+Relay observes and renders the resulting events. Non-Pi sessions and sessions
+without an observed path stay read-only.
 
 To consume an existing JSONL pipeline:
 
@@ -44,7 +52,8 @@ cargo run -q -p tokn-session-relay -- stdout --format json \
   | bun run start -- --stdin
 ```
 
-In pipeline mode, exit with Ctrl-C because stdin belongs to Relay.
+In pipeline mode, exit with Ctrl-C because stdin belongs to Relay and keyboard
+input is disabled.
 
 For fast art and animation iteration:
 
