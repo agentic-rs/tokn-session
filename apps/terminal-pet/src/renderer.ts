@@ -46,6 +46,9 @@ export interface RenderMeta {
   stats?: JsonlStats;
   control_mode?: "relay" | "demo" | "signal_only" | "none";
   focus_mode?: "auto" | "manual";
+  input_active?: boolean;
+  input_line?: string;
+  input_status?: string;
 }
 
 export interface RenderOptions {
@@ -463,9 +466,13 @@ function controlLine(meta: RenderMeta): string {
   if (mode === "signal_only") {
     return "Ctrl-C quit · keyboard controls unavailable";
   }
+  if (meta.input_active) {
+    return "Enter send · Esc cancel";
+  }
   const focus = `focus ${(meta.focus_mode ?? "auto").toUpperCase()}`;
+  const input = mode === "relay" ? " · Enter input" : "";
   const clear = mode === "relay" ? " · c clear" : "";
-  return `${focus} · ↑/↓ select · a auto${clear} · q/Esc quit`;
+  return `${focus}${input} · ↑/↓ select · a auto${clear} · q/Esc quit`;
 }
 
 function isUrgent(session: PetFocus): boolean {
@@ -688,6 +695,12 @@ function isRecentlyCompleted(session: PetFocus): boolean {
 }
 
 function activityLine(snapshot: PetSnapshot, meta: RenderMeta): string {
+  if (meta.input_active) {
+    return `> ${meta.input_line ?? ""}`;
+  }
+  if (meta.input_status) {
+    return meta.input_status;
+  }
   const malformed = meta.stats?.malformed_lines ?? 0;
   const active = `${snapshot.active_sessions} active`;
   const recent = `${recentSessions(snapshot).length} recent`;

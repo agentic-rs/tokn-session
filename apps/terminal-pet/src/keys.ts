@@ -3,7 +3,8 @@ export const PET_KEY_ACTIONS = [
   "acknowledge",
   "select_next",
   "select_previous",
-  "auto_focus"
+  "auto_focus",
+  "begin_input"
 ] as const;
 
 export type PetKeyAction = typeof PET_KEY_ACTIONS[number];
@@ -168,6 +169,9 @@ function actionForByte(byte: number): PetKeyAction | undefined {
       return "select_previous";
     case 0x61:
       return "auto_focus";
+    case 0x0a:
+    case 0x0d:
+      return "begin_input";
     default:
       return undefined;
   }

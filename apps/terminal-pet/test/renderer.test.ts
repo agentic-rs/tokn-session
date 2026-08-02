@@ -733,6 +733,32 @@ describe("renderer", () => {
     expect(output).toContain("keyboard controls unavailable");
     expect(output).not.toContain("↑/↓ select");
   });
+
+  test("shows the active input composer and its controls", async () => {
+    const art = await loadPetArt();
+    const screen = renderScreen(
+      petSnapshot([petFocus({ provider: "pi" })]),
+      art.running.ansi,
+      {
+        source_label: "relay",
+        control_mode: "relay",
+        input_active: true,
+        input_line: "continue the task"
+      },
+      {
+        columns: 80,
+        rows: 20,
+        color: false,
+        image_protocol: "ansi",
+        name: "Hachiware",
+        now_ms: 0
+      }
+    );
+    const output = screen.lines.join("\n");
+
+    expect(output).toContain("> continue the task");
+    expect(output).toContain("Enter send · Esc cancel");
+  });
 });
 
 function petFocus(overrides: Partial<PetFocus> = {}): PetFocus {

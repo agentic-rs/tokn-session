@@ -4,6 +4,7 @@ export interface RelaySession {
   provider?: string;
   session_id: string;
   parent_session_id?: string | null;
+  cwd?: string | null;
   title?: string | null;
   project?: {
     name?: string | null;
@@ -18,6 +19,7 @@ export interface AgentEvent extends JsonObject {
 }
 
 export interface RelayEvent {
+  path?: string;
   topic: string;
   session: RelaySession;
   event: AgentEvent;
@@ -44,6 +46,10 @@ export function parseRelayEvent(value: unknown): RelayEvent | null {
       type: eventType
     }
   };
+  const path = asString(record.path);
+  if (path) {
+    parsed.path = path;
+  }
   const provider = asString(session.provider);
   if (provider) {
     parsed.session.provider = provider;
@@ -51,6 +57,10 @@ export function parseRelayEvent(value: unknown): RelayEvent | null {
   const parentSessionId = asNullableString(session.parent_session_id);
   if (parentSessionId !== undefined) {
     parsed.session.parent_session_id = parentSessionId;
+  }
+  const cwd = asNullableString(session.cwd);
+  if (cwd !== undefined) {
+    parsed.session.cwd = cwd;
   }
   const title = asNullableString(session.title);
   if (title !== undefined) {
