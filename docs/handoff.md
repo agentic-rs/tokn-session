@@ -222,6 +222,10 @@ first valid `session_meta`, because subagent rollouts can contain copied parent
 headers. Pi resolves `parentSession` paths to parent IDs, and OpenCode uses its
 session `parent_id`.
 
+For Codex, only `parent_thread_id` establishes a subagent relationship.
+`forked_from_id` records that a user fork was created from another thread, but
+the fork remains a separate root session.
+
 `tokn-session show` defaults to `--scope self`. `--scope tree` discovers
 descendants, prints a compact hierarchy, and then renders every session in a
 separate section. Tree output is currently pretty-only; self-scoped JSONL keeps

@@ -178,7 +178,9 @@ fn inspect_session_header(path: &Path) -> Result<SessionRef, String> {
     if let Some(value) = payload.get("id").and_then(|value| value.as_str()) {
       reference.id = value.to_string();
     }
-    reference.parent_session_id = first_string_field(payload, &["parent_thread_id", "forked_from_id"]);
+    // A user fork is a new root session. Only Codex's explicit parent-thread
+    // relationship identifies a session that belongs in the subagent tree.
+    reference.parent_session_id = string_field(payload, "parent_thread_id");
     let thread_spawn = payload
       .get("source")
       .and_then(|source| source.get("subagent"))
@@ -252,6 +254,16 @@ mod tests {
     assert_eq!(reference.agent_role.as_deref(), Some("explorer"));
     assert_eq!(reference.timestamp.as_deref(), Some("2026-07-29T00:01:00Z"));
     assert_eq!(reference.message_count, 1);
+  }
+
+  #[test]
+  fn treats_user_forks_as_root_sessions() {
+    let reference = inspect_session(&fixtures_dir().join("forked_session.jsonl")).expect("fork should be inspectable");
+
+    assert_eq!(reference.id, "forked-session");
+    assert_eq!(reference.parent_session_id, None);
+    assert_eq!(reference.agent_path, None);
+    assert_eq!(reference.message_count, 2);
   }
 
   #[test]
