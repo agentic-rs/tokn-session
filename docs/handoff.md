@@ -46,10 +46,13 @@ OpenCode sessions are snapshotted without replay. `--codex-dir`, `--pi-dir`,
 
 Native filesystem watching is registered between the initial file snapshot and
 the EOF-seeding pass, so appends during startup remain visible. The periodic
-scan is a fallback for missed notifications and roots created after startup.
-Watcher notifications retain and coalesce their affected paths, so normal
-updates inspect only changed files instead of rescanning every session. macOS
-uses the kqueue backend because FSEvents can omit these session-file writes.
+scan is a 30-second fallback for missed notifications and roots created after
+startup. Watcher notifications retain and coalesce their affected paths, so
+normal updates inspect only changed files instead of rescanning every session.
+OpenCode is watched non-recursively at its data directory plus the database and
+SQLite WAL/SHM files; unrelated logs, snapshots, and auth files do not trigger
+database work. macOS uses the kqueue backend because FSEvents can omit these
+session-file writes.
 Newly discovered or replaced files emit all normalized events beginning at the
 third-most-recent message by default. `--replay=<count>` changes that window,
 while `--replay-all` emits every complete record. These replay options only
@@ -93,8 +96,11 @@ The relay publishes all normalized events, including reasoning, tool calls,
 errors, lifecycle events, and unknown provider-native shapes. It buffers partial
 JSONL records, discovers newly created files, handles truncation/replacement,
 and combines native filesystem notifications with a periodic rescan. OpenCode
-sessions are reloaded when the database changes; new sessions use the replay
-window, while changed or newly appended message/part events are emitted once.
+session summaries are cached, so a database notification reloads only new or
+changed sessions on the normal path; when message/part timestamps cannot prove
+which session changed, it performs one correctness fallback over the current
+sessions. New sessions use the replay window, while changed or newly appended
+message/part events are emitted once.
 The database is opened read-only with WAL visibility and an immutable fallback;
 the relay never runs provider migrations.
 
