@@ -153,13 +153,14 @@ impl SessionTailer {
     let mut changed_opencode = HashSet::new();
 
     for path in changed_paths {
+      if let Some(root) = self.open_code_root_for_event(&path) {
+        changed_opencode.insert(root);
+        continue;
+      }
       let Some(provider) = self.provider_for_path(&path) else {
         continue;
       };
       if matches!(provider, Provider::OpenCode) {
-        if let Some(root) = self.open_code_root_for_path(&path) {
-          changed_opencode.insert(root);
-        }
         continue;
       }
       if path.is_dir() {
@@ -248,13 +249,13 @@ impl SessionTailer {
       .map(|root| root.provider)
   }
 
-  fn open_code_root_for_path(&self, path: &Path) -> Option<PathBuf> {
+  fn open_code_root_for_event(&self, path: &Path) -> Option<PathBuf> {
     self
-      .roots
+      .opencode
       .iter()
-      .filter(|root| matches!(root.provider, Provider::OpenCode) && path.starts_with(&root.path))
-      .max_by_key(|root| root.path.components().count())
-      .map(|root| root.path.clone())
+      .filter(|(_, state)| state.matches_path(path))
+      .max_by_key(|(root, _)| root.components().count())
+      .map(|(root, _)| root.clone())
   }
 
   fn refresh_project_catalog(&mut self, update: &mut TailUpdate) {
@@ -305,10 +306,38 @@ struct OpenCodeState {
   root_path: PathBuf,
   source: OpenCodeSessionSource,
   sessions: HashMap<String, OpenCodeSessionState>,
+  database_version: Option<OpenCodeDatabaseVersion>,
 }
 
 struct OpenCodeSessionState {
+  summary: OpenCodeSessionSummary,
   fingerprints: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OpenCodeSessionSummary {
+  parent_session_id: Option<String>,
+  cwd: Option<String>,
+  timestamp: Option<String>,
+  message_count: usize,
+}
+
+impl OpenCodeSessionSummary {
+  fn from_reference(reference: &tokn_session_core::SessionRef) -> Self {
+    Self {
+      parent_session_id: reference.parent_session_id.clone(),
+      cwd: reference.cwd.clone(),
+      timestamp: reference.timestamp.clone(),
+      message_count: reference.message_count,
+    }
+  }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OpenCodeDatabaseVersion {
+  database: CatalogFileVersion,
+  wal: Option<CatalogFileVersion>,
+  shm: Option<CatalogFileVersion>,
 }
 
 impl OpenCodeState {
@@ -317,20 +346,49 @@ impl OpenCodeState {
       source: OpenCodeSessionSource::new(Some(root_path.clone())),
       root_path,
       sessions: HashMap::new(),
+      database_version: None,
     }
   }
 
   fn scan(&mut self, publish_new_sessions: bool, replay: NewFileReplay) -> Result<TailUpdate, String> {
-    if !self.database_exists() {
+    let Some(database_version) = self.database_version() else {
+      self.database_version = None;
+      self.sessions.clear();
+      return Ok(TailUpdate::default());
+    };
+    if self.database_version == Some(database_version) {
       return Ok(TailUpdate::default());
     }
 
     let references = self.source.list_sessions()?;
     let mut seen = HashSet::new();
     let mut update = TailUpdate::default();
-    for reference in references {
+    let mut to_load = Vec::new();
+    for reference in &references {
       let session_id = reference.id.clone();
       seen.insert(session_id.clone());
+      let summary = OpenCodeSessionSummary::from_reference(reference);
+      let changed = self
+        .sessions
+        .get(&session_id)
+        .is_none_or(|previous| previous.summary != summary);
+      if changed {
+        to_load.push((session_id, summary));
+      }
+    }
+
+    let removed_session = self.sessions.keys().any(|session_id| !seen.contains(session_id));
+    if to_load.is_empty() && !removed_session && !self.sessions.is_empty() {
+      // OpenCode does not expose update timestamps for message or part rows.
+      // If the session summary did not move, reload everything once to catch
+      // an in-place content edit; normal appends only reload changed sessions.
+      to_load = references
+        .iter()
+        .map(|reference| (reference.id.clone(), OpenCodeSessionSummary::from_reference(reference)))
+        .collect();
+    }
+
+    for (session_id, summary) in to_load {
       let loaded = self.source.load_session_exact(&session_id)?;
       let fingerprints = loaded.events.iter().map(event_fingerprint).collect::<Vec<_>>();
       let context = SessionContext::from_session_ref(&loaded.reference);
@@ -348,18 +406,34 @@ impl OpenCodeState {
         _ => {}
       }
 
-      self.sessions.insert(session_id, OpenCodeSessionState { fingerprints });
+      self
+        .sessions
+        .insert(session_id, OpenCodeSessionState { summary, fingerprints });
     }
     self.sessions.retain(|session_id, _| seen.contains(session_id));
+    self.database_version = Some(database_version);
     Ok(update)
   }
 
-  fn database_exists(&self) -> bool {
-    if self.root_path.is_dir() {
-      self.root_path.join("opencode.db").is_file()
-    } else {
-      self.root_path.is_file()
-    }
+  fn database_version(&self) -> Option<OpenCodeDatabaseVersion> {
+    let database_path = self.source.database_path().ok()?;
+    let database = file_version(&database_path)?;
+    Some(OpenCodeDatabaseVersion {
+      database,
+      wal: file_version(&sqlite_sidecar_path(&database_path, "-wal")),
+      shm: file_version(&sqlite_sidecar_path(&database_path, "-shm")),
+    })
+  }
+
+  fn matches_path(&self, path: &Path) -> bool {
+    let Ok(database_path) = self.source.database_path() else {
+      return false;
+    };
+    path == &database_path
+      || path == sqlite_sidecar_path(&database_path, "-wal")
+      || path == sqlite_sidecar_path(&database_path, "-shm")
+      || path == self.root_path
+      || database_path.parent().is_some_and(|parent| path == parent)
   }
 }
 
@@ -709,6 +783,23 @@ struct CatalogFileVersion {
   modified: Option<SystemTime>,
 }
 
+fn file_version(path: &Path) -> Option<CatalogFileVersion> {
+  let metadata = std::fs::metadata(path).ok()?;
+  metadata.is_file().then(|| CatalogFileVersion {
+    identity: file_identity(&metadata),
+    length: metadata.len(),
+    modified: metadata.modified().ok(),
+  })
+}
+
+fn sqlite_sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
+  let name = database_path
+    .file_name()
+    .and_then(|name| name.to_str())
+    .unwrap_or("opencode.db");
+  database_path.with_file_name(format!("{name}{suffix}"))
+}
+
 fn event_topic(provider: Provider, path: &Path, event: &AgentEvent) -> String {
   let provider = provider_name(provider);
   let session_id = event_session_id(event)
@@ -815,7 +906,7 @@ mod tests {
   use tempfile::TempDir;
   use tokn_session_core::{AgentEvent, Provider};
 
-  use super::{ProviderRoot, SessionTailer};
+  use super::{OpenCodeState, ProviderRoot, SessionTailer};
   use crate::NewFileReplay;
 
   #[test]
@@ -1019,6 +1110,19 @@ mod tests {
     let second_update = tailer.scan_paths(HashSet::from([second])).unwrap();
     assert_eq!(second_update.events.len(), 1);
     assert_eq!(second_update.events[0].topic, "pi.second");
+  }
+
+  #[test]
+  fn ignores_unrelated_opencode_paths() {
+    let fixture = TempDir::new().unwrap();
+    let database = fixture.path().join("opencode.db");
+    let state = OpenCodeState::new(fixture.path().to_path_buf());
+
+    assert!(state.matches_path(&database));
+    assert!(state.matches_path(&fixture.path().join("opencode.db-wal")));
+    assert!(state.matches_path(fixture.path()));
+    assert!(!state.matches_path(&fixture.path().join("opencode.log")));
+    assert!(!state.matches_path(&fixture.path().join("storage/snapshot")));
   }
 
   #[test]

@@ -123,7 +123,7 @@ impl OpenCodeSessionSource {
     Ok((connection, capabilities))
   }
 
-  fn database_path(&self) -> Result<PathBuf, String> {
+  pub fn database_path(&self) -> Result<PathBuf, String> {
     if let Some(path) = &self.session_dir {
       if path.is_dir() {
         return Ok(path.join("opencode.db"));

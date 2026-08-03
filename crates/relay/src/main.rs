@@ -588,7 +588,7 @@ Options:
   --codex-dir <path>          Codex session root (default: ~/.codex/sessions)
   --pi-dir <path>             Pi session root (default: ~/.pi/agent/sessions)
   --opencode-dir <path>       OpenCode data directory or database (default: ~/.local/share/opencode)
-  --poll-interval <duration>  Fallback rescan interval, such as 250ms, 2s, or 1m (default: 2s)
+  --poll-interval <duration>  Fallback rescan interval, such as 250ms, 2s, or 1m (default: 30s)
   --replay=<count>            Messages replayed for a newly discovered file (default: 3)
   --replay-all                Replay all records for a newly discovered file
   -h, --help                  Show this help
@@ -610,7 +610,7 @@ Options:
   --codex-dir <path>          Codex session root (default: ~/.codex/sessions)
   --pi-dir <path>             Pi session root (default: ~/.pi/agent/sessions)
   --opencode-dir <path>       OpenCode data directory or database (default: ~/.local/share/opencode)
-  --poll-interval <duration>  Fallback rescan interval, such as 250ms, 2s, or 1m (default: 2s)
+  --poll-interval <duration>  Fallback rescan interval, such as 250ms, 2s, or 1m (default: 30s)
   --replay=<count>            Messages replayed for a newly discovered file (default: 3)
   --replay-all                Replay all records for a newly discovered file
   -h, --help                  Show this help"

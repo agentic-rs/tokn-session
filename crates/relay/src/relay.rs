@@ -1,16 +1,18 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher, event::ModifyKind};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
+
+use tokn_session_core::Provider;
 
 use crate::{ProviderRoot, SessionTailer, TailUpdate};
 
 /// Default interval for recovering from missed filesystem notifications and
 /// discovering roots created after startup.
-pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// Default number of recent messages replayed from a newly discovered session.
 pub const DEFAULT_REPLAY_MESSAGES: usize = 3;
 
@@ -46,14 +48,14 @@ impl RelayConfig {
 pub struct SessionRelay {
   tailer: SessionTailer,
   watcher: RecommendedWatcher,
-  watched_roots: HashSet<PathBuf>,
-  wake_rx: mpsc::UnboundedReceiver<Result<Vec<PathBuf>, String>>,
+  watched_paths: HashSet<PathBuf>,
+  wake_rx: mpsc::UnboundedReceiver<Result<WatcherWake, String>>,
   poll: tokio::time::Interval,
   initial: Option<TailUpdate>,
 }
 
 impl SessionRelay {
-  /// Creates a relay and starts watching all provider roots that already exist.
+  /// Creates a relay and starts watching all provider paths that already exist.
   pub async fn new(config: RelayConfig) -> Result<Self, String> {
     if config.poll_interval.is_zero() {
       return Err("relay poll interval must be greater than zero".to_string());
@@ -62,14 +64,23 @@ impl SessionRelay {
     let tailer = SessionTailer::prepare(config.roots, config.new_file_replay)?;
     let (wake_tx, wake_rx) = mpsc::unbounded_channel();
     let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
-      let result = result.map(|event| event.paths).map_err(|err| err.to_string());
+      let result = result
+        .map(|event| {
+          let need_rescan = event.need_rescan();
+          WatcherWake {
+            paths: event.paths,
+            kind: event.kind,
+            need_rescan,
+          }
+        })
+        .map_err(|err| err.to_string());
       let _ = wake_tx.send(result);
     })
     .map_err(|err| format!("failed to create filesystem watcher: {err}"))?;
     let mut relay = Self {
       tailer,
       watcher,
-      watched_roots: HashSet::new(),
+      watched_paths: HashSet::new(),
       wake_rx,
       poll: tokio::time::interval_at(Instant::now() + config.poll_interval, config.poll_interval),
       initial: None,
@@ -128,7 +139,7 @@ impl SessionRelay {
     Ok(update)
   }
 
-  fn collect_watcher_events(&mut self, first: Result<Vec<PathBuf>, String>) -> (bool, HashSet<PathBuf>, Vec<String>) {
+  fn collect_watcher_events(&mut self, first: Result<WatcherWake, String>) -> (bool, HashSet<PathBuf>, Vec<String>) {
     let mut scan_all = false;
     let mut paths = HashSet::new();
     let mut warnings = Vec::new();
@@ -138,8 +149,9 @@ impl SessionRelay {
     }
     for wake in wakes {
       match wake {
-        Ok(event_paths) if event_paths.is_empty() => scan_all = true,
-        Ok(event_paths) => paths.extend(event_paths),
+        Ok(event) => {
+          merge_watcher_event(&mut self.watched_paths, &mut scan_all, &mut paths, event);
+        }
         Err(err) => {
           scan_all = true;
           warnings.push(format!("filesystem watcher error: {err}"));
@@ -151,27 +163,94 @@ impl SessionRelay {
 
   fn watch_available_roots(&mut self) -> Result<(), String> {
     for root in self.tailer.roots() {
-      if !root.path.exists() || self.watched_roots.contains(&root.path) {
-        continue;
+      for (path, mode) in watch_targets(root) {
+        if !path.exists() || self.watched_paths.contains(&path) {
+          continue;
+        }
+        self
+          .watcher
+          .watch(&path, mode)
+          .map_err(|err| format!("failed to watch {}: {err}", path.display()))?;
+        self.watched_paths.insert(path);
       }
-      let mode = if root.path.is_dir() {
-        RecursiveMode::Recursive
-      } else {
-        RecursiveMode::NonRecursive
-      };
-      self
-        .watcher
-        .watch(&root.path, mode)
-        .map_err(|err| format!("failed to watch {}: {err}", root.path.display()))?;
-      self.watched_roots.insert(root.path.clone());
     }
     Ok(())
   }
 }
 
+#[derive(Debug)]
+struct WatcherWake {
+  paths: Vec<PathBuf>,
+  kind: EventKind,
+  need_rescan: bool,
+}
+
 enum ScanRequest {
   Full,
-  Watcher(Result<Vec<PathBuf>, String>),
+  Watcher(Result<WatcherWake, String>),
+}
+
+fn merge_watcher_event(
+  watched_paths: &mut HashSet<PathBuf>,
+  scan_all: &mut bool,
+  paths: &mut HashSet<PathBuf>,
+  event: WatcherWake,
+) {
+  if matches!(
+    event.kind,
+    EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+  ) {
+    for path in &event.paths {
+      watched_paths.remove(path);
+    }
+  }
+  *scan_all |= event.need_rescan;
+  paths.extend(event.paths);
+}
+
+fn watch_targets(root: &ProviderRoot) -> Vec<(PathBuf, RecursiveMode)> {
+  if !matches!(root.provider, Provider::OpenCode) {
+    if !root.path.exists() {
+      return Vec::new();
+    }
+    let mode = if root.path.is_dir() {
+      RecursiveMode::Recursive
+    } else {
+      RecursiveMode::NonRecursive
+    };
+    return vec![(root.path.clone(), mode)];
+  }
+
+  let database_path = if root.path.is_dir() {
+    root.path.join("opencode.db")
+  } else {
+    root.path.clone()
+  };
+  let mut targets = Vec::new();
+  if root.path.is_dir() {
+    targets.push((root.path.clone(), RecursiveMode::NonRecursive));
+  } else if let Some(parent) = database_path.parent().filter(|parent| parent.exists()) {
+    targets.push((parent.to_path_buf(), RecursiveMode::NonRecursive));
+  }
+
+  for path in [
+    database_path.clone(),
+    sqlite_sidecar_path(&database_path, "-wal"),
+    sqlite_sidecar_path(&database_path, "-shm"),
+  ] {
+    if path.exists() {
+      targets.push((path, RecursiveMode::NonRecursive));
+    }
+  }
+  targets
+}
+
+fn sqlite_sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
+  let name = database_path
+    .file_name()
+    .and_then(|name| name.to_str())
+    .unwrap_or("opencode.db");
+  database_path.with_file_name(format!("{name}{suffix}"))
 }
 
 #[cfg(test)]
@@ -180,12 +259,47 @@ mod tests {
   use std::io::Write;
   use std::time::Duration;
 
+  use notify::{EventKind, RecursiveMode};
   use rusqlite::{Connection, params};
   use tempfile::TempDir;
   use tokn_session_core::{AgentEvent, Provider};
 
-  use super::{RelayConfig, SessionRelay};
+  use super::{RelayConfig, SessionRelay, WatcherWake, merge_watcher_event, watch_targets};
   use crate::ProviderRoot;
+
+  #[test]
+  fn ordinary_empty_watcher_events_do_not_force_a_full_scan() {
+    let mut watched_paths = std::collections::HashSet::new();
+    let mut scan_all = false;
+    let mut paths = std::collections::HashSet::new();
+    merge_watcher_event(
+      &mut watched_paths,
+      &mut scan_all,
+      &mut paths,
+      WatcherWake {
+        paths: Vec::new(),
+        kind: EventKind::Other,
+        need_rescan: false,
+      },
+    );
+    assert!(!scan_all);
+    assert!(paths.is_empty());
+  }
+
+  #[test]
+  fn opencode_directory_watches_are_non_recursive_and_database_scoped() {
+    let fixture = TempDir::new().unwrap();
+    let database = fixture.path().join("opencode.db");
+    std::fs::write(&database, b"not a database").unwrap();
+    std::fs::write(fixture.path().join("opencode.log"), b"log").unwrap();
+
+    let root = ProviderRoot::new(Provider::OpenCode, fixture.path().to_path_buf());
+    let targets = watch_targets(&root);
+    assert!(targets.iter().all(|(_, mode)| *mode == RecursiveMode::NonRecursive));
+    assert!(targets.iter().any(|(path, _)| path == fixture.path()));
+    assert!(targets.iter().any(|(path, _)| path == &database));
+    assert!(!targets.iter().any(|(path, _)| path.ends_with("opencode.log")));
+  }
 
   #[tokio::test]
   async fn follows_appends_through_the_library_api() {
