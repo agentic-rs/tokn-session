@@ -179,17 +179,27 @@ function renderWide(
     leftWidth
   ));
 
-  const roster = rosterLines(
-    snapshot,
+  const focusPanel = focusPanelLines(
+    snapshot.focus,
     rightWidth,
-    contentRows,
     options.now_ms,
     options.color
   );
+  const roster = rosterLines(
+    snapshot,
+    rightWidth,
+    Math.max(1, contentRows - focusPanel.length),
+    options.now_ms,
+    options.color
+  );
+  const rightLines = [
+    ...focusPanel,
+    ...roster
+  ];
   for (let index = 0; index < contentRows; index += 1) {
     lines.push(joinColumns(
       leftLines[index] ?? "",
-      roster[index] ?? "",
+      rightLines[index] ?? "",
       leftWidth,
       rightWidth,
       gapWidth
@@ -630,6 +640,65 @@ function focusStatusLine(
   return statusLine(state, color);
 }
 
+function focusPanelLines(
+  focus: PetFocus | undefined,
+  width: number,
+  nowMs: number,
+  color: boolean
+): string[] {
+  if (!focus) {
+    return [
+      dim(truncate("FOCUS · Waiting for Relay activity", width), color),
+      ""
+    ];
+  }
+
+  const state = effectivePetState(focus);
+  const activity = focus.current_activity?.detail
+    ?? focus.current_activity?.label
+    ?? focus.label;
+  const detail = `${focusReason(focus, state)}: ${activity}`;
+  const location = focus.cwd
+    ? `cwd ${focus.cwd}`
+    : contextLine(focus);
+  const metadata = [
+    formatAgeLabel(sessionAge(focus, nowMs)),
+    location,
+    focus.depth === 0 && focus.descendant_count > 0
+      ? sessionActivity(focus)
+      : undefined
+  ].filter((value): value is string => Boolean(value)).join(" · ");
+
+  return [
+    colorize(
+      `${BOLD}FOCUS${RESET} · ${truncate(sessionIdentity(focus), Math.max(1, width - 8))}`,
+      color,
+      STATUS_COLOR[state]
+    ),
+    truncate(detail, width),
+    dim(truncate(metadata, width), color),
+    ""
+  ];
+}
+
+function focusReason(focus: PetFocus, state: PetState): string {
+  if (state === "idle" && focus.recently_completed) {
+    return focus.outcome === "interrupted" ? "Interrupted" : "Last result";
+  }
+  switch (state) {
+    case "needs_input":
+      return "Waiting for input";
+    case "blocked":
+      return "Blocked";
+    case "ready":
+      return "Latest result";
+    case "running":
+      return "Current activity";
+    case "idle":
+      return "Last activity";
+  }
+}
+
 function statusLine(state: PetState, color: boolean): string {
   const label = `${STATUS_GLYPH[state]} ${STATUS_LABEL[state]}`;
   return colorize(`${BOLD}${label}${RESET}`, color, STATUS_COLOR[state]);
@@ -679,6 +748,10 @@ function sessionActivity(session: PetFocus): string {
 
 function formatCount(count: number, noun: string): string {
   return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+function formatAgeLabel(age: string): string {
+  return age === "now" ? age : `${age} ago`;
 }
 
 function normalizeAgent(agent: string | undefined): string | undefined {

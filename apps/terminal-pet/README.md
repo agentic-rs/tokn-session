@@ -72,7 +72,10 @@ the Kitty local-file protocol in iTerm2 3.6 or newer. It falls back to truecolor
 ANSI half-block pixels elsewhere. Image output is disabled inside tmux and
 Zellij; the explicit Kitty overrides do not bypass that safety fallback.
 
-Wide terminals use one graphical pet beside the session roster. Narrow
+Wide terminals use one graphical pet beside a focused-session detail panel and
+the session roster. The panel shows why the focused session is in its current
+state, the latest structured detail (such as a command, question, or error),
+the activity age, and its working directory when Relay provides one. Narrow
 terminals suppress the artwork and spend the available rows on the roster.
 Each row includes a state glyph, session identity, latest activity, and age, so
 the display remains useful without color. Project identity prefers the Codex

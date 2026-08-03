@@ -19,6 +19,25 @@ export const PET_STATES = [
 export type PetState = typeof PET_STATES[number];
 export type PetOutcome = "completed" | "interrupted";
 
+export type PetActivityKind =
+  | "message"
+  | "reasoning"
+  | "tool"
+  | "input"
+  | "error"
+  | "goal"
+  | "agent"
+  | "lifecycle"
+  | "provider"
+  | "activity";
+
+export interface PetActivity {
+  kind: PetActivityKind;
+  label: string;
+  detail?: string;
+  at: number;
+}
+
 export interface PetPolicy {
   ready_debounce_ms: number;
   ready_hold_ms: number;
@@ -45,8 +64,10 @@ export interface PetFocus {
   provider?: string;
   project_label?: string;
   title?: string;
+  cwd?: string;
   session_id: string;
   agent?: string;
+  current_activity?: PetActivity;
   completed_at?: number;
   recently_completed: boolean;
   outcome?: PetOutcome;
@@ -82,6 +103,7 @@ interface SessionActivity {
   is_provisional: boolean;
   last_event_at: number;
   label: string;
+  current_activity?: PetActivity;
   outcome?: PetOutcome;
   running_until: number;
   ready_after?: number;
@@ -173,7 +195,14 @@ export class PetStore {
     if (eventAt < activity.last_event_at) {
       return;
     }
-    recordActivity(activity, describeEvent(relay.event), eventAt);
+    const described = describeActivity(relay.event);
+    recordActivity(
+      activity,
+      described.label,
+      eventAt,
+      described.kind,
+      described.detail
+    );
     this.#applyEvent(activity, relay.event, eventAt);
   }
 
@@ -243,6 +272,11 @@ export class PetStore {
       is_provisional: true,
       last_event_at: eventAt,
       label: "Parent session",
+      current_activity: {
+        kind: "lifecycle",
+        label: "Parent session",
+        at: eventAt
+      },
       running_until: eventAt,
       open_tools: new Map(),
       pending_interactions: new Map()
@@ -317,7 +351,13 @@ export class PetStore {
       return;
     }
     if (kind !== "interacted" || target.outcome === undefined) {
-      recordActivity(target, agentActivityLabel(kind), eventAt);
+      recordActivity(
+        target,
+        agentActivityLabel(kind),
+        eventAt,
+        "agent",
+        agentActivityDetail(event)
+      );
     }
 
     switch (kind) {
@@ -349,7 +389,13 @@ export class PetStore {
           effectiveAgentPath(candidate) === normalizeAgentPath(targetAgentPath)
         ));
       if (matchingTargets.length === 1) {
-        recordActivity(matchingTargets[0]!, agentActivityLabel(kind), eventAt);
+        recordActivity(
+          matchingTargets[0]!,
+          agentActivityLabel(kind),
+          eventAt,
+          "agent",
+          agentActivityDetail(event)
+        );
         return;
       }
     }
@@ -359,7 +405,13 @@ export class PetStore {
       actorAgentPath
       && normalizeAgentPath(actorAgentPath) === effectiveAgentPath(source)
     ) {
-      recordActivity(source, agentActivityLabel(kind), eventAt);
+      recordActivity(
+        source,
+        agentActivityLabel(kind),
+        eventAt,
+        "agent",
+        agentActivityDetail(event)
+      );
     }
   }
 
@@ -695,10 +747,12 @@ export class PetStore {
       provider: activity.session.provider,
       project_label: displayProjectName(activity.session.project),
       title: activity.session.title ?? undefined,
+      cwd: activity.session.cwd ?? undefined,
       session_id: activity.session.session_id,
       agent: activity.session.agent_nickname
         ?? activity.session.agent_path
         ?? undefined,
+      current_activity: activity.current_activity,
       completed_at: activity.completed_at,
       recently_completed: recentlyCompleted,
       outcome: activity.outcome,
@@ -990,6 +1044,11 @@ function newProvisionalActivity(
     },
     last_event_at: eventAt,
     label: "Agent activity",
+    current_activity: {
+      kind: "agent",
+      label: "Agent activity",
+      at: eventAt
+    },
     running_until: eventAt,
     open_tools: new Map(),
     pending_interactions: new Map()
@@ -1129,16 +1188,34 @@ function agentActivityLabel(kind: string): string {
   }
 }
 
+function agentActivityDetail(event: AgentEvent): string | undefined {
+  const target = asString(event.target_agent_path)
+    ?? asString(event.target_session_id);
+  const actor = asString(event.actor_agent_path);
+  if (target && actor) {
+    return `${actor} → ${target}`;
+  }
+  return target ?? actor;
+}
+
 function recordActivity(
   activity: SessionActivity,
   label: string,
-  eventAt: number
+  eventAt: number,
+  kind: PetActivityKind = "activity",
+  detail?: string
 ): void {
   if (eventAt < activity.last_event_at) {
     return;
   }
   activity.last_event_at = eventAt;
   activity.label = label;
+  activity.current_activity = {
+    kind,
+    label,
+    detail,
+    at: eventAt
+  };
 }
 
 function eventOccurredAt(event: AgentEvent, receivedAt: number): number {
@@ -1191,17 +1268,122 @@ export function describeEvent(event: AgentEvent): string {
   }
 }
 
+interface ActivityDescription {
+  kind: PetActivityKind;
+  label: string;
+  detail?: string;
+}
+
+function describeActivity(event: AgentEvent): ActivityDescription {
+  const label = describeEvent(event);
+  switch (event.type) {
+    case "message":
+      return {
+        kind: "message",
+        label,
+        detail: firstLine(asString(event.text) ?? "") || undefined
+      };
+    case "reasoning":
+      return {
+        kind: "reasoning",
+        label,
+        detail: firstLine(asString(event.text) ?? "") || undefined
+      };
+    case "tool_call":
+      return {
+        kind: "tool",
+        label,
+        detail: toolDetail(event)
+      };
+    case "error":
+      return {
+        kind: "error",
+        label,
+        detail: asString(event.message)
+      };
+    case "goal_updated":
+      return {
+        kind: "goal",
+        label,
+        detail: goalDetail(event)
+      };
+    case "agent_activity":
+      return {
+        kind: "agent",
+        label,
+        detail: agentActivityDetail(event)
+      };
+    case "unknown": {
+      const nativeType = asString(event.native_type)?.toLowerCase();
+      return {
+        kind: nativeType && INPUT_NATIVE_TYPES.has(nativeType)
+          ? "input"
+          : "provider",
+        label,
+        detail: unknownDetail(event)
+      };
+    }
+    case "session_started":
+      return { kind: "lifecycle", label };
+    case "provider_changed":
+    case "session_settings_applied":
+      return { kind: "provider", label };
+    default:
+      return { kind: "activity", label };
+  }
+}
+
 function describeTool(event: AgentEvent): string {
   const summary = asObject(event.summary);
   const summaryType = asString(summary?.type);
-  const path = asString(summary?.path);
-  const command = asString(summary?.command);
-  const query = asString(summary?.query);
-  const url = asString(summary?.url);
-  const title = asString(summary?.title);
-  const detail = path ?? command ?? query ?? url ?? title;
+  const detail = toolDetail(event);
   const name = asString(event.tool_name) ?? summaryType ?? "tool";
   return detail ? `${name}: ${firstLine(detail)}` : name;
+}
+
+function toolDetail(event: AgentEvent): string | undefined {
+  const summary = asObject(event.summary);
+  const input = asObject(event.input);
+  return firstString([
+    summary?.path,
+    summary?.command,
+    summary?.query,
+    summary?.url,
+    summary?.title,
+    input?.path,
+    input?.command,
+    input?.cmd,
+    input?.query,
+    input?.prompt,
+    event.input
+  ]);
+}
+
+function goalDetail(event: AgentEvent): string | undefined {
+  const goal = asObject(event.goal);
+  return firstString([
+    goal?.status,
+    goal?.title,
+    goal?.description,
+    goal?.name
+  ]);
+}
+
+function unknownDetail(event: AgentEvent): string | undefined {
+  const native = asObject(event.native);
+  return firstString([
+    native?.prompt,
+    native?.question,
+    native?.message,
+    native?.description,
+    native?.command,
+    native?.reason,
+    native?.title
+  ]);
+}
+
+function firstString(values: unknown[]): string | undefined {
+  return values.map(asString).find(Boolean);
 }
 
 function firstLine(value: string): string {

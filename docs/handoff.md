@@ -208,10 +208,13 @@ Codex commentary messages count as progress rather than completion now that the
 normalized message delivery is preserved.
 
 Rendering uses Kitty graphics where available, the Kitty local-file protocol
-in iTerm2 3.6+, and a truecolor ANSI half-block fallback. `bun run dev` cycles
-through states for art iteration; `bun run check` runs strict TypeScript and
-Bun tests. The checked-in Hachiware frames are explicitly prototype-only fan
-art and must be replaced before publishing or distributing the project.
+in iTerm2 3.6+, and a truecolor ANSI half-block fallback. Wide mode includes a
+focused-session detail panel with the current activity kind/detail, age, and
+working directory when available; narrow modes preserve the compact roster.
+`bun run dev` cycles through states for art iteration; `bun run check` runs
+strict TypeScript and Bun tests. The checked-in Hachiware frames are explicitly
+prototype-only fan art and must be replaced before publishing or distributing
+the project.
 
 ## Provider Sources
 

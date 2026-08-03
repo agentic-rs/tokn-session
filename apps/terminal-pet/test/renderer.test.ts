@@ -99,6 +99,37 @@ describe("renderer", () => {
     expect(output).toContain("1 recent");
   });
 
+  test("renders focused activity details in the wide layout", async () => {
+    const art = await loadPetArt();
+    const focused = petFocus({
+      cwd: "/Users/clouds/Projects/tokn-agent",
+      current_activity: {
+        kind: "tool",
+        label: "exec_command: cargo test",
+        detail: "cargo test --workspace",
+        at: 88_000
+      },
+      last_event_at: 88_000,
+      family_last_event_at: 88_000
+    });
+    const output = renderScreen(petSnapshot([focused]), art.running.ansi, {
+      source_label: "test"
+    }, {
+      columns: 100,
+      rows: 24,
+      color: false,
+      image_protocol: "ansi",
+      name: "Hachiware",
+      now_ms: 100_000
+    }).lines.join("\n");
+
+    expect(output).toContain("FOCUS");
+    expect(output).toContain("Current activity: cargo test --workspace");
+    expect(output).toContain("12s ago");
+    expect(output).toContain("cwd /Users/clouds/Projects/tokn-agent");
+    expect(output).toContain("SESSION ROSTER");
+  });
+
   test("aligns roster columns across status and text widths", async () => {
     const art = await loadPetArt();
     const root = petFocus({
@@ -197,14 +228,17 @@ describe("renderer", () => {
       "↳ 作家",
       "↳ Reviewer"
     ].map((identity) => screenColumn(screen.lines, identity));
-    const activityColumns = [
-      "5 agents · 2 urgent",
-      "Running task",
-      "Approval required",
-      "Blocked on dependency",
-      "Release notes written",
-      "Review stopped"
-    ].map((activity) => screenColumn(screen.lines, activity));
+    const rosterRows = [
+      ["tokn-agent · root", "5 agents · 2 urgent"],
+      ["↳ Runner", "Running task"],
+      ["↳ Approver", "Approval required"],
+      ["↳ Blocker", "Blocked on dependency"],
+      ["↳ 作家", "Release notes written"],
+      ["↳ Reviewer", "Review stopped"]
+    ] as const;
+    const activityColumns = rosterRows.map(([identity, activity]) => (
+      screenColumnForRow(screen.lines, identity, activity)
+    ));
     const rowEndColumns = [
       "tokn-agent · root",
       "↳ Runner",
@@ -322,8 +356,11 @@ describe("renderer", () => {
       now_ms: 0
     });
     const output = screen.lines.join("\n");
-    const childLine = screen.lines.find((line) => line.includes("Approval required"));
-    const rootLine = screen.lines.find((line) => line.includes("1 urgent"));
+    const childLine = screen.lines.find((line) => (
+      line.includes("Approval required")
+      && line.includes("› ? Needs input")
+    )) ?? "";
+    const rootLine = lastScreenLine(screen.lines, "1 urgent");
 
     expect(output).toContain("ACTIVE 1");
     expect(rootLine).toContain("? Needs input · tokn-agent");
@@ -371,8 +408,8 @@ describe("renderer", () => {
       now_ms: 10_000
     });
     const output = screen.lines.join("\n");
-    const rootLine = screen.lines.find((line) => line.includes("1 urgent"));
-    const childLine = screen.lines.find((line) => line.includes("Approval required"));
+    const rootLine = lastScreenLine(screen.lines, "1 urgent");
+    const childLine = lastScreenLine(screen.lines, "Approval required");
 
     expect(snapshot.state).toBe("needs_input");
     expect(snapshot.state_changed_at).toBe(5_000);
@@ -805,16 +842,34 @@ function screenLine(output: string, content: string): string {
   return output.split("\n").find((line) => line.includes(content)) ?? "";
 }
 
+function lastScreenLine(lines: string[], content: string): string {
+  return [...lines].reverse().find((line) => line.includes(content)) ?? "";
+}
+
 function screenColumn(lines: string[], content: string): number {
-  const line = lines
+  const line = [...lines]
+    .reverse()
     .map((candidate) => Bun.stripANSI(candidate))
     .find((candidate) => candidate.includes(content));
   expect(line).toBeDefined();
   return Bun.stringWidth(line!.slice(0, line!.indexOf(content)));
 }
 
-function screenEndColumn(lines: string[], content: string): number {
+function screenColumnForRow(
+  lines: string[],
+  identity: string,
+  activity: string
+): number {
   const line = lines
+    .map((candidate) => Bun.stripANSI(candidate))
+    .find((candidate) => candidate.includes(identity) && candidate.includes(activity));
+  expect(line).toBeDefined();
+  return Bun.stringWidth(line!.slice(0, line!.indexOf(activity)));
+}
+
+function screenEndColumn(lines: string[], content: string): number {
+  const line = [...lines]
+    .reverse()
     .map((candidate) => Bun.stripANSI(candidate))
     .find((candidate) => candidate.includes(content));
   expect(line).toBeDefined();
