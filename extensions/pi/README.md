@@ -1,9 +1,9 @@
 # Pi input bridge
 
-`input-bridge.ts` is an opt-in Pi extension that exposes a local, session-scoped
-Unix socket. A client such as terminal-pet can send a prompt to the existing
-interactive Pi process, and Pi inserts it through `sendUserMessage()` so the
-prompt appears in the current TUI session.
+`input-bridge.ts` is an opt-in Pi extension that exposes a local Unix socket for
+the live Pi process. A client such as terminal-pet can submit input for the
+process's active session, and Pi inserts it through `sendUserMessage()` so the
+message appears in the current TUI session.
 
 Load it explicitly while experimenting:
 
@@ -18,36 +18,52 @@ unchanged.
 
 ## Discovery
 
-The extension writes a short-lived descriptor beside the session file:
+The extension writes a short-lived, session-scoped descriptor in its private
+runtime directory. On systems with `XDG_RUNTIME_DIR`, descriptors live under:
 
 ```text
-<session-file>.tokn-input.json
+$XDG_RUNTIME_DIR/tokn-session/input/pi/sessions/<session-path-hash>.json
 ```
 
-The descriptor points to a Unix socket in the system temporary directory and
-contains the session identity, process id, and a random capability token. The
-descriptor and socket are removed during normal session shutdown. A stale
-descriptor is harmless: clients must validate the session identity and treat a
+Otherwise the bridge uses a mode-0700 user directory under the system temporary
+directory. The descriptor filename is the SHA-256 digest of the absolute Pi
+session path. It points to a process-instance socket and contains the session
+identity, process instance id, process id, and a random capability token.
+Socket filenames use a shortened instance prefix to remain within Unix socket
+path limits; clients always use the complete path from the descriptor.
+
+Only one live bridge may claim a session descriptor. The descriptor and socket
+are removed during normal session shutdown. A stale descriptor is harmless:
+clients must validate the session and process instance identities and treat a
 failed connection as an unavailable bridge.
 
 ## Protocol
 
-Requests and responses are one JSON object per line. Every request includes the
-`protocol`, `token`, `session_id`, and `session_file` from the descriptor.
+Requests and responses are one JSON object per line over a fresh socket
+connection. Every request includes the `protocol`, `token`, `session_id`,
+`session_file`, and `instance_id` from the descriptor.
 
 Status request:
 
 ```json
-{"protocol":1,"type":"status","request_id":"r1","token":"...","session_id":"...","session_file":"..."}
+{"protocol":1,"type":"status","request_id":"r1","token":"...","session_id":"...","session_file":"...","instance_id":"..."}
 ```
 
-Prompt request:
+Input submission:
 
 ```json
-{"protocol":1,"type":"prompt","request_id":"r2","token":"...","session_id":"...","session_file":"...","message":"Continue the task"}
+{"protocol":1,"type":"submit","request_id":"r2","token":"...","session_id":"...","session_file":"...","instance_id":"...","delivery":"auto","content":[{"type":"text","text":"Continue the task"}]}
 ```
 
-The bridge returns `ready`, `accepted`, or `error` responses. `accepted` means
-Pi accepted the prompt and started a turn; Relay remains responsible for
-streaming the resulting events. The first version rejects prompts while Pi is
-already streaming instead of silently queueing them.
+`delivery` may be `auto`, `follow_up`, or `steer`. Idle input always starts a
+turn immediately. While Pi is busy, `auto` and `follow_up` wait until the agent
+finishes its current work; `steer` is delivered at Pi's next safe steering
+boundary.
+
+The bridge returns `ready`, `admitted`, or `error`. An `admitted` response has a
+`started`, `queued_follow_up`, or `queued_steer` disposition. It means the live
+Pi runtime accepted responsibility for the input, not that the user message is
+already durable. Relay observing the resulting user-message event is the
+authoritative confirmation. Repeating an identical `request_id` returns the
+cached admission without submitting the message twice; reusing it for different
+input is rejected.

@@ -11,7 +11,8 @@ Each provider owns its extension implementation and lifecycle:
 The extensions are deliberately separate from the provider implementations and
 from Relay. Relay remains the source of truth for observed session events; an
 extension only exposes a local input endpoint for the live process that loaded
-it.
+it. Process-scoped transports publish session-scoped descriptors so clients can
+resolve an observed session to the process instance that currently owns it.
 
 These extensions are opt-in. They run inside the provider process with that
 process's permissions, so only load code you trust.

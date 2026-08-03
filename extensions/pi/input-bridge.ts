@@ -3,21 +3,21 @@ import {
   chmod,
   lstat,
   mkdir,
+  open,
   readFile,
-  rename,
   unlink,
-  writeFile
 } from "node:fs/promises";
 import { createServer, createConnection, type Server, type Socket } from "node:net";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
 const PROTOCOL_VERSION = 1;
-const DESCRIPTOR_SUFFIX = ".tokn-input.json";
-const SOCKET_DIRECTORY = "tokn-pi-input";
+const PROVIDER = "pi";
+const RUNTIME_DIRECTORY = `tokn-session-input-${process.getuid?.() ?? "user"}`;
 const MAX_FRAME_BYTES = 32 * 1024;
 const MAX_MESSAGE_LENGTH = 16 * 1024;
 const SOCKET_REQUEST_TIMEOUT_MS = 5_000;
+const MAX_ADMISSION_CACHE_SIZE = 256;
 
 type SessionStartReason = "startup" | "reload" | "new" | "resume" | "fork";
 type SessionShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
@@ -66,12 +66,21 @@ export interface PiExtensionApi {
 
 export interface PiInputBridgeDescriptor {
   protocol: typeof PROTOCOL_VERSION;
+  provider: typeof PROVIDER;
   transport: "unix";
   session_id: string;
   session_file: string;
+  instance_id: string;
   socket_path: string;
   pid: number;
   token: string;
+}
+
+export type PiInputDelivery = "auto" | "follow_up" | "steer";
+
+export interface PiInputTextContent {
+  type: "text";
+  text: string;
 }
 
 export type PiInputBridgeRequest =
@@ -82,15 +91,18 @@ export type PiInputBridgeRequest =
       token: string;
       session_id: string;
       session_file: string;
+      instance_id: string;
     }
   | {
       protocol: typeof PROTOCOL_VERSION;
-      type: "prompt";
-      request_id?: string;
+      type: "submit";
+      request_id: string;
       token: string;
       session_id: string;
       session_file: string;
-      message: string;
+      instance_id: string;
+      delivery: PiInputDelivery;
+      content: PiInputTextContent[];
     };
 
 export type PiInputBridgeResponse =
@@ -100,13 +112,16 @@ export type PiInputBridgeResponse =
       request_id?: string;
       session_id: string;
       session_file: string;
+      instance_id: string;
       state: "idle" | "busy";
     }
   | {
       protocol: typeof PROTOCOL_VERSION;
-      type: "accepted";
-      request_id?: string;
+      type: "admitted";
+      request_id: string;
       session_id: string;
+      instance_id: string;
+      disposition: "started" | "queued_follow_up" | "queued_steer";
     }
   | {
       protocol: typeof PROTOCOL_VERSION;
@@ -114,9 +129,10 @@ export type PiInputBridgeResponse =
       request_id?: string;
       code:
         | "bridge_unavailable"
-        | "busy"
+        | "instance_mismatch"
         | "invalid_request"
         | "message_invalid"
+        | "request_conflict"
         | "session_mismatch"
         | "unauthorized"
         | "unsupported";
@@ -129,16 +145,35 @@ export interface PiInputBridgeOptions {
   descriptor_path?: string;
   socket_path?: string;
   token?: string;
+  instance_id?: string;
   pid?: number;
 }
 
 export function descriptorPathForSession(sessionFile: string): string {
-  return `${resolve(sessionFile)}${DESCRIPTOR_SUFFIX}`;
+  const digest = createHash("sha256").update(resolve(sessionFile)).digest("hex");
+  return join(runtimeDirectory(), PROVIDER, "sessions", `${digest}.json`);
 }
 
-export function socketPathForSession(sessionFile: string): string {
-  const digest = createHash("sha256").update(resolve(sessionFile)).digest("hex").slice(0, 24);
-  return join(tmpdir(), SOCKET_DIRECTORY, `${digest}.sock`);
+export function socketPathForProcess(pid: number, instanceId: string): string {
+  const user = process.getuid?.() ?? "user";
+  const filename = `${pid}-${instanceId.slice(0, 16)}.sock`;
+  const preferred = join(tmpdir(), `tsi-${user}`, "p", filename);
+  return Buffer.byteLength(preferred) < 104
+    ? preferred
+    : join("/tmp", `tsi-${user}`, "p", filename);
+}
+
+function runtimeDirectory(): string {
+  const configured = process.env.XDG_RUNTIME_DIR;
+  if (configured && isAbsolute(configured)) {
+    return join(configured, "tokn-session", "input");
+  }
+  return join(tmpdir(), RUNTIME_DIRECTORY);
+}
+
+interface CachedAdmission {
+  fingerprint: string;
+  response: Extract<PiInputBridgeResponse, { type: "admitted" }>;
 }
 
 export class PiInputBridge {
@@ -147,11 +182,13 @@ export class PiInputBridge {
   readonly #descriptorPathOverride: string | undefined;
   readonly #socketPathOverride: string | undefined;
   readonly #tokenOverride: string | undefined;
+  readonly #instanceIdOverride: string | undefined;
   readonly #pid: number;
   #server: Server | undefined;
   #descriptor: PiInputBridgeDescriptor | undefined;
   #descriptorPath: string | undefined;
   readonly #connections = new Set<Socket>();
+  readonly #admissions = new Map<string, CachedAdmission>();
 
   constructor(options: PiInputBridgeOptions) {
     this.#api = options.api;
@@ -159,6 +196,7 @@ export class PiInputBridge {
     this.#descriptorPathOverride = options.descriptor_path;
     this.#socketPathOverride = options.socket_path;
     this.#tokenOverride = options.token;
+    this.#instanceIdOverride = options.instance_id;
     this.#pid = options.pid ?? process.pid;
   }
 
@@ -183,20 +221,24 @@ export class PiInputBridge {
     }
 
     const sessionPath = resolve(sessionFile);
+    const instanceId = this.#instanceIdOverride ?? randomBytes(16).toString("hex");
     const descriptorPath = this.#descriptorPathOverride ?? descriptorPathForSession(sessionPath);
-    const socketPath = this.#socketPathOverride ?? socketPathForSession(sessionPath);
+    const socketPath = this.#socketPathOverride ?? socketPathForProcess(this.#pid, instanceId);
     const descriptor: PiInputBridgeDescriptor = {
       protocol: PROTOCOL_VERSION,
+      provider: PROVIDER,
       transport: "unix",
       session_id: this.#context.sessionManager.getSessionId(),
       session_file: sessionPath,
+      instance_id: instanceId,
       socket_path: socketPath,
       pid: this.#pid,
       token: this.#tokenOverride ?? randomBytes(32).toString("hex")
     };
 
     await prepareSocketPath(socketPath);
-    await mkdir(dirname(descriptorPath), { recursive: true, mode: 0o700 });
+    await ensurePrivateDirectory(dirname(descriptorPath));
+    await prepareDescriptorPath(descriptorPath);
 
     const server = createServer((socket) => {
       this.#connections.add(socket);
@@ -208,7 +250,7 @@ export class PiInputBridge {
       await listen(server, socketPath);
       server.unref();
       await chmod(socketPath, 0o600);
-      await writeDescriptor(descriptorPath, descriptor);
+      await claimDescriptor(descriptorPath, descriptor);
     } catch (error) {
       for (const socket of this.#connections) {
         socket.destroy();
@@ -230,6 +272,7 @@ export class PiInputBridge {
     this.#descriptor = undefined;
     this.#server = undefined;
     this.#descriptorPath = undefined;
+    this.#admissions.clear();
 
     if (descriptor) {
       try {
@@ -298,12 +341,16 @@ export class PiInputBridge {
     const token = asOptionalString(value.token);
     const sessionId = asOptionalString(value.session_id);
     const sessionFile = asOptionalString(value.session_file);
+    const instanceId = asOptionalString(value.instance_id);
     const descriptor = this.#descriptor;
     if (!descriptor || !token || token !== descriptor.token) {
       return errorResponse("unauthorized", "bridge capability token is invalid", requestId);
     }
     if (!sessionId || !sessionFile || sessionId !== descriptor.session_id || resolve(sessionFile) !== descriptor.session_file) {
       return errorResponse("session_mismatch", "request does not target the active Pi session", requestId);
+    }
+    if (!instanceId || instanceId !== descriptor.instance_id) {
+      return errorResponse("instance_mismatch", "request targets a stale Pi process instance", requestId);
     }
 
     if (value.type === "status") {
@@ -313,34 +360,79 @@ export class PiInputBridge {
         ...(requestId ? { request_id: requestId } : {}),
         session_id: descriptor.session_id,
         session_file: descriptor.session_file,
+        instance_id: descriptor.instance_id,
         state: this.#context.isIdle() ? "idle" : "busy"
       };
     }
 
-    if (value.type !== "prompt") {
+    if (value.type !== "submit" || !requestId) {
       return errorResponse("invalid_request", "request type is unsupported", requestId);
     }
 
-    const message = normalizeMessage(value.message);
-    if (!message) {
-      return errorResponse("message_invalid", "message must be non-empty and contain no control characters", requestId);
+    const delivery = normalizeDelivery(value.delivery);
+    const message = normalizeContent(value.content);
+    if (!delivery) {
+      return errorResponse("invalid_request", "delivery must be auto, follow_up, or steer", requestId);
     }
-    if (!this.#context.isIdle()) {
-      return errorResponse("busy", "Pi is already processing a turn", requestId);
+    if (!message) {
+      return errorResponse("message_invalid", "content must contain one valid text message", requestId);
     }
 
+    const fingerprint = JSON.stringify({
+      session_id: descriptor.session_id,
+      instance_id: descriptor.instance_id,
+      delivery,
+      message
+    });
+    const previous = this.#admissions.get(requestId);
+    if (previous) {
+      if (previous.fingerprint !== fingerprint) {
+        return errorResponse("request_conflict", "request_id was already used for different input", requestId);
+      }
+      return previous.response;
+    }
+
+    const idle = this.#context.isIdle();
+    const deliverAs = idle
+      ? undefined
+      : delivery === "steer"
+        ? "steer"
+        : "followUp";
     try {
-      this.#api.sendUserMessage(message);
+      this.#api.sendUserMessage(message, deliverAs ? { deliverAs } : undefined);
     } catch (error) {
       return errorResponse("bridge_unavailable", errorMessage(error), requestId);
     }
 
-    return {
+    const response: Extract<PiInputBridgeResponse, { type: "admitted" }> = {
       protocol: PROTOCOL_VERSION,
-      type: "accepted",
-      ...(requestId ? { request_id: requestId } : {}),
-      session_id: descriptor.session_id
+      type: "admitted",
+      request_id: requestId,
+      session_id: descriptor.session_id,
+      instance_id: descriptor.instance_id,
+      disposition: idle
+        ? "started"
+        : deliverAs === "steer"
+          ? "queued_steer"
+          : "queued_follow_up"
     };
+    this.#rememberAdmission(requestId, fingerprint, response);
+    return response;
+  }
+
+  #rememberAdmission(
+    requestId: string,
+    fingerprint: string,
+    response: Extract<PiInputBridgeResponse, { type: "admitted" }>
+  ): void {
+    this.#admissions.set(requestId, { fingerprint, response });
+    if (this.#admissions.size <= MAX_ADMISSION_CACHE_SIZE) {
+      return;
+    }
+    const oldest = this.#admissions.keys().next().value as string | undefined;
+    if (oldest) {
+      this.#admissions.delete(oldest);
+    }
   }
 }
 
@@ -372,7 +464,7 @@ export default function installPiInputBridge(pi: PiExtensionApi): void {
 }
 
 async function prepareSocketPath(socketPath: string): Promise<void> {
-  await mkdir(dirname(socketPath), { recursive: true, mode: 0o700 });
+  await ensurePrivateDirectory(dirname(socketPath));
   try {
     const info = await lstat(socketPath);
     if (!info.isSocket()) {
@@ -390,6 +482,37 @@ async function prepareSocketPath(socketPath: string): Promise<void> {
     throw new Error("another Pi input bridge is already active for this session");
   }
   await unlink(socketPath).catch((error: unknown) => {
+    if (!isNodeError(error, "ENOENT")) {
+      throw error;
+    }
+  });
+}
+
+async function ensurePrivateDirectory(path: string): Promise<void> {
+  await mkdir(path, { recursive: true, mode: 0o700 });
+  const info = await lstat(path);
+  if (!info.isDirectory()) {
+    throw new Error(`bridge runtime path is not a directory: ${path}`);
+  }
+  await chmod(path, 0o700);
+}
+
+async function prepareDescriptorPath(descriptorPath: string): Promise<void> {
+  let existing: Partial<PiInputBridgeDescriptor>;
+  try {
+    existing = JSON.parse(await readFile(descriptorPath, "utf8")) as Partial<PiInputBridgeDescriptor>;
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) {
+      return;
+    }
+    await unlink(descriptorPath);
+    return;
+  }
+
+  if (typeof existing.socket_path === "string" && await probeSocket(existing.socket_path)) {
+    throw new Error("another Pi input bridge is already active for this session");
+  }
+  await unlink(descriptorPath).catch((error: unknown) => {
     if (!isNodeError(error, "ENOENT")) {
       throw error;
     }
@@ -463,15 +586,16 @@ async function closeServer(server: Server, socketPath: string): Promise<void> {
   });
 }
 
-async function writeDescriptor(path: string, descriptor: PiInputBridgeDescriptor): Promise<void> {
-  const temporaryPath = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+async function claimDescriptor(path: string, descriptor: PiInputBridgeDescriptor): Promise<void> {
+  const handle = await open(path, "wx", 0o600);
   try {
-    await writeFile(temporaryPath, `${JSON.stringify(descriptor)}\n`, { mode: 0o600 });
-    await chmod(temporaryPath, 0o600);
-    await rename(temporaryPath, path);
+    await handle.writeFile(`${JSON.stringify(descriptor)}\n`);
+    await handle.chmod(0o600);
   } catch (error) {
-    await unlink(temporaryPath).catch(() => {});
+    await unlink(path).catch(() => {});
     throw error;
+  } finally {
+    await handle.close();
   }
 }
 
@@ -494,11 +618,21 @@ async function removeDescriptor(path: string, descriptor: PiInputBridgeDescripto
   });
 }
 
-function normalizeMessage(value: unknown): string | undefined {
-  if (typeof value !== "string") {
+function normalizeDelivery(value: unknown): PiInputDelivery | undefined {
+  return value === "auto" || value === "follow_up" || value === "steer"
+    ? value
+    : undefined;
+}
+
+function normalizeContent(value: unknown): string | undefined {
+  if (!Array.isArray(value) || value.length !== 1) {
     return undefined;
   }
-  const message = value.trim();
+  const item = value[0];
+  if (!isRecord(item) || item.type !== "text" || typeof item.text !== "string") {
+    return undefined;
+  }
+  const message = item.text.trim();
   if (
     message.length === 0
     || message.length > MAX_MESSAGE_LENGTH
