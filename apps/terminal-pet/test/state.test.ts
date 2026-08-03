@@ -99,6 +99,48 @@ describe("PetStore", () => {
     expect(store.snapshot(60).state).toBe("ready");
   });
 
+  test("retains structured details for the focused activity", () => {
+    const store = new PetStore(policy);
+    const tool = relayEvent({
+      type: "tool_call",
+      tool_call_id: "call-1",
+      tool_name: "exec_command",
+      phase: "started",
+      input: { cmd: "cargo test" },
+      summary: { command: "cargo test" }
+    });
+    tool.session.cwd = "/tmp/tokn-agent";
+    store.ingest(tool, 0);
+
+    expect(store.snapshot(1).focus).toMatchObject({
+      cwd: "/tmp/tokn-agent",
+      current_activity: {
+        kind: "tool",
+        label: "exec_command: cargo test",
+        detail: "cargo test",
+        at: 0
+      }
+    });
+
+    store.ingest(relayEvent({
+      type: "unknown",
+      native_type: "event_msg.request_user_input",
+      native: {
+        id: "question-1",
+        prompt: "Approve cargo test?"
+      }
+    }), 10);
+
+    expect(store.snapshot(11).focus).toMatchObject({
+      state: "needs_input",
+      current_activity: {
+        kind: "input",
+        detail: "Approve cargo test?",
+        at: 10
+      }
+    });
+  });
+
   test("does not let an older assistant finish override newer progress", () => {
     const store = new PetStore(policy);
     const progress = relayEvent({

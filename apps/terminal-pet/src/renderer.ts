@@ -179,17 +179,27 @@ function renderWide(
     leftWidth
   ));
 
-  const roster = rosterLines(
-    snapshot,
+  const focusPanel = focusPanelLines(
+    snapshot.focus,
     rightWidth,
-    contentRows,
     options.now_ms,
     options.color
   );
+  const roster = rosterLines(
+    snapshot,
+    rightWidth,
+    Math.max(1, contentRows - focusPanel.length),
+    options.now_ms,
+    options.color
+  );
+  const rightLines = [
+    ...focusPanel,
+    ...roster
+  ];
   for (let index = 0; index < contentRows; index += 1) {
     lines.push(joinColumns(
       leftLines[index] ?? "",
-      roster[index] ?? "",
+      rightLines[index] ?? "",
       leftWidth,
       rightWidth,
       gapWidth
@@ -309,7 +319,7 @@ function rosterLines(
   nowMs: number,
   color: boolean
 ): string[] {
-  const statusWidth = rosterStatusWidth(snapshot.sessions);
+  const providerWidth = rosterProviderWidth(snapshot.sessions);
   const ageWidth = rosterAgeWidth(snapshot.sessions, nowMs);
   const families = sessionFamilies(snapshot);
   const activeFamilies = families.filter((family) => (
@@ -331,7 +341,7 @@ function rosterLines(
     width,
     nowMs,
     color,
-    statusWidth,
+    providerWidth,
     ageWidth
   );
   appendRosterGroup(
@@ -343,7 +353,7 @@ function rosterLines(
     width,
     nowMs,
     color,
-    statusWidth,
+    providerWidth,
     ageWidth
   );
 
@@ -360,7 +370,7 @@ function rosterLines(
       width,
       nowMs,
       color,
-      statusWidth,
+      providerWidth,
       ageWidth
     ));
   }
@@ -374,7 +384,7 @@ function rosterLines(
             width,
             nowMs,
             color,
-            statusWidth,
+            providerWidth,
             ageWidth
           )
         ]
@@ -389,7 +399,7 @@ function rosterLines(
       width,
       nowMs,
       color,
-      statusWidth,
+      providerWidth,
       ageWidth
     )),
     dim(truncate(overflowLine(window), width), color)
@@ -488,7 +498,7 @@ function appendRosterGroup(
   width: number,
   nowMs: number,
   color: boolean,
-  statusWidth: number,
+  providerWidth: number,
   ageWidth: number
 ): void {
   if (sessions.length === 0) {
@@ -505,7 +515,7 @@ function appendRosterGroup(
         width,
         nowMs,
         color,
-        statusWidth,
+        providerWidth,
         ageWidth
       )
     });
@@ -518,7 +528,7 @@ function sessionLine(
   width: number,
   nowMs: number,
   color: boolean,
-  statusWidth = 0,
+  providerWidth = 0,
   ageWidth = 0
 ): string {
   const rowState = effectivePetState(session);
@@ -527,14 +537,14 @@ function sessionLine(
   const displayState = isRecent && !isInterrupted ? "ready" : rowState;
   const marker = session.topic === focusTopic ? "›" : " ";
   const glyph = isInterrupted ? "×" : isRecent ? "✓" : STATUS_GLYPH[rowState];
-  const status = sessionStatusLabel(session);
+  const provider = providerLabel(session);
   const age = sessionAge(session, nowMs);
-  const alignedStatus = padRight(
-    status,
-    Math.max(statusWidth, Bun.stringWidth(status))
+  const alignedProvider = padRight(
+    provider,
+    Math.max(providerWidth, Bun.stringWidth(provider))
   );
   const prefix = width >= 32
-    ? `${marker} ${glyph} ${alignedStatus} · `
+    ? `${marker} ${glyph} ${alignedProvider} · `
     : `${marker} ${glyph} `;
   const suffix = ` · ${padLeft(age, Math.max(ageWidth, Bun.stringWidth(age)))}`;
   const separator = " · ";
@@ -544,7 +554,9 @@ function sessionLine(
     - Bun.stringWidth(suffix);
   if (available < separatorWidth + 2) {
     const compact = [
+      `${marker} ${glyph} ${provider} · ${age}`,
       `${marker} ${glyph} ${age}`,
+      `${glyph} ${provider} · ${age}`,
       `${glyph} ${age}`,
       age
     ].find((candidate) => Bun.stringWidth(candidate.trim()) <= width) ?? age;
@@ -574,9 +586,9 @@ function sessionLine(
   return colorize(plain, color, STATUS_COLOR[displayState]);
 }
 
-function rosterStatusWidth(sessions: PetFocus[]): number {
+function rosterProviderWidth(sessions: PetFocus[]): number {
   return sessions.reduce((width, session) => (
-    Math.max(width, Bun.stringWidth(sessionStatusLabel(session)))
+    Math.max(width, Bun.stringWidth(providerLabel(session)))
   ), 0);
 }
 
@@ -584,14 +596,6 @@ function rosterAgeWidth(sessions: PetFocus[], nowMs: number): number {
   return sessions.reduce((width, session) => (
     Math.max(width, Bun.stringWidth(sessionAge(session, nowMs)))
   ), 0);
-}
-
-function sessionStatusLabel(session: PetFocus): string {
-  const rowState = effectivePetState(session);
-  if (rowState === "idle" && session.recently_completed) {
-    return session.outcome === "interrupted" ? "Interrupted" : "Ready";
-  }
-  return STATUS_LABEL[rowState];
 }
 
 function sessionAge(session: PetFocus, nowMs: number): string {
@@ -630,6 +634,65 @@ function focusStatusLine(
   return statusLine(state, color);
 }
 
+function focusPanelLines(
+  focus: PetFocus | undefined,
+  width: number,
+  nowMs: number,
+  color: boolean
+): string[] {
+  if (!focus) {
+    return [
+      dim(truncate("FOCUS · Waiting for Relay activity", width), color),
+      ""
+    ];
+  }
+
+  const state = effectivePetState(focus);
+  const activity = focus.current_activity?.detail
+    ?? focus.current_activity?.label
+    ?? focus.label;
+  const detail = `${focusReason(focus, state)}: ${activity}`;
+  const location = focus.cwd
+    ? `cwd ${focus.cwd}`
+    : contextLine(focus);
+  const metadata = [
+    formatAgeLabel(sessionAge(focus, nowMs)),
+    location,
+    focus.depth === 0 && focus.descendant_count > 0
+      ? sessionActivity(focus)
+      : undefined
+  ].filter((value): value is string => Boolean(value)).join(" · ");
+
+  return [
+    colorize(
+      `${BOLD}FOCUS${RESET} · ${truncate(sessionIdentity(focus), Math.max(1, width - 8))}`,
+      color,
+      STATUS_COLOR[state]
+    ),
+    truncate(detail, width),
+    dim(truncate(metadata, width), color),
+    ""
+  ];
+}
+
+function focusReason(focus: PetFocus, state: PetState): string {
+  if (state === "idle" && focus.recently_completed) {
+    return focus.outcome === "interrupted" ? "Interrupted" : "Last result";
+  }
+  switch (state) {
+    case "needs_input":
+      return "Waiting for input";
+    case "blocked":
+      return "Blocked";
+    case "ready":
+      return "Latest result";
+    case "running":
+      return "Current activity";
+    case "idle":
+      return "Last activity";
+  }
+}
+
 function statusLine(state: PetState, color: boolean): string {
   const label = `${STATUS_GLYPH[state]} ${STATUS_LABEL[state]}`;
   return colorize(`${BOLD}${label}${RESET}`, color, STATUS_COLOR[state]);
@@ -653,9 +716,14 @@ function sessionIdentity(session: PetFocus): string {
     : session.session_id.slice(0, 8);
   const agent = normalizeAgent(session.agent);
   const identity = session.depth > 0
-    ? agent || session.title || session.provider || "agent"
-    : session.project_label || session.title || session.provider || "session";
+    ? agent || session.title || "agent"
+    : session.project_label || session.title || "session";
   return `${identity} · ${shortId}`;
+}
+
+function providerLabel(session: PetFocus): string {
+  const provider = session.provider ?? session.topic.split(".", 1)[0];
+  return provider?.toLowerCase() || "unknown";
 }
 
 function sessionActivity(session: PetFocus): string {
@@ -679,6 +747,10 @@ function sessionActivity(session: PetFocus): string {
 
 function formatCount(count: number, noun: string): string {
   return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+function formatAgeLabel(age: string): string {
+  return age === "now" ? age : `${age} ago`;
 }
 
 function normalizeAgent(agent: string | undefined): string | undefined {

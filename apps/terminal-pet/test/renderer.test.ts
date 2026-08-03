@@ -30,7 +30,12 @@ describe("renderer", () => {
     expect(output).toContain("H A C H I W A R E");
     expect(output).toContain("SESSION ROSTER");
     expect(output).toContain("ACTIVE 1");
-    expect(output).toContain("● Running");
+    expect(output).toContain("● codex");
+    const runningRow = screen.lines.find((line) => (
+      line.includes("● codex") && line.includes("llm-router_2")
+    )) ?? "";
+    expect(runningRow).not.toContain("Running");
+    expect(output).toContain("codex · llm-router_2");
     expect(output).toContain("llm-router_2");
     expect(output).toContain("exec_command: cargo test");
     expect(output).not.toContain("\u001b");
@@ -92,14 +97,47 @@ describe("renderer", () => {
 
     expect(output).toContain("ACTIVE 2");
     expect(output).toContain("RECENT 1");
-    expect(output).toContain("? Needs input");
+    expect(output).toContain("? codex");
+    expect(output).toContain("● pi");
     expect(output).toContain("Running provider tests");
-    expect(output).toContain("✓ Ready");
+    expect(output).toContain("✓ codex");
+    expect(output).not.toContain("✓ Ready");
     expect(output).toContain("Updated Relay docs");
     expect(output).toContain("1 recent");
   });
 
-  test("aligns roster columns across status and text widths", async () => {
+  test("renders focused activity details in the wide layout", async () => {
+    const art = await loadPetArt();
+    const focused = petFocus({
+      cwd: "/Users/clouds/Projects/tokn-agent",
+      current_activity: {
+        kind: "tool",
+        label: "exec_command: cargo test",
+        detail: "cargo test --workspace",
+        at: 88_000
+      },
+      last_event_at: 88_000,
+      family_last_event_at: 88_000
+    });
+    const output = renderScreen(petSnapshot([focused]), art.running.ansi, {
+      source_label: "test"
+    }, {
+      columns: 100,
+      rows: 24,
+      color: false,
+      image_protocol: "ansi",
+      name: "Hachiware",
+      now_ms: 100_000
+    }).lines.join("\n");
+
+    expect(output).toContain("FOCUS");
+    expect(output).toContain("Current activity: cargo test --workspace");
+    expect(output).toContain("12s ago");
+    expect(output).toContain("cwd /Users/clouds/Projects/tokn-agent");
+    expect(output).toContain("SESSION ROSTER");
+  });
+
+  test("aligns roster columns across provider and text widths", async () => {
     const art = await loadPetArt();
     const root = petFocus({
       topic: "codex.root",
@@ -197,14 +235,17 @@ describe("renderer", () => {
       "↳ 作家",
       "↳ Reviewer"
     ].map((identity) => screenColumn(screen.lines, identity));
-    const activityColumns = [
-      "5 agents · 2 urgent",
-      "Running task",
-      "Approval required",
-      "Blocked on dependency",
-      "Release notes written",
-      "Review stopped"
-    ].map((activity) => screenColumn(screen.lines, activity));
+    const rosterRows = [
+      ["tokn-agent · root", "5 agents · 2 urgent"],
+      ["↳ Runner", "Running task"],
+      ["↳ Approver", "Approval required"],
+      ["↳ Blocker", "Blocked on dependency"],
+      ["↳ 作家", "Release notes written"],
+      ["↳ Reviewer", "Review stopped"]
+    ] as const;
+    const activityColumns = rosterRows.map(([identity, activity]) => (
+      screenColumnForRow(screen.lines, identity, activity)
+    ));
     const rowEndColumns = [
       "tokn-agent · root",
       "↳ Runner",
@@ -322,13 +363,16 @@ describe("renderer", () => {
       now_ms: 0
     });
     const output = screen.lines.join("\n");
-    const childLine = screen.lines.find((line) => line.includes("Approval required"));
-    const rootLine = screen.lines.find((line) => line.includes("1 urgent"));
+    const childLine = screen.lines.find((line) => (
+      line.includes("Approval required")
+      && line.includes("› ? codex")
+    )) ?? "";
+    const rootLine = lastScreenLine(screen.lines, "1 urgent");
 
     expect(output).toContain("ACTIVE 1");
-    expect(rootLine).toContain("? Needs input · tokn-agent");
-    expect(rootLine).not.toContain("› ? Needs input");
-    expect(childLine).toContain("› ? Needs input · ↳ Reviewer");
+    expect(rootLine).toContain("? codex · tokn-agent");
+    expect(rootLine).not.toContain("› ? codex");
+    expect(childLine).toContain("› ? codex · ↳ Reviewer");
   });
 
   test("uses family state and timing when a root is manually focused", async () => {
@@ -371,13 +415,13 @@ describe("renderer", () => {
       now_ms: 10_000
     });
     const output = screen.lines.join("\n");
-    const rootLine = screen.lines.find((line) => line.includes("1 urgent"));
-    const childLine = screen.lines.find((line) => line.includes("Approval required"));
+    const rootLine = lastScreenLine(screen.lines, "1 urgent");
+    const childLine = lastScreenLine(screen.lines, "Approval required");
 
     expect(snapshot.state).toBe("needs_input");
     expect(snapshot.state_changed_at).toBe(5_000);
     expect(output).toContain("? Needs input");
-    expect(rootLine).toContain("› ? Needs input · tokn-agent");
+    expect(rootLine).toContain("› ? codex · tokn-agent");
     expect(rootLine).toContain("· 5s");
     expect(childLine).not.toContain("› ? Needs input");
   });
@@ -443,9 +487,10 @@ describe("renderer", () => {
 
     expect(output).toContain("RECENT 2");
     expect(output).toContain("2 agents · 2 recent");
-    expect(output).toMatch(/✓ Ready\s+· ↳ Writer/);
-    expect(output).toContain("× Interrupted · ↳ Reviewer");
-    expect(output.match(/× Interrupted/g)).toHaveLength(2);
+    expect(output).toMatch(/✓ codex\s+· ↳ Writer/);
+    expect(output).toContain("× codex · ↳ Reviewer");
+    expect(output).toContain("× Interrupted");
+    expect(output.match(/× codex/g)).toHaveLength(1);
     expect(output).not.toContain("! Blocked");
     expect(output).not.toContain("✓ Ready recently");
   });
@@ -592,7 +637,7 @@ describe("renderer", () => {
       now_ms: 0
     });
 
-    expect(wide.lines.join("\n")).toContain("codex · session-");
+    expect(wide.lines.join("\n")).toContain("codex · session");
     expect(tiny.lines.join("\n")).toContain("ERR");
     expect(tiny.lines.every((line) => Bun.stringWidth(line) <= 7)).toBe(true);
   });
@@ -805,16 +850,34 @@ function screenLine(output: string, content: string): string {
   return output.split("\n").find((line) => line.includes(content)) ?? "";
 }
 
+function lastScreenLine(lines: string[], content: string): string {
+  return [...lines].reverse().find((line) => line.includes(content)) ?? "";
+}
+
 function screenColumn(lines: string[], content: string): number {
-  const line = lines
+  const line = [...lines]
+    .reverse()
     .map((candidate) => Bun.stripANSI(candidate))
     .find((candidate) => candidate.includes(content));
   expect(line).toBeDefined();
   return Bun.stringWidth(line!.slice(0, line!.indexOf(content)));
 }
 
-function screenEndColumn(lines: string[], content: string): number {
+function screenColumnForRow(
+  lines: string[],
+  identity: string,
+  activity: string
+): number {
   const line = lines
+    .map((candidate) => Bun.stripANSI(candidate))
+    .find((candidate) => candidate.includes(identity) && candidate.includes(activity));
+  expect(line).toBeDefined();
+  return Bun.stringWidth(line!.slice(0, line!.indexOf(activity)));
+}
+
+function screenEndColumn(lines: string[], content: string): number {
+  const line = [...lines]
+    .reverse()
     .map((candidate) => Bun.stripANSI(candidate))
     .find((candidate) => candidate.includes(content));
   expect(line).toBeDefined();
