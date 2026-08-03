@@ -110,7 +110,9 @@ impl SessionContext {
     if let Some(id) = string_field(payload, "id") {
       self.session_id = id;
     }
-    self.parent_session_id = first_string_field(payload, &["parent_thread_id", "forked_from_id"]);
+    // A user fork is a new root session. Only Codex's explicit parent-thread
+    // relationship identifies a session that belongs in the subagent tree.
+    self.parent_session_id = string_field(payload, "parent_thread_id");
     let thread_spawn = payload
       .get("source")
       .and_then(|source| source.get("subagent"))
@@ -332,6 +334,24 @@ mod tests {
     assert_eq!(context.agent_path, None);
     assert_eq!(context.cwd.as_deref(), Some("/tmp/child"));
     assert_eq!(context.started_at.as_deref(), Some("2026-07-24T17:52:40Z"));
+  }
+
+  #[test]
+  fn keeps_codex_user_forks_out_of_the_subagent_tree() {
+    let mut context = SessionContext::from_path(Provider::Codex, Path::new("fork.jsonl"));
+    context.update(&json!({
+      "type": "session_meta",
+      "payload": {
+        "id": "forked-session",
+        "forked_from_id": "root-session",
+        "thread_source": "user",
+        "timestamp": "2026-08-03T06:56:15Z",
+        "cwd": "/tmp/fork"
+      }
+    }));
+
+    assert_eq!(context.session_id, "forked-session");
+    assert_eq!(context.parent_session_id, None);
   }
 
   #[test]

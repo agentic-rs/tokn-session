@@ -1,0 +1,3 @@
+{"timestamp":"2026-08-03T06:56:16Z","type":"session_meta","payload":{"id":"forked-session","forked_from_id":"tree-root","timestamp":"2026-08-03T06:56:15Z","cwd":"/tmp/fork","source":"vscode","thread_source":"user"}}
+{"timestamp":"2026-08-03T06:56:17Z","type":"event_msg","payload":{"type":"user_message","message":"continue from the fork"}}
+{"timestamp":"2026-08-03T06:56:18Z","type":"response_item","payload":{"type":"message","id":"forked-answer","role":"assistant","content":[{"type":"output_text","text":"forked result"}],"phase":"final"}}
