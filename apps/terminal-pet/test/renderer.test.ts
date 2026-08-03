@@ -30,7 +30,12 @@ describe("renderer", () => {
     expect(output).toContain("H A C H I W A R E");
     expect(output).toContain("SESSION ROSTER");
     expect(output).toContain("ACTIVE 1");
-    expect(output).toContain("● Running");
+    expect(output).toContain("● codex");
+    const runningRow = screen.lines.find((line) => (
+      line.includes("● codex") && line.includes("llm-router_2")
+    )) ?? "";
+    expect(runningRow).not.toContain("Running");
+    expect(output).toContain("codex · llm-router_2");
     expect(output).toContain("llm-router_2");
     expect(output).toContain("exec_command: cargo test");
     expect(output).not.toContain("\u001b");
@@ -92,9 +97,11 @@ describe("renderer", () => {
 
     expect(output).toContain("ACTIVE 2");
     expect(output).toContain("RECENT 1");
-    expect(output).toContain("? Needs input");
+    expect(output).toContain("? codex");
+    expect(output).toContain("● pi");
     expect(output).toContain("Running provider tests");
-    expect(output).toContain("✓ Ready");
+    expect(output).toContain("✓ codex");
+    expect(output).not.toContain("✓ Ready");
     expect(output).toContain("Updated Relay docs");
     expect(output).toContain("1 recent");
   });
@@ -130,7 +137,7 @@ describe("renderer", () => {
     expect(output).toContain("SESSION ROSTER");
   });
 
-  test("aligns roster columns across status and text widths", async () => {
+  test("aligns roster columns across provider and text widths", async () => {
     const art = await loadPetArt();
     const root = petFocus({
       topic: "codex.root",
@@ -358,14 +365,14 @@ describe("renderer", () => {
     const output = screen.lines.join("\n");
     const childLine = screen.lines.find((line) => (
       line.includes("Approval required")
-      && line.includes("› ? Needs input")
+      && line.includes("› ? codex")
     )) ?? "";
     const rootLine = lastScreenLine(screen.lines, "1 urgent");
 
     expect(output).toContain("ACTIVE 1");
-    expect(rootLine).toContain("? Needs input · tokn-agent");
-    expect(rootLine).not.toContain("› ? Needs input");
-    expect(childLine).toContain("› ? Needs input · ↳ Reviewer");
+    expect(rootLine).toContain("? codex · tokn-agent");
+    expect(rootLine).not.toContain("› ? codex");
+    expect(childLine).toContain("› ? codex · ↳ Reviewer");
   });
 
   test("uses family state and timing when a root is manually focused", async () => {
@@ -414,7 +421,7 @@ describe("renderer", () => {
     expect(snapshot.state).toBe("needs_input");
     expect(snapshot.state_changed_at).toBe(5_000);
     expect(output).toContain("? Needs input");
-    expect(rootLine).toContain("› ? Needs input · tokn-agent");
+    expect(rootLine).toContain("› ? codex · tokn-agent");
     expect(rootLine).toContain("· 5s");
     expect(childLine).not.toContain("› ? Needs input");
   });
@@ -480,9 +487,10 @@ describe("renderer", () => {
 
     expect(output).toContain("RECENT 2");
     expect(output).toContain("2 agents · 2 recent");
-    expect(output).toMatch(/✓ Ready\s+· ↳ Writer/);
-    expect(output).toContain("× Interrupted · ↳ Reviewer");
-    expect(output.match(/× Interrupted/g)).toHaveLength(2);
+    expect(output).toMatch(/✓ codex\s+· ↳ Writer/);
+    expect(output).toContain("× codex · ↳ Reviewer");
+    expect(output).toContain("× Interrupted");
+    expect(output.match(/× codex/g)).toHaveLength(1);
     expect(output).not.toContain("! Blocked");
     expect(output).not.toContain("✓ Ready recently");
   });
@@ -629,7 +637,7 @@ describe("renderer", () => {
       now_ms: 0
     });
 
-    expect(wide.lines.join("\n")).toContain("codex · session-");
+    expect(wide.lines.join("\n")).toContain("codex · session");
     expect(tiny.lines.join("\n")).toContain("ERR");
     expect(tiny.lines.every((line) => Bun.stringWidth(line) <= 7)).toBe(true);
   });

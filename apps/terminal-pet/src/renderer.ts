@@ -319,7 +319,7 @@ function rosterLines(
   nowMs: number,
   color: boolean
 ): string[] {
-  const statusWidth = rosterStatusWidth(snapshot.sessions);
+  const providerWidth = rosterProviderWidth(snapshot.sessions);
   const ageWidth = rosterAgeWidth(snapshot.sessions, nowMs);
   const families = sessionFamilies(snapshot);
   const activeFamilies = families.filter((family) => (
@@ -341,7 +341,7 @@ function rosterLines(
     width,
     nowMs,
     color,
-    statusWidth,
+    providerWidth,
     ageWidth
   );
   appendRosterGroup(
@@ -353,7 +353,7 @@ function rosterLines(
     width,
     nowMs,
     color,
-    statusWidth,
+    providerWidth,
     ageWidth
   );
 
@@ -370,7 +370,7 @@ function rosterLines(
       width,
       nowMs,
       color,
-      statusWidth,
+      providerWidth,
       ageWidth
     ));
   }
@@ -384,7 +384,7 @@ function rosterLines(
             width,
             nowMs,
             color,
-            statusWidth,
+            providerWidth,
             ageWidth
           )
         ]
@@ -399,7 +399,7 @@ function rosterLines(
       width,
       nowMs,
       color,
-      statusWidth,
+      providerWidth,
       ageWidth
     )),
     dim(truncate(overflowLine(window), width), color)
@@ -498,7 +498,7 @@ function appendRosterGroup(
   width: number,
   nowMs: number,
   color: boolean,
-  statusWidth: number,
+  providerWidth: number,
   ageWidth: number
 ): void {
   if (sessions.length === 0) {
@@ -515,7 +515,7 @@ function appendRosterGroup(
         width,
         nowMs,
         color,
-        statusWidth,
+        providerWidth,
         ageWidth
       )
     });
@@ -528,7 +528,7 @@ function sessionLine(
   width: number,
   nowMs: number,
   color: boolean,
-  statusWidth = 0,
+  providerWidth = 0,
   ageWidth = 0
 ): string {
   const rowState = effectivePetState(session);
@@ -537,14 +537,14 @@ function sessionLine(
   const displayState = isRecent && !isInterrupted ? "ready" : rowState;
   const marker = session.topic === focusTopic ? "›" : " ";
   const glyph = isInterrupted ? "×" : isRecent ? "✓" : STATUS_GLYPH[rowState];
-  const status = sessionStatusLabel(session);
+  const provider = providerLabel(session);
   const age = sessionAge(session, nowMs);
-  const alignedStatus = padRight(
-    status,
-    Math.max(statusWidth, Bun.stringWidth(status))
+  const alignedProvider = padRight(
+    provider,
+    Math.max(providerWidth, Bun.stringWidth(provider))
   );
   const prefix = width >= 32
-    ? `${marker} ${glyph} ${alignedStatus} · `
+    ? `${marker} ${glyph} ${alignedProvider} · `
     : `${marker} ${glyph} `;
   const suffix = ` · ${padLeft(age, Math.max(ageWidth, Bun.stringWidth(age)))}`;
   const separator = " · ";
@@ -554,7 +554,9 @@ function sessionLine(
     - Bun.stringWidth(suffix);
   if (available < separatorWidth + 2) {
     const compact = [
+      `${marker} ${glyph} ${provider} · ${age}`,
       `${marker} ${glyph} ${age}`,
+      `${glyph} ${provider} · ${age}`,
       `${glyph} ${age}`,
       age
     ].find((candidate) => Bun.stringWidth(candidate.trim()) <= width) ?? age;
@@ -584,9 +586,9 @@ function sessionLine(
   return colorize(plain, color, STATUS_COLOR[displayState]);
 }
 
-function rosterStatusWidth(sessions: PetFocus[]): number {
+function rosterProviderWidth(sessions: PetFocus[]): number {
   return sessions.reduce((width, session) => (
-    Math.max(width, Bun.stringWidth(sessionStatusLabel(session)))
+    Math.max(width, Bun.stringWidth(providerLabel(session)))
   ), 0);
 }
 
@@ -594,14 +596,6 @@ function rosterAgeWidth(sessions: PetFocus[], nowMs: number): number {
   return sessions.reduce((width, session) => (
     Math.max(width, Bun.stringWidth(sessionAge(session, nowMs)))
   ), 0);
-}
-
-function sessionStatusLabel(session: PetFocus): string {
-  const rowState = effectivePetState(session);
-  if (rowState === "idle" && session.recently_completed) {
-    return session.outcome === "interrupted" ? "Interrupted" : "Ready";
-  }
-  return STATUS_LABEL[rowState];
 }
 
 function sessionAge(session: PetFocus, nowMs: number): string {
@@ -722,9 +716,14 @@ function sessionIdentity(session: PetFocus): string {
     : session.session_id.slice(0, 8);
   const agent = normalizeAgent(session.agent);
   const identity = session.depth > 0
-    ? agent || session.title || session.provider || "agent"
-    : session.project_label || session.title || session.provider || "session";
+    ? agent || session.title || "agent"
+    : session.project_label || session.title || "session";
   return `${identity} · ${shortId}`;
+}
+
+function providerLabel(session: PetFocus): string {
+  const provider = session.provider ?? session.topic.split(".", 1)[0];
+  return provider?.toLowerCase() || "unknown";
 }
 
 function sessionActivity(session: PetFocus): string {

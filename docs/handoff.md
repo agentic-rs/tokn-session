@@ -191,11 +191,13 @@ records the observed Relay path for each Pi topic and starts
 the session JSONL and Relay remains the only event/display source. Non-Pi or
 unobserved sessions remain read-only. `c` acknowledges the selected
 notification. Responsive text rows keep concurrent
-and recent sessions visible; overflow windows around a manual selection so it
-cannot disappear off-screen. Root labels prefer `project_name`, then folder
-name, repository name, and the legacy inferred name. Child labels prefer agent
-nickname, then agent path. Wide terminals show the art and roster side by
-side, while narrow terminals become roster-only.
+and recent sessions visible; roster rows use the state glyph plus a compact
+provider badge instead of repeating the state label. The renderer uses overflow
+windows around a manual selection so it cannot disappear off-screen. Root
+labels prefer `project_name`, then folder name, repository name, and the legacy
+inferred name. Child labels prefer agent nickname, then agent path. Wide
+terminals show the art and roster side by side, while narrow terminals become
+roster-only.
 
 States currently derive from normalized messages, reasoning, tool calls,
 errors, goals, and preserved input-request events. Codex task start/complete
