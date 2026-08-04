@@ -13,6 +13,7 @@ import { TerminalSurface } from "./terminal";
 import {
   PiInputBroker,
   TerminalInputEditor,
+  piInputAdmissionStatus,
   type TerminalInputEvent
 } from "./input";
 
@@ -259,9 +260,9 @@ export class TerminalPetWorker {
             break;
           }
           void this.#piInput.submit(topic, event.text).then(
-            () => {
+            (admission) => {
               if (this.#started) {
-                this.#meta.input_status = "Pi input sent";
+                this.#meta.input_status = piInputAdmissionStatus(admission);
                 this.#render();
               }
             },

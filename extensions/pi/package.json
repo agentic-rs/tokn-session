@@ -1,0 +1,10 @@
+{
+  "name": "@tokn/pi-input-bridge",
+  "private": true,
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./input-bridge.ts"
+    ]
+  }
+}

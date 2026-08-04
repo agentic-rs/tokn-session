@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import {
   chmod,
   lstat,
@@ -8,12 +8,32 @@ import {
   unlink,
 } from "node:fs/promises";
 import { createServer, createConnection, type Server, type Socket } from "node:net";
-import { dirname, isAbsolute, join, resolve } from "node:path";
-import { tmpdir } from "node:os";
+import { dirname, resolve } from "node:path";
+import {
+  descriptorPathForSession,
+  PI_INPUT_PROTOCOL_VERSION,
+  PI_INPUT_PROVIDER,
+  socketPathForProcess,
+  type PiInputBridgeDescriptor,
+  type PiInputBridgeRequest,
+  type PiInputBridgeResponse,
+  type PiInputDelivery,
+} from "./lib/input-protocol";
 
-const PROTOCOL_VERSION = 1;
-const PROVIDER = "pi";
-const RUNTIME_DIRECTORY = `tokn-session-input-${process.getuid?.() ?? "user"}`;
+export {
+  descriptorPathForSession,
+  socketPathForProcess,
+} from "./lib/input-protocol";
+export type {
+  PiInputBridgeDescriptor,
+  PiInputBridgeRequest,
+  PiInputBridgeResponse,
+  PiInputDelivery,
+  PiInputTextContent,
+} from "./lib/input-protocol";
+
+const PROTOCOL_VERSION = PI_INPUT_PROTOCOL_VERSION;
+const PROVIDER = PI_INPUT_PROVIDER;
 const MAX_FRAME_BYTES = 32 * 1024;
 const MAX_MESSAGE_LENGTH = 16 * 1024;
 const SOCKET_REQUEST_TIMEOUT_MS = 5_000;
@@ -64,81 +84,6 @@ export interface PiExtensionApi {
   ): void;
 }
 
-export interface PiInputBridgeDescriptor {
-  protocol: typeof PROTOCOL_VERSION;
-  provider: typeof PROVIDER;
-  transport: "unix";
-  session_id: string;
-  session_file: string;
-  instance_id: string;
-  socket_path: string;
-  pid: number;
-  token: string;
-}
-
-export type PiInputDelivery = "auto" | "follow_up" | "steer";
-
-export interface PiInputTextContent {
-  type: "text";
-  text: string;
-}
-
-export type PiInputBridgeRequest =
-  | {
-      protocol: typeof PROTOCOL_VERSION;
-      type: "status";
-      request_id?: string;
-      token: string;
-      session_id: string;
-      session_file: string;
-      instance_id: string;
-    }
-  | {
-      protocol: typeof PROTOCOL_VERSION;
-      type: "submit";
-      request_id: string;
-      token: string;
-      session_id: string;
-      session_file: string;
-      instance_id: string;
-      delivery: PiInputDelivery;
-      content: PiInputTextContent[];
-    };
-
-export type PiInputBridgeResponse =
-  | {
-      protocol: typeof PROTOCOL_VERSION;
-      type: "ready";
-      request_id?: string;
-      session_id: string;
-      session_file: string;
-      instance_id: string;
-      state: "idle" | "busy";
-    }
-  | {
-      protocol: typeof PROTOCOL_VERSION;
-      type: "admitted";
-      request_id: string;
-      session_id: string;
-      instance_id: string;
-      disposition: "started" | "queued_follow_up" | "queued_steer";
-    }
-  | {
-      protocol: typeof PROTOCOL_VERSION;
-      type: "error";
-      request_id?: string;
-      code:
-        | "bridge_unavailable"
-        | "instance_mismatch"
-        | "invalid_request"
-        | "message_invalid"
-        | "request_conflict"
-        | "session_mismatch"
-        | "unauthorized"
-        | "unsupported";
-      message: string;
-    };
-
 export interface PiInputBridgeOptions {
   api: Pick<PiExtensionApi, "sendUserMessage">;
   context: PiExtensionContext;
@@ -147,28 +92,6 @@ export interface PiInputBridgeOptions {
   token?: string;
   instance_id?: string;
   pid?: number;
-}
-
-export function descriptorPathForSession(sessionFile: string): string {
-  const digest = createHash("sha256").update(resolve(sessionFile)).digest("hex");
-  return join(runtimeDirectory(), PROVIDER, "sessions", `${digest}.json`);
-}
-
-export function socketPathForProcess(pid: number, instanceId: string): string {
-  const user = process.getuid?.() ?? "user";
-  const filename = `${pid}-${instanceId.slice(0, 16)}.sock`;
-  const preferred = join(tmpdir(), `tsi-${user}`, "p", filename);
-  return Buffer.byteLength(preferred) < 104
-    ? preferred
-    : join("/tmp", `tsi-${user}`, "p", filename);
-}
-
-function runtimeDirectory(): string {
-  const configured = process.env.XDG_RUNTIME_DIR;
-  if (configured && isAbsolute(configured)) {
-    return join(configured, "tokn-session", "input");
-  }
-  return join(tmpdir(), RUNTIME_DIRECTORY);
 }
 
 interface CachedAdmission {
