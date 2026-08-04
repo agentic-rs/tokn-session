@@ -11,10 +11,11 @@ Load it explicitly while experimenting:
 pi --extension /absolute/path/to/tokn-session/extensions/pi/input-bridge.ts
 ```
 
-For regular use, place the extension in `~/.pi/agent/extensions/` so Pi
-auto-discovers it. The bridge is only enabled for interactive (`tui`) sessions
-with a persisted session file. JSON, print, RPC, and ephemeral sessions remain
-unchanged.
+For regular use, copy this entire `pi/` directory into a subdirectory of
+`~/.pi/agent/extensions/`. Its package manifest makes Pi auto-discover only the
+bridge entry point while the shared protocol module remains importable. The
+bridge is only enabled for interactive (`tui`) sessions with a persisted
+session file. JSON, print, RPC, and ephemeral sessions remain unchanged.
 
 ## Discovery
 

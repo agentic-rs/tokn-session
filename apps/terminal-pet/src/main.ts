@@ -17,6 +17,7 @@ import { renderScreen, type RenderMeta } from "./renderer";
 import {
   PiInputBroker,
   TerminalInputEditor,
+  piInputAdmissionStatus,
   type TerminalInputEvent
 } from "./input";
 import {
@@ -221,9 +222,9 @@ async function runInteractive(runOptions: Options): Promise<void> {
             break;
           }
           void piInput.submit(topic, event.text).then(
-            () => {
+            (admission) => {
               if (!stopped) {
-                meta.input_status = "Pi input sent";
+                meta.input_status = piInputAdmissionStatus(admission);
                 render();
               }
             },

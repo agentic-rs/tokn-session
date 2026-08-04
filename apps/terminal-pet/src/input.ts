@@ -1,9 +1,23 @@
-import { realpathSync, statSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { statSync } from "node:fs";
+import { lstat, readFile } from "node:fs/promises";
+import { createConnection } from "node:net";
 import { isAbsolute, resolve } from "node:path";
 
+import {
+  descriptorPathForSession,
+  PI_INPUT_PROTOCOL_VERSION,
+  PI_INPUT_PROVIDER,
+  type PiInputBridgeDescriptor,
+  type PiInputBridgeRequest,
+  type PiInputBridgeResponse,
+  type PiInputDelivery,
+} from "../../../extensions/pi/lib/input-protocol";
 import type { RelayEvent } from "./protocol";
 
 const MAX_INPUT_LENGTH = 16 * 1024;
+const MAX_RESPONSE_BYTES = 32 * 1024;
+const BRIDGE_TIMEOUT_MS = 5_000;
 
 export type TerminalInputEvent =
   | { type: "submitted"; text: string }
@@ -115,41 +129,48 @@ export class TerminalInputEditor {
 export interface PiSessionTarget {
   provider: string;
   path: string;
-  cwd?: string | null;
+  session_id: string;
 }
 
-export interface PiSessionInputRequest {
-  path: string;
-  cwd?: string;
-  prompt: string;
+export type PiInputAdmission = Extract<
+  PiInputBridgeResponse,
+  { type: "admitted" }
+>;
+
+export function piInputAdmissionStatus(admission: PiInputAdmission): string {
+  switch (admission.disposition) {
+    case "started":
+      return "Pi accepted input";
+    case "queued_follow_up":
+      return "Pi queued follow-up input";
+    case "queued_steer":
+      return "Pi queued steering input";
+  }
 }
 
-export type PiSessionRunner = (
-  request: PiSessionInputRequest
-) => Promise<void>;
+export type PiBridgeDescriptorReader = (path: string) => Promise<unknown>;
+export type PiBridgeRequestSender = (
+  socketPath: string,
+  request: PiInputBridgeRequest
+) => Promise<unknown>;
 
 export interface PiInputBrokerOptions {
-  run?: PiSessionRunner;
-}
-
-export function piCommand(path: string): string[] {
-  return [
-    "pi",
-    "--mode",
-    "json",
-    "--session",
-    path,
-    "--print"
-  ];
+  read_descriptor?: PiBridgeDescriptorReader;
+  request?: PiBridgeRequestSender;
+  request_id?: () => string;
 }
 
 export class PiInputBroker {
-  readonly #run: PiSessionRunner;
+  readonly #readDescriptor: PiBridgeDescriptorReader;
+  readonly #request: PiBridgeRequestSender;
+  readonly #requestId: () => string;
   readonly #targets = new Map<string, PiSessionTarget>();
-  readonly #inFlight = new Map<string, Promise<void>>();
+  readonly #inFlight = new Map<string, Promise<PiInputAdmission>>();
 
   constructor(options: PiInputBrokerOptions = {}) {
-    this.#run = options.run ?? runPiSession;
+    this.#readDescriptor = options.read_descriptor ?? readDescriptor;
+    this.#request = options.request ?? requestPiBridge;
+    this.#requestId = options.request_id ?? randomUUID;
   }
 
   observe(event: RelayEvent): void {
@@ -159,39 +180,79 @@ export class PiInputBroker {
     if (provider?.toLowerCase() !== "pi" || !event.path) {
       return;
     }
-    const previous = this.#targets.get(event.topic);
     this.#targets.set(event.topic, {
       provider: "pi",
       path: event.path,
-      cwd: event.session.cwd ?? previous?.cwd
+      session_id: event.session.session_id
     });
   }
 
-  async submit(topic: string, prompt: string): Promise<void> {
+  async submit(
+    topic: string,
+    prompt: string,
+    delivery: PiInputDelivery = "auto"
+  ): Promise<PiInputAdmission> {
     const target = this.#targets.get(topic);
     if (!target || target.provider !== "pi") {
       throw new Error("input is only available for an observed Pi session");
     }
 
     const normalizedPrompt = normalizePrompt(prompt);
-    const path = existingSessionPath(target.path);
-    if (this.#inFlight.has(path)) {
+    const sessionPath = existingSessionPath(target.path);
+    if (this.#inFlight.has(sessionPath)) {
       throw new Error("that Pi session already has input in flight");
     }
 
-    const run = Promise.resolve().then(() => this.#run({
-      path,
-      cwd: existingDirectory(target.cwd),
-      prompt: normalizedPrompt
-    }));
-    this.#inFlight.set(path, run);
+    const run = this.#submitToBridge(
+      target,
+      sessionPath,
+      normalizedPrompt,
+      delivery
+    );
+    this.#inFlight.set(sessionPath, run);
     try {
-      await run;
+      return await run;
     } finally {
-      if (this.#inFlight.get(path) === run) {
-        this.#inFlight.delete(path);
+      if (this.#inFlight.get(sessionPath) === run) {
+        this.#inFlight.delete(sessionPath);
       }
     }
+  }
+
+  async #submitToBridge(
+    target: PiSessionTarget,
+    sessionPath: string,
+    prompt: string,
+    delivery: PiInputDelivery
+  ): Promise<PiInputAdmission> {
+    const descriptorPath = descriptorPathForSession(sessionPath);
+    let descriptorValue: unknown;
+    try {
+      descriptorValue = await this.#readDescriptor(descriptorPath);
+    } catch (error) {
+      throw bridgeUnavailable(error);
+    }
+    const descriptor = parseDescriptor(descriptorValue, target, sessionPath);
+    const requestId = this.#requestId();
+    const request: PiInputBridgeRequest = {
+      protocol: PI_INPUT_PROTOCOL_VERSION,
+      type: "submit",
+      request_id: requestId,
+      token: descriptor.token,
+      session_id: descriptor.session_id,
+      session_file: descriptor.session_file,
+      instance_id: descriptor.instance_id,
+      delivery,
+      content: [{ type: "text", text: prompt }]
+    };
+
+    let responseValue: unknown;
+    try {
+      responseValue = await this.#request(descriptor.socket_path, request);
+    } catch (error) {
+      throw bridgeUnavailable(error);
+    }
+    return parseAdmission(responseValue, descriptor, requestId);
   }
 }
 
@@ -218,44 +279,178 @@ function existingSessionPath(value: string): string {
     if (!statSync(candidate).isFile()) {
       throw new Error("not a regular file");
     }
-    return realpathSync(candidate);
+    return candidate;
   } catch {
     throw new Error("the observed Pi session file is unavailable");
   }
 }
 
-function existingDirectory(value: string | null | undefined): string | undefined {
-  if (!value || !isAbsolute(value)) {
-    return undefined;
+async function readDescriptor(path: string): Promise<unknown> {
+  const info = await lstat(path);
+  if (!info.isFile()) {
+    throw new Error("descriptor is not a regular file");
   }
-  const candidate = resolve(value);
-  try {
-    return statSync(candidate).isDirectory() ? realpathSync(candidate) : undefined;
-  } catch {
-    return undefined;
+  if (info.size > MAX_RESPONSE_BYTES) {
+    throw new Error("descriptor is too large");
   }
+  if ((info.mode & 0o077) !== 0) {
+    throw new Error("descriptor permissions are not private");
+  }
+  const currentUid = process.getuid?.();
+  if (currentUid !== undefined && info.uid !== currentUid) {
+    throw new Error("descriptor is owned by another user");
+  }
+  return JSON.parse(await readFile(path, "utf8")) as unknown;
 }
 
-async function runPiSession(request: PiSessionInputRequest): Promise<void> {
-  const child = Bun.spawn({
-    cmd: piCommand(request.path),
-    ...(request.cwd ? { cwd: request.cwd } : {}),
-    stdin: "pipe",
-    stdout: "ignore",
-    stderr: "pipe"
-  });
-  const stderr = new Response(child.stderr).arrayBuffer();
-  try {
-    await child.stdin.write(request.prompt);
-    await child.stdin.end();
-  } catch (error) {
-    child.kill("SIGTERM");
-    await child.exited;
-    throw error;
+function parseDescriptor(
+  value: unknown,
+  target: PiSessionTarget,
+  sessionPath: string
+): PiInputBridgeDescriptor {
+  const descriptor = asRecord(value);
+  if (
+    !descriptor
+    || descriptor.protocol !== PI_INPUT_PROTOCOL_VERSION
+    || descriptor.provider !== PI_INPUT_PROVIDER
+    || descriptor.transport !== "unix"
+    || descriptor.session_id !== target.session_id
+    || descriptor.session_file !== sessionPath
+    || !isNonEmptyString(descriptor.instance_id)
+    || !isNonEmptyString(descriptor.socket_path)
+    || !isAbsolute(descriptor.socket_path)
+    || typeof descriptor.pid !== "number"
+    || !Number.isInteger(descriptor.pid)
+    || descriptor.pid <= 0
+    || !isNonEmptyString(descriptor.token)
+  ) {
+    throw new Error("Pi input bridge descriptor does not match the observed session");
   }
+  return {
+    protocol: PI_INPUT_PROTOCOL_VERSION,
+    provider: PI_INPUT_PROVIDER,
+    transport: "unix",
+    session_id: descriptor.session_id,
+    session_file: descriptor.session_file,
+    instance_id: descriptor.instance_id,
+    socket_path: descriptor.socket_path,
+    pid: descriptor.pid,
+    token: descriptor.token
+  };
+}
 
-  const [exitCode] = await Promise.all([child.exited, stderr]);
-  if (exitCode !== 0) {
-    throw new Error(`pi exited with status ${exitCode}`);
+function parseAdmission(
+  value: unknown,
+  descriptor: PiInputBridgeDescriptor,
+  requestId: string
+): PiInputAdmission {
+  const response = asRecord(value);
+  if (!response || response.protocol !== PI_INPUT_PROTOCOL_VERSION) {
+    throw new Error("Pi input bridge returned an invalid response");
   }
+  if (response.type === "error") {
+    if (
+      response.request_id !== undefined
+      && response.request_id !== requestId
+    ) {
+      throw new Error("Pi input bridge returned a mismatched error response");
+    }
+    const message = isNonEmptyString(response.message)
+      ? response.message
+      : "input was rejected";
+    throw new Error(`Pi input bridge rejected the message: ${message}`);
+  }
+  if (
+    response.type !== "admitted"
+    || response.request_id !== requestId
+    || response.session_id !== descriptor.session_id
+    || response.instance_id !== descriptor.instance_id
+    || !isDisposition(response.disposition)
+  ) {
+    throw new Error("Pi input bridge returned a mismatched admission");
+  }
+  return {
+    protocol: PI_INPUT_PROTOCOL_VERSION,
+    type: "admitted",
+    request_id: response.request_id,
+    session_id: response.session_id,
+    instance_id: response.instance_id,
+    disposition: response.disposition
+  };
+}
+
+export function requestPiBridge(
+  socketPath: string,
+  request: PiInputBridgeRequest
+): Promise<unknown> {
+  return new Promise((resolveRequest, rejectRequest) => {
+    const socket = createConnection(socketPath);
+    let settled = false;
+    let buffer = "";
+
+    const finish = (error?: unknown, value?: unknown): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.removeAllListeners();
+      socket.destroy();
+      if (error !== undefined) {
+        rejectRequest(error);
+      } else {
+        resolveRequest(value);
+      }
+    };
+
+    socket.setEncoding("utf8");
+    socket.setTimeout(BRIDGE_TIMEOUT_MS, () => {
+      finish(new Error("Pi input bridge timed out"));
+    });
+    socket.once("connect", () => {
+      socket.write(`${JSON.stringify(request)}\n`);
+    });
+    socket.on("data", (chunk: string) => {
+      buffer += chunk;
+      if (Buffer.byteLength(buffer, "utf8") > MAX_RESPONSE_BYTES) {
+        finish(new Error("Pi input bridge response is too large"));
+        return;
+      }
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) {
+        return;
+      }
+      try {
+        finish(undefined, JSON.parse(buffer.slice(0, newline)) as unknown);
+      } catch {
+        finish(new Error("Pi input bridge returned invalid JSON"));
+      }
+    });
+    socket.once("end", () => {
+      finish(new Error("Pi input bridge closed without a response"));
+    });
+    socket.once("error", (error) => finish(error));
+  });
+}
+
+function bridgeUnavailable(error: unknown): Error {
+  const detail = error instanceof Error ? error.message : String(error);
+  return new Error(
+    `Pi input bridge is unavailable for this session; load the extension in the active Pi process (${detail})`
+  );
+}
+
+function isDisposition(value: unknown): value is PiInputAdmission["disposition"] {
+  return value === "started"
+    || value === "queued_follow_up"
+    || value === "queued_steer";
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
 }

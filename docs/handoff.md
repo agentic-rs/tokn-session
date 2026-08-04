@@ -186,11 +186,12 @@ that were inferred Ready or Interrupted in the last five minutes. Up/Down or
 `j`/`k` selects another session by topic, `a` restores automatic focus, and
 `Enter` opens a composer for the focused session. A second `Enter` submits the
 message and `Escape` cancels it. Input is currently Pi-only: the terminal
-records the observed Relay path for each Pi topic and starts
-`pi --mode json --session <path> --print` with the prompt on stdin. Pi writes
-the session JSONL and Relay remains the only event/display source. Non-Pi or
-unobserved sessions remain read-only. `c` acknowledges the selected
-notification. Responsive text rows keep concurrent
+records the observed Relay path for each Pi topic, resolves the live bridge
+descriptor, and submits an `auto` input request to the owning Pi process's Unix
+socket. Idle input starts immediately and busy input enters Pi's follow-up
+queue. The terminal never starts another Pi process or writes provider JSONL.
+Non-Pi, unobserved, or unbridged sessions remain read-only. `c` acknowledges
+the selected notification. Responsive text rows keep concurrent
 and recent sessions visible; roster rows use the state glyph plus a compact
 provider badge instead of repeating the state label. The renderer uses overflow
 windows around a manual selection so it cannot disappear off-screen. Root
@@ -217,11 +218,10 @@ generation. Idle input starts immediately; busy input defaults to Pi's
 follow-up queue, with explicit steering available. Request IDs are deduplicated
 within the bridge process. Admission only means Pi's live runtime accepted the
 input; Relay observing the resulting user message remains the authoritative
-confirmation. Terminal-pet does not consume the bridge descriptor yet, so its
-current CLI runner remains the compatibility path until the bridge client is
-integrated; it must not be used concurrently with an open Pi process because
-that would create a second session writer. `extensions/codex/` is reserved for
-a future Codex transport.
+confirmation. Terminal-pet consumes this descriptor and shares the bridge wire
+contract from `extensions/pi/lib/`; it does not fall back to a second Pi
+process when the bridge is unavailable. `extensions/codex/` is reserved for a
+future Codex transport.
 
 Rendering uses Kitty graphics where available, the Kitty local-file protocol
 in iTerm2 3.6+, and a truecolor ANSI half-block fallback. Wide mode includes a

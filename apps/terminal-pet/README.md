@@ -39,11 +39,19 @@ available for keyboard controls:
 - `Enter` opens a composer for the focused Pi session; type a message and press
   `Enter` again to submit it, or press `Escape` to cancel.
 
-Input is currently Pi-only. The pet remembers the observed Relay path for the
-focused session and starts `pi --mode json --session <path> --print` with the
-message on stdin. Pi's JSONL session file remains the source of truth; the
-Relay observes and renders the resulting events. Non-Pi sessions and sessions
-without an observed path stay read-only.
+Input is currently Pi-only and requires the Pi input bridge in the active TUI:
+
+```sh
+pi --extension /absolute/path/to/tokn-session/extensions/pi/input-bridge.ts
+```
+
+The pet uses the observed Relay session path to discover the bridge descriptor,
+then submits the message over the owning Pi process's Unix socket. Input starts
+immediately when Pi is idle and enters Pi's follow-up queue when it is busy.
+The pet never opens a second Pi process or writes the JSONL directly. Relay
+observing the resulting user message remains the authoritative confirmation.
+Non-Pi sessions, sessions without an observed path, and Pi sessions without a
+live bridge remain read-only.
 
 To consume an existing JSONL pipeline:
 

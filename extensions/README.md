@@ -8,6 +8,9 @@ Each provider owns its extension implementation and lifecycle:
 - `pi/` contains the Pi session bridge.
 - `codex/` is reserved for a future Codex bridge.
 
+Provider wire contracts shared with clients live below the provider directory's
+`lib/` folder so Pi does not mistake them for standalone extension entry points.
+
 The extensions are deliberately separate from the provider implementations and
 from Relay. Relay remains the source of truth for observed session events; an
 extension only exposes a local input endpoint for the live process that loaded
