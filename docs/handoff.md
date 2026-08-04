@@ -209,6 +209,20 @@ running because Relay seeds existing session files from their snapshotted EOF.
 Codex commentary messages count as progress rather than completion now that the
 normalized message delivery is preserved.
 
+Provider input bridges live under the top-level `extensions/` directory. The
+Pi bridge is an opt-in extension that starts a process-instance Unix socket for
+interactive sessions and publishes a session-scoped descriptor in a private
+runtime directory. Requests are bound to both the Pi session and live process
+generation. Idle input starts immediately; busy input defaults to Pi's
+follow-up queue, with explicit steering available. Request IDs are deduplicated
+within the bridge process. Admission only means Pi's live runtime accepted the
+input; Relay observing the resulting user message remains the authoritative
+confirmation. Terminal-pet does not consume the bridge descriptor yet, so its
+current CLI runner remains the compatibility path until the bridge client is
+integrated; it must not be used concurrently with an open Pi process because
+that would create a second session writer. `extensions/codex/` is reserved for
+a future Codex transport.
+
 Rendering uses Kitty graphics where available, the Kitty local-file protocol
 in iTerm2 3.6+, and a truecolor ANSI half-block fallback. Wide mode includes a
 focused-session detail panel with the current activity kind/detail, age, and
