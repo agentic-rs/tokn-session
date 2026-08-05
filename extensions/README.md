@@ -6,7 +6,9 @@ to an already-running agent session.
 Each provider owns its extension implementation and lifecycle:
 
 - `pi/` contains the Pi session bridge.
-- `codex/` is reserved for a future Codex bridge.
+- `codex/` contains an isolated experiment for the Codex App private IPC
+  router. It is not connected to Terminal Pet yet and requires callers to pass
+  an explicit socket path.
 
 Provider wire contracts shared with clients live below the provider directory's
 `lib/` folder so Pi does not mistake them for standalone extension entry points.
