@@ -220,8 +220,19 @@ within the bridge process. Admission only means Pi's live runtime accepted the
 input; Relay observing the resulting user message remains the authoritative
 confirmation. Terminal-pet consumes this descriptor and shares the bridge wire
 contract from `extensions/pi/lib/`; it does not fall back to a second Pi
-process when the bridge is unavailable. `extensions/codex/` is reserved for a
-future Codex transport.
+process when the bridge is unavailable.
+
+`extensions/codex/` now contains an isolated experiment for Codex App's private
+length-prefixed JSON IPC router. The client requires an explicit socket path
+and sends the observed version-1 `thread-follower-start-turn` request using the
+rollout thread id as `conversationId`. A temporary-socket fake desktop router
+exercises client initialization, owner discovery, forwarding, and no-owner
+errors. Its lab owner can forward accepted input to a standalone
+`codex app-server` under a temporary `CODEX_HOME`; the end-to-end smoke passes
+with `deepseek-v4-flash` at `http://localhost:4141/v1`. This experiment is not
+connected to Terminal Pet and has not contacted the real Codex App socket. The
+desktop IPC contract is private and must remain a fail-closed compatibility
+transport rather than being treated as a supported app-server API.
 
 Rendering uses Kitty graphics where available, the Kitty local-file protocol
 in iTerm2 3.6+, and a truecolor ANSI half-block fallback. Wide mode includes a
