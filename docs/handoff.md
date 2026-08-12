@@ -220,8 +220,26 @@ within the bridge process. Admission only means Pi's live runtime accepted the
 input; Relay observing the resulting user message remains the authoritative
 confirmation. Terminal-pet consumes this descriptor and shares the bridge wire
 contract from `extensions/pi/lib/`; it does not fall back to a second Pi
-process when the bridge is unavailable. `extensions/codex/` is reserved for a
-future Codex transport.
+process when the bridge is unavailable.
+
+`extensions/codex/` now contains an isolated experiment for Codex App's private
+length-prefixed JSON IPC router. The client requires an explicit IPC endpoint:
+a Unix socket on macOS/Unix or a local Windows named pipe. Platform discovery
+maps `$CODEX_HOME/ipc/ipc.sock` on Unix and `\\.\pipe\codex-ipc` on Windows.
+The client sends the observed version-1 `thread-follower-start-turn` request
+using the rollout thread id as `conversationId`. An isolated fake desktop
+router exercises client initialization, owner discovery, forwarding, and the
+successful response path over the native transport on Linux, macOS, and Windows
+CI. Fake-router error responses are tested on Unix only because Bun 1.3.13 does
+not flush those server-side named-pipe responses on Windows. Its
+lab owner can forward accepted input to a standalone `codex app-server` under a
+temporary `CODEX_HOME`; the local smoke passes with `deepseek-v4-flash` at
+`http://localhost:4141/v1`. These are protocol and transport regression tests,
+not evidence of compatibility with a real Codex App build. The experiment is
+not connected to Terminal Pet and has not contacted the real Codex App IPC
+endpoint. The desktop IPC contract is private and must remain a fail-closed
+compatibility transport rather than being treated as a supported app-server
+API.
 
 Rendering uses Kitty graphics where available, the Kitty local-file protocol
 in iTerm2 3.6+, and a truecolor ANSI half-block fallback. Wide mode includes a

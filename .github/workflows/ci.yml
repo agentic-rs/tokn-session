@@ -68,3 +68,29 @@ jobs:
         run: |
           bun install --frozen-lockfile
           bun run check
+
+  codex-ipc:
+    name: Codex IPC (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+
+      - name: Check Codex IPC transport
+        working-directory: extensions/codex
+        run: |
+          bun install --frozen-lockfile
+          bun run check
