@@ -84,10 +84,6 @@ describe("Codex desktop input experiment", () => {
   });
 
   test("fails cleanly when no connected window owns the conversation", async () => {
-    owner = await FakeCodexDesktopOwner.connect({
-      endpoint,
-      conversation_id: "another-thread"
-    });
     client = await CodexDesktopInputClient.connect({
       endpoint,
       timeout_ms: 5_000
