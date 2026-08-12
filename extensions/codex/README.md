@@ -25,10 +25,10 @@ app-server-style text input in `turnStartParams`.
 
 GitHub Actions runs the framing and transport harness on Linux, macOS, and
 Windows. The Windows job verifies named-pipe initialization, owner discovery,
-successful forwarding, and routed errors. The fake router's zero-candidate
-`no-client-found` shortcut is Unix-only because Bun 1.3.13 does not flush that
-server-side named-pipe response on Windows. These tests do not claim
-compatibility with a real Codex App build.
+successful forwarding, and the successful response path. Fake-router error
+responses are Unix-only because Bun 1.3.13 does not flush those server-side
+named-pipe responses on Windows. These tests do not claim compatibility with a
+real Codex App build.
 
 This is an undocumented compatibility surface. A production transport must
 fail closed when the endpoint, request version, or owning window is unavailable.

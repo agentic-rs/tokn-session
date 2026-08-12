@@ -97,7 +97,9 @@ describe("Codex desktop input experiment", () => {
     }
   );
 
-  test("returns an owning window's routed error", async () => {
+  test.skipIf(process.platform === "win32")(
+    "returns an owning window's routed error",
+    async () => {
     owner = await FakeCodexDesktopOwner.connect({
       endpoint,
       conversation_id: "thread-lab-error",
@@ -113,7 +115,8 @@ describe("Codex desktop input experiment", () => {
     await expect(client.startTurn("thread-lab-error", "hello")).rejects.toThrow(
       "owner rejected test input"
     );
-  });
+    }
+  );
 
   test("requires an explicit endpoint address", async () => {
     await expect(CodexDesktopInputClient.connect({
