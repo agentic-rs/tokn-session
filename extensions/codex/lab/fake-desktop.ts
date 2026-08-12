@@ -136,7 +136,7 @@ export class FakeCodexDesktopRouter {
   #discoverOwner(source: RouterPeer, request: CodexDesktopStartTurnRequest): void {
     const candidates = [...this.#peers].filter((peer) => peer !== source && peer.client_id);
     if (candidates.length === 0) {
-      source.socket.write(encodeIpcFrame(errorResponse(request.requestId, "no-client-found")));
+      deferWrite(source.socket, errorResponse(request.requestId, "no-client-found"));
       return;
     }
     const group: DiscoveryGroup = {
@@ -183,9 +183,10 @@ export class FakeCodexDesktopRouter {
     }
     if (group.pending_ids.size === 0) {
       group.settled = true;
-      group.source.socket.write(encodeIpcFrame(
+      deferWrite(
+        group.source.socket,
         errorResponse(group.request.requestId, "no-client-found")
-      ));
+      );
     }
   }
 }
@@ -329,6 +330,14 @@ function errorResponse(requestId: string, error: string): Record<string, unknown
     resultType: "error",
     error
   };
+}
+
+function deferWrite(socket: Socket, message: unknown): void {
+  setImmediate(() => {
+    if (socket.writable) {
+      socket.write(encodeIpcFrame(message));
+    }
+  });
 }
 
 function listen(server: Server, path: string): Promise<void> {
