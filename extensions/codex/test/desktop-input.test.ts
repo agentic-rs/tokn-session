@@ -83,7 +83,9 @@ describe("Codex desktop input experiment", () => {
     });
   });
 
-  test("fails cleanly when no connected window owns the conversation", async () => {
+  test.skipIf(process.platform === "win32")(
+    "fails cleanly when no connected window owns the conversation",
+    async () => {
     client = await CodexDesktopInputClient.connect({
       endpoint,
       timeout_ms: 5_000
@@ -91,6 +93,25 @@ describe("Codex desktop input experiment", () => {
 
     await expect(client.startTurn("thread-lab-2", "hello")).rejects.toThrow(
       "no-client-found"
+    );
+    }
+  );
+
+  test("returns an owning window's routed error", async () => {
+    owner = await FakeCodexDesktopOwner.connect({
+      endpoint,
+      conversation_id: "thread-lab-error",
+      start_turn: () => {
+        throw new Error("owner rejected test input");
+      }
+    });
+    client = await CodexDesktopInputClient.connect({
+      endpoint,
+      timeout_ms: 5_000
+    });
+
+    await expect(client.startTurn("thread-lab-error", "hello")).rejects.toThrow(
+      "owner rejected test input"
     );
   });
 

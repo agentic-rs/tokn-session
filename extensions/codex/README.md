@@ -24,8 +24,11 @@ The currently observed desktop request is `thread-follower-start-turn` version
 app-server-style text input in `turnStartParams`.
 
 GitHub Actions runs the framing and transport harness on Linux, macOS, and
-Windows. These tests validate Unix sockets and Windows named pipes, but they do
-not claim compatibility with a real Codex App build.
+Windows. The Windows job verifies named-pipe initialization, owner discovery,
+successful forwarding, and routed errors. The fake router's zero-candidate
+`no-client-found` shortcut is Unix-only because Bun 1.3.13 does not flush that
+server-side named-pipe response on Windows. These tests do not claim
+compatibility with a real Codex App build.
 
 This is an undocumented compatibility surface. A production transport must
 fail closed when the endpoint, request version, or owning window is unavailable.

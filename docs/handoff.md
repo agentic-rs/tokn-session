@@ -229,7 +229,10 @@ maps `$CODEX_HOME/ipc/ipc.sock` on Unix and `\\.\pipe\codex-ipc` on Windows.
 The client sends the observed version-1 `thread-follower-start-turn` request
 using the rollout thread id as `conversationId`. An isolated fake desktop
 router exercises client initialization, owner discovery, forwarding, and
-no-owner errors over the native transport on Linux, macOS, and Windows CI. Its
+routed errors over the native transport on Linux, macOS, and Windows CI. The
+fake router's direct zero-candidate `no-client-found` shortcut is tested on Unix
+only because Bun 1.3.13 does not flush that server-side named-pipe response on
+Windows. Its
 lab owner can forward accepted input to a standalone `codex app-server` under a
 temporary `CODEX_HOME`; the local smoke passes with `deepseek-v4-flash` at
 `http://localhost:4141/v1`. These are protocol and transport regression tests,
