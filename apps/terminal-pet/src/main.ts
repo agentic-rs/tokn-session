@@ -15,11 +15,14 @@ import { focusSnapshot, moveFocusTopic, type FocusDirection } from "./navigation
 import { parseRelayEvent, type RelayEvent } from "./protocol";
 import { renderScreen, type RenderMeta } from "./renderer";
 import {
-  PiInputBroker,
   TerminalInputEditor,
-  piInputAdmissionStatus,
   type TerminalInputEvent
 } from "./input";
+import {
+  SessionInputBroker,
+  sessionInputAdmissionStatus,
+  sessionInputProviderLabel
+} from "./session_input";
 import {
   PET_STATES,
   PetStore,
@@ -79,7 +82,7 @@ async function runInteractive(runOptions: Options): Promise<void> {
   const sourceAbort = new AbortController();
   const keyDecoder = new TerminalKeyDecoder();
   const inputEditor = new TerminalInputEditor();
-  const piInput = new PiInputBroker();
+  const sessionInput = new SessionInputBroker();
 
   let child: RelayChild | undefined;
   let stopped = false;
@@ -184,8 +187,13 @@ async function runInteractive(runOptions: Options): Promise<void> {
       return;
     }
     const provider = focus.provider ?? focus.topic.split(".", 1)[0];
-    if (provider?.toLowerCase() !== "pi") {
-      meta.input_status = "terminal input currently supports Pi sessions only";
+    if (!provider || !["pi", "codex"].includes(provider.toLowerCase())) {
+      meta.input_status = "terminal input supports Pi and Codex sessions";
+      render();
+      return;
+    }
+    if (provider.toLowerCase() === "codex" && focus.depth !== 0) {
+      meta.input_status = "Codex input is only available for root sessions";
       render();
       return;
     }
@@ -214,17 +222,17 @@ async function runInteractive(runOptions: Options): Promise<void> {
             render();
             break;
           }
-          meta.input_status = "sending input to Pi…";
+          meta.input_status = `sending input to ${sessionInputProviderLabel(topic ?? "")}…`;
           render();
           if (!topic) {
             meta.input_status = "no session is selected";
             render();
             break;
           }
-          void piInput.submit(topic, event.text).then(
+          void sessionInput.submit(topic, event.text).then(
             (admission) => {
               if (!stopped) {
-                meta.input_status = piInputAdmissionStatus(admission);
+                meta.input_status = sessionInputAdmissionStatus(admission);
                 render();
               }
             },
@@ -320,7 +328,7 @@ async function runInteractive(runOptions: Options): Promise<void> {
         decoder,
         (event) => {
           if (!stopped) {
-            piInput.observe(event);
+            sessionInput.observe(event);
             store.ingest(event);
             render();
           }
@@ -339,7 +347,7 @@ async function runInteractive(runOptions: Options): Promise<void> {
           decoder,
           (event) => {
             if (!stopped) {
-              piInput.observe(event);
+              sessionInput.observe(event);
               store.ingest(event);
               render();
             }

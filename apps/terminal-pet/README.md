@@ -36,10 +36,10 @@ available for keyboard controls:
 - Up/Down or `j`/`k` selects a session, including recently completed work.
 - `a` returns to automatic highest-priority focus.
 - `c` clears the selected session's notification.
-- `Enter` opens a composer for the focused Pi session; type a message and press
+- `Enter` opens a composer for the focused Pi or root Codex session; type a message and press
   `Enter` again to submit it, or press `Escape` to cancel.
 
-Input is currently Pi-only and requires the Pi input bridge in the active TUI:
+Pi input requires the Pi input bridge in the active TUI:
 
 ```sh
 pi --extension /absolute/path/to/tokn-session/extensions/pi/input-bridge.ts
@@ -48,10 +48,20 @@ pi --extension /absolute/path/to/tokn-session/extensions/pi/input-bridge.ts
 The pet uses the observed Relay session path to discover the bridge descriptor,
 then submits the message over the owning Pi process's Unix socket. Input starts
 immediately when Pi is idle and enters Pi's follow-up queue when it is busy.
-The pet never opens a second Pi process or writes the JSONL directly. Relay
-observing the resulting user message remains the authoritative confirmation.
-Non-Pi sessions, sessions without an observed path, and Pi sessions without a
-live bridge remain read-only.
+The pet never opens a second Pi process or writes the JSONL directly.
+
+For root Codex sessions, the pet first asks the existing Codex App owner to
+start the turn through its private local IPC router. If the router is absent or
+no App window owns the session, the pet runs one non-interactive
+`codex exec resume <session-id> -` turn and sends the prompt over stdin. It does
+not fall back after timeouts, malformed responses, or owner rejection because
+the App may already have accepted the message. The CLI path restores the latest
+model and reasoning effort recorded in the rollout. Set `TOKN_CODEX_BIN` to an
+explicit Codex executable when `codex` is not on `PATH`.
+
+Codex subagents remain read-only because their parent session may own input.
+All providers require an observed absolute session path, and Relay observing
+the resulting user message remains the authoritative confirmation.
 
 To consume an existing JSONL pipeline:
 

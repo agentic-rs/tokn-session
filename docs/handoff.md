@@ -185,12 +185,15 @@ Within each family, state still uses
 that were inferred Ready or Interrupted in the last five minutes. Up/Down or
 `j`/`k` selects another session by topic, `a` restores automatic focus, and
 `Enter` opens a composer for the focused session. A second `Enter` submits the
-message and `Escape` cancels it. Input is currently Pi-only: the terminal
-records the observed Relay path for each Pi topic, resolves the live bridge
-descriptor, and submits an `auto` input request to the owning Pi process's Unix
-socket. Idle input starts immediately and busy input enters Pi's follow-up
-queue. The terminal never starts another Pi process or writes provider JSONL.
-Non-Pi, unobserved, or unbridged sessions remain read-only. `c` acknowledges
+message and `Escape` cancels it. Pi input records the observed Relay path,
+resolves the live bridge descriptor, and submits an `auto` request to the
+owning Pi process's Unix socket. Idle input starts immediately and busy input
+enters Pi's follow-up queue. Root Codex input first uses the Desktop IPC owner.
+A missing/refused IPC endpoint or explicit `no-client-found` response falls
+back to one `codex exec resume` turn with the prompt on stdin; ambiguous IPC
+failures never fall back. The CLI route restores the latest model and reasoning
+effort from the rollout, and `TOKN_CODEX_BIN` overrides executable discovery.
+Codex subagents and unobserved sessions remain read-only. `c` acknowledges
 the selected notification. Responsive text rows keep concurrent
 and recent sessions visible; roster rows use the state glyph plus a compact
 provider badge instead of repeating the state label. The renderer uses overflow
@@ -240,8 +243,10 @@ against Codex Desktop successfully appended to an existing rollout through the
 real IPC endpoint. Model and effort overrides require a version-1
 `thread-follower-update-thread-settings` request before start-turn; inline
 start-turn fields are silently replaced by the owning window's current settings.
-The update is retained for subsequent turns. The experiment is not connected
-to Terminal Pet. The desktop IPC contract is private and must remain a fail-closed
+The update is retained for subsequent turns. Terminal Pet uses the client for
+root Codex session input and falls back to non-interactive CLI resume only when
+the endpoint is unavailable or no App window owns the session. The desktop IPC
+contract is private and must remain a fail-closed
 compatibility transport rather than being treated as a supported app-server
 API.
 
