@@ -1,4 +1,4 @@
-import { join, resolve } from "node:path";
+import { posix } from "node:path";
 
 export const CODEX_WINDOWS_PIPE_NAME = String.raw`\\.\pipe\codex-ipc`;
 
@@ -24,7 +24,7 @@ export function codexDesktopIpcEndpoint(
   }
   return {
     transport: "unix_socket",
-    path: join(resolve(codexHome), "ipc", "ipc.sock")
+    path: posix.join(posix.resolve(codexHome), "ipc", "ipc.sock")
   };
 }
 

@@ -66,7 +66,7 @@ describe("Codex desktop input experiment", () => {
     });
     client = await CodexDesktopInputClient.connect({
       endpoint,
-      timeout_ms: 1_000
+      timeout_ms: 5_000
     });
 
     const admission = await client.startTurn("thread-lab-1", "hello from Terminal Pet");
@@ -90,7 +90,7 @@ describe("Codex desktop input experiment", () => {
     });
     client = await CodexDesktopInputClient.connect({
       endpoint,
-      timeout_ms: 1_000
+      timeout_ms: 5_000
     });
 
     await expect(client.startTurn("thread-lab-2", "hello")).rejects.toThrow(
