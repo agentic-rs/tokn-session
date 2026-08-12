@@ -235,9 +235,13 @@ not flush those server-side named-pipe responses on Windows. Its
 lab owner can forward accepted input to a standalone `codex app-server` under a
 temporary `CODEX_HOME`; the local smoke passes with `deepseek-v4-flash` at
 `http://localhost:4141/v1`. These are protocol and transport regression tests,
-not evidence of compatibility with a real Codex App build. The experiment is
-not connected to Terminal Pet and has not contacted the real Codex App IPC
-endpoint. The desktop IPC contract is private and must remain a fail-closed
+not general compatibility guarantees for future Codex App builds. A live test
+against Codex Desktop successfully appended to an existing rollout through the
+real IPC endpoint. Model and effort overrides require a version-1
+`thread-follower-update-thread-settings` request before start-turn; inline
+start-turn fields are silently replaced by the owning window's current settings.
+The update is retained for subsequent turns. The experiment is not connected
+to Terminal Pet. The desktop IPC contract is private and must remain a fail-closed
 compatibility transport rather than being treated as a supported app-server
 API.
 

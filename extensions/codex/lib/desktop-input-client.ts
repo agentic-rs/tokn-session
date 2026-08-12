@@ -42,6 +42,11 @@ export interface CodexDesktopInputAdmission {
   result: unknown;
 }
 
+export interface CodexDesktopStartTurnOptions {
+  model?: string;
+  effort?: string;
+}
+
 export class CodexDesktopInputClient {
   readonly #socket: Socket;
   readonly #clientType: string;
@@ -72,15 +77,25 @@ export class CodexDesktopInputClient {
 
   async startTurn(
     conversationId: string,
-    prompt: string
+    prompt: string,
+    options: CodexDesktopStartTurnOptions = {}
   ): Promise<CodexDesktopInputAdmission> {
     const normalizedConversationId = conversationId.trim();
     const normalizedPrompt = prompt.trim();
+    const normalizedModel = normalizeOptionalOverride(options.model, "model");
+    const normalizedEffort = normalizeOptionalOverride(options.effort, "reasoning effort");
     if (!normalizedConversationId) {
       throw new Error("Codex conversation id is required");
     }
     if (!normalizedPrompt) {
       throw new Error("Codex input message is empty");
+    }
+
+    if (normalizedModel || normalizedEffort) {
+      await this.#updateThreadSettings(normalizedConversationId, {
+        ...(normalizedModel ? { model: normalizedModel } : {}),
+        ...(normalizedEffort ? { effort: normalizedEffort } : {})
+      });
     }
 
     const requestId = randomUUID();
@@ -108,6 +123,22 @@ export class CodexDesktopInputClient {
       handled_by_client_id: success.handledByClientId,
       result: success.result
     };
+  }
+
+  async #updateThreadSettings(
+    conversationId: string,
+    threadSettings: { model?: string; effort?: string }
+  ): Promise<void> {
+    const response = await this.#request({
+      type: "request",
+      requestId: randomUUID(),
+      sourceClientId: this.#clientId,
+      version: 1,
+      method: "thread-follower-update-thread-settings",
+      params: { conversationId, threadSettings },
+      timeoutMs: this.#timeoutMs
+    });
+    expectSuccess(response, "thread-follower-update-thread-settings");
   }
 
   close(): void {
@@ -217,6 +248,20 @@ export class CodexDesktopInputClient {
     }
     this.#pending.clear();
   }
+}
+
+function normalizeOptionalOverride(
+  value: string | undefined,
+  label: string
+): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const normalized = value.trim();
+  if (!normalized) {
+    throw new Error(`Codex ${label} override is empty`);
+  }
+  return normalized;
 }
 
 function expectSuccess(

@@ -23,6 +23,13 @@ The currently observed desktop request is `thread-follower-start-turn` version
 1. Its payload maps the rollout thread id to `conversationId` and wraps the
 app-server-style text input in `turnStartParams`.
 
+Optional model and reasoning-effort overrides use a separate version-1
+`thread-follower-update-thread-settings` request before start-turn. Codex App
+treats these as retained thread settings, so they apply to the injected turn
+and subsequent turns. Putting `model` and `effort` directly in the start-turn
+payload is accepted by the router but does not override the owning window's
+current thread settings.
+
 GitHub Actions runs the framing and transport harness on Linux, macOS, and
 Windows. The Windows job verifies named-pipe initialization, owner discovery,
 successful forwarding, and the successful response path. Fake-router error

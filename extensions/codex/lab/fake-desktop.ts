@@ -15,6 +15,7 @@ import {
   type CodexDesktopClientDiscoveryRequest,
   type CodexDesktopClientDiscoveryResponse,
   type CodexDesktopStartTurnRequest,
+  type CodexDesktopUpdateThreadSettingsRequest,
 } from "../lib/ipc-protocol";
 
 interface RouterPeer {
@@ -25,7 +26,7 @@ interface RouterPeer {
 
 interface DiscoveryGroup {
   source: RouterPeer;
-  request: CodexDesktopStartTurnRequest;
+  request: CodexDesktopStartTurnRequest | CodexDesktopUpdateThreadSettingsRequest;
   pending_ids: Set<string>;
   settled: boolean;
 }
@@ -99,7 +100,7 @@ export class FakeCodexDesktopRouter {
         this.#initialize(peer, message);
         return;
       }
-      if (isStartTurnRequest(message)) {
+      if (isRoutableThreadRequest(message)) {
         this.#discoverOwner(peer, message);
       }
       return;
@@ -133,7 +134,10 @@ export class FakeCodexDesktopRouter {
     }));
   }
 
-  #discoverOwner(source: RouterPeer, request: CodexDesktopStartTurnRequest): void {
+  #discoverOwner(
+    source: RouterPeer,
+    request: CodexDesktopStartTurnRequest | CodexDesktopUpdateThreadSettingsRequest
+  ): void {
     const candidates = [...this.#peers].filter((peer) => peer !== source && peer.client_id);
     if (candidates.length === 0) {
       source.socket.write(encodeIpcFrame(errorResponse(request.requestId, "no-client-found")));
@@ -206,6 +210,7 @@ export class FakeCodexDesktopOwner {
   #initializeResolve: (() => void) | undefined;
   #initializeReject: ((error: Error) => void) | undefined;
   last_start_turn: CodexDesktopStartTurnRequest | undefined;
+  last_thread_settings: CodexDesktopUpdateThreadSettingsRequest | undefined;
 
   private constructor(socket: Socket, options: FakeCodexDesktopOwnerOptions) {
     this.#socket = socket;
@@ -279,12 +284,23 @@ export class FakeCodexDesktopOwner {
         type: "client-discovery-response",
         requestId: message.requestId,
         response: {
-          canHandle: isRecord(message.request)
-            && isStartTurnRequest(message.request)
+          canHandle: isRoutableThreadRequest(message.request)
             && message.request.params.conversationId === this.#conversationId
         }
       };
       this.#socket.write(encodeIpcFrame(response));
+      return;
+    }
+    if (isUpdateThreadSettingsRequest(message)) {
+      this.last_thread_settings = message;
+      this.#socket.write(encodeIpcFrame({
+        type: "response",
+        requestId: message.requestId,
+        resultType: "success",
+        method: message.method,
+        handledByClientId: this.#clientId,
+        result: { ok: true }
+      }));
       return;
     }
     if (!isStartTurnRequest(message)) {
@@ -310,6 +326,12 @@ export class FakeCodexDesktopOwner {
   }
 }
 
+function isRoutableThreadRequest(
+  value: unknown
+): value is CodexDesktopStartTurnRequest | CodexDesktopUpdateThreadSettingsRequest {
+  return isStartTurnRequest(value) || isUpdateThreadSettingsRequest(value);
+}
+
 function isStartTurnRequest(value: unknown): value is CodexDesktopStartTurnRequest {
   return isRecord(value)
     && value.type === "request"
@@ -320,6 +342,19 @@ function isStartTurnRequest(value: unknown): value is CodexDesktopStartTurnReque
     && typeof value.params.conversationId === "string"
     && isRecord(value.params.turnStartParams)
     && Array.isArray(value.params.turnStartParams.input);
+}
+
+function isUpdateThreadSettingsRequest(
+  value: unknown
+): value is CodexDesktopUpdateThreadSettingsRequest {
+  return isRecord(value)
+    && value.type === "request"
+    && value.method === "thread-follower-update-thread-settings"
+    && value.version === 1
+    && typeof value.requestId === "string"
+    && isRecord(value.params)
+    && typeof value.params.conversationId === "string"
+    && isRecord(value.params.threadSettings);
 }
 
 function errorResponse(requestId: string, error: string): Record<string, unknown> {
