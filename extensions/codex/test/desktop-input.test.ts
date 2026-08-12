@@ -83,6 +83,36 @@ describe("Codex desktop input experiment", () => {
     });
   });
 
+  test("forwards model and reasoning effort overrides", async () => {
+    owner = await FakeCodexDesktopOwner.connect({
+      endpoint,
+      conversation_id: "thread-lab-settings",
+      start_turn: () => ({ turn: { id: "turn-lab-settings", status: "inProgress" } })
+    });
+    client = await CodexDesktopInputClient.connect({
+      endpoint,
+      timeout_ms: 5_000
+    });
+
+    await client.startTurn("thread-lab-settings", "use luna", {
+      model: "gpt-5.6-luna",
+      effort: "low"
+    });
+
+    expect(owner.last_thread_settings?.params).toEqual({
+      conversationId: "thread-lab-settings",
+      threadSettings: {
+        model: "gpt-5.6-luna",
+        effort: "low"
+      }
+    });
+    expect(owner.last_start_turn?.params.turnStartParams).toEqual({
+      input: [{ type: "text", text: "use luna" }],
+      clientUserMessageId: expect.any(String),
+      additionalContext: null
+    });
+  });
+
   test.skipIf(process.platform === "win32")(
     "fails cleanly when no connected window owns the conversation",
     async () => {

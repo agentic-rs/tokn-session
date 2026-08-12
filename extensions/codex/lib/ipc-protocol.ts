@@ -14,6 +14,11 @@ export interface CodexDesktopTurnStartParams {
   additionalContext: null;
 }
 
+export interface CodexDesktopThreadSettings {
+  model?: string;
+  effort?: string;
+}
+
 export interface CodexDesktopInitializeRequest {
   type: "request";
   requestId: string;
@@ -38,9 +43,23 @@ export interface CodexDesktopStartTurnRequest {
   timeoutMs: number;
 }
 
+export interface CodexDesktopUpdateThreadSettingsRequest {
+  type: "request";
+  requestId: string;
+  sourceClientId: string;
+  version: 1;
+  method: "thread-follower-update-thread-settings";
+  params: {
+    conversationId: string;
+    threadSettings: CodexDesktopThreadSettings;
+  };
+  timeoutMs: number;
+}
+
 export type CodexDesktopRequest =
   | CodexDesktopInitializeRequest
-  | CodexDesktopStartTurnRequest;
+  | CodexDesktopStartTurnRequest
+  | CodexDesktopUpdateThreadSettingsRequest;
 
 export interface CodexDesktopSuccessResponse {
   type: "response";
