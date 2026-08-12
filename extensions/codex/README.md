@@ -2,7 +2,9 @@
 
 This directory contains an experimental client for the private local IPC router
 used by Codex App. It is intentionally separate from the supported Codex
-app-server API and is not yet connected to Terminal Pet.
+app-server API. Terminal Pet uses it as the preferred route for root Codex
+session input, with a narrowly scoped CLI resume fallback when no App owner is
+available.
 
 The experiment never discovers or defaults to the user's real Codex App IPC
 endpoint. Callers must pass an explicit Unix socket or Windows named-pipe

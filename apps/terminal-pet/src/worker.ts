@@ -11,11 +11,14 @@ import { renderScreen, type RenderMeta } from "./renderer";
 import { PetStore, type PetSnapshot } from "./state";
 import { TerminalSurface } from "./terminal";
 import {
-  PiInputBroker,
   TerminalInputEditor,
-  piInputAdmissionStatus,
   type TerminalInputEvent
 } from "./input";
+import {
+  SessionInputBroker,
+  sessionInputAdmissionStatus,
+  sessionInputProviderLabel
+} from "./session_input";
 
 const KEY_SEQUENCE_TIMEOUT_MS = 50;
 
@@ -39,7 +42,7 @@ export class TerminalPetWorker {
   readonly #name: string;
   readonly #onQuit: () => void;
   readonly #inputEditor = new TerminalInputEditor();
-  readonly #piInput = new PiInputBroker();
+  readonly #sessionInput = new SessionInputBroker();
   readonly #store = new PetStore();
   readonly #surface = new TerminalSurface();
 
@@ -95,7 +98,7 @@ export class TerminalPetWorker {
     if (!this.#started) {
       throw new Error("terminal pet worker is not started");
     }
-    this.#piInput.observe(event);
+    this.#sessionInput.observe(event);
     this.#store.ingest(event);
     this.#render();
   }
@@ -221,8 +224,13 @@ export class TerminalPetWorker {
       return;
     }
     const provider = focus.provider ?? focus.topic.split(".", 1)[0];
-    if (provider?.toLowerCase() !== "pi") {
-      this.#meta.input_status = "terminal input currently supports Pi sessions only";
+    if (!provider || !["pi", "codex"].includes(provider.toLowerCase())) {
+      this.#meta.input_status = "terminal input supports Pi and Codex sessions";
+      this.#render();
+      return;
+    }
+    if (provider.toLowerCase() === "codex" && focus.depth !== 0) {
+      this.#meta.input_status = "Codex input is only available for root sessions";
       this.#render();
       return;
     }
@@ -252,17 +260,17 @@ export class TerminalPetWorker {
             this.#render();
             break;
           }
-          this.#meta.input_status = "sending input to Pi…";
+          this.#meta.input_status = `sending input to ${sessionInputProviderLabel(topic ?? "")}…`;
           this.#render();
           if (!topic) {
             this.#meta.input_status = "no session is selected";
             this.#render();
             break;
           }
-          void this.#piInput.submit(topic, event.text).then(
+          void this.#sessionInput.submit(topic, event.text).then(
             (admission) => {
               if (this.#started) {
-                this.#meta.input_status = piInputAdmissionStatus(admission);
+                this.#meta.input_status = sessionInputAdmissionStatus(admission);
                 this.#render();
               }
             },
