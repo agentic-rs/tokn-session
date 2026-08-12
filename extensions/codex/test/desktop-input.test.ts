@@ -4,6 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { CodexDesktopInputClient } from "../lib/desktop-input-client";
+import {
+  CODEX_WINDOWS_PIPE_NAME,
+  codexDesktopIpcEndpoint,
+  type CodexIpcEndpoint,
+} from "../lib/ipc-endpoint";
 import { encodeIpcFrame, IpcFrameDecoder } from "../lib/ipc-protocol";
 import { FakeCodexDesktopOwner, FakeCodexDesktopRouter } from "../lab/fake-desktop";
 
@@ -23,16 +28,26 @@ describe("Codex desktop IPC framing", () => {
 
 describe("Codex desktop input experiment", () => {
   let directory = "";
-  let socketPath = "";
+  let endpoint: CodexIpcEndpoint;
   let router: FakeCodexDesktopRouter;
   let owner: FakeCodexDesktopOwner | undefined;
   let client: CodexDesktopInputClient | undefined;
 
   beforeEach(async () => {
     directory = await mkdtemp(join(tmpdir(), "tokn-codex-ipc-test-"));
-    await mkdir(join(directory, "ipc"), { mode: 0o700 });
-    socketPath = join(directory, "ipc", "ipc.sock");
-    router = new FakeCodexDesktopRouter(socketPath);
+    if (process.platform === "win32") {
+      endpoint = {
+        transport: "windows_pipe",
+        pipe_name: String.raw`\\.\pipe\tokn-codex-ipc-test-${process.pid}-${crypto.randomUUID()}`
+      };
+    } else {
+      await mkdir(join(directory, "ipc"), { mode: 0o700 });
+      endpoint = {
+        transport: "unix_socket",
+        path: join(directory, "ipc", "ipc.sock")
+      };
+    }
+    router = new FakeCodexDesktopRouter(endpoint);
     await router.start();
   });
 
@@ -45,12 +60,12 @@ describe("Codex desktop input experiment", () => {
 
   test("routes a start turn to the owner of the rollout conversation", async () => {
     owner = await FakeCodexDesktopOwner.connect({
-      socket_path: socketPath,
+      endpoint,
       conversation_id: "thread-lab-1",
       start_turn: () => ({ turn: { id: "turn-lab-1", status: "inProgress" } })
     });
     client = await CodexDesktopInputClient.connect({
-      socket_path: socketPath,
+      endpoint,
       timeout_ms: 1_000
     });
 
@@ -70,11 +85,11 @@ describe("Codex desktop input experiment", () => {
 
   test("fails cleanly when no connected window owns the conversation", async () => {
     owner = await FakeCodexDesktopOwner.connect({
-      socket_path: socketPath,
+      endpoint,
       conversation_id: "another-thread"
     });
     client = await CodexDesktopInputClient.connect({
-      socket_path: socketPath,
+      endpoint,
       timeout_ms: 1_000
     });
 
@@ -83,9 +98,33 @@ describe("Codex desktop input experiment", () => {
     );
   });
 
-  test("requires an explicit socket path", async () => {
-    await expect(CodexDesktopInputClient.connect({ socket_path: "" })).rejects.toThrow(
-      "explicit Codex desktop IPC socket path"
+  test("requires an explicit endpoint address", async () => {
+    await expect(CodexDesktopInputClient.connect({
+      endpoint: { transport: "unix_socket", path: "" }
+    })).rejects.toThrow(
+      "Unix socket path is required"
     );
+  });
+});
+
+describe("Codex desktop IPC endpoint discovery", () => {
+  test("uses CODEX_HOME for Unix desktop IPC", () => {
+    expect(codexDesktopIpcEndpoint("/tmp/codex-lab", "darwin")).toEqual({
+      transport: "unix_socket",
+      path: "/tmp/codex-lab/ipc/ipc.sock"
+    });
+  });
+
+  test("uses the Codex named pipe on Windows", () => {
+    expect(codexDesktopIpcEndpoint("C:\\ignored", "win32")).toEqual({
+      transport: "windows_pipe",
+      pipe_name: CODEX_WINDOWS_PIPE_NAME
+    });
+  });
+
+  test("rejects a Windows pipe outside the local named-pipe namespace", async () => {
+    await expect(CodexDesktopInputClient.connect({
+      endpoint: { transport: "windows_pipe", pipe_name: "codex-ipc" }
+    })).rejects.toThrow("local named-pipe namespace");
   });
 });

@@ -4,10 +4,15 @@ This directory contains an experimental client for the private local IPC router
 used by Codex App. It is intentionally separate from the supported Codex
 app-server API and is not yet connected to Terminal Pet.
 
-The experiment never discovers or defaults to the user's real Codex App socket.
-Callers must pass an explicit Unix socket path. The test harness creates its own
-socket in a temporary directory and emulates the desktop router's client
-discovery and thread-owner forwarding flow.
+The experiment never discovers or defaults to the user's real Codex App IPC
+endpoint. Callers must pass an explicit Unix socket or Windows named-pipe
+endpoint. The test harness creates an isolated endpoint and emulates the
+desktop router's client discovery and thread-owner forwarding flow.
+
+Codex currently uses these platform endpoints:
+
+- macOS and Unix: `$CODEX_HOME/ipc/ipc.sock`
+- Windows: `\\.\pipe\codex-ipc`
 
 ```sh
 cd extensions/codex
@@ -18,5 +23,9 @@ The currently observed desktop request is `thread-follower-start-turn` version
 1. Its payload maps the rollout thread id to `conversationId` and wraps the
 app-server-style text input in `turnStartParams`.
 
+GitHub Actions runs the framing and transport harness on Linux, macOS, and
+Windows. These tests validate Unix sockets and Windows named pipes, but they do
+not claim compatibility with a real Codex App build.
+
 This is an undocumented compatibility surface. A production transport must
-fail closed when the socket, request version, or owning window is unavailable.
+fail closed when the endpoint, request version, or owning window is unavailable.

@@ -3,6 +3,11 @@ import { chmod, lstat, unlink } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 
 import {
+  ipcEndpointAddress,
+  type CodexIpcEndpoint,
+} from "../lib/ipc-endpoint";
+
+import {
   CODEX_DESKTOP_START_TURN_VERSION,
   encodeIpcFrame,
   IpcFrameDecoder,
@@ -31,24 +36,26 @@ interface PendingRoute {
 }
 
 export class FakeCodexDesktopRouter {
-  readonly #socketPath: string;
+  readonly #endpoint: CodexIpcEndpoint;
+  readonly #address: string;
   readonly #peers = new Set<RouterPeer>();
   readonly #discoveries = new Map<string, DiscoveryGroup>();
   readonly #routes = new Map<string, PendingRoute>();
   #server: Server | undefined;
 
-  constructor(socketPath: string) {
-    this.#socketPath = socketPath;
+  constructor(endpoint: CodexIpcEndpoint) {
+    this.#endpoint = endpoint;
+    this.#address = ipcEndpointAddress(endpoint);
   }
 
   async start(): Promise<void> {
     if (this.#server) {
       return;
     }
-    await refuseExistingPath(this.#socketPath);
+    await prepareEndpoint(this.#endpoint);
     const server = createServer((socket) => this.#accept(socket));
-    await listen(server, this.#socketPath);
-    await chmod(this.#socketPath, 0o600);
+    await listen(server, this.#address);
+    await secureEndpoint(this.#endpoint);
     this.#server = server;
   }
 
@@ -64,11 +71,7 @@ export class FakeCodexDesktopRouter {
     if (server) {
       await close(server);
     }
-    await unlink(this.#socketPath).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== "ENOENT") {
-        throw error;
-      }
-    });
+    await removeEndpoint(this.#endpoint);
   }
 
   #accept(socket: Socket): void {
@@ -188,7 +191,7 @@ export class FakeCodexDesktopRouter {
 }
 
 export interface FakeCodexDesktopOwnerOptions {
-  socket_path: string;
+  endpoint: CodexIpcEndpoint;
   conversation_id: string;
   start_turn?: (request: CodexDesktopStartTurnRequest) => unknown | Promise<unknown>;
 }
@@ -214,7 +217,7 @@ export class FakeCodexDesktopOwner {
   }
 
   static async connect(options: FakeCodexDesktopOwnerOptions): Promise<FakeCodexDesktopOwner> {
-    const socket = await connectSocket(options.socket_path);
+    const socket = await connectEndpoint(options.endpoint);
     const owner = new FakeCodexDesktopOwner(socket, options);
     await owner.#initialize();
     return owner;
@@ -344,9 +347,9 @@ function close(server: Server): Promise<void> {
   });
 }
 
-function connectSocket(path: string): Promise<Socket> {
+function connectEndpoint(endpoint: CodexIpcEndpoint): Promise<Socket> {
   return new Promise((resolve, reject) => {
-    const socket = createConnection(path);
+    const socket = createConnection(ipcEndpointAddress(endpoint));
     socket.once("connect", () => {
       socket.off("error", reject);
       resolve(socket);
@@ -355,17 +358,37 @@ function connectSocket(path: string): Promise<Socket> {
   });
 }
 
-async function refuseExistingPath(path: string): Promise<void> {
+async function prepareEndpoint(endpoint: CodexIpcEndpoint): Promise<void> {
+  if (endpoint.transport === "windows_pipe") {
+    return;
+  }
   try {
-    const metadata = await lstat(path);
+    const metadata = await lstat(endpoint.path);
     throw new Error(
-      `refusing to replace existing ${metadata.isSocket() ? "socket" : "path"}: ${path}`
+      `refusing to replace existing ${metadata.isSocket() ? "socket" : "path"}: ${endpoint.path}`
     );
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
       throw error;
     }
   }
+}
+
+async function secureEndpoint(endpoint: CodexIpcEndpoint): Promise<void> {
+  if (endpoint.transport === "unix_socket") {
+    await chmod(endpoint.path, 0o600);
+  }
+}
+
+async function removeEndpoint(endpoint: CodexIpcEndpoint): Promise<void> {
+  if (endpoint.transport === "windows_pipe") {
+    return;
+  }
+  await unlink(endpoint.path).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "ENOENT") {
+      throw error;
+    }
+  });
 }
 
 function asError(error: unknown): Error {

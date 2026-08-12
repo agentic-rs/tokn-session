@@ -2,6 +2,11 @@ import { randomUUID } from "node:crypto";
 import { createConnection, type Socket } from "node:net";
 
 import {
+  ipcEndpointAddress,
+  type CodexIpcEndpoint,
+} from "./ipc-endpoint";
+
+import {
   CODEX_DESKTOP_INITIALIZE_VERSION,
   CODEX_DESKTOP_START_TURN_VERSION,
   encodeIpcFrame,
@@ -25,7 +30,7 @@ interface PendingRequest {
 }
 
 export interface CodexDesktopInputClientOptions {
-  socket_path: string;
+  endpoint: CodexIpcEndpoint;
   client_type?: string;
   timeout_ms?: number;
 }
@@ -58,10 +63,8 @@ export class CodexDesktopInputClient {
   static async connect(
     options: CodexDesktopInputClientOptions
   ): Promise<CodexDesktopInputClient> {
-    if (!options.socket_path) {
-      throw new Error("an explicit Codex desktop IPC socket path is required");
-    }
-    const socket = await connectSocket(options.socket_path, options.timeout_ms ?? DEFAULT_TIMEOUT_MS);
+    const address = ipcEndpointAddress(options.endpoint);
+    const socket = await connectEndpoint(address, options.timeout_ms ?? DEFAULT_TIMEOUT_MS);
     const client = new CodexDesktopInputClient(socket, options);
     await client.#initialize();
     return client;
@@ -229,9 +232,9 @@ function expectSuccess(
   return response;
 }
 
-function connectSocket(path: string, timeoutMs: number): Promise<Socket> {
+function connectEndpoint(address: string, timeoutMs: number): Promise<Socket> {
   return new Promise((resolve, reject) => {
-    const socket = createConnection(path);
+    const socket = createConnection(address);
     const timeout = setTimeout(() => {
       socket.destroy();
       reject(new Error("Codex desktop IPC connection timed out"));

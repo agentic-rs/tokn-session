@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { CodexDesktopInputClient } from "../lib/desktop-input-client";
+import type { CodexIpcEndpoint } from "../lib/ipc-endpoint";
 import type { CodexDesktopStartTurnRequest } from "../lib/ipc-protocol";
 import { IsolatedCodexAppServer, type AppServerTurnHandle } from "./app-server";
 import { FakeCodexDesktopOwner, FakeCodexDesktopRouter } from "./fake-desktop";
@@ -14,6 +15,10 @@ const PROMPT = "Reply with exactly: codex pet bridge works";
 const directory = await mkdtemp(join(tmpdir(), "tokn-codex-lab-"));
 const ipcDirectory = join(directory, "ipc");
 const socketPath = join(ipcDirectory, "ipc.sock");
+const endpoint: CodexIpcEndpoint = {
+  transport: "unix_socket",
+  path: socketPath
+};
 const codexHome = join(directory, "codex-home");
 const repository = join(directory, "repo");
 await mkdir(ipcDirectory, { mode: 0o700 });
@@ -30,12 +35,12 @@ try {
     model: MODEL,
     base_url: BASE_URL
   });
-  router = new FakeCodexDesktopRouter(socketPath);
+  router = new FakeCodexDesktopRouter(endpoint);
   await router.start();
 
   let turn: AppServerTurnHandle | undefined;
   owner = await FakeCodexDesktopOwner.connect({
-    socket_path: socketPath,
+    endpoint,
     conversation_id: appServer.thread_id,
     start_turn: async (request) => {
       const prompt = textFromRequest(request);
@@ -47,7 +52,7 @@ try {
     }
   });
   input = await CodexDesktopInputClient.connect({
-    socket_path: socketPath,
+    endpoint,
     timeout_ms: 10_000
   });
   const admission = await input.startTurn(appServer.thread_id, PROMPT);
@@ -59,7 +64,7 @@ try {
   console.log(JSON.stringify({
     model: MODEL,
     base_url: BASE_URL,
-    socket_path: socketPath,
+    endpoint,
     codex_home: codexHome,
     conversation_id: appServer.thread_id,
     admission,

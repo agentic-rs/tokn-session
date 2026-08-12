@@ -223,16 +223,21 @@ contract from `extensions/pi/lib/`; it does not fall back to a second Pi
 process when the bridge is unavailable.
 
 `extensions/codex/` now contains an isolated experiment for Codex App's private
-length-prefixed JSON IPC router. The client requires an explicit socket path
-and sends the observed version-1 `thread-follower-start-turn` request using the
-rollout thread id as `conversationId`. A temporary-socket fake desktop router
-exercises client initialization, owner discovery, forwarding, and no-owner
-errors. Its lab owner can forward accepted input to a standalone
-`codex app-server` under a temporary `CODEX_HOME`; the end-to-end smoke passes
-with `deepseek-v4-flash` at `http://localhost:4141/v1`. This experiment is not
-connected to Terminal Pet and has not contacted the real Codex App socket. The
-desktop IPC contract is private and must remain a fail-closed compatibility
-transport rather than being treated as a supported app-server API.
+length-prefixed JSON IPC router. The client requires an explicit IPC endpoint:
+a Unix socket on macOS/Unix or a local Windows named pipe. Platform discovery
+maps `$CODEX_HOME/ipc/ipc.sock` on Unix and `\\.\pipe\codex-ipc` on Windows.
+The client sends the observed version-1 `thread-follower-start-turn` request
+using the rollout thread id as `conversationId`. An isolated fake desktop
+router exercises client initialization, owner discovery, forwarding, and
+no-owner errors over the native transport on Linux, macOS, and Windows CI. Its
+lab owner can forward accepted input to a standalone `codex app-server` under a
+temporary `CODEX_HOME`; the local smoke passes with `deepseek-v4-flash` at
+`http://localhost:4141/v1`. These are protocol and transport regression tests,
+not evidence of compatibility with a real Codex App build. The experiment is
+not connected to Terminal Pet and has not contacted the real Codex App IPC
+endpoint. The desktop IPC contract is private and must remain a fail-closed
+compatibility transport rather than being treated as a supported app-server
+API.
 
 Rendering uses Kitty graphics where available, the Kitty local-file protocol
 in iTerm2 3.6+, and a truecolor ANSI half-block fallback. Wide mode includes a
