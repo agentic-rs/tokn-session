@@ -495,6 +495,62 @@ describe("renderer", () => {
     expect(output).not.toContain("✓ Ready recently");
   });
 
+  test("renders interrupted roots and subagents as neutral outcomes", async () => {
+    const art = await loadPetArt();
+    const root = petFocus({
+      topic: "codex.root",
+      session_id: "root",
+      state: "idle",
+      family_state: "idle",
+      root_topic: "codex.root",
+      label: "Interrupted",
+      completed_at: 8_000,
+      recently_completed: true,
+      outcome: "interrupted",
+      descendant_count: 1,
+      recent_descendant_count: 1
+    });
+    const child = petFocus({
+      topic: "codex.child",
+      session_id: "child",
+      root_topic: root.topic,
+      parent_topic: root.topic,
+      depth: 1,
+      state: "idle",
+      family_state: "idle",
+      agent: "Reviewer",
+      label: "Interrupted",
+      completed_at: 9_000,
+      recently_completed: true,
+      outcome: "interrupted"
+    });
+
+    const screen = renderScreen(
+      petSnapshot([root, child]),
+      art.idle.ansi,
+      { source_label: "test" },
+      {
+        columns: 100,
+        rows: 24,
+        color: true,
+        image_protocol: "ansi",
+        name: "Hachiware",
+        now_ms: 10_000
+      }
+    );
+    const rootLine = lastScreenLine(screen.lines, "tokn-agent");
+    const childLine = lastScreenLine(screen.lines, "Reviewer");
+    const blockedColor = "\u001b[38;2;239;91;91m";
+    const idleColor = "\u001b[38;2;139;148;158m";
+
+    expect(rootLine).toContain("×");
+    expect(childLine).toContain("×");
+    expect(rootLine).toContain(idleColor);
+    expect(childLine).toContain(idleColor);
+    expect(rootLine).not.toContain(blockedColor);
+    expect(childLine).not.toContain(blockedColor);
+  });
+
   test("uses one image anchor alongside the wide roster", async () => {
     const art = await loadPetArt();
     const running = petFocus();

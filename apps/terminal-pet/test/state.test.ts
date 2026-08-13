@@ -185,6 +185,46 @@ describe("PetStore", () => {
     expect(store.snapshot(31).state).toBe("running");
   });
 
+  test("treats Codex turn interruption as a recent outcome, not blocked", () => {
+    const store = new PetStore(policy);
+    const rootInterrupted = relayEvent({
+      type: "error",
+      provider: "codex",
+      message: "interrupted"
+    }, "codex.root");
+    rootInterrupted.session.session_id = "root";
+    store.ingest(rootInterrupted, 10);
+
+    const childInterrupted = relayEvent({
+      type: "error",
+      provider: "codex",
+      message: "interrupted"
+    }, "codex.child");
+    childInterrupted.session.session_id = "child";
+    childInterrupted.session.parent_session_id = "root";
+    childInterrupted.session.agent_path = "/root/reviewer";
+    store.ingest(childInterrupted, 20);
+
+    const snapshot = store.snapshot(40);
+    expect(snapshot.active_sessions).toBe(0);
+    expect(snapshot.sessions).toHaveLength(2);
+    expect(snapshot.sessions).toEqual([
+      expect.objectContaining({
+        topic: "codex.root",
+        state: "idle",
+        family_state: "idle",
+        outcome: "interrupted",
+        recently_completed: true
+      }),
+      expect.objectContaining({
+        topic: "codex.child",
+        state: "idle",
+        outcome: "interrupted",
+        recently_completed: true
+      })
+    ]);
+  });
+
   test("prioritizes needs input and clears it when work resumes", () => {
     const store = new PetStore(policy);
     store.ingest(relayEvent({
