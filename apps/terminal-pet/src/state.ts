@@ -478,6 +478,10 @@ export class PetStore {
         this.#applyToolCall(activity, event, nowMs);
         return;
       case "error":
+        if (isInterruptedError(event)) {
+          this.#markInterrupted(activity, nowMs);
+          return;
+        }
         activity.ready_after = undefined;
         activity.ready_until = undefined;
         activity.completed_at = undefined;
@@ -1003,6 +1007,11 @@ function visibleStatePriority(focus: PetFocus): number {
 
 function isUrgentState(state: PetState): boolean {
   return state === "needs_input" || state === "blocked";
+}
+
+function isInterruptedError(event: AgentEvent): boolean {
+  return asString(event.provider)?.toLowerCase() === "codex"
+    && asString(event.message)?.trim().toLowerCase() === "interrupted";
 }
 
 function newSessionActivity(relay: RelayEvent, nowMs: number): SessionActivity {
