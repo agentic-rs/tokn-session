@@ -7,3 +7,6 @@
 [submodule "vendor/pi"]
 	path = vendor/pi
 	url = https://github.com/earendil-works/pi
+[submodule "vendor/dsh"]
+	path = vendor/dsh
+	url = https://github.com/deepseek-ai/deepseek-harness

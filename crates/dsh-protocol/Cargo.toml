@@ -1,0 +1,12 @@
+[package]
+name = "tokn-dsh-protocol"
+version.workspace = true
+edition.workspace = true
+description = "Tolerant, lossless wire types for persisted DeepSeek Harness session logs."
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
