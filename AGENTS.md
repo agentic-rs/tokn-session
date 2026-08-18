@@ -41,6 +41,7 @@ The core abstraction is `AgentEvent`: provider-native historical sessions and li
 - `crates/codex-protocol`: tolerant, lossless wire types for persisted Codex rollout JSONL.
 - `crates/pi-protocol`: tolerant, lossless wire types for persisted Pi session JSONL.
 - `crates/opencode-protocol`: tolerant, lossless wire types for OpenCode V1 payloads and run JSONL.
+- `crates/dsh-protocol`: tolerant, lossless wire types for persisted DeepSeek Harness session logs.
 - `crates/client`: source dispatch and public client API.
 - `crates/cli`: argument parsing and terminal rendering.
 - `crates/pi`: Pi JSONL session source and normalization.

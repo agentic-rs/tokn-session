@@ -419,6 +419,11 @@ Current browser keys:
 - Codex native JSONL parsing uses `tokn-codex-protocol`. New rollout and
   response tags retain their native identity and payload for unknown-event
   discovery instead of being erased by an upstream catch-all enum.
+- DeepSeek Harness is pinned as the `vendor/dsh` source-of-truth submodule.
+  `tokn-dsh-protocol` decodes its logical session records, including the core
+  event envelope and packed chunk rows. It preserves plugin-defined events and
+  malformed known records losslessly. Zstandard/SQLite access, discovery, and
+  normalization remain future provider work.
 - Codex `response_item.agent_message` and legacy
   `inter_agent_communication` records map to `agent_activity` with
   provider-supplied author and recipient paths. Paths remain null when the
