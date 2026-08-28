@@ -832,6 +832,9 @@ fn event_session_id(event: &AgentEvent) -> Option<&str> {
     AgentEvent::ToolCall(event) => event.session_id.as_deref(),
     AgentEvent::Error(event) => event.session_id.as_deref(),
     AgentEvent::Unknown(event) => event.session_id.as_deref(),
+    AgentEvent::Lifecycle(event) => event.session_id.as_deref(),
+    AgentEvent::Usage(event) => event.session_id.as_deref(),
+    AgentEvent::Metadata(event) => event.session_id.as_deref(),
   }
 }
 

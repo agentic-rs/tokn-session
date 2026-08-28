@@ -353,6 +353,7 @@ fn normalize_message(session_id: Option<String>, item: MessageItem, timestamp: O
   }
 
   vec![AgentEvent::Message(MessageEvent {
+    provenance: None,
     provider: Provider::Codex,
     session_id,
     message_id: item.id,
@@ -373,6 +374,7 @@ fn normalize_reasoning(session_id: Option<String>, item: ReasoningItem, timestam
   }
 
   vec![AgentEvent::Reasoning(ReasoningEvent {
+    provenance: None,
     provider: Provider::Codex,
     session_id,
     message_id: item.id,
@@ -531,6 +533,7 @@ fn normalize_reasoning_event(
     return Vec::new();
   };
   vec![AgentEvent::Reasoning(ReasoningEvent {
+    provenance: None,
     provider: Provider::Codex,
     session_id,
     message_id: string_field(payload, "item_id"),
@@ -902,6 +905,7 @@ fn message_event(
   timestamp: Option<String>,
 ) -> AgentEvent {
   AgentEvent::Message(MessageEvent {
+    provenance: None,
     provider: Provider::Codex,
     session_id,
     message_id,

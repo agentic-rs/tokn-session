@@ -334,8 +334,16 @@ Current event families include:
 - `goal_updated`
 - `agent_activity`
 - `tool_call`
+- `lifecycle`
+- `usage`
+- `metadata`
 - `error`
 - `unknown`
+
+DSH uses the shared lifecycle, per-call usage, metadata, and message provenance
+contracts described in `docs/event-ir.md`. Lifecycle/usage/metadata render as
+compact lines; expanded browser rows and JSONL preserve native details.
+Other providers' lifecycle/usage mappings are unchanged in this iteration.
 
 Messages carry an orthogonal `delivery` field: `commentary`, `final`, or
 `unspecified`. Codex preserves the provider's response phase. Pi and OpenCode
@@ -432,8 +440,13 @@ Current browser keys:
   malformed known records losslessly. `tokn-session-dsh` expands packed rows,
   prefers assembled messages over redundant chunks, keeps unfinished deltas,
   and correlates tool calls/results. Its output is a chronological log view,
-  not a reconstruction of the compacted model surface. Plugin/control records,
-  usage, and unsupported content remain native unknown events. Only explicit
+  not a reconstruction of the compacted model surface. Turn/step boundaries
+  and outcomes are typed lifecycle events. Per-call usage prefers assembled
+  usage, falling back to the last stream snapshot, and includes cached input
+  in the normalized total. Recognized plugin/control records are validated
+  metadata; plugin attribution and surface operations accompany messages and
+  reasoning as provenance. Unsupported/malformed records and content remain
+  native unknown events. Only explicit
   subagents form tree relationships; their `seedLength` excludes inherited
   parent history, while resume markers never hide their own earlier turns.
 - Codex `response_item.agent_message` and legacy
@@ -511,6 +524,5 @@ cd apps/terminal-pet && bun run snapshot
 - Decide whether live stream consumption should live in `client` as callbacks/iterators or in the CLI command path.
 - Extend provider fixture coverage with OpenCode SQLite normalization.
 - Add CLI golden tests for tiny fixture-backed `list` and `show` outputs.
-- Add provider-neutral lifecycle and input-request events to the IR, then remove
-  the terminal pet's corresponding heuristics.
-- Consider splitting stable event IR notes into `docs/event-ir.md` once the IR changes again.
+- Map other providers into the new lifecycle/usage IR, add input-request events,
+  then teach terminal pet to use authoritative lifecycle instead of heuristics.

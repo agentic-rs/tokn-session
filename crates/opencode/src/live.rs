@@ -22,6 +22,7 @@ impl OpenCodeLiveNormalizer {
 
     Ok(match event {
       RunEvent::Text(part) => vec![wrap_agent_event(AgentEvent::Message(MessageEvent {
+        provenance: None,
         provider: Provider::OpenCode,
         session_id,
         message_id: part.identity.message_id.or(part.identity.id),
@@ -33,6 +34,7 @@ impl OpenCodeLiveNormalizer {
         timestamp: timestamp(raw_timestamp),
       }))],
       RunEvent::Reasoning(part) => vec![wrap_agent_event(AgentEvent::Reasoning(ReasoningEvent {
+        provenance: None,
         provider: Provider::OpenCode,
         session_id,
         message_id: part.identity.message_id.or(part.identity.id),

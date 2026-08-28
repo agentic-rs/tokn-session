@@ -12,6 +12,9 @@ pub enum AgentEvent {
   GoalUpdated(GoalUpdated),
   AgentActivity(AgentActivity),
   ToolCall(ToolCallEvent),
+  Lifecycle(LifecycleEvent),
+  Usage(UsageEvent),
+  Metadata(MetadataEvent),
   Error(ErrorEvent),
   Unknown(UnknownEvent),
 }
@@ -57,6 +60,8 @@ pub struct SessionSettingsApplied {
 
 #[derive(Debug, Serialize)]
 pub struct MessageEvent {
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub provenance: Option<MessageProvenance>,
   pub provider: Provider,
   pub session_id: Option<String>,
   pub message_id: Option<String>,
@@ -70,6 +75,8 @@ pub struct MessageEvent {
 
 #[derive(Debug, Serialize)]
 pub struct ReasoningEvent {
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub provenance: Option<MessageProvenance>,
   pub provider: Provider,
   pub session_id: Option<String>,
   pub message_id: Option<String>,
@@ -129,6 +136,92 @@ pub struct ErrorEvent {
   pub session_id: Option<String>,
   pub message: String,
   pub timestamp: Option<String>,
+}
+
+/// Provider-native attribution and surface edits, not extra conversation text.
+#[derive(Clone, Debug, Serialize)]
+pub struct MessageProvenance {
+  pub source: Value,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub surface_op: Option<Value>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub source_event_seqs: Option<Vec<u64>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LifecycleEvent {
+  pub provider: Provider,
+  pub session_id: Option<String>,
+  pub turn_id: String,
+  pub step_id: Option<String>,
+  pub scope: LifecycleScope,
+  pub phase: Phase,
+  /// Closing a step alone does not imply success; absent means unspecified.
+  pub outcome: Option<LifecycleOutcome>,
+  pub native: Value,
+  pub timestamp: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleScope {
+  Turn,
+  Step,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleOutcome {
+  Completed,
+  Cancelled,
+  Interrupted,
+  Blocked,
+  Failed,
+  TokenLimit,
+}
+
+/// Usage for one model call, never a running session total.
+#[derive(Debug, Serialize)]
+pub struct UsageEvent {
+  pub provider: Provider,
+  pub session_id: Option<String>,
+  pub turn_id: Option<String>,
+  pub step_id: Option<String>,
+  pub message_id: Option<String>,
+  /// Total input, including cache reads and writes. Cache fields are subsets.
+  pub input_tokens: u64,
+  pub output_tokens: u64,
+  pub cache_read_tokens: Option<u64>,
+  pub cache_write_tokens: Option<u64>,
+  /// Provider-reported reasoning count; do not add it to output_tokens.
+  pub reasoning_tokens: Option<u64>,
+  /// Original usage object (not a duplicate of the entire assistant message).
+  pub native: Value,
+  pub timestamp: Option<String>,
+}
+
+/// Recognized non-conversation records. Unknown is reserved for unsupported or
+/// malformed shapes; metadata must only be emitted after shape validation.
+#[derive(Debug, Serialize)]
+pub struct MetadataEvent {
+  pub provider: Provider,
+  pub session_id: Option<String>,
+  pub kind: MetadataKind,
+  pub native_type: String,
+  pub summary: String,
+  pub native: Value,
+  pub timestamp: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataKind {
+  Session,
+  Configuration,
+  Context,
+  Queue,
+  Diagnostic,
+  Stream,
 }
 
 #[derive(Debug, Serialize)]

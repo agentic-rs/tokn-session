@@ -251,6 +251,7 @@ fn normalize_assistant_message(
       PiContentBlock::Thinking(content) => {
         if content.thinking.is_some() || content.thinking_signature.is_some() {
           events.push(AgentEvent::Reasoning(ReasoningEvent {
+            provenance: None,
             provider: Provider::Pi,
             session_id: session_id.clone(),
             message_id: meta.id.clone(),
@@ -356,6 +357,7 @@ fn message_event(
   timestamp: Option<String>,
 ) -> AgentEvent {
   AgentEvent::Message(MessageEvent {
+    provenance: None,
     provider: Provider::Pi,
     session_id,
     message_id: meta.id.clone(),
