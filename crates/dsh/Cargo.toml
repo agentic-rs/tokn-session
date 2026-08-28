@@ -1,0 +1,13 @@
+[package]
+name = "tokn-session-dsh"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+tokn-dsh-protocol.workspace = true
+tokn-session-core.workspace = true
+zstd = "0.13"
+
+[dev-dependencies]
+tempfile = "3"

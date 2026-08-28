@@ -29,7 +29,7 @@ The core abstraction is `AgentEvent`: provider-native historical sessions and li
 
 - The CLI binary is `tokn-session`.
 - Commands are top-level. Do not reintroduce a `sessions` namespace.
-- Supported sources today are `pi`, `codex`, and `opencode`.
+- Historical sources today are `pi`, `codex`, `opencode`, and `dsh`.
 - Current implemented commands are `list` and `show`.
 - Future likely commands are `create` and `attach`.
 - Provider-native events are normalized for display first; exact round-trip preservation is not a current goal.
@@ -42,6 +42,7 @@ The core abstraction is `AgentEvent`: provider-native historical sessions and li
 - `crates/pi-protocol`: tolerant, lossless wire types for persisted Pi session JSONL.
 - `crates/opencode-protocol`: tolerant, lossless wire types for OpenCode V1 payloads and run JSONL.
 - `crates/dsh-protocol`: tolerant, lossless wire types for persisted DeepSeek Harness session logs.
+- `crates/dsh`: read-only DSH JSONL/Zstandard session discovery and normalization.
 - `crates/client`: source dispatch and public client API.
 - `crates/cli`: argument parsing and terminal rendering.
 - `crates/pi`: Pi JSONL session source and normalization.

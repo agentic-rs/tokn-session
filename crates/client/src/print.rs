@@ -63,6 +63,9 @@ pub(crate) fn append_session(request: AppendSessionRequest) -> Result<(), String
 }
 
 fn run_print_session(request: PrintSessionRequest) -> Result<(), String> {
+  if request.source == Source::Dsh {
+    return Err("dsh currently supports historical list/show/browse only; create/append are not implemented".into());
+  }
   let executor = request
     .executor
     .or_else(|| executor_from_env(request.source))
@@ -92,12 +95,13 @@ fn run_print_session(request: PrintSessionRequest) -> Result<(), String> {
   ))
 }
 
-fn print_args(source: Source, action: &PrintAction) -> Vec<String> {
-  match source {
+fn print_args(source: Source, action: &PrintAction) -> Result<Vec<String>, String> {
+  Ok(match source {
+    Source::Dsh => return Err("dsh create/append are not implemented".into()),
     Source::Pi => pi_print_args(action),
     Source::Codex => codex_print_args(action),
     Source::OpenCode => opencode_print_args(action),
-  }
+  })
 }
 
 fn opencode_print_args(action: &PrintAction) -> Vec<String> {
@@ -197,7 +201,7 @@ fn print_argv(source: Source, executor: &str, action: &PrintAction) -> Result<Ve
       }
     }
   } else {
-    parts.extend(print_args(source, action));
+    parts.extend(print_args(source, action)?);
   }
 
   Ok(parts)

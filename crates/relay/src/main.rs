@@ -280,6 +280,7 @@ fn provider_name(provider: Provider) -> &'static str {
     Provider::Pi => "pi",
     Provider::Codex => "codex",
     Provider::OpenCode => "opencode",
+    Provider::Dsh => "dsh",
   }
 }
 

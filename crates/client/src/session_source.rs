@@ -3,12 +3,14 @@ use std::path::{Path, PathBuf};
 
 use tokn_session_codex::CodexSessionSource;
 use tokn_session_core::{LoadedSession, LoadedSessionTree, SessionRef};
+use tokn_session_dsh::DshSessionSource;
 use tokn_session_opencode::OpenCodeSessionSource;
 use tokn_session_pi::PiSessionSource;
 
 use crate::Source;
 
 pub(crate) enum SessionSourceClient {
+  Dsh(DshSessionSource),
   Codex(CodexSessionSource),
   OpenCode(OpenCodeSessionSource),
   Pi(PiSessionSource),
@@ -17,6 +19,7 @@ pub(crate) enum SessionSourceClient {
 impl SessionSourceClient {
   pub(crate) fn list_sessions(&self) -> Result<Vec<SessionRef>, String> {
     match self {
+      Self::Dsh(source) => source.list_sessions(),
       Self::Codex(source) => source.list_sessions(),
       Self::OpenCode(source) => source.list_sessions(),
       Self::Pi(source) => source.list_sessions(),
@@ -25,6 +28,7 @@ impl SessionSourceClient {
 
   pub(crate) fn list_session_relations(&self) -> Result<Vec<SessionRef>, String> {
     match self {
+      Self::Dsh(source) => source.list_session_relations(),
       Self::Codex(source) => source.list_session_relations(),
       Self::OpenCode(source) => source.list_sessions(),
       Self::Pi(source) => source.list_session_relations(),
@@ -33,6 +37,7 @@ impl SessionSourceClient {
 
   pub(crate) fn load_session(&self, session: &str) -> Result<LoadedSession, String> {
     match self {
+      Self::Dsh(source) => source.load_session(session),
       Self::Codex(source) => source.load_session(session),
       Self::OpenCode(source) => source.load_session(session),
       Self::Pi(source) => source.load_session(session),
@@ -41,6 +46,7 @@ impl SessionSourceClient {
 
   pub(crate) fn load_session_path(&self, path: &Path) -> Result<LoadedSession, String> {
     match self {
+      Self::Dsh(source) => source.load_session_path(path),
       Self::Codex(source) => source.load_session_path(path),
       Self::OpenCode(_) => {
         Err("opencode sessions are stored in sqlite; pass a session id and use --session-dir for the database".into())
@@ -98,6 +104,7 @@ impl SessionSourceClient {
 
   fn load_reference(&self, reference: &SessionRef) -> Result<LoadedSession, String> {
     match self {
+      Self::Dsh(source) => source.load_session_path(&reference.path),
       Self::Codex(source) => source.load_session_path(&reference.path),
       Self::OpenCode(source) => source.load_session_exact(&reference.id),
       Self::Pi(source) => source.load_session_path(&reference.path),
@@ -107,6 +114,7 @@ impl SessionSourceClient {
 
 pub(crate) fn session_source(source: Source, session_dir: Option<PathBuf>) -> Result<SessionSourceClient, String> {
   match source {
+    Source::Dsh => Ok(SessionSourceClient::Dsh(DshSessionSource::new(session_dir))),
     Source::Pi => Ok(SessionSourceClient::Pi(PiSessionSource::new(session_dir))),
     Source::Codex => Ok(SessionSourceClient::Codex(CodexSessionSource::new(session_dir))),
     Source::OpenCode => Ok(SessionSourceClient::OpenCode(OpenCodeSessionSource::new(session_dir))),

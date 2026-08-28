@@ -4,7 +4,7 @@ Read `AGENTS.md` first for the project goal, stable architecture, and working ru
 
 ## Current Status
 
-`tokn-session` can list and show existing sessions from Pi, Codex, and OpenCode.
+`tokn-session` can list and show existing sessions from Pi, Codex, OpenCode, and DSH.
 
 Implemented CLI:
 
@@ -262,6 +262,13 @@ the project.
 ## Provider Sources
 
 - Pi reads JSONL from `~/.pi/agent/sessions` unless `--session-dir` is passed.
+- DSH reads `session.jsonl` and `session.jsonl.zstd` recursively from
+  `$DSH_HOME/sessions` or `~/.dsh/sessions`, with `--session-dir` overriding it.
+  `show` accepts paths and exact/unambiguous-prefix IDs; `browse` and tree scope
+  also work. Compressed files support concatenated frames. Invalid JSON,
+  corrupt/truncated frames, invalid packed runs, and unsupported format versions
+  are reported, never repaired. This is historical-only; DSH SQLite, relay,
+  create/append, and input are not implemented.
 - Codex reads JSONL from `~/.codex/sessions` and `~/.codex/archived_sessions` unless `--session-dir` is passed.
 - OpenCode reads SQLite from `~/.local/share/opencode/opencode.db` unless `--session-dir` is passed.
 - OpenCode opens its database with a WAL-aware read-only SQLite URI so active WAL data is visible without application writes; if that cannot open, it falls back to immutable read-only mode. Viewing sessions never runs migrations.
@@ -422,8 +429,13 @@ Current browser keys:
 - DeepSeek Harness is pinned as the `vendor/dsh` source-of-truth submodule.
   `tokn-dsh-protocol` decodes its logical session records, including the core
   event envelope and packed chunk rows. It preserves plugin-defined events and
-  malformed known records losslessly. Zstandard/SQLite access, discovery, and
-  normalization remain future provider work.
+  malformed known records losslessly. `tokn-session-dsh` expands packed rows,
+  prefers assembled messages over redundant chunks, keeps unfinished deltas,
+  and correlates tool calls/results. Its output is a chronological log view,
+  not a reconstruction of the compacted model surface. Plugin/control records,
+  usage, and unsupported content remain native unknown events. Only explicit
+  subagents form tree relationships; their `seedLength` excludes inherited
+  parent history, while resume markers never hide their own earlier turns.
 - Codex `response_item.agent_message` and legacy
   `inter_agent_communication` records map to `agent_activity` with
   provider-supplied author and recipient paths. Paths remain null when the

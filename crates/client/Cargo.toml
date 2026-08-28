@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+tokn-session-dsh.workspace = true
 tokn-session-codex.workspace = true
 tokn-session-core.workspace = true
 tokn-session-opencode.workspace = true
 tokn-session-pi.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
