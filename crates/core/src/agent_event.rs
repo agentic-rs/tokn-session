@@ -143,6 +143,7 @@ pub struct UnknownEvent {
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
+  Dsh,
   Pi,
   Codex,
   #[serde(rename = "opencode")]

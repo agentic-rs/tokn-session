@@ -311,6 +311,7 @@ fn parse_source(value: &str) -> Result<Source, String> {
     "pi" => Ok(Source::Pi),
     "codex" => Ok(Source::Codex),
     "opencode" => Ok(Source::OpenCode),
+    "dsh" => Ok(Source::Dsh),
     _ => Err(format!("unknown source `{value}`")),
   }
 }
@@ -349,10 +350,10 @@ fn reject_show_scope(command: &str, scope: Option<ShowScope>) -> Result<(), Stri
 
 fn help() -> String {
   "usage:
-  tokn-session list [--source pi|codex|opencode] [--session-dir <dir>]
-  tokn-session list [--source pi|codex|opencode] [--limit <n>]
-  tokn-session show [--source pi|codex|opencode] [--format pretty|jsonl] [--scope self|tree] [--session-dir <dir>] <session-id-or-path>
-  tokn-session browse [--source pi|codex|opencode] [--session-dir <dir>] [session-id-or-path]
+  tokn-session list [--source pi|codex|opencode|dsh] [--session-dir <dir>]
+  tokn-session list [--source pi|codex|opencode|dsh] [--limit <n>]
+  tokn-session show [--source pi|codex|opencode|dsh] [--format pretty|jsonl] [--scope self|tree] [--session-dir <dir>] <session-id-or-path>
+  tokn-session browse [--source pi|codex|opencode|dsh] [--session-dir <dir>] [session-id-or-path]
   tokn-session create [--source pi|codex|opencode] [--executor <command>] [--cwd <dir>] <prompt>
   tokn-session append [--source pi|codex|opencode] [--executor <command>] [--cwd <dir>] (--continue|--session <id>) <prompt>"
     .to_string()

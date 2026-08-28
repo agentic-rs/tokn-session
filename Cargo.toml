@@ -8,6 +8,7 @@ members = [
   "crates/opencode-protocol",
   "crates/opencode",
   "crates/dsh-protocol",
+  "crates/dsh",
   "crates/client",
   "crates/render",
   "crates/cli",
@@ -35,6 +36,7 @@ tokn-pi-protocol = { path = "crates/pi-protocol" }
 tokn-session-client = { path = "crates/client" }
 tokn-session-codex = { path = "crates/codex" }
 tokn-session-core = { path = "crates/core" }
+tokn-session-dsh = { path = "crates/dsh" }
 tokn-session-opencode = { path = "crates/opencode" }
 tokn-session-pi = { path = "crates/pi" }
 tokn-session-relay = { path = "crates/relay" }

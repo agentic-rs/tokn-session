@@ -92,6 +92,33 @@ mod tests {
   use super::*;
 
   #[test]
+  fn loads_dsh_tree_without_forks_or_inherited_parent_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = include_str!("../../dsh/fixtures/basic/session.jsonl");
+    for (id, metadata) in [
+      ("root", ""),
+      (
+        "child",
+        ",\"parentSession\":\"root\",\"origin\":\"subagent\",\"seedLength\":2",
+      ),
+      ("fork", ",\"parentSession\":\"root\",\"seedLength\":2"),
+    ] {
+      let folder = dir.path().join(id);
+      std::fs::create_dir(&folder).unwrap();
+      let content = fixture
+        .replace("dsh-fixture", id)
+        .replace("\"delegationDepth\":0", &format!("\"delegationDepth\":0{metadata}"));
+      std::fs::write(folder.join("session.jsonl"), content).unwrap();
+    }
+    let path = dir.path().join("root/session.jsonl");
+    let tree = AgentClient::load_session_tree(Source::Dsh, Some(dir.path().into()), path.to_str().unwrap()).unwrap();
+    assert_eq!(tree.session.reference.id, "root");
+    assert_eq!(tree.children.len(), 1);
+    assert_eq!(tree.children[0].session.reference.id, "child");
+    assert_eq!(tree.children[0].session.reference.message_count, 3);
+  }
+
+  #[test]
   fn loads_codex_session_tree_recursively() {
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../codex/fixtures");
     let tree =

@@ -302,6 +302,16 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn rejects_dsh_watching_until_a_live_reader_exists() {
+    let config = RelayConfig::new(vec![ProviderRoot::new(Provider::Dsh, "unused".into())]);
+    let error = SessionRelay::new(config)
+      .await
+      .err()
+      .expect("DSH relay must be rejected");
+    assert!(error.contains("dsh relay watching is not implemented"));
+  }
+
+  #[tokio::test]
   async fn follows_appends_through_the_library_api() {
     let fixture = TempDir::new().unwrap();
     let path = fixture.path().join("session_test.jsonl");
