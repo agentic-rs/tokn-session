@@ -98,6 +98,11 @@ fn usage_prefers_assembled_snapshots_and_includes_cache_once() {
   let usage = &events[1];
   assert_eq!(usage["type"], "usage");
   assert_eq!(usage["input_tokens"], 33);
+  assert_eq!(usage["kind"], "model_call");
+  assert_eq!(
+    usage["total_tokens"],
+    usage["input_tokens"].as_u64().unwrap() + usage["output_tokens"].as_u64().unwrap()
+  );
   assert_eq!(usage["output_tokens"], 5);
   assert_eq!(usage["reasoning_tokens"], 2);
   assert_eq!(usage["message_id"], "message-1");

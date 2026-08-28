@@ -19,6 +19,22 @@ pub enum AgentEvent {
   Unknown(UnknownEvent),
 }
 
+impl AgentEvent {
+  /// Human-facing consumers honor explicit visibility even when a hidden Pi
+  /// extension message has an unsupported shape. Machine export stays lossless.
+  pub fn is_hidden(&self) -> bool {
+    match self {
+      Self::Message(event) => event.provenance.as_ref().and_then(|source| source.display) == Some(false),
+      Self::Reasoning(event) => event.provenance.as_ref().and_then(|source| source.display) == Some(false),
+      Self::Unknown(event) if matches!(event.provider, Provider::Pi) => event
+        .native
+        .as_ref()
+        .is_some_and(|native| native["type"] == "custom_message" && native["display"] == false),
+      _ => false,
+    }
+  }
+}
+
 #[derive(Debug, Serialize)]
 pub struct SessionStarted {
   pub provider: Provider,
@@ -142,6 +158,11 @@ pub struct ErrorEvent {
 #[derive(Clone, Debug, Serialize)]
 pub struct MessageProvenance {
   pub source: Value,
+  /// Explicit provider visibility; absent means visible. JSONL retains content.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub display: Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub native: Option<Value>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub surface_op: Option<Value>,
   #[serde(skip_serializing_if = "Option::is_none")]
@@ -180,17 +201,30 @@ pub enum LifecycleOutcome {
   TokenLimit,
 }
 
-/// Usage for one model call, never a running session total.
+/// Accounting scope is explicit: session snapshots replace rather than add.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageKind {
+  ModelCall,
+  OperationTotal,
+  SessionSnapshot,
+}
+
 #[derive(Debug, Serialize)]
 pub struct UsageEvent {
+  pub kind: UsageKind,
   pub provider: Provider,
   pub session_id: Option<String>,
   pub turn_id: Option<String>,
   pub step_id: Option<String>,
   pub message_id: Option<String>,
+  /// Provider record identity when available, including non-message operations.
+  pub record_id: Option<String>,
   /// Total input, including cache reads and writes. Cache fields are subsets.
   pub input_tokens: u64,
   pub output_tokens: u64,
+  /// Total when known; native estimates need not equal the sum of the counters.
+  pub total_tokens: Option<u64>,
   pub cache_read_tokens: Option<u64>,
   pub cache_write_tokens: Option<u64>,
   /// Provider-reported reasoning count; do not add it to output_tokens.

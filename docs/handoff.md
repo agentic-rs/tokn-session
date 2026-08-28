@@ -340,10 +340,12 @@ Current event families include:
 - `error`
 - `unknown`
 
-DSH uses the shared lifecycle, per-call usage, metadata, and message provenance
-contracts described in `docs/event-ir.md`. Lifecycle/usage/metadata render as
-compact lines; expanded browser rows and JSONL preserve native details.
-Other providers' lifecycle/usage mappings are unchanged in this iteration.
+DSH, Pi, and Codex use the accounting/metadata contracts in `docs/event-ir.md`.
+Usage distinguishes model calls, operation totals, and replaceable session
+snapshots. DSH still owns lifecycle adoption. Compact human output labels the
+usage scope; expanded browser rows and JSONL preserve native details except
+explicitly hidden Pi content, which is available only in JSONL. Terminal Pet
+ignores accounting/metadata/hidden content for activity and lease handling.
 
 Messages carry an orthogonal `delivery` field: `commentary`, `final`, or
 `unspecified`. Codex preserves the provider's response phase. Pi and OpenCode
@@ -427,10 +429,12 @@ Current browser keys:
 - Pi native JSONL parsing uses `tokn-pi-protocol`. Unknown message roles such
   as historical `bashExecution` records remain visible without preventing the
   rest of the session from loading.
-- Pi compaction, branch-summary, extension, label, session-info, leaf, and
-  active-tool records are typed at the wire boundary but remain visible
-  as native `unknown` events until the display IR has a useful semantic
-  mapping.
+- Pi compaction, branch-summary, opaque extension state, label, session-info,
+  leaf, and active-tool records are validated metadata. Extension context
+  messages have system role and explicit provenance/visibility; hidden content
+  is redacted from human views and does not displace replayed visible messages.
+  Assistant usage is per-call; tool-result and summary usage are operation
+  totals. Cached input is included once; native costs remain inspectable.
 - Codex native JSONL parsing uses `tokn-codex-protocol`. New rollout and
   response tags retain their native identity and payload for unknown-event
   discovery instead of being erased by an upstream catch-all enum.
@@ -453,9 +457,12 @@ Current browser keys:
   `inter_agent_communication` records map to `agent_activity` with
   provider-supplied author and recipient paths. Paths remain null when the
   record does not supply them.
-- Codex `world_state`, `turn_context`, and
-  `inter_agent_communication_metadata` are known control records and are not
-  emitted into the display-oriented event stream.
+- Codex `world_state`, `turn_context`, `inter_agent_communication_metadata`,
+  compaction, and rollback records are metadata, not conversation replies.
+  `token_count` emits replaceable usage snapshots with consecutive identical
+  info suppressed; decreases and context estimates are not rewritten as deltas.
+  Missing usage and changed rate limits are diagnostic metadata. Historical
+  subagent filtering still excludes copied parent context/accounting.
 - Codex `event_msg.thread_goal_updated` maps to the visible `goal_updated` IR event.
 - Codex `event_msg.thread_settings_applied` is a full effective snapshot, not a
   diff. Repeated applications remain visible in the event stream.
@@ -524,5 +531,7 @@ cd apps/terminal-pet && bun run snapshot
 - Decide whether live stream consumption should live in `client` as callbacks/iterators or in the CLI command path.
 - Extend provider fixture coverage with OpenCode SQLite normalization.
 - Add CLI golden tests for tiny fixture-backed `list` and `show` outputs.
-- Map other providers into the new lifecycle/usage IR, add input-request events,
-  then teach terminal pet to use authoritative lifecycle instead of heuristics.
+- Map Codex lifecycle next and teach terminal pet to use authoritative lifecycle
+  instead of heuristics. Pi live boundaries require a bridge feature; do not
+  infer them from historical assistant/tool records. OpenCode accounting and
+  input-request events remain follow-ups.

@@ -172,6 +172,20 @@ export class PetStore {
   }
 
   ingest(relay: RelayEvent, nowMs = Date.now()): void {
+    // Accounting and context updates are observations, not user/agent activity.
+    // Ignoring them here also avoids creating a new focus row from metadata alone.
+    if (
+      relay.event.type === "usage"
+      || relay.event.type === "metadata"
+      || asObject(relay.event.provenance)?.display === false
+      || (
+        relay.event.provider === "pi"
+        && asObject(relay.event.native)?.type === "custom_message"
+        && asObject(relay.event.native)?.display === false
+      )
+    ) {
+      return;
+    }
     const eventAt = eventOccurredAt(relay.event, nowMs);
     const activity = this.sessions.get(relay.topic)
       ?? newSessionActivity(relay, eventAt);

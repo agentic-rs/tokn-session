@@ -4,7 +4,7 @@ use serde_json::Value;
 use tokn_session_core::{
   AgentActivity, AgentEvent, LifecycleEvent, LifecycleOutcome, LifecycleScope, LiveSessionEvent, LoadedSession,
   LoadedSessionTree, Phase, Role, SessionHistoryStatus, SessionRef, SessionSettingsApplied, ToolCallEvent, ToolKind,
-  ToolSummary, UsageEvent,
+  ToolSummary, UsageEvent, UsageKind,
 };
 
 pub struct EventDisplay {
@@ -14,6 +14,13 @@ pub struct EventDisplay {
 }
 
 pub fn display_event(event: &AgentEvent) -> EventDisplay {
+  if event.is_hidden() {
+    return EventDisplay {
+      kind: event_type(event),
+      summary: render_event_summary(event),
+      detail: render_event_pretty(event),
+    };
+  }
   let mut detail = render_event_pretty(event);
   // Browser expansion is explicit inspection; linear pretty output stays compact.
   let native = match event {
@@ -211,6 +218,9 @@ fn render_session_tree_node(output: &mut String, tree: &LoadedSessionTree, depth
 }
 
 pub fn render_event_pretty(event: &AgentEvent) -> String {
+  if event.is_hidden() {
+    return "[hidden provider content]\n\n".into();
+  }
   let mut output = String::new();
   match event {
     AgentEvent::SessionStarted(_) => {}
@@ -296,6 +306,9 @@ pub fn render_event_pretty(event: &AgentEvent) -> String {
 }
 
 pub fn render_event_summary(event: &AgentEvent) -> String {
+  if event.is_hidden() {
+    return "[hidden provider content]".into();
+  }
   match event {
     AgentEvent::SessionStarted(event) => format!("session started {}", event.session_id),
     AgentEvent::ProviderChanged(event) => {
@@ -392,8 +405,14 @@ fn render_lifecycle(event: &LifecycleEvent) -> String {
 }
 
 fn render_usage(event: &UsageEvent) -> String {
-  let mut summary = format!("[usage] input={} output={}", event.input_tokens, event.output_tokens);
+  let label = match event.kind {
+    UsageKind::ModelCall => "usage",
+    UsageKind::OperationTotal => "usage operation total",
+    UsageKind::SessionSnapshot => "usage session snapshot",
+  };
+  let mut summary = format!("[{label}] input={} output={}", event.input_tokens, event.output_tokens);
   for (label, value) in [
+    ("total", event.total_tokens),
     ("cache_read", event.cache_read_tokens),
     ("cache_write", event.cache_write_tokens),
     ("reasoning", event.reasoning_tokens),
@@ -994,14 +1013,17 @@ mod tests {
 
   #[test]
   fn usage_renders_normalized_totals_without_summing_subsets() {
-    let event = AgentEvent::Usage(UsageEvent {
+    let mut event = AgentEvent::Usage(UsageEvent {
+      kind: UsageKind::ModelCall,
       provider: Provider::Dsh,
       session_id: Some("session".into()),
       turn_id: Some("1".into()),
       step_id: Some("1".into()),
       message_id: None,
+      record_id: None,
       input_tokens: 33,
       output_tokens: 5,
+      total_tokens: Some(38),
       cache_read_tokens: Some(20),
       cache_write_tokens: Some(3),
       reasoning_tokens: Some(2),
@@ -1010,10 +1032,56 @@ mod tests {
     });
     assert_eq!(
       render_event_summary(&event),
-      "[usage] input=33 output=5 cache_read=20 cache_write=3 reasoning=2"
+      "[usage] input=33 output=5 total=38 cache_read=20 cache_write=3 reasoning=2"
     );
     assert_eq!(display_event(&event).kind, "usage");
     assert!(display_event(&event).detail.contains("inputTokens"));
+    if let AgentEvent::Usage(usage) = &mut event {
+      usage.kind = UsageKind::SessionSnapshot;
+    }
+    assert!(render_event_summary(&event).starts_with("[usage session snapshot]"));
+    if let AgentEvent::Usage(usage) = &mut event {
+      usage.kind = UsageKind::OperationTotal;
+    }
+    assert!(render_event_summary(&event).starts_with("[usage operation total]"));
+  }
+
+  #[test]
+  fn hidden_content_is_redacted_in_all_human_views_but_retained_in_jsonl() {
+    let native = json!({"type":"custom_message","customType":"extension","display":false,"content":"secret content"});
+    let events = vec![
+      AgentEvent::Message(MessageEvent {
+        provider: Provider::Pi,
+        session_id: None,
+        message_id: None,
+        parent_id: None,
+        role: Role::System,
+        delivery: MessageDelivery::Unspecified,
+        phase: Phase::Finished,
+        text: "secret content".into(),
+        timestamp: None,
+        provenance: Some(tokn_session_core::MessageProvenance {
+          source: json!({"kind":"extension"}),
+          display: Some(false),
+          native: Some(native.clone()),
+          surface_op: None,
+          source_event_seqs: None,
+        }),
+      }),
+      AgentEvent::Unknown(tokn_session_core::UnknownEvent {
+        provider: Provider::Pi,
+        session_id: None,
+        native_type: Some("custom_message".into()),
+        native: Some(native),
+        timestamp: None,
+      }),
+    ];
+    for event in &events {
+      assert_eq!(render_event_summary(event), "[hidden provider content]");
+      assert_eq!(render_event_pretty(event), "[hidden provider content]\n\n");
+      assert!(!display_event(event).detail.contains("secret"));
+    }
+    assert!(render_agent_jsonl(&events).unwrap().contains("secret content"));
   }
 
   #[test]

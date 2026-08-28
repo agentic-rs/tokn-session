@@ -637,7 +637,9 @@ fn retain_message_history(events: &mut Vec<RelayEvent>, message_count: usize) {
   let message_indices = events
     .iter()
     .enumerate()
-    .filter_map(|(index, event)| matches!(event.event, AgentEvent::Message(_)).then_some(index))
+    .filter_map(|(index, event)| {
+      (matches!(event.event, AgentEvent::Message(_)) && !event.event.is_hidden()).then_some(index)
+    })
     .collect::<Vec<_>>();
   if message_indices.len() <= message_count {
     return;
@@ -1202,16 +1204,19 @@ mod tests {
         "{\"type\":\"message\",\"id\":\"3\",\"message\":{\"role\":\"user\",\"content\":\"three\"}}\n",
         "{\"type\":\"error\",\"message\":\"inside window\"}\n",
         "{\"type\":\"message\",\"id\":\"4\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"four\"}]}}\n",
+        "{\"type\":\"custom_message\",\"id\":\"hidden\",\"parentId\":\"4\",\"timestamp\":\"2026-01-01\",\"customType\":\"plugin\",\"display\":false,\"content\":\"hidden\"}\n",
         "{\"type\":\"message\",\"id\":\"5\",\"message\":{\"role\":\"user\",\"content\":\"five\"}}\n"
       ),
     )
     .unwrap();
 
     let update = tailer.scan_paths(HashSet::from([path])).unwrap();
-    assert_eq!(update.events.len(), 4);
+    assert_eq!(update.events.len(), 5);
+    assert_eq!(update.events.iter().filter(|event| event.event.is_hidden()).count(), 1);
     let texts = update
       .events
       .iter()
+      .filter(|event| !event.event.is_hidden())
       .filter_map(|event| match &event.event {
         AgentEvent::Message(message) => Some(message.text.as_str()),
         _ => None,
@@ -1224,6 +1229,37 @@ mod tests {
         .iter()
         .any(|event| matches!(event.event, AgentEvent::Error(_)))
     );
+  }
+
+  #[test]
+  fn codex_tail_starts_with_a_snapshot_without_replaying_previous_accounting() {
+    let fixture = TempDir::new().unwrap();
+    let path = fixture.path().join("rollout-usage.jsonl");
+    let counters = serde_json::json!({"input_tokens":100,"cached_input_tokens":20,
+      "output_tokens":5,"reasoning_output_tokens":2,"total_tokens":105});
+    let record = serde_json::json!({"type":"event_msg","payload":{"type":"token_count",
+      "info":{"total_token_usage":counters,"last_token_usage":counters},"rate_limits":null}});
+    let accounting_line = format!("{record}\n");
+    std::fs::write(
+      &path,
+      format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"accounting-session\"}}}}\n{accounting_line}"),
+    )
+    .unwrap();
+    let (mut tailer, initial) = SessionTailer::initialize(
+      vec![ProviderRoot::new(Provider::Codex, fixture.path().to_path_buf())],
+      NewFileReplay::Messages(3),
+    )
+    .unwrap();
+    assert!(initial.events.is_empty());
+    append(&path, &accounting_line);
+    append(&path, &accounting_line);
+    let update = tailer.scan_paths(HashSet::from([path])).unwrap();
+    assert!(update.warnings.is_empty());
+    assert_eq!(update.events.len(), 1);
+    assert_eq!(update.events[0].topic, "codex.accounting-session");
+    assert!(matches!(&update.events[0].event, AgentEvent::Usage(event)
+      if event.kind == tokn_session_core::UsageKind::SessionSnapshot
+        && event.input_tokens == 100 && event.total_tokens == Some(105)));
   }
 
   #[test]

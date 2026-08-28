@@ -15,6 +15,28 @@ const policy = {
 };
 
 describe("PetStore", () => {
+  test("passive records and hidden messages do not change activity or renew leases", () => {
+    const store = new PetStore(policy);
+    const passive = [
+      { type: "metadata", native_type: "compacted", summary: "context summary" },
+      { type: "usage", kind: "session_snapshot", input_tokens: 100 },
+      { type: "message", role: "user", phase: "finished", text: "hidden", provenance: { display: false } },
+      { type: "unknown", provider: "pi", native: { type: "custom_message", display: false, content: "hidden" } }
+    ];
+    for (const event of passive) {
+      store.ingest(relayEvent(event), 0);
+    }
+    expect(store.snapshot(0).sessions).toHaveLength(0);
+
+    store.ingest(relayEvent({ type: "message", role: "user", phase: "finished", text: "real work" }), 0);
+    const before = store.snapshot(1);
+    for (const event of passive) {
+      store.ingest(relayEvent(event), 50);
+    }
+    expect(store.snapshot(50)).toEqual(before);
+    expect(store.snapshot(101).state).toBe("idle");
+  });
+
   test("moves from user work to debounced ready and then idle", () => {
     const store = new PetStore(policy);
     store.ingest(relayEvent({

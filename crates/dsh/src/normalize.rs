@@ -7,7 +7,7 @@ use tokn_dsh_protocol::{
 use tokn_session_core::{
   AgentEvent, ErrorEvent, LifecycleEvent, LifecycleOutcome, LifecycleScope, MessageDelivery, MessageEvent,
   MessageProvenance, MetadataEvent, MetadataKind, Phase, Provider, ProviderChanged, ReasoningEvent, Role,
-  SessionStarted, ToolCallEvent, UnknownEvent, UsageEvent, tool_kind_for_optional_name, tool_summary_for_io,
+  SessionStarted, ToolCallEvent, UnknownEvent, UsageEvent, UsageKind, tool_kind_for_optional_name, tool_summary_for_io,
 };
 
 /// Historical log view, not a reconstruction of the compacted model surface.
@@ -356,6 +356,8 @@ impl Normalizer {
     };
     let provenance = MessageProvenance {
       source: message["source"].clone(),
+      display: None,
+      native: None,
       surface_op: native.get("surfaceOp").cloned(),
       source_event_seqs: native
         .get("sourceEventSeqs")
@@ -512,13 +514,16 @@ impl Normalizer {
       &native["data"]["chunk"]["usage"]
     };
     AgentEvent::Usage(UsageEvent {
+      kind: UsageKind::ModelCall,
       provider: Provider::Dsh,
       session_id: Some(self.session_id.clone()),
       turn_id: Some(step.0.to_string()),
       step_id: Some(step.1.to_string()),
       message_id,
+      record_id: native.get("seq").and_then(Value::as_u64).map(|seq| seq.to_string()),
       input_tokens,
       output_tokens: usage.output_tokens,
+      total_tokens: input_tokens.checked_add(usage.output_tokens),
       cache_read_tokens: usage.cache_read_tokens,
       cache_write_tokens: usage.cache_write_tokens,
       reasoning_tokens: usage.reasoning_tokens,

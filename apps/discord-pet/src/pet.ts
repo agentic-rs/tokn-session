@@ -115,6 +115,7 @@ function publishedKind(relay: RelayEvent): PublishedKind | undefined {
   if (
     relay.event.type !== "message"
     || asString(relay.event.phase) !== "finished"
+    || asObject(relay.event.provenance)?.display === false
   ) {
     return undefined;
   }
