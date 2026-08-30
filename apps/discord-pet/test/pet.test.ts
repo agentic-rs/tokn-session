@@ -17,6 +17,23 @@ afterEach(async () => {
 });
 
 describe("DiscordPet", () => {
+  test("does not publish metadata or extension messages, including hidden user-shaped messages", async () => {
+    const fixture = await temporaryDirectory();
+    const api = new FakeDiscord();
+    const pet = await DiscordPet.create(api, "channel", join(fixture, "state.json"));
+    for (const event of [
+      { type: "metadata", native_type: "compacted", summary: "summary" },
+      { type: "usage", kind: "session_snapshot" },
+      { role: "system", text: "extension text", provenance: { display: true } },
+      { role: "user", text: "hidden extension", provenance: { display: false } },
+      { role: "assistant", delivery: "final", text: "hidden final", provenance: { display: false } }
+    ]) {
+      await pet.process(relayEvent({ phase: "finished", ...event }));
+    }
+    expect(api.messages).toHaveLength(0);
+    expect(api.threads).toHaveLength(0);
+  });
+
   test("publishes only root user and final messages", async () => {
     const fixture = await temporaryDirectory();
     const api = new FakeDiscord();

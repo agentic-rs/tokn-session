@@ -26,9 +26,20 @@ fn lists_dsh_and_renders_pretty_and_jsonl() {
   let pretty = run(&["show", "--source", "dsh", "dsh-fixture"]);
   assert!(pretty.contains("All done."));
   assert!(pretty.contains("guide.md"));
+  assert!(pretty.contains("[turn 1] completed"));
+  assert!(pretty.contains("[turn 1 step 1] ended"));
+  assert!(pretty.contains("[usage] input=10 output=3"));
+  assert!(pretty.contains("[session/title] title: Reading a guide"));
+  assert!(!pretty.contains("unknown turn/start"));
+  assert!(!pretty.contains("assistant/message.usage"));
+  assert!(pretty.contains("unknown plugin/future"));
+  assert!(pretty.contains("unknown user/message"));
   let jsonl = run(&["show", "--source", "dsh", "dsh-fixture", "--format", "jsonl"]);
   let events: Vec<Value> = jsonl.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
   assert!(events.iter().all(|event| event["provider"] == "dsh"));
+  assert_eq!(events.iter().filter(|event| event["type"] == "unknown").count(), 2);
+  assert_eq!(events.iter().filter(|event| event["type"] == "usage").count(), 1);
+  assert_eq!(events.iter().filter(|event| event["type"] == "lifecycle").count(), 8);
   assert_eq!(
     events
       .iter()

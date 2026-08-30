@@ -1348,6 +1348,7 @@ dependencies = [
 name = "tokn-session-dsh"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
  "tempfile",
  "tokn-dsh-protocol",

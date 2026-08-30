@@ -51,6 +51,7 @@ mod tests {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let event = AgentEvent::Message(MessageEvent {
+      provenance: None,
       provider: Provider::Pi,
       session_id: Some("session-1".to_string()),
       message_id: Some("message-1".to_string()),

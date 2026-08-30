@@ -3,7 +3,7 @@ use serde_json::Value;
 use crate::event::{PiContentBlock, PiMessage, PiMessageItem, PiSessionItem, PiSessionLine, PiUserContent};
 use tokn_session_core::{
   AgentEvent, ErrorEvent, MessageDelivery, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role,
-  SessionStarted, ToolCallEvent, UnknownEvent, tool_kind_for_name, tool_summary_for_input,
+  SessionStarted, ToolCallEvent, UnknownEvent, UsageKind, tool_kind_for_name, tool_summary_for_input,
 };
 
 pub struct PiNormalizer {
@@ -75,12 +75,9 @@ impl PiNormalizer {
       | PiSessionItem::Label(_)
       | PiSessionItem::SessionInfo(_)
       | PiSessionItem::Leaf(_)
-      | PiSessionItem::ActiveToolsChange(_) => vec![unknown_event(
-        self.session_id.clone(),
-        native_type(&native),
-        Some(native),
-        line_timestamp,
-      )],
+      | PiSessionItem::ActiveToolsChange(_) => {
+        crate::records::normalize(self.session_id.clone(), native, line_timestamp)
+      }
       PiSessionItem::Unknown(event) => vec![unknown_event(
         self.session_id.clone(),
         event.native_type,
@@ -112,7 +109,27 @@ fn normalize_message(
     )];
   };
 
-  match message {
+  let usage_kind = match &message {
+    PiMessage::Assistant(_) => Some(UsageKind::ModelCall),
+    PiMessage::ToolResult(_) => Some(UsageKind::OperationTotal),
+    _ => None,
+  };
+  let accounting = usage_kind.and_then(|kind| {
+    native["message"]
+      .get("usage")
+      .filter(|value| !value.is_null())
+      .map(|usage| {
+        crate::records::usage(
+          session_id.clone(),
+          meta.id.clone(),
+          true,
+          kind,
+          usage.clone(),
+          meta.timestamp.clone(),
+        )
+      })
+  });
+  let mut events = match message {
     PiMessage::User(message) => normalize_user_message(session_id, &meta, message),
     PiMessage::Assistant(message) => normalize_assistant_message(session_id, &meta, message),
     PiMessage::ToolResult(message) => normalize_tool_result_message(session_id, &meta, message),
@@ -125,7 +142,16 @@ fn normalize_message(
       Some(message.native),
       meta.timestamp,
     )],
+  };
+  if let Some(accounting) = accounting {
+    // A usage-only assistant record is still useful; don't manufacture unknown
+    // content for a valid empty response. Unsupported content remains visible.
+    if matches!(accounting, AgentEvent::Usage(_)) && native["message"]["content"] == serde_json::json!([]) {
+      events.retain(|event| !matches!(event, AgentEvent::Unknown(event) if event.native.is_none()));
+    }
+    events.push(accounting);
   }
+  events
 }
 
 struct PiMessageMeta {
@@ -251,6 +277,7 @@ fn normalize_assistant_message(
       PiContentBlock::Thinking(content) => {
         if content.thinking.is_some() || content.thinking_signature.is_some() {
           events.push(AgentEvent::Reasoning(ReasoningEvent {
+            provenance: None,
             provider: Provider::Pi,
             session_id: session_id.clone(),
             message_id: meta.id.clone(),
@@ -356,6 +383,7 @@ fn message_event(
   timestamp: Option<String>,
 ) -> AgentEvent {
   AgentEvent::Message(MessageEvent {
+    provenance: None,
     provider: Provider::Pi,
     session_id,
     message_id: meta.id.clone(),
@@ -422,10 +450,6 @@ fn prefixed_type(prefix: &str, native_type: Option<&str>) -> Option<String> {
     Some(native_type) => format!("{prefix}.{native_type}"),
     None => prefix.to_string(),
   })
-}
-
-fn native_type(value: &Value) -> Option<String> {
-  value.get("type").and_then(Value::as_str).map(str::to_string)
 }
 
 fn json_value(value: impl serde::Serialize) -> Value {

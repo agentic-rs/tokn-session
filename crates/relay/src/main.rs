@@ -317,6 +317,9 @@ fn event_timestamp(event: &tokn_session_core::AgentEvent) -> Option<&str> {
     AgentEvent::ToolCall(event) => event.timestamp.as_deref(),
     AgentEvent::Error(event) => event.timestamp.as_deref(),
     AgentEvent::Unknown(event) => event.timestamp.as_deref(),
+    AgentEvent::Lifecycle(event) => event.timestamp.as_deref(),
+    AgentEvent::Usage(event) => event.timestamp.as_deref(),
+    AgentEvent::Metadata(event) => event.timestamp.as_deref(),
   }
 }
 
@@ -362,7 +365,8 @@ fn event_color(event: &tokn_session_core::AgentEvent) -> &'static str {
     AgentEvent::ToolCall(event) if event.is_error == Some(true) => ANSI_BOLD_RED,
     AgentEvent::ToolCall(_) => ANSI_YELLOW,
     AgentEvent::Error(_) => ANSI_BOLD_RED,
-    AgentEvent::Unknown(_) => ANSI_DIM,
+    AgentEvent::Unknown(_) | AgentEvent::Usage(_) | AgentEvent::Metadata(_) => ANSI_DIM,
+    AgentEvent::Lifecycle(_) => ANSI_BLUE,
   }
 }
 
@@ -884,6 +888,7 @@ mod tests {
       topic: "pi.session-1".to_string(),
       session: session_context(),
       event: AgentEvent::Message(MessageEvent {
+        provenance: None,
         provider: Provider::Pi,
         session_id: Some("session-1".to_string()),
         message_id: Some("message-1".to_string()),

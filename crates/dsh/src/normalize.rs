@@ -1,10 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
-use tokn_dsh_protocol::{ContentBlock, DshSessionItem, DshSessionLine, SessionEvent, SessionHeader, StreamChunk};
+use tokn_dsh_protocol::{
+  ContentBlock, DshSessionItem, DshSessionLine, SessionEvent, SessionHeader, StreamChunk, SurfaceOp, TokenUsage,
+};
 use tokn_session_core::{
-  AgentEvent, ErrorEvent, MessageDelivery, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role,
-  SessionStarted, ToolCallEvent, UnknownEvent, tool_kind_for_optional_name, tool_summary_for_io,
+  AgentEvent, ErrorEvent, LifecycleEvent, LifecycleOutcome, LifecycleScope, MessageDelivery, MessageEvent,
+  MessageProvenance, MetadataEvent, MetadataKind, Phase, Provider, ProviderChanged, ReasoningEvent, Role,
+  SessionStarted, ToolCallEvent, UnknownEvent, UsageEvent, UsageKind, tool_kind_for_optional_name, tool_summary_for_io,
 };
 
 /// Historical log view, not a reconstruction of the compacted model surface.
@@ -14,13 +17,36 @@ pub(crate) fn normalize(header: &SessionHeader, lines: Vec<DshSessionLine>) -> V
   let mut state = Normalizer {
     session_id: header.id.clone(),
     assembled: HashSet::new(),
+    usage_records: HashMap::new(),
     calls: HashMap::new(),
     emitted_calls: HashSet::new(),
   };
+  // Stream usage is a per-call snapshot, not an additive delta. Keep the last
+  // snapshot unless an assembled message supplies the authoritative usage.
   for line in &lines {
+    if !valid_surface(line.native()) {
+      continue;
+    }
+    if let DshSessionItem::Event(SessionEvent::AssistantChunk(event)) = line.item()
+      && matches!(event.data.chunk, StreamChunk::Usage(_))
+    {
+      state
+        .usage_records
+        .insert((event.data.turn, event.data.step), event.seq);
+    }
+  }
+  for line in &lines {
+    if !valid_surface(line.native()) {
+      continue;
+    }
     match line.item() {
       DshSessionItem::Event(SessionEvent::AssistantMessage(event)) => {
         state.assembled.insert((event.data.turn, event.data.step));
+        if event.data.usage.is_some() {
+          state
+            .usage_records
+            .insert((event.data.turn, event.data.step), event.seq);
+        }
       }
       DshSessionItem::Event(SessionEvent::ToolCall(event)) => {
         state.calls.insert(
@@ -48,6 +74,7 @@ type CallKey = (u64, u64, String);
 struct Normalizer {
   session_id: String,
   assembled: HashSet<(u64, u64)>,
+  usage_records: HashMap<(u64, u64), u64>,
   calls: HashMap<CallKey, (String, Value)>,
   emitted_calls: HashSet<CallKey>,
 }
@@ -60,7 +87,13 @@ impl Normalizer {
       .and_then(Value::as_i64)
       .map(|time| time.to_string());
     let (item, native) = line.into_parts();
+    if !valid_surface(&native) {
+      return vec![self.unknown(native, time)];
+    }
     let DshSessionItem::Event(event) = item else {
+      if let Some((kind, summary)) = super::metadata::classify(&native) {
+        return vec![self.metadata(kind, summary, native, time)];
+      }
       return vec![self.unknown(native, time)];
     };
     match event {
@@ -78,13 +111,20 @@ impl Normalizer {
         self.message(&event.data.id, &event.data.role, event.data.content, None, native, time)
       }
       SessionEvent::AssistantMessage(event) => {
-        let usage = event.data.usage.as_ref().map(|_| {
-          json!({
-            "type": "assistant/message.usage", "seq": event.seq,
-            "turn": event.data.turn, "step": event.data.step,
-            "message_id": event.data.message.id, "usage": native["data"]["usage"]
-          })
-        });
+        let step = (event.data.turn, event.data.step);
+        let usage = event
+          .data
+          .usage
+          .filter(|_| self.usage_records.get(&step) == Some(&event.seq))
+          .map(|usage| {
+            self.usage(
+              step,
+              Some(event.data.message.id.clone()),
+              usage,
+              native.clone(),
+              time.clone(),
+            )
+          });
         let mut events = self.message(
           &event.data.message.id,
           &event.data.message.role,
@@ -94,7 +134,7 @@ impl Normalizer {
           time.clone(),
         );
         if let Some(usage) = usage {
-          events.push(self.unknown(usage, time));
+          events.push(usage);
         }
         events
       }
@@ -149,12 +189,23 @@ impl Normalizer {
         let step = (event.data.turn, event.data.step);
         match event.data.chunk {
           StreamChunk::Unknown(_) => vec![self.unknown(native, time)],
-          StreamChunk::BlockEnd(ref chunk) if matches!(chunk.block, ContentBlock::Unknown(_)) => {
+          StreamChunk::BlockEnd(ref chunk)
+            if matches!(chunk.block, ContentBlock::Unknown(_) | ContentBlock::Image(_)) =>
+          {
             vec![self.unknown(native, time)]
           }
-          // Usage and failures have no dedicated IR yet; retain the whole
-          // record rather than discarding provider facts.
-          StreamChunk::Usage(_) => vec![self.unknown(native, time)],
+          StreamChunk::Usage(usage) => {
+            if self.usage_records.get(&step) == Some(&event.seq) {
+              vec![self.usage(step, None, usage.usage, native, time)]
+            } else {
+              vec![]
+            }
+          }
+          StreamChunk::BlockStart(ref chunk)
+            if !matches!(chunk.block_type.as_str(), "text" | "reasoning" | "tool-call") =>
+          {
+            vec![self.unknown(native, time)]
+          }
           StreamChunk::Finish(chunk) if !matches!(chunk.reason.kind.as_str(), "stop" | "tool-calls" | "max-tokens") => {
             vec![self.unknown(native, time)]
           }
@@ -168,34 +219,68 @@ impl Normalizer {
             time,
           )],
           StreamChunk::ReasoningDelta(chunk) => vec![self.reasoning(None, Phase::Delta, chunk.text, time)],
-          // Without an assembled message, raw tool fragments/block boundaries
-          // remain visible and do not pretend to be completed tool calls.
-          _ => vec![self.unknown(native, time)],
+          // Known incomplete stream structure is inspectable metadata, not a
+          // fabricated completed message/tool call or an unknown wire shape.
+          _ => vec![self.metadata(MetadataKind::Stream, "partial assistant stream".into(), native, time)],
         }
       }
-      SessionEvent::TurnEnd(event) if event.data.reason.kind == "error" => {
-        let message = event
-          .data
-          .reason
-          .extra
-          .get("error")
-          .and_then(|error| error.get("message"))
-          .and_then(Value::as_str)
-          .unwrap_or("DSH turn failed")
-          .to_string();
-        vec![
-          AgentEvent::Error(ErrorEvent {
+      SessionEvent::TurnStart(event) => vec![self.lifecycle(event.data.turn, None, Phase::Started, None, native, time)],
+      SessionEvent::StepStart(event) => vec![self.lifecycle(
+        event.data.turn,
+        Some(event.data.step),
+        Phase::Started,
+        None,
+        native,
+        time,
+      )],
+      SessionEvent::StepEnd(event) => vec![self.lifecycle(
+        event.data.turn,
+        Some(event.data.step),
+        Phase::Finished,
+        None,
+        native,
+        time,
+      )],
+      SessionEvent::TurnEnd(event) => {
+        let reason = &native["data"]["reason"];
+        let outcome = match event.data.reason.kind.as_str() {
+          "completed" => LifecycleOutcome::Completed,
+          "aborted" if valid_cancel_cause(&reason["reason"]) => LifecycleOutcome::Cancelled,
+          "interrupted" => LifecycleOutcome::Interrupted,
+          "blocked" => LifecycleOutcome::Blocked,
+          "max-tokens" => LifecycleOutcome::TokenLimit,
+          "error" if reason["error"]["message"].is_string() && reason["error"]["code"].is_string() => {
+            LifecycleOutcome::Failed
+          }
+          _ => return vec![self.unknown(native, time)],
+        };
+        let mut events = Vec::new();
+        if matches!(outcome, LifecycleOutcome::Failed) {
+          events.push(AgentEvent::Error(ErrorEvent {
             provider: Provider::Dsh,
             session_id: Some(self.session_id.clone()),
-            message,
+            message: reason["error"]["message"].as_str().unwrap().to_string(),
             timestamp: time.clone(),
-          }),
-          self.unknown(native, time),
-        ]
+          }));
+        }
+        events.push(self.lifecycle(event.data.turn, None, Phase::Finished, Some(outcome), native, time));
+        events
       }
-      // Lifecycle, title, compaction/surface operations, plugin records and
-      // future vocabulary remain inspectable in the chronological log view.
-      _ => vec![self.unknown(native, time)],
+      SessionEvent::RequestContext(event) => vec![self.metadata(
+        MetadataKind::Context,
+        format!("request context {}/{}", event.data.provider, event.data.model),
+        native,
+        time,
+      )],
+      SessionEvent::SessionEndSeed(_) => {
+        vec![self.metadata(MetadataKind::Session, "session seed ended".into(), native, time)]
+      }
+      SessionEvent::TodoWrite(event) => vec![self.metadata(
+        MetadataKind::Context,
+        format!("todo snapshot ({} items)", event.data.todos.len()),
+        native,
+        time,
+      )],
     }
   }
 
@@ -262,18 +347,43 @@ impl Normalizer {
         _ => preserve_native = true,
       }
     }
-    // Nonstandard sources and surface replacements affect provenance; retain
-    // them alongside readable text until the shared IR can express them.
+    // Attach provenance once per normalized content block instead of emitting
+    // a second unknown event containing the entire plugin-origin message.
     let message = if native["type"] == "user/message" {
       &native["data"]
     } else {
       &native["data"]["message"]
     };
-    let source = message["source"]["kind"].as_str();
-    if preserve_native
-      || !matches!(source, Some("user" | "model"))
-      || native.get("surfaceOp").is_some_and(Value::is_object)
+    let provenance = MessageProvenance {
+      source: message["source"].clone(),
+      display: None,
+      native: None,
+      surface_op: native.get("surfaceOp").cloned(),
+      source_event_seqs: native
+        .get("sourceEventSeqs")
+        .and_then(|value| serde_json::from_value(value.clone()).ok()),
+    };
+    for event in &mut events {
+      match event {
+        AgentEvent::Message(event) => event.provenance = Some(provenance.clone()),
+        AgentEvent::Reasoning(event) => event.provenance = Some(provenance.clone()),
+        _ => {}
+      }
+    }
+    if !preserve_native
+      && provenance.surface_op.as_ref().is_some_and(Value::is_object)
+      && !events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::Message(_) | AgentEvent::Reasoning(_)))
     {
+      events.push(self.metadata(
+        MetadataKind::Context,
+        "message surface replaced".into(),
+        native.clone(),
+        time.clone(),
+      ));
+    }
+    if preserve_native || matches!(role, Role::Unknown) {
       events.push(self.unknown(native, time));
     }
     events
@@ -289,6 +399,7 @@ impl Normalizer {
     time: Option<String>,
   ) -> AgentEvent {
     AgentEvent::Message(MessageEvent {
+      provenance: None,
       provider: Provider::Dsh,
       session_id: Some(self.session_id.clone()),
       message_id: id,
@@ -303,6 +414,7 @@ impl Normalizer {
 
   fn reasoning(&self, id: Option<String>, phase: Phase, text: String, time: Option<String>) -> AgentEvent {
     AgentEvent::Reasoning(ReasoningEvent {
+      provenance: None,
       provider: Provider::Dsh,
       session_id: Some(self.session_id.clone()),
       message_id: id,
@@ -354,8 +466,105 @@ impl Normalizer {
       timestamp: time,
     })
   }
+
+  fn lifecycle(
+    &self,
+    turn: u64,
+    step: Option<u64>,
+    phase: Phase,
+    outcome: Option<LifecycleOutcome>,
+    native: Value,
+    time: Option<String>,
+  ) -> AgentEvent {
+    AgentEvent::Lifecycle(LifecycleEvent {
+      provider: Provider::Dsh,
+      session_id: Some(self.session_id.clone()),
+      turn_id: turn.to_string(),
+      step_id: step.map(|step| step.to_string()),
+      scope: if step.is_some() {
+        LifecycleScope::Step
+      } else {
+        LifecycleScope::Turn
+      },
+      phase,
+      outcome,
+      native,
+      timestamp: time,
+    })
+  }
+
+  fn usage(
+    &self,
+    step: (u64, u64),
+    message_id: Option<String>,
+    usage: TokenUsage,
+    native: Value,
+    time: Option<String>,
+  ) -> AgentEvent {
+    let Some(input_tokens) = usage
+      .input_tokens
+      .checked_add(usage.cache_read_tokens.unwrap_or(0))
+      .and_then(|tokens| tokens.checked_add(usage.cache_write_tokens.unwrap_or(0)))
+    else {
+      return self.unknown(native, time);
+    };
+    let raw = if native["type"] == "assistant/message" {
+      &native["data"]["usage"]
+    } else {
+      &native["data"]["chunk"]["usage"]
+    };
+    AgentEvent::Usage(UsageEvent {
+      kind: UsageKind::ModelCall,
+      provider: Provider::Dsh,
+      session_id: Some(self.session_id.clone()),
+      turn_id: Some(step.0.to_string()),
+      step_id: Some(step.1.to_string()),
+      message_id,
+      record_id: native.get("seq").and_then(Value::as_u64).map(|seq| seq.to_string()),
+      input_tokens,
+      output_tokens: usage.output_tokens,
+      total_tokens: input_tokens.checked_add(usage.output_tokens),
+      cache_read_tokens: usage.cache_read_tokens,
+      cache_write_tokens: usage.cache_write_tokens,
+      reasoning_tokens: usage.reasoning_tokens,
+      native: raw.clone(),
+      timestamp: time,
+    })
+  }
+
+  fn metadata(&self, kind: MetadataKind, summary: String, native: Value, time: Option<String>) -> AgentEvent {
+    AgentEvent::Metadata(MetadataEvent {
+      provider: Provider::Dsh,
+      session_id: Some(self.session_id.clone()),
+      kind,
+      native_type: native["type"].as_str().unwrap_or("event").to_string(),
+      summary,
+      native,
+      timestamp: time,
+    })
+  }
 }
 
 fn arguments(raw: &str) -> Value {
   serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+}
+
+fn valid_cancel_cause(cause: &Value) -> bool {
+  match cause["kind"].as_str() {
+    Some("user" | "parent" | "disposed" | "legacy") => true,
+    Some("hook") => cause["reason"].is_string(),
+    _ => false,
+  }
+}
+
+fn valid_surface(native: &Value) -> bool {
+  native
+    .get("surfaceOp")
+    .filter(|value| !value.is_null())
+    .is_none_or(|surface| {
+      matches!(
+        serde_json::from_value::<SurfaceOp>(surface.clone()),
+        Ok(SurfaceOp::Append | SurfaceOp::Replace(_))
+      )
+    })
 }

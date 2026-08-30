@@ -146,6 +146,7 @@ impl OpenCodeNormalizer {
     let mut events = Vec::with_capacity(unknowns.len() + 1);
     if !text.is_empty() {
       events.push(AgentEvent::Message(MessageEvent {
+        provenance: None,
         provider: Provider::OpenCode,
         session_id: Some(self.session_id.clone()),
         message_id: Some(message_id),
@@ -208,6 +209,7 @@ impl OpenCodeNormalizer {
 
     match item {
       PartItem::Text(part) => vec![AgentEvent::Message(MessageEvent {
+        provenance: None,
         provider: Provider::OpenCode,
         session_id: Some(self.session_id.clone()),
         message_id: Some(message_id.to_string()),
@@ -219,6 +221,7 @@ impl OpenCodeNormalizer {
         timestamp: timestamp(time_created),
       })],
       PartItem::Reasoning(part) => vec![AgentEvent::Reasoning(ReasoningEvent {
+        provenance: None,
         provider: Provider::OpenCode,
         session_id: Some(self.session_id.clone()),
         message_id: Some(message_id.to_string()),

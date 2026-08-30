@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 use tokn_codex_protocol::{
-  AgentMessageItem, CompactedItem, ContentItem, EventMessage, InterAgentCommunicationItem, MessageItem, ReasoningItem,
-  ResponseItem, RolloutItem, SessionMetaItem, UnknownItem,
+  AgentMessageItem, ContentItem, EventMessage, InterAgentCommunicationItem, MessageItem, ReasoningItem, ResponseItem,
+  RolloutItem, SessionMetaItem, UnknownItem,
 };
 use tokn_session_core::{
   AgentActivity, AgentEvent, ErrorEvent, GoalUpdated, MessageDelivery, MessageEvent, Phase, Provider, ProviderChanged,
@@ -15,6 +15,7 @@ use crate::event::CodexLine;
 pub struct CodexNormalizer {
   session_id: Option<String>,
   history_boundary: Option<CodexHistoryBoundary>,
+  records: crate::records::RecordsNormalizer,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +78,7 @@ impl CodexNormalizer {
     Self {
       session_id: None,
       history_boundary: None,
+      records: Default::default(),
     }
   }
 
@@ -84,22 +86,24 @@ impl CodexNormalizer {
     Self {
       session_id: None,
       history_boundary: Some(CodexHistoryBoundary::new()),
+      records: Default::default(),
     }
   }
 
   pub fn normalize(&mut self, line: CodexLine) -> Vec<AgentEvent> {
     let timestamp = line.timestamp().map(str::to_string);
-    let item = line.into_item();
-
     if self
       .history_boundary
       .as_mut()
-      .is_some_and(|boundary| !boundary.accepts(&item))
+      .is_some_and(|boundary| !boundary.accepts(line.item()))
     {
       return Vec::new();
     }
 
-    self.normalize_item(item, timestamp)
+    if let Some(events) = self.records.normalize(&line, self.session_id.clone()) {
+      return events;
+    }
+    self.normalize_item(line.into_item(), timestamp)
   }
 
   pub fn history_status(&self) -> SessionHistoryStatus {
@@ -117,10 +121,10 @@ impl CodexNormalizer {
       RolloutItem::InterAgentCommunication(item) => {
         normalize_inter_agent_communication(self.session_id.clone(), item, timestamp)
       }
-      RolloutItem::InterAgentCommunicationMetadata(_) | RolloutItem::TurnContext(_) | RolloutItem::WorldState(_) => {
-        Vec::new()
-      }
-      RolloutItem::Compacted(item) => normalize_compacted(self.session_id.clone(), item, timestamp),
+      RolloutItem::InterAgentCommunicationMetadata(_)
+      | RolloutItem::TurnContext(_)
+      | RolloutItem::WorldState(_)
+      | RolloutItem::Compacted(_) => unreachable!("context records handled before consuming native envelope"),
       RolloutItem::EventMessage(item) => normalize_event_message(self.session_id.clone(), item, timestamp),
       RolloutItem::Unknown(item) => vec![unknown_rollout_event(self.session_id.clone(), item, timestamp)],
     }
@@ -353,6 +357,7 @@ fn normalize_message(session_id: Option<String>, item: MessageItem, timestamp: O
   }
 
   vec![AgentEvent::Message(MessageEvent {
+    provenance: None,
     provider: Provider::Codex,
     session_id,
     message_id: item.id,
@@ -373,6 +378,7 @@ fn normalize_reasoning(session_id: Option<String>, item: ReasoningItem, timestam
   }
 
   vec![AgentEvent::Reasoning(ReasoningEvent {
+    provenance: None,
     provider: Provider::Codex,
     session_id,
     message_id: item.id,
@@ -428,20 +434,6 @@ fn normalize_inter_agent_communication(
   })]
 }
 
-fn normalize_compacted(session_id: Option<String>, item: CompactedItem, timestamp: Option<String>) -> Vec<AgentEvent> {
-  let Some(text) = item.message.filter(|message| !message.is_empty()) else {
-    return Vec::new();
-  };
-  vec![message_event(
-    session_id,
-    None,
-    Role::Assistant,
-    Phase::Finished,
-    text,
-    timestamp,
-  )]
-}
-
 fn normalize_event_message(
   session_id: Option<String>,
   item: EventMessage,
@@ -449,7 +441,7 @@ fn normalize_event_message(
 ) -> Vec<AgentEvent> {
   let payload = item.native;
   match item.event_type.as_deref() {
-    Some("task_started" | "turn_started" | "task_complete" | "turn_complete" | "token_count") => Vec::new(),
+    Some("task_started" | "turn_started" | "task_complete" | "turn_complete") => Vec::new(),
     Some("user_message") => string_field(&payload, "message")
       .map(|text| {
         vec![message_event(
@@ -531,6 +523,7 @@ fn normalize_reasoning_event(
     return Vec::new();
   };
   vec![AgentEvent::Reasoning(ReasoningEvent {
+    provenance: None,
     provider: Provider::Codex,
     session_id,
     message_id: string_field(payload, "item_id"),
@@ -902,6 +895,7 @@ fn message_event(
   timestamp: Option<String>,
 ) -> AgentEvent {
   AgentEvent::Message(MessageEvent {
+    provenance: None,
     provider: Provider::Codex,
     session_id,
     message_id,
@@ -1115,7 +1109,7 @@ mod tests {
 {"type":"turn_context","payload":{"turn_id":"turn-1","effort":"ultra"}}"#,
     );
 
-    assert_eq!(events.len(), 3);
+    assert_eq!(events.len(), 6);
     let AgentEvent::ToolCall(output) = &events[1] else {
       panic!("expected custom tool output");
     };
@@ -1127,6 +1121,7 @@ mod tests {
     assert_eq!(activity.actor_agent_path.as_deref(), Some("/root"));
     assert_eq!(activity.target_agent_path.as_deref(), Some("/root/reviewer"));
     assert_eq!(activity.kind, "messaged");
+    assert!(events[3..].iter().all(|event| matches!(event, AgentEvent::Metadata(_))));
   }
 
   #[test]

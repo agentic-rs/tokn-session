@@ -14,7 +14,7 @@
 {"type":"assistant/message","seq":18,"time":1018,"surfaceOp":"append","data":{"turn":1,"step":2,"message":{"id":"assistant-2","role":"assistant","source":{"kind":"model","provider":"deepseek-official","model":"deepseek-v4-flash"},"content":[{"type":"text","text":"All done."}]}}}
 {"type":"step/end","seq":19,"time":1019,"data":{"turn":1,"step":2}}
 {"type":"turn/end","seq":20,"time":1020,"data":{"turn":1,"reason":{"kind":"completed"}}}
-{"type":"session/title","seq":21,"time":1021,"ignorable":true,"data":{"title":"Reading a guide"}}
+{"type":"session/title","seq":21,"time":1021,"ignorable":true,"data":{"title":"Reading a guide","messageSeqs":[1],"source":{"kind":"fallback"}}}
 {"type":"session/end-seed","seq":22,"time":1022,"data":{}}
 {"type":"turn/start","seq":23,"time":1023,"data":{"turn":2}}
 {"type":"user/message","seq":24,"time":1024,"surfaceOp":"append","data":{"id":"user-2","role":"user","source":{"kind":"user"},"content":[{"type":"text","text":"Continue."}]}}

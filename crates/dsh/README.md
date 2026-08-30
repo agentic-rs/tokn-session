@@ -25,9 +25,22 @@ The output is a chronological event view, not the reconstructed model context.
 Assembled messages take precedence over redundant streamed chunks; unfinished
 steps retain text/reasoning deltas. Tool calls and results are correlated by
 turn, step, and call ID. Raw JSON arguments are parsed for tool summaries, with
-malformed strings retained. Unknown events and content, lifecycle records,
-plugin provenance, and surface replacements remain inspectable. Token usage is
-retained as native unknown records because the shared IR has no usage event.
+malformed strings retained. Turn/step boundaries become `lifecycle` events;
+turn outcomes distinguish completion, cancellation, interruption, blocking,
+failure, and token limits. A closed step does not imply success.
+
+Per-call `usage` prefers assembled usage, falling back to the last streamed
+snapshot when necessary (even if an assembled message exists without usage).
+Normalized input includes uncached input plus cache reads/writes; cache counts
+are subsets, not additional tokens to add to the normalized total.
+
+Recognized title, configuration, inbox, context, todo, and auxiliary-request
+records become `metadata`, validated against their known shapes. Pretty output
+shows compact summaries; JSONL and expanded browser rows retain native detail.
+Plugin attribution and surface operations accompany messages/reasoning in
+`provenance`, without a duplicate unknown message. Unfamiliar or malformed
+records and unsupported content still render visibly as `unknown`, even when
+the provider marks them ignorable. See [event IR](../../docs/event-ir.md).
 Message counts include assembled user/assistant records, not deltas or tools.
 Timestamps retain native epoch milliseconds as strings.
 
