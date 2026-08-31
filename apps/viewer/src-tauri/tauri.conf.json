@@ -5,7 +5,7 @@
   "identifier": "dev.tokn.session.viewer",
   "build": {
     "beforeDevCommand": "pnpm dev",
-    "devUrl": "http://localhost:1420",
+    "devUrl": "http://localhost:1437",
     "beforeBuildCommand": "pnpm build",
     "frontendDist": "../dist"
   },
@@ -29,7 +29,7 @@
       },
       "devCsp": {
         "default-src": "'self'",
-        "connect-src": "'self' ipc: http://ipc.localhost ws://localhost:1420 ws://localhost:1421",
+        "connect-src": "'self' ipc: http://ipc.localhost ws://localhost:1437 ws://localhost:1438",
         "img-src": "'self' asset: http://asset.localhost blob: data:",
         "style-src": "'self' 'unsafe-inline'"
       }
