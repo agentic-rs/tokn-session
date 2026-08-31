@@ -152,6 +152,39 @@ pub struct EventSummary {
   pub is_hidden: bool,
   pub is_error: Option<bool>,
   pub tool: Option<ToolCardSummary>,
+  pub usage: Option<UsageCardSummary>,
+  pub reasoning: Option<ReasoningCardSummary>,
+}
+
+/// Source-neutral token accounting for a usage event.
+///
+/// Token counts intentionally cross the IPC boundary as decimal strings:
+/// JavaScript `number` cannot represent every `u64` exactly.
+#[derive(Debug, Serialize)]
+pub struct UsageCardSummary {
+  pub kind: String,
+  pub input_tokens: String,
+  pub output_tokens: String,
+  pub total_tokens: Option<String>,
+  pub cache_read_tokens: Option<String>,
+  pub cache_write_tokens: Option<String>,
+  pub reasoning_tokens: Option<String>,
+  pub turn_id: Option<String>,
+  pub step_id: Option<String>,
+}
+
+/// Safe reasoning metadata for a collapsed event card.
+///
+/// Raw encrypted reasoning, signatures, and full reasoning text deliberately
+/// remain out of this projection. The viewer can use the boolean flags to
+/// select an appropriate disclosure state without exposing opaque payloads.
+#[derive(Debug, Serialize)]
+pub struct ReasoningCardSummary {
+  pub preview: Option<String>,
+  pub has_summary: bool,
+  pub has_text: bool,
+  pub has_encrypted_content: bool,
+  pub is_redacted: bool,
 }
 
 #[derive(Debug, Serialize)]

@@ -283,6 +283,16 @@ not combine those lifecycle records into one timeline event or correlate records
 that lack an id. Inline output retains at most 64 KiB with both its head and tail
 visible and never renders provider output as Markdown or HTML.
 
+Usage events have dedicated token cards. The card labels model-call,
+operation-total, and replaceable session-snapshot scopes so users do not sum
+unrelated rows; cache counts are already included in input, while reasoning and
+total counters remain provider-reported. Usage-card `u64` counters cross the
+viewer IPC as decimal strings to avoid JavaScript precision loss. Reasoning
+cards use a sanitized one-line preview and load readable Markdown lazily when
+expanded.
+Encrypted and provider-redacted reasoning remain opaque in the timeline; a
+redaction is visible metadata rather than a hidden event.
+
 The Tauri backend calls `tokn-session-client`, `tokn-session-core`, and
 `tokn-session-render` directly from async commands; it does not parse CLI
 output or depend on Relay. The frontend receives source-neutral snake-case
@@ -434,12 +444,14 @@ Current event families include:
 - `error`
 - `unknown`
 
-DSH, Pi, and Codex use the accounting/metadata contracts in `docs/event-ir.md`.
-Usage distinguishes model calls, operation totals, and replaceable session
-snapshots. DSH still owns lifecycle adoption. Compact human output labels the
-usage scope; expanded browser rows and JSONL preserve native details except
-explicitly hidden Pi content, which is available only in JSONL. Terminal Pet
-ignores accounting/metadata/hidden content for activity and lease handling.
+All providers use the accounting contract in `docs/event-ir.md`. Usage
+distinguishes model calls, operation totals, and replaceable session snapshots.
+OpenCode emits one model-call usage event per historical assistant turn: the
+last valid `step-finish` tokens win, with assistant-message tokens as fallback.
+DSH still owns lifecycle adoption. Compact human output labels the usage scope;
+expanded browser rows and JSONL preserve native details except explicitly
+hidden Pi content, which is available only in JSONL. Terminal Pet ignores
+accounting/metadata/hidden content for activity and lease handling.
 
 Messages carry an orthogonal `delivery` field: `commentary`, `final`, or
 `unspecified`. Codex preserves the provider's response phase. Pi and OpenCode
@@ -458,10 +470,14 @@ Reasoning is intentionally flat:
 
 - `text`
 - `summary`
+- `redacted`
 - `encrypted_content`
 - `signature`
 
-Pretty rendering shows visible reasoning text and summaries, but does not display encrypted reasoning payloads. JSONL preserves encrypted reasoning in the IR.
+`redacted: true` is a visible marker that the provider withheld readable text;
+it is distinct from a hidden event. Pretty rendering shows visible reasoning
+text and summaries, but does not display encrypted reasoning payloads. JSONL
+preserves encrypted reasoning in the IR.
 
 Codex `event_msg.thread_settings_applied` maps to
 `session_settings_applied`. The normalized event exposes a compact settings
@@ -519,7 +535,9 @@ Current browser keys:
   types are decoded by `tokn-opencode-protocol`. Unknown and malformed shapes
   preserve their complete native JSON. The adapter retains SQLite row IDs and
   uses a part row ID as the fallback tool-call ID for historical records that
-  lack `callID`.
+  lack `callID`. Assistant token rows normalize as one `model_call` per turn:
+  the last valid `step-finish` row wins, with assistant-message usage as a
+  fallback; malformed accounting stays visible as unknown data.
 - Pi native JSONL parsing uses `tokn-pi-protocol`. Unknown message roles such
   as historical `bashExecution` records remain visible without preventing the
   rest of the session from loading.
@@ -586,7 +604,7 @@ Advanced custom executors may include an argv that is exactly `{prompt}`; in tha
 
 Current limitation: provider output is inherited directly from the child process. The shared `LiveSessionEvent` envelope now exists in `crates/core`, and `crates/render` can pretty-render live events, but the CLI print path does not consume it yet.
 
-OpenCode has the first live-output normalizer: `OpenCodeLiveNormalizer` parses `opencode run --format json` JSONL envelopes into `LiveSessionEvent`. It currently maps `text`, `reasoning`, `tool_use`, and `error` into normalized `AgentEvent`s and preserves other live envelopes such as `step_start` as unknown native events.
+OpenCode has the first live-output normalizer: `OpenCodeLiveNormalizer` parses `opencode run --format json` JSONL envelopes into `LiveSessionEvent`. It maps `text`, `reasoning`, `tool_use`, `error`, and valid `step_finish` token data into normalized `AgentEvent`s; `step_start` and malformed or missing `step_finish` accounting stay lossless unknown native events.
 
 ## Known Gaps
 
@@ -636,5 +654,5 @@ cd apps/viewer && pnpm tauri dev
   viewer after the historical read-only surface stabilizes.
 - Map Codex lifecycle next and teach terminal pet to use authoritative lifecycle
   instead of heuristics. Pi live boundaries require a bridge feature; do not
-  infer them from historical assistant/tool records. OpenCode accounting and
-  input-request events remain follow-ups.
+  infer them from historical assistant/tool records. OpenCode input-request
+  events remain a follow-up.

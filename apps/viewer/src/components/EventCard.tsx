@@ -6,9 +6,13 @@ import {
   ReasoningIcon,
   TechnicalIcon,
   ToolIcon,
+  UsageIcon,
   WarningIcon,
 } from "./Icons";
 import { MarkdownContent } from "./MarkdownContent";
+import type { TechnicalCardHeading } from "./CardPresentation";
+import { ReasoningCard, reasoningHeading } from "./ReasoningCard";
+import { UsageCard, usageHeading } from "./UsageCard";
 
 interface EventCardProps {
   event: EventSummary;
@@ -21,13 +25,6 @@ interface EventCardProps {
   on_select: (event_key: string) => void;
   on_toggle: (event_key: string) => void;
   on_retry_detail: () => void;
-}
-
-interface ToolHeading {
-  action: string | null;
-  primary: string;
-  secondary: string | null;
-  monospace: boolean;
 }
 
 function isMessage(event: EventSummary): boolean {
@@ -48,7 +45,7 @@ function toolFallbackName(event: EventSummary, tool: ToolCardSummary): string {
   return humanize(tool.tool_name?.trim() || event.title || "Tool call");
 }
 
-function toolHeading(event: EventSummary): ToolHeading {
+function toolHeading(event: EventSummary): TechnicalCardHeading {
   const tool = event.tool;
   if (!tool) {
     return {
@@ -142,6 +139,9 @@ function eventIcon(event: EventSummary) {
   if (event.type === "reasoning") {
     return <ReasoningIcon />;
   }
+  if (event.type === "usage") {
+    return <UsageIcon />;
+  }
   if (event.type === "tool_call") {
     return <ToolIcon />;
   }
@@ -161,15 +161,38 @@ function eventTone(event: EventSummary): string {
   if (event.type === "reasoning") {
     return "reasoning";
   }
+  if (event.type === "usage") {
+    return "usage";
+  }
   if (event.type === "tool_call") {
     return "tool";
   }
   return "technical";
 }
 
+function cardHeading(event: EventSummary): TechnicalCardHeading | null {
+  if (event.type === "tool_call") {
+    return toolHeading(event);
+  }
+  if (event.type === "usage" && event.usage) {
+    return usageHeading(event.usage);
+  }
+  if (event.type === "reasoning" && event.reasoning) {
+    return reasoningHeading(event);
+  }
+  return null;
+}
+
+function usesControlledExpansion(event: EventSummary): boolean {
+  return event.type === "tool_call" || event.type === "reasoning";
+}
+
 function eventStatus(event: EventSummary): { label: string; tone: string } | null {
   if (event.type !== "tool_call") {
-    return event.phase ? { label: event.phase, tone: "neutral" } : null;
+    if (!event.phase || (event.type === "reasoning" && event.phase === "finished")) {
+      return null;
+    }
+    return { label: event.phase, tone: "neutral" };
   }
   if (event.tool?.exit_code !== null
     && event.tool?.exit_code !== undefined
@@ -315,12 +338,12 @@ export function EventCard({
     );
   }
 
-  const heading = event.type === "tool_call" ? toolHeading(event) : null;
+  const heading = cardHeading(event);
   const title = heading?.primary ?? event.title;
   const status = eventStatus(event);
   const regionId = `${button_id}-details`;
   const labelId = `${button_id}-label`;
-  const cardIsExpanded = event.type === "tool_call" ? is_expanded : isLocallyExpanded;
+  const cardIsExpanded = usesControlledExpansion(event) ? is_expanded : isLocallyExpanded;
   return (
     <article
       className="technical-event"
@@ -334,7 +357,7 @@ export function EventCard({
           aria-label={heading?.action ? `${heading.action}: ${title}` : title}
           className="technical-event__toggle"
           onClick={() => {
-            if (event.type === "tool_call") {
+            if (usesControlledExpansion(event)) {
               on_toggle(event.event_key);
             } else {
               setIsLocallyExpanded((expanded) => !expanded);
@@ -396,8 +419,16 @@ export function EventCard({
               is_loading={detail_loading}
               on_retry={on_retry_detail}
             />
-          ) : event.type === "reasoning" && !event.is_hidden ? (
-            <MarkdownContent content={event.summary || "No summary available."} />
+          ) : event.type === "usage" && event.usage ? (
+            <UsageCard usage={event.usage} />
+          ) : event.type === "reasoning" ? (
+            <ReasoningCard
+              detail={detail}
+              error={detail_error}
+              event={event}
+              is_loading={detail_loading}
+              on_retry={on_retry_detail}
+            />
           ) : (
             <p>{event.is_hidden ? "Hidden extension event" : event.summary || "No summary available."}</p>
           )}

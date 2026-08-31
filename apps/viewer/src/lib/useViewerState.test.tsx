@@ -78,6 +78,8 @@ function toolEventPage(): EventPageResponse {
         added: null,
         removed: null,
       },
+      usage: null,
+      reasoning: null,
     }],
     next_cursor: null,
     previous_cursor: null,
@@ -98,6 +100,38 @@ function toolDetail(text: string): EventDetail {
       original_size_bytes: text.length,
       source_event_key: "event.v1.1",
     },
+  };
+}
+
+function reasoningEventPage(overrides: Partial<EventPageResponse["events"][number]> = {}): EventPageResponse {
+  return {
+    events: [{
+      event_key: "event.v1.reasoning",
+      type: "reasoning",
+      provider: "codex",
+      timestamp: "2026-08-31T00:00:00Z",
+      phase: "finished",
+      role: null,
+      title: "Reasoning",
+      summary: "Inspect the source",
+      summary_truncated: false,
+      is_hidden: false,
+      is_error: false,
+      tool: null,
+      usage: null,
+      reasoning: {
+        preview: "Inspect the source",
+        has_summary: true,
+        has_text: false,
+        has_encrypted_content: false,
+        is_redacted: false,
+      },
+      ...overrides,
+    }],
+    next_cursor: null,
+    previous_cursor: null,
+    total_events: 1,
+    history_status: "complete",
   };
 }
 
@@ -174,6 +208,8 @@ describe("useViewerState expanded tool detail", () => {
           added: null,
           removed: null,
         },
+        usage: null,
+        reasoning: null,
       }],
       next_cursor: null,
       previous_cursor: null,
@@ -258,5 +294,62 @@ describe("useViewerState expanded tool detail", () => {
       expect(result.current.expandedDetail?.tool_output?.sections[0]?.text).toBe("fresh A");
     });
     expect(loadEventDetail).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("useViewerState expanded reasoning detail", () => {
+  it("loads readable reasoning only after expansion and shares the detail cache", async () => {
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [session("codex:reasoning")],
+      next_cursor: null,
+      source_errors: [],
+    });
+    vi.mocked(loadEventPage).mockResolvedValue(reasoningEventPage());
+    vi.mocked(loadEventDetail).mockResolvedValue({
+      event_key: "event.v1.reasoning",
+      event: { type: "reasoning", summary: "Inspect the source" },
+      native: null,
+      is_hidden: false,
+      tool_output: null,
+    });
+    const { result } = renderHook(() => useViewerState());
+
+    await waitFor(() => expect(result.current.events).toHaveLength(1));
+    expect(loadEventDetail).not.toHaveBeenCalled();
+
+    act(() => result.current.toggleEventExpanded("event.v1.reasoning"));
+    await waitFor(() => expect(result.current.expandedDetail?.event).toMatchObject({ type: "reasoning" }));
+    expect(loadEventDetail).toHaveBeenCalledOnce();
+
+    act(() => result.current.selectEvent("event.v1.reasoning"));
+    await waitFor(() => expect(result.current.detail?.event).toMatchObject({ type: "reasoning" }));
+    expect(loadEventDetail).toHaveBeenCalledOnce();
+  });
+
+  it("does not request opaque, redacted, or hidden reasoning detail", async () => {
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [session("codex:opaque")],
+      next_cursor: null,
+      source_errors: [],
+    });
+    vi.mocked(loadEventPage).mockResolvedValue(reasoningEventPage({
+      event_key: "event.v1.opaque",
+      summary: "Reasoning redacted by provider",
+      is_hidden: false,
+      reasoning: {
+        preview: null,
+        has_summary: false,
+        has_text: false,
+        has_encrypted_content: true,
+        is_redacted: true,
+      },
+    }));
+    const { result } = renderHook(() => useViewerState());
+
+    await waitFor(() => expect(result.current.events).toHaveLength(1));
+    act(() => result.current.toggleEventExpanded("event.v1.opaque"));
+    await waitFor(() => expect(result.current.expandedEventKey).toBe("event.v1.opaque"));
+    expect(result.current.expandedDetailLoading).toBe(false);
+    expect(loadEventDetail).not.toHaveBeenCalled();
   });
 });

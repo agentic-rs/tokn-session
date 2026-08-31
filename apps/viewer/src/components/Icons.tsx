@@ -68,6 +68,15 @@ export function ReasoningIcon(props: IconProps) {
   );
 }
 
+export function UsageIcon(props: IconProps) {
+  return (
+    <IconBase {...props}>
+      <path d="M5 19V12m7 7V5m7 14v-9" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+      <path d="M3.5 20.5h17" stroke="currentColor" strokeLinecap="round" strokeWidth="1.6" />
+    </IconBase>
+  );
+}
+
 export function ToolIcon(props: IconProps) {
   return (
     <IconBase {...props}>

@@ -276,7 +276,8 @@ fn normalize_assistant_message(
         }
       }
       PiContentBlock::Thinking(content) => {
-        if content.thinking.is_some() || content.thinking_signature.is_some() {
+        let redacted = content.redacted;
+        if content.thinking.is_some() || content.thinking_signature.is_some() || redacted == Some(true) {
           events.push(AgentEvent::Reasoning(ReasoningEvent {
             provenance: None,
             provider: Provider::Pi,
@@ -284,8 +285,11 @@ fn normalize_assistant_message(
             message_id: meta.id.clone(),
             parent_id: meta.parent_id.clone(),
             phase: Phase::Finished,
-            text: content.thinking.and_then(present_text),
+            text: (redacted != Some(true))
+              .then(|| content.thinking.and_then(present_text))
+              .flatten(),
             summary: None,
+            redacted,
             encrypted_content: None,
             signature: content.thinking_signature,
             timestamp: timestamp.clone(),
@@ -529,6 +533,39 @@ mod tests {
         cwd: None,
         exit_code: None,
       })
+    ));
+  }
+
+  #[test]
+  fn preserves_redacted_thinking_without_exposing_content_or_hiding_event() {
+    let events = normalize_fixture(
+      r#"{"type":"session","id":"pi-session"}
+{"type":"message","id":"assistant-1","message":{"role":"assistant","content":[{"type":"thinking","thinking":"private chain of thought","thinkingSignature":"sig-1","redacted":true}]}}"#,
+    );
+
+    let AgentEvent::Reasoning(event) = &events[1] else {
+      panic!("expected redacted reasoning");
+    };
+    assert_eq!(event.redacted, Some(true));
+    assert!(event.text.is_none());
+    assert_eq!(event.signature.as_deref(), Some("sig-1"));
+    assert!(!events[1].is_hidden());
+
+    let serialized = serde_json::to_string(event).expect("reasoning event should serialize");
+    assert!(!serialized.contains("private chain of thought"));
+  }
+
+  #[test]
+  fn emits_an_explicit_event_when_redacted_thinking_has_no_payload() {
+    let events = normalize_fixture(
+      r#"{"type":"session","id":"pi-session"}
+{"type":"message","id":"assistant-1","message":{"role":"assistant","content":[{"type":"thinking","redacted":true}]}}"#,
+    );
+
+    assert!(matches!(
+      &events[..],
+      [AgentEvent::SessionStarted(_), AgentEvent::Reasoning(event)]
+        if event.redacted == Some(true) && event.text.is_none() && event.signature.is_none()
     ));
   }
 

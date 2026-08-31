@@ -1,6 +1,12 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { EventDetail, EventSummary, ToolCardSummary } from "../lib/types";
+import type {
+  EventDetail,
+  EventSummary,
+  ReasoningCardSummary,
+  ToolCardSummary,
+  UsageCardSummary,
+} from "../lib/types";
 import { EventCard } from "./EventCard";
 
 afterEach(cleanup);
@@ -24,6 +30,32 @@ function tool(overrides: Partial<ToolCardSummary> = {}): ToolCardSummary {
   };
 }
 
+function usage(overrides: Partial<UsageCardSummary> = {}): UsageCardSummary {
+  return {
+    kind: "model_call",
+    input_tokens: "33",
+    output_tokens: "5",
+    total_tokens: "38",
+    cache_read_tokens: "20",
+    cache_write_tokens: "3",
+    reasoning_tokens: "2",
+    turn_id: null,
+    step_id: null,
+    ...overrides,
+  };
+}
+
+function reasoning(overrides: Partial<ReasoningCardSummary> = {}): ReasoningCardSummary {
+  return {
+    preview: "Inspect the source",
+    has_summary: true,
+    has_text: false,
+    has_encrypted_content: false,
+    is_redacted: false,
+    ...overrides,
+  };
+}
+
 function event(overrides: Partial<EventSummary> = {}): EventSummary {
   return {
     event_key: "event.v1.1",
@@ -38,6 +70,8 @@ function event(overrides: Partial<EventSummary> = {}): EventSummary {
     is_hidden: false,
     is_error: false,
     tool: null,
+    usage: null,
+    reasoning: null,
     ...overrides,
   };
 }
@@ -108,23 +142,17 @@ describe("EventCard conversation content", () => {
     expect(screen.getByText("View full message")).toBeInTheDocument();
   });
 
-  it("keeps reasoning Markdown local and unknown events expanded by default", () => {
+  it("keeps unknown events expanded by default", () => {
     const { unmount } = renderCard(event({
-      type: "reasoning",
+      type: "unknown",
       role: null,
-      title: "Reasoning",
-      summary: "## Approach\n\n- inspect the source\n- verify the **result**",
+      title: "Mystery",
+      summary: "raw shape",
     }));
 
-    expect(screen.queryByRole("heading", { name: "Approach" })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Reasoning" }));
-    expect(screen.getByRole("heading", { name: "Approach" })).toBeInTheDocument();
-    expect(screen.getByText("result").tagName).toBe("STRONG");
-    unmount();
-
-    renderCard(event({ type: "unknown", role: null, title: "Mystery", summary: "raw shape" }));
     expect(screen.getByRole("button", { name: "Mystery" })).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("raw shape")).toBeInTheDocument();
+    unmount();
   });
 });
 
@@ -341,5 +369,169 @@ describe("EventCard tool output", () => {
 
     expect(screen.getByText("Tool output is hidden by the provider.")).toBeInTheDocument();
     expect(screen.queryByText("secret output")).not.toBeInTheDocument();
+  });
+});
+
+describe("EventCard usage", () => {
+  const usageEvent = event({
+    type: "usage",
+    role: null,
+    title: "Usage",
+    summary: "[usage] input=33 output=5 total=38",
+    usage: usage(),
+  });
+
+  it("shows scope-aware, exact token data without treating subsets as totals", () => {
+    renderCard(usageEvent);
+
+    expect(screen.getByRole("button", { name: "Usage: 38 tokens" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.getByText("Model call · 33 input · 5 output")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Usage: 38 tokens" }));
+    expect(screen.getByRole("region", { name: "38 tokens" })).toBeInTheDocument();
+    expect(screen.getByText("Reported total")).toBeInTheDocument();
+    expect(screen.getAllByText("38")).toHaveLength(1);
+    expect(screen.getByText(/Cache counts are already included in input/i)).toBeInTheDocument();
+  });
+
+  it("retains zero values, exact large counters, and the snapshot warning", () => {
+    renderCard({
+      ...usageEvent,
+      usage: usage({
+        kind: "session_snapshot",
+        input_tokens: "18446744073709551615",
+        output_tokens: "0",
+        total_tokens: null,
+        cache_read_tokens: "0",
+        cache_write_tokens: null,
+        reasoning_tokens: "0",
+      }),
+    });
+
+    const button = screen.getByRole("button", {
+      name: "Usage: 18,446,744,073,709,551,615 input · 0 output",
+    });
+    fireEvent.click(button);
+    expect(screen.getByText("18,446,744,073,709,551,615")).toBeInTheDocument();
+    expect(screen.getAllByText("0")).toHaveLength(3);
+    expect(screen.queryByText("Reported total")).not.toBeInTheDocument();
+    expect(screen.getByText(/replaces earlier snapshots/i)).toBeInTheDocument();
+  });
+});
+
+describe("EventCard reasoning", () => {
+  const summary = "## Approach\n\n- inspect the source\n- verify the **result**";
+  const detailed = "I checked the implementation details.";
+  const reasoningEvent = event({
+    type: "reasoning",
+    role: null,
+    title: "Reasoning",
+    summary,
+    reasoning: reasoning({ preview: "Approach", has_text: true }),
+  });
+
+  it("loads reasoning through the controlled detail path and keeps Inspect independent", () => {
+    const onToggle = vi.fn();
+    const onSelect = vi.fn();
+    const { rerender } = renderCard(reasoningEvent, { on_select: onSelect, on_toggle: onToggle });
+    const toggle = screen.getByRole("button", { name: "Reasoning: Approach" });
+
+    fireEvent.click(toggle);
+    expect(onToggle).toHaveBeenCalledWith("event.v1.1");
+    expect(onSelect).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Inspect Approach" }));
+    expect(onSelect).toHaveBeenCalledWith("event.v1.1");
+
+    rerender(
+      <EventCard
+        button_id="event-button"
+        detail={detail({
+          event: { type: "reasoning", summary, text: detailed },
+        })}
+        detail_error={null}
+        detail_loading={false}
+        event={reasoningEvent}
+        is_expanded
+        is_selected={false}
+        on_retry_detail={vi.fn()}
+        on_select={onSelect}
+        on_toggle={onToggle}
+      />,
+    );
+
+    expect(screen.getByRole("heading", { name: "Approach" })).toBeInTheDocument();
+    expect(screen.getByText("result").tagName).toBe("STRONG");
+    expect(screen.getByText(detailed).closest("details")).not.toHaveAttribute("open");
+    fireEvent.click(screen.getByText("Detailed reasoning"));
+    expect(screen.getByText(detailed).closest("details")).toHaveAttribute("open");
+  });
+
+  it("shows deliberate opaque and redacted reasoning states without requesting content", () => {
+    const { rerender } = renderCard({
+      ...reasoningEvent,
+      reasoning: reasoning({
+        preview: null,
+        has_summary: false,
+        has_text: false,
+        has_encrypted_content: true,
+      }),
+    }, { is_expanded: true });
+    expect(screen.getByText(/encrypted and cannot be shown inline/i)).toBeInTheDocument();
+    expect(screen.queryByText(summary)).not.toBeInTheDocument();
+
+    rerender(
+      <EventCard
+        button_id="event-button"
+        detail={null}
+        detail_error={null}
+        detail_loading={false}
+        event={{
+          ...reasoningEvent,
+          reasoning: reasoning({
+            preview: null,
+            has_summary: false,
+            has_text: false,
+            is_redacted: true,
+          }),
+        }}
+        is_expanded
+        is_selected={false}
+        on_retry_detail={vi.fn()}
+        on_select={vi.fn()}
+        on_toggle={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(/redacted by the provider/i)).toBeInTheDocument();
+  });
+
+  it("shows loading and a retryable detail failure", () => {
+    const onRetry = vi.fn();
+    const { rerender } = renderCard(reasoningEvent, {
+      detail_loading: true,
+      is_expanded: true,
+      on_retry_detail: onRetry,
+    });
+    expect(screen.getByRole("status")).toHaveTextContent("Loading reasoning");
+
+    rerender(
+      <EventCard
+        button_id="event-button"
+        detail={null}
+        detail_error="session file is unavailable"
+        detail_loading={false}
+        event={reasoningEvent}
+        is_expanded
+        is_selected={false}
+        on_retry_detail={onRetry}
+        on_select={vi.fn()}
+        on_toggle={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("session file is unavailable");
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(onRetry).toHaveBeenCalledOnce();
   });
 });

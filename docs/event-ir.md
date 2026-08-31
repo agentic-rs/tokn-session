@@ -47,6 +47,14 @@ is metadata, not zero usage, and resets deduplication; rollback/compaction also
 reset it. Malformed counters remain unknown. A live tail started at EOF emits
 its first observed snapshot without reconstructing earlier calls.
 
+OpenCode assistant turns emit at most one `model_call` usage event. When valid
+`step-finish` parts are present, the last one is authoritative; the assistant
+message's tokens are a fallback for incomplete or older rows. Cache reads and
+writes are included in `input_tokens` once, while a provider-reported total is
+kept unchanged. Invalid accounting remains a visible unknown record without
+hiding the turn's message, tool, or reasoning content. Live `step_finish`
+envelopes use the same rule when their token data is valid.
+
 ## Metadata and provenance
 
 `metadata` means a recognized non-conversation record whose required envelope
@@ -66,6 +74,11 @@ Messages and reasoning may carry optional `provenance`: the native `source`,
 context edits without duplicating the conversation as an unknown event.
 Provenance does not apply surface edits to the chronological history.
 
+Reasoning may also explicitly state `redacted: true`. This means the provider
+withheld the readable text; it is distinct from a hidden event. Redacted
+reasoning remains visible as a safe event marker, while its content is not
+retained for human rendering.
+
 Pi `custom` records are opaque extension state, not messages. `custom_message`
 records are system-role context messages with extension attribution, original
 native content/details, and the provider's `display` flag in provenance.
@@ -83,8 +96,9 @@ a session's source for otherwise unattributed messages.
 
 ## Adoption
 
-DSH produces lifecycle, usage, metadata, and provenance. Pi and Codex now adopt
-usage and metadata; Pi also supplies extension provenance. OpenCode is unchanged.
+DSH produces lifecycle, usage, metadata, and provenance. Pi, Codex, and
+OpenCode all normalize usage; Pi and Codex also adopt metadata, and Pi supplies
+extension provenance.
 Terminal Pet ignores usage, metadata, and hidden content for activity/focus and
 lease handling. Codex lifecycle mapping and authoritative Pet runtime state are
 next; Pi historical logs do not contain the live agent/turn boundaries, so

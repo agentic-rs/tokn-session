@@ -39,6 +39,9 @@ export function readableEventContent(
   if (summary.type !== "reasoning") {
     return null;
   }
+  if (summary.reasoning?.is_redacted) {
+    return null;
+  }
 
   const reasoningSummary = readableString(event.summary);
   const reasoningText = readableString(event.text);

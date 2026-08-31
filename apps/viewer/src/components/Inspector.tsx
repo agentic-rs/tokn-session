@@ -46,6 +46,7 @@ export function Inspector({
     () => event ? readableEventContent(event, detail) : null,
     [detail, event],
   );
+  const isRedactedReasoning = event?.type === "reasoning" && event.reasoning?.is_redacted === true;
   const contentAvailable = readableContent !== null;
   useLayoutEffect(() => {
     if (contentAvailable && !userSelectedTabRef.current) {
@@ -55,10 +56,15 @@ export function Inspector({
     }
   }, [activeTab, contentAvailable]);
 
+  const redactedNormalizedEvent = isRedactedReasoning && event ? {
+    type: "reasoning",
+    provider: event.provider,
+    redacted: true,
+  } : null;
   const visibleValue = activeTab === "native"
-    ? detail?.native
+    ? isRedactedReasoning ? null : detail?.native
     : activeTab === "normalized"
-      ? detail?.event
+      ? redactedNormalizedEvent ?? detail?.event
       : undefined;
   const formattedValue = useMemo(() => {
     if (visibleValue === undefined) {
@@ -66,7 +72,7 @@ export function Inspector({
     }
     return JSON.stringify(visibleValue, null, 2);
   }, [visibleValue]);
-  const nativeAvailable = detail !== null && detail.native !== null && !detail.is_hidden;
+  const nativeAvailable = detail !== null && detail.native !== null && !detail.is_hidden && !isRedactedReasoning;
 
   function selectTab(tab: InspectorTab) {
     userSelectedTabRef.current = true;
@@ -163,11 +169,22 @@ export function Inspector({
             </div>
           ) : null}
 
+          {isRedactedReasoning ? (
+            <div className="redaction-notice" role="status">
+              <WarningIcon />
+              <span>
+                <strong>Reasoning redacted by provider</strong>
+                <small>The viewer does not render its readable or native payload.</small>
+              </span>
+            </div>
+          ) : null}
+
           {event.summary_truncated
             && detail
             && !readableContent
             && !detail.is_hidden
-            && !event.is_hidden ? (
+            && !event.is_hidden
+            && !isRedactedReasoning ? (
               <div className="content-notice" role="status">
                 The timeline preview was capped, but this event has no readable plain-text field.
                 Normalized and native data remain available below.

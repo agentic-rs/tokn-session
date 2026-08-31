@@ -100,6 +100,11 @@ pub struct ReasoningEvent {
   pub phase: Phase,
   pub text: Option<String>,
   pub summary: Option<String>,
+  /// The provider deliberately withheld the reasoning text. This is distinct
+  /// from surface visibility: redacted reasoning remains part of the event
+  /// stream and can be represented without exposing its content.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub redacted: Option<bool>,
   pub encrypted_content: Option<String>,
   pub signature: Option<String>,
   pub timestamp: Option<String>,
@@ -531,6 +536,28 @@ fn joined_string_array_field(value: &Value, field: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn redacted_reasoning_remains_visible() {
+    let event = AgentEvent::Reasoning(ReasoningEvent {
+      provenance: None,
+      provider: Provider::Pi,
+      session_id: Some("session-1".to_string()),
+      message_id: Some("message-1".to_string()),
+      parent_id: None,
+      phase: Phase::Finished,
+      text: None,
+      summary: None,
+      redacted: Some(true),
+      encrypted_content: None,
+      signature: None,
+      timestamp: None,
+    });
+
+    assert!(!event.is_hidden());
+    let serialized = serde_json::to_value(event).expect("reasoning event should serialize");
+    assert_eq!(serialized["redacted"], true);
+  }
 
   #[test]
   fn classifies_known_tool_families_without_treating_user_input_as_a_task() {

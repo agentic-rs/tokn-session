@@ -54,6 +54,31 @@ export interface ToolCardSummary {
   removed: number | null;
 }
 
+/**
+ * Token counters cross IPC as decimal strings so Rust u64 values retain their
+ * exact value in a JavaScript renderer.
+ */
+export interface UsageCardSummary {
+  kind: string;
+  input_tokens: string;
+  output_tokens: string;
+  total_tokens: string | null;
+  cache_read_tokens: string | null;
+  cache_write_tokens: string | null;
+  reasoning_tokens: string | null;
+  turn_id: string | null;
+  step_id: string | null;
+}
+
+/** Safe presentation metadata only; detailed reasoning stays behind event detail. */
+export interface ReasoningCardSummary {
+  preview: string | null;
+  has_summary: boolean;
+  has_text: boolean;
+  has_encrypted_content: boolean;
+  is_redacted: boolean;
+}
+
 export type ToolOutputFormat = "text" | "json";
 
 export interface ToolOutputSection {
@@ -128,6 +153,8 @@ export interface EventSummary {
   is_hidden: boolean;
   is_error: boolean | null;
   tool: ToolCardSummary | null;
+  usage: UsageCardSummary | null;
+  reasoning: ReasoningCardSummary | null;
 }
 
 export type EventPageDirection = "forward" | "backward";

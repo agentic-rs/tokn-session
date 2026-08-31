@@ -52,6 +52,19 @@ function writeCachedDetail(cache: Map<string, EventDetail>, key: string, detail:
   }
 }
 
+function expandedEventNeedsDetail(event: EventSummary | null | undefined): boolean {
+  if (!event || event.is_hidden) {
+    return false;
+  }
+  if (event.type === "tool_call") {
+    return true;
+  }
+  return event.type === "reasoning"
+    && event.reasoning !== null
+    && !event.reasoning.is_redacted
+    && (event.reasoning.has_summary || event.reasoning.has_text);
+}
+
 export function useViewerState() {
   const [search, setSearchValue] = useState("");
   const debouncedSearch = useDebouncedValue(search.trim(), 180);
@@ -357,12 +370,7 @@ export function useViewerState() {
     setExpandedDetailError(null);
 
     const expandedEvent = events.find((event) => event.event_key === expandedEventKey);
-    if (
-      !selectedSessionKey
-      || !expandedEventKey
-      || expandedEvent?.type !== "tool_call"
-      || expandedEvent.is_hidden
-    ) {
+    if (!selectedSessionKey || !expandedEventKey || !expandedEventNeedsDetail(expandedEvent)) {
       setExpandedDetailOwnerKey(null);
       setExpandedDetailLoading(false);
       return;
@@ -430,8 +438,7 @@ export function useViewerState() {
     : visibleEvents.find((event) => event.event_key === expandedEventKey) ?? null;
   const expandedEventIsVisible = expandedVisibleEvent !== null;
   const expandedDetailTargetKey = selectedSessionKey
-    && expandedVisibleEvent?.type === "tool_call"
-    && !expandedVisibleEvent.is_hidden
+    && expandedEventNeedsDetail(expandedVisibleEvent)
     ? `${selectedSessionKey}:${expandedEventKey}`
     : null;
   const expandedDetailIsOwned = expandedDetailTargetKey !== null

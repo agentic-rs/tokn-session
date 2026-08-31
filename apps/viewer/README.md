@@ -48,6 +48,13 @@ inspector content do render GitHub-flavored Markdown. Raw HTML is disabled,
 remote images are never loaded, and links remain inert so provider content
 cannot navigate the WebView.
 
+Usage events have an inline token card. It labels whether a row is a model call,
+operation total, or cumulative session snapshot; snapshots replace earlier
+snapshots and must not be summed. Cache counts are already part of input, and
+reasoning or total counters remain provider-reported. Reasoning cards use a
+safe, single-line preview and load readable Markdown only after expansion.
+Encrypted or provider-redacted reasoning stays opaque in the timeline.
+
 Provider storage is resolved as follows:
 
 - Codex: `$CODEX_HOME`, then the platform home directory's `.codex` folder.
@@ -96,3 +103,7 @@ large histories.
 Each normalized and provider-native inspector representation is capped at 512
 KiB before IPC. Oversized values become structured JSON truncation placeholders;
 an uncapped export path is future work.
+
+Usage-card counters cross IPC as decimal strings so every Rust `u64` remains
+exact in the JavaScript renderer. Reasoning-card summaries contain only safe
+preview metadata; encrypted content and signatures stay out of that projection.
