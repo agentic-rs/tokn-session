@@ -79,6 +79,54 @@ fn accepts_new_turn_context_values_without_schema_failure() {
 }
 
 #[test]
+fn preserves_canonical_item_lifecycle_payloads_losslessly() {
+  let native = json!({
+    "timestamp": "2026-08-28T07:49:14Z",
+    "type": "event_msg",
+    "payload": {
+      "type": "item_completed",
+      "thread_id": "thread-1",
+      "turn_id": "turn-1",
+      "item": {
+        "type": "SubAgentActivity",
+        "id": "subagent-1",
+        "kind": "completed",
+        "agent_thread_id": "child-1",
+        "agent_path": "/root/reviewer",
+        "future_field": true
+      },
+      "started_at_ms": 1000,
+      "completed_at_ms": 1001
+    }
+  });
+  let line: RolloutLine = serde_json::from_value(native.clone()).expect("item lifecycle should decode");
+  let RolloutItem::EventMessage(event) = line.item() else {
+    panic!("expected event message");
+  };
+  assert_eq!(event.event_type.as_deref(), Some("item_completed"));
+  assert_eq!(event.native["item"]["future_field"], json!(true));
+  assert_eq!(serde_json::to_value(line).expect("line should serialize"), native);
+}
+
+#[test]
+fn session_history_mode_remains_tolerant_of_future_values() {
+  for history_mode in ["legacy", "paginated", "future_mode"] {
+    let line: RolloutLine = serde_json::from_value(json!({
+      "type": "session_meta",
+      "payload": {
+        "id": "thread-1",
+        "history_mode": history_mode
+      }
+    }))
+    .expect("history mode should decode");
+    let RolloutItem::SessionMeta(item) = line.item() else {
+      panic!("expected session metadata");
+    };
+    assert_eq!(item.history_mode.as_deref(), Some(history_mode));
+  }
+}
+
+#[test]
 fn accepts_null_optional_reasoning_content() {
   let line: RolloutLine = serde_json::from_value(json!({
     "type": "response_item",

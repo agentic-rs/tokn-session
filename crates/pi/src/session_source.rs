@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -91,8 +92,85 @@ impl PiSessionSource {
       return Ok(root.clone());
     }
 
-    let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
-    Ok(PathBuf::from(home).join(".pi").join("agent").join("sessions"))
+    let configured_session_dir = std::env::var_os("PI_CODING_AGENT_SESSION_DIR");
+    let configured_agent_dir = std::env::var_os("PI_CODING_AGENT_DIR");
+    let platform_home = dirs::home_dir();
+    resolve_pi_session_root(
+      self.session_dir.as_deref(),
+      configured_session_dir.as_deref(),
+      configured_agent_dir.as_deref(),
+      platform_home.as_deref(),
+      cfg!(windows),
+    )
+  }
+}
+
+fn resolve_pi_session_root(
+  explicit_session_dir: Option<&Path>,
+  configured_session_dir: Option<&OsStr>,
+  configured_agent_dir: Option<&OsStr>,
+  platform_home: Option<&Path>,
+  is_windows: bool,
+) -> Result<PathBuf, String> {
+  if let Some(explicit_session_dir) = explicit_session_dir {
+    return Ok(explicit_session_dir.to_path_buf());
+  }
+
+  if let Some(configured_session_dir) = configured_session_dir.filter(|value| !value.is_empty()) {
+    return expand_pi_tilde(
+      configured_session_dir,
+      platform_home,
+      "PI_CODING_AGENT_SESSION_DIR",
+      is_windows,
+    );
+  }
+
+  if let Some(configured_agent_dir) = configured_agent_dir.filter(|value| !value.is_empty()) {
+    return expand_pi_tilde(configured_agent_dir, platform_home, "PI_CODING_AGENT_DIR", is_windows)
+      .map(|agent_dir| agent_dir.join("sessions"));
+  }
+
+  let platform_home = platform_home
+    .filter(|path| !path.as_os_str().is_empty())
+    .ok_or_else(|| {
+      "could not determine the user home directory; set PI_CODING_AGENT_SESSION_DIR, PI_CODING_AGENT_DIR, or pass --session-dir"
+        .to_string()
+    })?;
+  Ok(platform_home.join(".pi").join("agent").join("sessions"))
+}
+
+fn expand_pi_tilde(
+  value: &OsStr,
+  platform_home: Option<&Path>,
+  variable: &str,
+  is_windows: bool,
+) -> Result<PathBuf, String> {
+  let Some(value) = value.to_str() else {
+    return Ok(PathBuf::from(value));
+  };
+  let suffix = if value == "~" {
+    Some("")
+  } else if let Some(suffix) = value.strip_prefix("~/") {
+    Some(suffix)
+  } else if is_windows {
+    value.strip_prefix("~\\")
+  } else {
+    None
+  };
+
+  let Some(suffix) = suffix else {
+    return Ok(PathBuf::from(value));
+  };
+  let platform_home = platform_home.ok_or_else(|| {
+    format!(
+      "{variable} uses `~`, but the user home directory could not be determined; set {variable} to a path without `~` or pass --session-dir"
+    )
+  })?;
+
+  if suffix.is_empty() {
+    Ok(platform_home.to_path_buf())
+  } else {
+    Ok(platform_home.join(suffix))
   }
 }
 
@@ -234,6 +312,120 @@ mod tests {
 
     assert_eq!(reference.parent_session_id.as_deref(), Some("pi-tree-root"));
     assert_eq!(reference.message_count, 0);
+  }
+
+  #[test]
+  fn explicit_session_directory_has_highest_precedence_and_is_unchanged() {
+    let explicit = Path::new("~/explicit-sessions");
+
+    let resolved = resolve_pi_session_root(
+      Some(explicit),
+      Some(OsStr::new("environment-sessions")),
+      Some(OsStr::new("environment-agent")),
+      Some(Path::new("platform-home")),
+      false,
+    )
+    .expect("explicit session directory should resolve");
+
+    assert_eq!(resolved, explicit);
+  }
+
+  #[test]
+  fn session_environment_override_precedes_agent_directory() {
+    let resolved = resolve_pi_session_root(
+      None,
+      Some(OsStr::new("environment-sessions")),
+      Some(OsStr::new("environment-agent")),
+      Some(Path::new("platform-home")),
+      false,
+    )
+    .expect("session environment override should resolve");
+
+    assert_eq!(resolved, Path::new("environment-sessions"));
+  }
+
+  #[test]
+  fn empty_session_override_falls_back_to_agent_directory() {
+    let resolved = resolve_pi_session_root(
+      None,
+      Some(OsStr::new("")),
+      Some(OsStr::new("environment-agent")),
+      Some(Path::new("platform-home")),
+      false,
+    )
+    .expect("agent directory should resolve");
+
+    assert_eq!(resolved, Path::new("environment-agent").join("sessions"));
+  }
+
+  #[test]
+  fn empty_environment_overrides_use_cross_platform_home_input() {
+    // At runtime dirs::home_dir supplies this value from the Windows profile
+    // known folder, rather than this crate depending on HOME being present.
+    let user_profile = Path::new(r"C:\Users\Alice");
+    let resolved = resolve_pi_session_root(
+      None,
+      Some(OsStr::new("")),
+      Some(OsStr::new("")),
+      Some(user_profile),
+      true,
+    )
+    .expect("platform home should resolve");
+
+    assert_eq!(resolved, user_profile.join(".pi").join("agent").join("sessions"));
+  }
+
+  #[test]
+  fn environment_overrides_expand_tilde_with_platform_home() {
+    let platform_home = Path::new("platform-home");
+    let session_root = resolve_pi_session_root(
+      None,
+      Some(OsStr::new("~/custom-sessions")),
+      None,
+      Some(platform_home),
+      false,
+    )
+    .expect("session override should expand");
+    let agent_root = resolve_pi_session_root(
+      None,
+      None,
+      Some(OsStr::new("~/custom-agent")),
+      Some(platform_home),
+      false,
+    )
+    .expect("agent override should expand");
+
+    assert_eq!(session_root, platform_home.join("custom-sessions"));
+    assert_eq!(agent_root, platform_home.join("custom-agent").join("sessions"));
+  }
+
+  #[test]
+  fn windows_tilde_separator_uses_platform_home() {
+    let platform_home = Path::new(r"C:\Users\Alice");
+
+    let resolved = resolve_pi_session_root(
+      None,
+      Some(OsStr::new(r"~\custom-sessions")),
+      None,
+      Some(platform_home),
+      true,
+    )
+    .expect("Windows tilde path should expand");
+
+    assert_eq!(resolved, platform_home.join("custom-sessions"));
+  }
+
+  #[test]
+  fn missing_platform_home_has_actionable_errors() {
+    let default_error =
+      resolve_pi_session_root(None, None, None, None, false).expect_err("default discovery requires a platform home");
+    let tilde_error = resolve_pi_session_root(None, Some(OsStr::new("~/custom-sessions")), None, None, false)
+      .expect_err("tilde expansion requires a platform home");
+
+    assert!(default_error.contains("PI_CODING_AGENT_SESSION_DIR"));
+    assert!(default_error.contains("--session-dir"));
+    assert!(tilde_error.contains("PI_CODING_AGENT_SESSION_DIR"));
+    assert!(tilde_error.contains("--session-dir"));
   }
 
   fn fixtures_dir() -> PathBuf {

@@ -8,10 +8,25 @@ use tokn_session_core::{LoadedSession, LoadedSessionTree, SessionRef};
 
 pub use print::{AppendAction, AppendSessionRequest, CreateSessionRequest};
 pub use source::Source;
+pub use tokn_session_core::SessionHeader;
 
 pub struct AgentClient;
 
 impl AgentClient {
+  /// Lists session headers without computing conversation counts.
+  ///
+  /// File-backed providers read only their session header, while catalog-backed
+  /// providers read only their session rows. This is the appropriate discovery
+  /// API for latency-sensitive viewers and other metadata-only consumers.
+  pub fn list_session_headers(source: Source, session_dir: Option<PathBuf>) -> Result<Vec<SessionHeader>, String> {
+    session_source::session_source(source, session_dir)?.list_session_headers()
+  }
+
+  /// Lists sessions with provider-specific message counts.
+  ///
+  /// This preserves the CLI's counted-list behavior and may scan every session
+  /// body. Prefer [`AgentClient::list_session_headers`] when counts are not
+  /// required.
   pub fn list_sessions(source: Source, session_dir: Option<PathBuf>) -> Result<Vec<SessionRef>, String> {
     session_source::session_source(source, session_dir)?.list_sessions()
   }
@@ -90,6 +105,44 @@ fn tree_discovery_plan(source: Source, session_dir: Option<PathBuf>, session: &s
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn header_listing_stops_before_an_invalid_conversation_body() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("header-only.jsonl");
+    std::fs::write(
+      &path,
+      concat!(
+        r#"{"timestamp":"2026-08-31T00:00:00Z","type":"session_meta","payload":{"id":"header-only","timestamp":"2026-08-31T00:00:00Z","cwd":"/tmp/project"}}"#,
+        "\n",
+        "{invalid conversation record\n",
+      ),
+    )
+    .unwrap();
+
+    let headers = AgentClient::list_session_headers(Source::Codex, Some(directory.path().to_path_buf())).unwrap();
+
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0].id, "header-only");
+    assert_eq!(headers[0].path, path);
+    assert_eq!(headers[0].cwd.as_deref(), Some("/tmp/project"));
+    assert_eq!(headers[0].timestamp.as_deref(), Some("2026-08-31T00:00:00Z"));
+    let expected_updated_at_ms = i64::try_from(
+      std::fs::metadata(&headers[0].path)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis(),
+    )
+    .unwrap();
+    assert_eq!(headers[0].updated_at_ms, Some(expected_updated_at_ms));
+    assert_eq!(
+      headers[0].updated_at.as_deref(),
+      Some(expected_updated_at_ms.to_string().as_str())
+    );
+  }
 
   #[test]
   fn loads_dsh_tree_without_forks_or_inherited_parent_messages() {

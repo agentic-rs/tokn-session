@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "apps/viewer/src-tauri",
   "crates/core",
   "crates/codex-protocol",
   "crates/codex",
@@ -23,7 +24,9 @@ license = "MIT"
 repository = "https://github.com/agentic-rs/tokn-session"
 
 [workspace.dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 crossterm = "0.28"
+dirs = "6"
 notify = { version = "8.2.0", features = ["macos_kqueue"] }
 ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }

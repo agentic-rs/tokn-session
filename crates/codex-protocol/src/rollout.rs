@@ -112,6 +112,8 @@ pub struct SessionMetaItem {
   #[serde(default)]
   pub model_provider: Option<String>,
   #[serde(default)]
+  pub history_mode: Option<String>,
+  #[serde(default)]
   pub parent_thread_id: Option<String>,
   #[serde(default)]
   pub source: Option<Value>,
