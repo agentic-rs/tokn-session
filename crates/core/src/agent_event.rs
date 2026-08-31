@@ -134,21 +134,51 @@ pub struct AgentActivity {
   pub timestamp: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ToolCallEvent {
   pub provider: Provider,
   pub session_id: Option<String>,
+  /// Provider turn identity when one is available. It scopes a tool call ID
+  /// without requiring consumers to infer a turn from nearby messages.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub turn_id: Option<String>,
   pub message_id: Option<String>,
   pub parent_id: Option<String>,
+  /// The provider's role for this append-only tool record. `phase` describes
+  /// the record's delivery state; it must not be used to guess whether the
+  /// logical tool operation has a result yet.
+  #[serde(default)]
+  pub record_kind: ToolRecordKind,
   pub tool_call_id: Option<String>,
+  /// The provider-native tool name before an adapter projects a semantic tool
+  /// name. For a direct provider tool this may match `tool_name`.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub provider_tool_name: Option<String>,
   pub tool_name: Option<String>,
   pub tool_kind: ToolKind,
+  /// The transport that carried the provider call, when it is distinct from
+  /// the semantic tool operation. For example, Codex Code Mode can transport
+  /// a `write_stdin` call through an outer JavaScript `exec` call.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub transport: Option<ToolTransport>,
   pub summary: Option<ToolSummary>,
   pub phase: Phase,
   pub input: Option<Value>,
   pub output: Option<Value>,
   pub is_error: Option<bool>,
+  /// Lossless provider payload for this record. Semantic input/output may be
+  /// projected from it, but consumers can still inspect the original wrapper.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub native: Option<Value>,
   pub timestamp: Option<String>,
+}
+
+impl ToolCallEvent {
+  /// The provider-facing name, falling back to the semantic name for direct
+  /// tool calls that predate explicit provider attribution.
+  pub fn effective_provider_tool_name(&self) -> Option<&str> {
+    self.provider_tool_name.as_deref().or(self.tool_name.as_deref())
+  }
 }
 
 #[derive(Debug, Serialize)]
@@ -272,7 +302,7 @@ pub struct UnknownEvent {
   pub timestamp: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
   Dsh,
@@ -282,7 +312,7 @@ pub enum Provider {
   OpenCode,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum Role {
@@ -293,7 +323,7 @@ pub enum Role {
   Unknown,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageDelivery {
   Commentary,
@@ -301,7 +331,7 @@ pub enum MessageDelivery {
   Unspecified,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum Phase {
@@ -311,10 +341,43 @@ pub enum Phase {
   Finished,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+/// The role of one provider record within a logical tool operation.
+///
+/// Providers may persist an invocation and its result separately. Keeping the
+/// role explicit lets live consumers update one operation without pretending
+/// that an invocation record already contains its later result.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRecordKind {
+  #[default]
+  Invocation,
+  Progress,
+  Result,
+  /// A provider emits the current state of a tool operation rather than a
+  /// distinct invocation or result record.
+  Snapshot,
+}
+
+/// How a provider transported a semantic tool operation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolTransport {
+  /// The provider recorded the semantic tool call directly.
+  Native,
+  /// The semantic call was encoded in a code-execution wrapper.
+  CodeExecution,
+  /// The semantic call crossed an adapter, bridge, or proxy boundary.
+  Proxy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolKind {
+  /// A code cell, script, or similar execution wrapper.
+  CodeExecution,
   Shell,
+  /// Interactive terminal control such as writing to an existing process.
+  Terminal,
   FileRead,
   FileWrite,
   FileEdit,
@@ -324,13 +387,22 @@ pub enum ToolKind {
   Unknown,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolSummary {
+  CodeExecution {
+    language: Option<String>,
+  },
   Shell {
     command: Option<String>,
     cwd: Option<String>,
     exit_code: Option<i64>,
+  },
+  Terminal {
+    session_id: Option<String>,
+    action: Option<TerminalAction>,
+    chars_len: Option<u64>,
+    wait_ms: Option<u64>,
   },
   FileRead {
     path: Option<String>,
@@ -355,10 +427,19 @@ pub enum ToolSummary {
   },
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalAction {
+  Send,
+  Wait,
+}
+
 pub fn tool_kind_for_name(name: &str) -> ToolKind {
   let normalized = name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase();
   match normalized.as_str() {
+    "code_execution" | "code_interpreter" | "script" => ToolKind::CodeExecution,
     "bash" | "exec" | "exec_command" | "local_shell" | "shell" | "terminal" => ToolKind::Shell,
+    "write_stdin" | "stdin" => ToolKind::Terminal,
     "ls" | "list_dir" | "list_directory" | "read" | "read_file" | "view" => ToolKind::FileRead,
     "write" | "write_file" | "create_file" => ToolKind::FileWrite,
     "edit" | "apply_patch" | "patch" | "str_replace" => ToolKind::FileEdit,
@@ -381,12 +462,36 @@ pub fn tool_summary_for_input(name: &str, input: &Value) -> Option<ToolSummary> 
 }
 
 pub fn tool_summary_for_io(name: Option<&str>, input: Option<&Value>, output: Option<&Value>) -> Option<ToolSummary> {
-  let kind = tool_kind_for_optional_name(name);
+  tool_summary_for_kind_io(tool_kind_for_optional_name(name), input, output)
+}
+
+/// Build a summary from an explicit semantic tool kind.
+///
+/// Most providers use their tool name for classification, but adapters may
+/// safely project a different semantic operation from an outer transport. For
+/// example, a Code Mode `exec` wrapper is code execution, not a shell call.
+pub fn tool_summary_for_kind_io(kind: ToolKind, input: Option<&Value>, output: Option<&Value>) -> Option<ToolSummary> {
   match kind {
+    ToolKind::CodeExecution => Some(ToolSummary::CodeExecution {
+      language: input.and_then(|input| string_field(input, "language")),
+    }),
     ToolKind::Shell => Some(ToolSummary::Shell {
       command: input.and_then(shell_command_from_value),
       cwd: input.and_then(|input| string_field(input, "cwd").or_else(|| string_field(input, "workdir"))),
       exit_code: output.and_then(output_exit_code),
+    }),
+    ToolKind::Terminal => Some(ToolSummary::Terminal {
+      session_id: input.and_then(terminal_session_id),
+      action: input.and_then(terminal_action),
+      chars_len: input.and_then(|input| {
+        input
+          .get("chars")
+          .and_then(Value::as_str)
+          .map(|chars| chars.chars().count() as u64)
+      }),
+      wait_ms: input.and_then(|input| {
+        unsigned_integer_field(input, "yield_time_ms").or_else(|| unsigned_integer_field(input, "wait_ms"))
+      }),
     }),
     ToolKind::FileRead => Some(ToolSummary::FileRead {
       path: input.and_then(path_field),
@@ -453,6 +558,21 @@ fn output_exit_code(value: &Value) -> Option<i64> {
     .or_else(|| value.get("details").and_then(output_exit_code))
 }
 
+fn terminal_session_id(value: &Value) -> Option<String> {
+  string_field(value, "session_id")
+    .or_else(|| unsigned_integer_field(value, "session_id").map(|value| value.to_string()))
+}
+
+fn terminal_action(value: &Value) -> Option<TerminalAction> {
+  value.get("chars").and_then(Value::as_str).map(|chars| {
+    if chars.is_empty() {
+      TerminalAction::Wait
+    } else {
+      TerminalAction::Send
+    }
+  })
+}
+
 fn patch_path(value: &Value) -> Option<String> {
   path_field(value)
     .or_else(|| first_change_map_path(value))
@@ -517,6 +637,10 @@ fn path_field(value: &Value) -> Option<String> {
 
 fn string_field(value: &Value, field: &str) -> Option<String> {
   value.get(field).and_then(Value::as_str).map(str::to_string)
+}
+
+fn unsigned_integer_field(value: &Value, field: &str) -> Option<u64> {
+  value.get(field).and_then(Value::as_u64)
 }
 
 fn string_array_field(value: &Value, field: &str) -> Option<Vec<String>> {
@@ -643,6 +767,18 @@ mod tests {
         cwd: None,
         exit_code: Some(2),
       })
+    ));
+  }
+
+  #[test]
+  fn explicit_code_execution_kind_does_not_inherit_exec_shell_classification() {
+    let input = serde_json::json!({ "language": "javascript", "source": "await tools.write_stdin(...)" });
+
+    assert!(matches!(
+      tool_summary_for_kind_io(ToolKind::CodeExecution, Some(&input), None),
+      Some(ToolSummary::CodeExecution {
+        language: Some(language),
+      }) if language == "javascript"
     ));
   }
 

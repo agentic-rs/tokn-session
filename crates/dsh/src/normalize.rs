@@ -7,7 +7,8 @@ use tokn_dsh_protocol::{
 use tokn_session_core::{
   AgentEvent, ErrorEvent, LifecycleEvent, LifecycleOutcome, LifecycleScope, MessageDelivery, MessageEvent,
   MessageProvenance, MetadataEvent, MetadataKind, Phase, Provider, ProviderChanged, ReasoningEvent, Role,
-  SessionStarted, ToolCallEvent, UnknownEvent, UsageEvent, UsageKind, tool_kind_for_optional_name, tool_summary_for_io,
+  SessionStarted, ToolCallEvent, ToolRecordKind, ToolTransport, UnknownEvent, UsageEvent, UsageKind,
+  tool_kind_for_optional_name, tool_summary_for_io,
 };
 
 /// Historical log view, not a reconstruction of the compacted model surface.
@@ -144,6 +145,7 @@ impl Normalizer {
           return vec![];
         }
         vec![self.tool(
+          Some(event.data.turn),
           Some(event.data.call_id),
           Some(event.data.name),
           None,
@@ -170,6 +172,7 @@ impl Normalizer {
             "error": native["data"]["error"]
           });
           events.push(self.tool(
+            Some(event.data.turn),
             Some(block.tool_call_id),
             call.map(|(name, _)| name.clone()),
             Some(event.data.message.id.clone()),
@@ -333,6 +336,7 @@ impl Normalizer {
             let input = arguments(&block.arguments);
             self.calls.insert(key, (block.name.clone(), input.clone()));
             events.push(self.tool(
+              Some(turn),
               Some(block.id),
               Some(block.name),
               Some(id.into()),
@@ -432,6 +436,7 @@ impl Normalizer {
   #[allow(clippy::too_many_arguments)]
   fn tool(
     &self,
+    turn_id: Option<u64>,
     id: Option<String>,
     name: Option<String>,
     message_id: Option<String>,
@@ -441,19 +446,34 @@ impl Normalizer {
     phase: Phase,
     time: Option<String>,
   ) -> AgentEvent {
+    let record_kind = match (
+      input.is_some(),
+      output.as_ref().is_some_and(|value| !value.is_null()),
+      phase,
+    ) {
+      (true, false, _) | (_, false, Phase::Started) => ToolRecordKind::Invocation,
+      (_, _, Phase::Delta | Phase::Updated) => ToolRecordKind::Progress,
+      (false, true, _) => ToolRecordKind::Result,
+      _ => ToolRecordKind::Snapshot,
+    };
     AgentEvent::ToolCall(ToolCallEvent {
       provider: Provider::Dsh,
       session_id: Some(self.session_id.clone()),
+      turn_id: turn_id.map(|value| value.to_string()),
       message_id,
       parent_id: None,
+      record_kind,
       tool_call_id: id,
+      provider_tool_name: name.clone(),
       tool_kind: tool_kind_for_optional_name(name.as_deref()),
       summary: tool_summary_for_io(name.as_deref(), input.as_ref(), output.as_ref()),
       tool_name: name,
+      transport: Some(ToolTransport::Native),
       phase,
       input,
       output,
       is_error,
+      native: None,
       timestamp: time,
     })
   }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -7,16 +7,18 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokn_session_client::SessionHeader;
 use tokn_session_core::{
-  AgentEvent, LifecycleOutcome, LoadedSession, Phase, Provider, Role, ToolCallEvent, ToolKind, ToolSummary, UsageKind,
+  AgentActivity, AgentEvent, LifecycleOutcome, LoadedSession, Phase, Provider, Role, TerminalAction, ToolCallEvent,
+  ToolKind, ToolOperation, ToolOperationStatus, ToolSummary, UsageKind, assemble_tool_operations,
 };
 use tokn_session_render::render_event_summary;
 
 use crate::model::{
-  EventDetail, EventPage, EventPageRequest, EventSummary, ListSessionsRequest, ListSessionsResponse,
-  LoadEventDetailRequest, PageDirection, ReasoningCardSummary, SessionLocator, SessionSummary, SourceError,
-  ToolCardSummary, ToolOutputPreview, ToolOutputSection, UsageCardSummary, ViewerProvider, bounded_limit,
-  decode_event_cursor, decode_event_key, decode_list_cursor, decode_session_key, encode_event_cursor, encode_event_key,
-  encode_list_cursor, encode_session_key, parse_updated_at_ms, requested_offset,
+  AgentActivityCardSummary, EventDetail, EventPage, EventPageRequest, EventSummary, ListSessionChildrenRequest,
+  ListSessionChildrenResponse, ListSessionsRequest, ListSessionsResponse, LoadEventDetailRequest, PageDirection,
+  ReasoningCardSummary, SessionLocator, SessionSummary, SourceError, ToolCardSummary, ToolOutputPreview,
+  ToolOutputSection, UsageCardSummary, ViewerProvider, bounded_limit, decode_event_cursor, decode_event_key,
+  decode_list_cursor, decode_session_key, encode_event_cursor, encode_event_key, encode_list_cursor,
+  encode_session_key, parse_updated_at_ms, requested_offset,
 };
 use crate::repository::{NativeRepository, ViewerRepository};
 
@@ -24,6 +26,7 @@ const MAX_DETAIL_VALUE_BYTES: usize = 512 * 1024;
 const MAX_MESSAGE_SUMMARY_CHARS: usize = 16 * 1024;
 const MAX_SESSION_PREVIEW_CHARS: usize = 240;
 const MAX_SESSION_TITLE_CHARS: usize = 160;
+const MAX_AGENT_IDENTITY_CHARS: usize = 160;
 const MAX_REASONING_CARD_PREVIEW_CHARS: usize = 240;
 const MAX_TECHNICAL_SUMMARY_CHARS: usize = 500;
 const MAX_TOOL_CARD_STRING_CHARS: usize = 500;
@@ -60,6 +63,33 @@ struct FileRevision {
   len: u64,
   modified: Option<SystemTime>,
   created: Option<SystemTime>,
+}
+
+#[derive(Clone)]
+struct SessionListCandidate {
+  provider: ViewerProvider,
+  header: SessionHeader,
+  child_count: usize,
+  is_subagent: bool,
+}
+
+struct SessionRelationIndex {
+  headers: Vec<SessionHeader>,
+  parent_indices: Vec<Option<usize>>,
+  child_counts: Vec<usize>,
+}
+
+/// One visible historical timeline row. Tool operations intentionally retain
+/// their source event index as the stable detail key while hiding intermediate
+/// invocation/progress/result fragments from the presentation timeline.
+enum TimelineEntry {
+  Event {
+    source_event_index: usize,
+  },
+  ToolOperation {
+    source_event_index: usize,
+    operation: ToolOperation,
+  },
 }
 
 impl ViewerService {
@@ -105,64 +135,82 @@ impl ViewerService {
         }
       };
 
-      for header in headers {
-        // The global roster intentionally shows roots. Descendants will be
-        // loaded within a selected root's conversation tree in a later slice.
-        if header.parent_session_id.is_some() {
+      let relations = session_relation_index(provider, headers, &mut source_errors);
+      for (index, header) in relations.headers.into_iter().enumerate() {
+        // A child is hidden from the root roster only when its parent is a
+        // present, canonical header and its relation does not make a cycle.
+        // That deliberately keeps orphaned and cyclic records discoverable.
+        if relations.parent_indices[index].is_some() {
           continue;
         }
-        if let Err(message) = validate_session_header(provider, &header) {
-          record_source_error(&mut source_errors, provider, message);
-          continue;
-        }
-        candidates.push((provider, header));
+        candidates.push(SessionListCandidate {
+          provider,
+          header,
+          child_count: relations.child_counts[index],
+          is_subagent: false,
+        });
       }
     }
 
     if let Some(search) = search.as_deref() {
       let mut matches = Vec::new();
-      for (provider, header) in candidates {
-        let summary = match session_summary(provider, header.clone()) {
+      for candidate in candidates {
+        let summary = match session_summary_with_child_count(
+          candidate.provider,
+          candidate.header.clone(),
+          candidate.child_count,
+          candidate.is_subagent,
+        ) {
           Ok(summary) => summary,
           Err(message) => {
-            record_source_error(&mut source_errors, provider, message);
+            record_source_error(&mut source_errors, candidate.provider, message);
             continue;
           }
         };
         if matches_search(&summary, Some(search)) {
-          matches.push((provider, header));
+          matches.push(candidate);
           continue;
         }
         if summary.preview.is_some() {
           continue;
         }
-        let hydrated = self.hydrate_session_header(provider, header);
-        let summary = match session_summary(provider, hydrated.clone()) {
+        let hydrated = self.hydrate_session_header(candidate.provider, candidate.header.clone());
+        let summary = match session_summary_with_child_count(
+          candidate.provider,
+          hydrated.clone(),
+          candidate.child_count,
+          candidate.is_subagent,
+        ) {
           Ok(summary) => summary,
           Err(message) => {
-            record_source_error(&mut source_errors, provider, message);
+            record_source_error(&mut source_errors, candidate.provider, message);
             continue;
           }
         };
         if matches_search(&summary, Some(search)) {
-          matches.push((provider, hydrated));
+          matches.push(SessionListCandidate {
+            header: hydrated,
+            ..candidate
+          });
         }
       }
-      sort_session_headers(&mut matches);
+      sort_session_candidates(&mut matches);
       let start = offset.min(matches.len());
       let end = start.saturating_add(limit).min(matches.len());
       let next_cursor = (end < matches.len()).then(|| encode_list_cursor(end));
       let mut sessions = Vec::with_capacity(end - start);
-      for (provider, header) in matches[start..end].iter().cloned() {
-        let header =
-          if present_string(header.title.as_deref()).is_none() && present_string(header.preview.as_deref()).is_none() {
-            self.hydrate_session_header(provider, header)
-          } else {
-            header
-          };
-        match session_summary(provider, header) {
+      for candidate in matches[start..end].iter().cloned() {
+        let header = if present_string(candidate.header.title.as_deref()).is_none()
+          && present_string(candidate.header.preview.as_deref()).is_none()
+        {
+          self.hydrate_session_header(candidate.provider, candidate.header)
+        } else {
+          candidate.header
+        };
+        match session_summary_with_child_count(candidate.provider, header, candidate.child_count, candidate.is_subagent)
+        {
           Ok(summary) => sessions.push(summary),
-          Err(message) => record_source_error(&mut source_errors, provider, message),
+          Err(message) => record_source_error(&mut source_errors, candidate.provider, message),
         }
       }
       return Ok(ListSessionsResponse {
@@ -172,21 +220,22 @@ impl ViewerService {
       });
     }
 
-    sort_session_headers(&mut candidates);
+    sort_session_candidates(&mut candidates);
     let start = offset.min(candidates.len());
     let end = start.saturating_add(limit).min(candidates.len());
     let next_cursor = (end < candidates.len()).then(|| encode_list_cursor(end));
     let mut sessions = Vec::with_capacity(end - start);
-    for (provider, header) in candidates[start..end].iter().cloned() {
-      let header =
-        if present_string(header.title.as_deref()).is_none() && present_string(header.preview.as_deref()).is_none() {
-          self.hydrate_session_header(provider, header)
-        } else {
-          header
-        };
-      match session_summary(provider, header) {
+    for candidate in candidates[start..end].iter().cloned() {
+      let header = if present_string(candidate.header.title.as_deref()).is_none()
+        && present_string(candidate.header.preview.as_deref()).is_none()
+      {
+        self.hydrate_session_header(candidate.provider, candidate.header)
+      } else {
+        candidate.header
+      };
+      match session_summary_with_child_count(candidate.provider, header, candidate.child_count, candidate.is_subagent) {
         Ok(summary) => sessions.push(summary),
-        Err(message) => record_source_error(&mut source_errors, provider, message),
+        Err(message) => record_source_error(&mut source_errors, candidate.provider, message),
       }
     }
 
@@ -195,6 +244,60 @@ impl ViewerService {
       next_cursor,
       source_errors,
     })
+  }
+
+  /// Lists a bounded page of direct child headers without reading any child
+  /// conversation body. The opaque parent key binds the request to one
+  /// provider and one source record, so raw provider-local IDs never connect
+  /// sessions from different providers.
+  pub fn list_session_children(
+    &self,
+    request: ListSessionChildrenRequest,
+  ) -> Result<ListSessionChildrenResponse, String> {
+    let limit = bounded_limit(request.limit)?;
+    let offset = requested_offset(request.cursor.as_deref(), request.offset, decode_list_cursor)?.unwrap_or(0);
+    let parent_locator = decode_session_key(&request.parent_session_key)?;
+    let headers = self.repository.list_session_headers(parent_locator.provider)?;
+    let mut ignored_errors = Vec::new();
+    let relations = session_relation_index(parent_locator.provider, headers, &mut ignored_errors);
+    let parent_index = relations
+      .headers
+      .iter()
+      .position(|header| locator_for_header(parent_locator.provider, header) == parent_locator)
+      .ok_or_else(|| "session key no longer matches its source record".to_string())?;
+
+    let mut candidates = relations
+      .headers
+      .into_iter()
+      .enumerate()
+      .filter_map(|(index, header)| {
+        (relations.parent_indices[index] == Some(parent_index)).then_some(SessionListCandidate {
+          provider: parent_locator.provider,
+          header,
+          child_count: relations.child_counts[index],
+          is_subagent: true,
+        })
+      })
+      .collect::<Vec<_>>();
+    sort_session_candidates(&mut candidates);
+
+    let start = offset.min(candidates.len());
+    let end = start.saturating_add(limit).min(candidates.len());
+    let next_cursor = (end < candidates.len()).then(|| encode_list_cursor(end));
+    let sessions = candidates[start..end]
+      .iter()
+      .cloned()
+      .map(|candidate| {
+        session_summary_with_child_count(
+          candidate.provider,
+          candidate.header,
+          candidate.child_count,
+          candidate.is_subagent,
+        )
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(ListSessionChildrenResponse { sessions, next_cursor })
   }
 
   fn hydrate_session_header(&self, provider: ViewerProvider, mut header: SessionHeader) -> SessionHeader {
@@ -260,17 +363,38 @@ impl ViewerService {
     let limit = bounded_limit(request.limit)?;
     let locator = decode_session_key(&request.session_key)?;
     let loaded = self.load_verified(&locator)?;
-    let total_events = loaded.events.len();
+    let timeline = timeline_entries(&loaded.events);
+    let total_events = timeline.len();
     let requested = requested_offset(request.cursor.as_deref(), request.offset, decode_event_cursor)?;
     let boundary = requested.unwrap_or(match request.direction {
       PageDirection::Forward => 0,
       PageDirection::Backward => total_events,
     });
     let (start, end) = event_page_bounds(total_events, boundary, request.direction, limit)?;
-    let events = loaded.events[start..end]
+    let has_targeted_agent_activity = timeline[start..end].iter().any(|entry| match entry {
+      TimelineEntry::Event { source_event_index } => matches!(
+        loaded.events.get(*source_event_index),
+        Some(AgentEvent::AgentActivity(activity)) if present_string(activity.target_session_id.as_deref()).is_some()
+      ),
+      TimelineEntry::ToolOperation { .. } => false,
+    });
+    let delegation_targets = has_targeted_agent_activity
+      .then(|| self.delegation_targets_for_parent(&locator))
+      .unwrap_or_default();
+    let events = timeline[start..end]
       .iter()
-      .enumerate()
-      .map(|(relative_index, event)| event_summary(&loaded.events, start + relative_index, event))
+      .map(|entry| match entry {
+        TimelineEntry::Event { source_event_index } => event_summary_with_delegation_targets(
+          &loaded.events,
+          *source_event_index,
+          &loaded.events[*source_event_index],
+          &delegation_targets,
+        ),
+        TimelineEntry::ToolOperation {
+          source_event_index,
+          operation,
+        } => tool_operation_event_summary(*source_event_index, operation),
+      })
       .collect();
 
     Ok(EventPage {
@@ -284,55 +408,26 @@ impl ViewerService {
 
   pub fn load_event_detail(&self, request: LoadEventDetailRequest) -> Result<EventDetail, String> {
     let locator = decode_session_key(&request.session_key)?;
-    let index = decode_event_key(&request.event_key)?;
+    let source_event_index = decode_event_key(&request.event_key)?;
     let loaded = self.load_verified(&locator)?;
-    let event = loaded
-      .events
-      .get(index)
+    let entry = timeline_entry_for_source(&loaded.events, source_event_index)
       .ok_or_else(|| "event key is outside the session".to_string())?;
-    let is_hidden = event.is_hidden();
-    if is_hidden {
-      return Ok(EventDetail {
-        event_key: request.event_key,
-        event: json!({
-          "type": normalized_event_type(event),
-          "provider": provider_for_event(event).as_str(),
-          "redacted": true,
-        }),
-        native: None,
-        is_hidden: true,
-        tool_output: None,
-      });
-    }
-    if matches!(event, AgentEvent::Reasoning(reasoning) if reasoning.redacted == Some(true)) {
-      return Ok(EventDetail {
-        event_key: request.event_key,
-        event: json!({
-          "type": "reasoning",
-          "provider": provider_for_event(event).as_str(),
-          "redacted": true,
-        }),
-        native: None,
-        is_hidden: false,
-        tool_output: None,
-      });
-    }
 
-    let native = native_detail(event)
-      .map(|value| bounded_detail_value(value, "provider_native"))
-      .transpose()?;
-    let mut normalized =
-      serde_json::to_value(event).map_err(|error| format!("failed to serialize normalized event: {error}"))?;
-    remove_embedded_native(&mut normalized);
-    let normalized = bounded_detail_value(normalized, "normalized_event")?;
-    let tool_output = tool_output_preview(&loaded.events, index);
-    Ok(EventDetail {
-      event_key: request.event_key,
-      event: normalized,
-      native,
-      is_hidden: false,
-      tool_output,
-    })
+    match entry {
+      TimelineEntry::Event { source_event_index } => {
+        let event = &loaded.events[source_event_index];
+        event_detail(
+          encode_event_key(source_event_index),
+          event,
+          &loaded.events,
+          source_event_index,
+        )
+      }
+      TimelineEntry::ToolOperation {
+        source_event_index,
+        operation,
+      } => tool_operation_detail(encode_event_key(source_event_index), &operation, &loaded.events),
+    }
   }
 
   fn load_verified(&self, locator: &SessionLocator) -> Result<Arc<LoadedSession>, String> {
@@ -370,6 +465,139 @@ impl ViewerService {
     };
     Ok(loaded)
   }
+
+  /// Returns direct, canonical descendants that are safe to open from a
+  /// parent activity card. Header discovery is deliberately fail-closed: an
+  /// unavailable provider catalog or a parent source that is no longer the
+  /// canonical header produces no links, while leaving the parent timeline
+  /// readable.
+  fn delegation_targets_for_parent(&self, parent_locator: &SessionLocator) -> HashMap<String, SessionSummary> {
+    let Ok(headers) = self.repository.list_session_headers(parent_locator.provider) else {
+      return HashMap::new();
+    };
+    let mut ignored_errors = Vec::new();
+    let relations = session_relation_index(parent_locator.provider, headers, &mut ignored_errors);
+    let Some(parent_index) = relations
+      .headers
+      .iter()
+      .position(|header| locator_for_header(parent_locator.provider, header) == *parent_locator)
+    else {
+      return HashMap::new();
+    };
+
+    relations
+      .headers
+      .into_iter()
+      .enumerate()
+      .filter_map(|(index, header)| (relations.parent_indices[index] == Some(parent_index)).then_some((index, header)))
+      .filter_map(|(index, header)| {
+        session_summary_with_child_count(parent_locator.provider, header, relations.child_counts[index], true).ok()
+      })
+      .map(|summary| (summary.session_id.clone(), summary))
+      .collect()
+  }
+}
+
+fn event_detail(
+  event_key: String,
+  event: &AgentEvent,
+  events: &[AgentEvent],
+  source_event_index: usize,
+) -> Result<EventDetail, String> {
+  let is_hidden = event.is_hidden();
+  if is_hidden {
+    return Ok(EventDetail {
+      event_key,
+      event: json!({
+        "type": normalized_event_type(event),
+        "provider": provider_for_event(event).as_str(),
+        "redacted": true,
+      }),
+      native: None,
+      is_hidden: true,
+      tool_output: None,
+    });
+  }
+  if matches!(event, AgentEvent::Reasoning(reasoning) if reasoning.redacted == Some(true)) {
+    return Ok(EventDetail {
+      event_key,
+      event: json!({
+        "type": "reasoning",
+        "provider": provider_for_event(event).as_str(),
+        "redacted": true,
+      }),
+      native: None,
+      is_hidden: false,
+      tool_output: None,
+    });
+  }
+
+  let native = native_detail(event)
+    .map(|value| bounded_detail_value(value, "provider_native"))
+    .transpose()?;
+  let mut normalized =
+    serde_json::to_value(event).map_err(|error| format!("failed to serialize normalized event: {error}"))?;
+  remove_embedded_native(&mut normalized);
+  let normalized = bounded_detail_value(normalized, "normalized_event")?;
+  let tool_output = tool_output_preview(events, source_event_index);
+  Ok(EventDetail {
+    event_key,
+    event: normalized,
+    native,
+    is_hidden: false,
+    tool_output,
+  })
+}
+
+fn tool_operation_detail(
+  event_key: String,
+  operation: &ToolOperation,
+  events: &[AgentEvent],
+) -> Result<EventDetail, String> {
+  let mut normalized = serde_json::to_value(operation)
+    .map_err(|error| format!("failed to serialize normalized tool operation: {error}"))?;
+  remove_embedded_native(&mut normalized);
+  let normalized = bounded_detail_value(normalized, "normalized_tool_operation")?;
+  let native = tool_operation_native_detail(operation, events)
+    .map(|value| bounded_detail_value(value, "provider_native"))
+    .transpose()?;
+  let tool_output = tool_operation_output_preview(operation);
+
+  Ok(EventDetail {
+    event_key,
+    event: normalized,
+    native,
+    is_hidden: false,
+    tool_output,
+  })
+}
+
+fn tool_operation_native_detail(operation: &ToolOperation, events: &[AgentEvent]) -> Option<Value> {
+  let records = operation
+    .source_event_indices
+    .iter()
+    .filter_map(|&source_event_index| {
+      let AgentEvent::ToolCall(event) = events.get(source_event_index)? else {
+        return None;
+      };
+      event.native.as_ref().map(|native| {
+        json!({
+          "event_key": encode_event_key(source_event_index),
+          "record_kind": serialized_label(event.record_kind),
+          "timestamp": event.timestamp,
+          "native": native,
+        })
+      })
+    })
+    .collect::<Vec<_>>();
+  (!records.is_empty()).then(|| json!({ "source_records": records }))
+}
+
+fn tool_operation_output_preview(operation: &ToolOperation) -> Option<ToolOutputPreview> {
+  let output = operation.output.as_ref().filter(|value| !value.is_null())?;
+  let sections = project_output(output, 0);
+  let source_event_index = *operation.source_event_indices.first()?;
+  (!sections.is_empty()).then(|| bound_tool_output(sections, source_event_index))
 }
 
 fn apply_cached_session_header(
@@ -438,16 +666,96 @@ fn validate_session_header(provider: ViewerProvider, header: &SessionHeader) -> 
   encode_session_key(&locator_for_header(provider, header)).map(|_| ())
 }
 
-fn sort_session_headers(candidates: &mut [(ViewerProvider, SessionHeader)]) {
-  candidates.sort_by(|(left_provider, left), (right_provider, right)| {
+fn session_relation_index(
+  provider: ViewerProvider,
+  headers: Vec<SessionHeader>,
+  source_errors: &mut Vec<SourceError>,
+) -> SessionRelationIndex {
+  let mut valid_headers = Vec::with_capacity(headers.len());
+  for header in headers {
+    if let Err(message) = validate_session_header(provider, &header) {
+      record_source_error(source_errors, provider, message);
+      continue;
+    }
+    valid_headers.push(header);
+  }
+  let headers = canonical_session_headers(valid_headers);
+  let indices_by_id = headers
+    .iter()
+    .enumerate()
+    .map(|(index, header)| (header.id.as_str(), index))
+    .collect::<HashMap<_, _>>();
+  let mut parent_indices = vec![None; headers.len()];
+
+  for (child_index, header) in headers.iter().enumerate() {
+    let Some(parent_id) = header.parent_session_id.as_deref() else {
+      continue;
+    };
+    let Some(&parent_index) = indices_by_id.get(parent_id) else {
+      continue;
+    };
+    if parent_index == child_index || relation_would_cycle(&parent_indices, child_index, parent_index) {
+      continue;
+    }
+    parent_indices[child_index] = Some(parent_index);
+  }
+
+  let mut child_counts = vec![0; headers.len()];
+  for parent_index in parent_indices.iter().flatten() {
+    child_counts[*parent_index] += 1;
+  }
+
+  SessionRelationIndex {
+    headers,
+    parent_indices,
+    child_counts,
+  }
+}
+
+fn canonical_session_headers(mut headers: Vec<SessionHeader>) -> Vec<SessionHeader> {
+  // Match the client tree loader's policy: when a provider has more than one
+  // header with the same ID, the newest provider timestamp owns that
+  // provider-local identity. Filesystem mtime is deliberately not involved:
+  // it can change long after the provider wrote the rollout. The source path
+  // remains part of the opaque key, but cannot resolve an ambiguous parent ID
+  // on its own.
+  headers.sort_by(|left, right| {
     right
-      .updated_at_ms
-      .cmp(&left.updated_at_ms)
-      .then_with(|| right.timestamp.cmp(&left.timestamp))
-      .then_with(|| left_provider.as_str().cmp(right_provider.as_str()))
-      .then_with(|| left.id.cmp(&right.id))
-      .then_with(|| left.path.cmp(&right.path))
+      .timestamp
+      .cmp(&left.timestamp)
+      .then_with(|| right.path.cmp(&left.path))
   });
+  let mut canonical_ids = HashSet::new();
+  headers.retain(|header| canonical_ids.insert(header.id.clone()));
+  headers.sort_by(compare_session_headers);
+  headers
+}
+
+fn relation_would_cycle(parent_indices: &[Option<usize>], child_index: usize, parent_index: usize) -> bool {
+  let mut current = Some(parent_index);
+  while let Some(index) = current {
+    if index == child_index {
+      return true;
+    }
+    current = parent_indices[index];
+  }
+  false
+}
+
+fn sort_session_candidates(candidates: &mut [SessionListCandidate]) {
+  candidates.sort_by(|left, right| {
+    compare_session_headers(&left.header, &right.header)
+      .then_with(|| left.provider.as_str().cmp(right.provider.as_str()))
+  });
+}
+
+fn compare_session_headers(left: &SessionHeader, right: &SessionHeader) -> std::cmp::Ordering {
+  right
+    .updated_at_ms
+    .cmp(&left.updated_at_ms)
+    .then_with(|| right.timestamp.cmp(&left.timestamp))
+    .then_with(|| left.id.cmp(&right.id))
+    .then_with(|| left.path.cmp(&right.path))
 }
 
 fn locator_for_header(provider: ViewerProvider, header: &SessionHeader) -> SessionLocator {
@@ -459,11 +767,24 @@ fn locator_for_header(provider: ViewerProvider, header: &SessionHeader) -> Sessi
   }
 }
 
+#[cfg(test)]
 fn session_summary(provider: ViewerProvider, header: SessionHeader) -> Result<SessionSummary, String> {
+  session_summary_with_child_count(provider, header, 0, false)
+}
+
+fn session_summary_with_child_count(
+  provider: ViewerProvider,
+  header: SessionHeader,
+  child_count: usize,
+  is_subagent: bool,
+) -> Result<SessionSummary, String> {
   let locator = locator_for_header(provider, &header);
   let project = header.cwd.as_deref().and_then(path_name).map(str::to_string);
   let title = normalize_session_text(header.title, MAX_SESSION_TITLE_CHARS);
   let preview = normalize_session_text(header.preview, MAX_SESSION_PREVIEW_CHARS);
+  let agent_path = normalize_session_text(header.agent_path, MAX_AGENT_IDENTITY_CHARS);
+  let agent_nickname = normalize_session_text(header.agent_nickname, MAX_AGENT_IDENTITY_CHARS);
+  let agent_role = normalize_session_text(header.agent_role, MAX_AGENT_IDENTITY_CHARS);
   Ok(SessionSummary {
     session_key: encode_session_key(&locator)?,
     session_id: header.id,
@@ -477,7 +798,11 @@ fn session_summary(provider: ViewerProvider, header: SessionHeader) -> Result<Se
       .or_else(|| parse_updated_at_ms(header.updated_at.as_deref())),
     timestamp: header.timestamp,
     parent_session_id: header.parent_session_id,
-    agent_path: header.agent_path,
+    is_subagent,
+    agent_path,
+    agent_nickname,
+    agent_role,
+    child_count,
     message_count: None,
     // The listing adapters deliberately inspect only headers. Loading every
     // normalized body here would make the bounded UI query unbounded.
@@ -504,6 +829,8 @@ fn matches_search(session: &SessionSummary, search: Option<&str>) -> bool {
     session.project.as_deref(),
     session.cwd.as_deref(),
     session.agent_path.as_deref(),
+    session.agent_nickname.as_deref(),
+    session.agent_role.as_deref(),
   ]
   .into_iter()
   .flatten()
@@ -610,7 +937,71 @@ fn event_page_bounds(
   })
 }
 
+fn timeline_entries(events: &[AgentEvent]) -> Vec<TimelineEntry> {
+  let mut operations_by_timeline_source = HashMap::new();
+  let mut hidden_tool_sources = HashSet::new();
+
+  for operation in assemble_tool_operations(events) {
+    let Some(timeline_source_event_index) = operation.timeline_source_event_index() else {
+      continue;
+    };
+    let Some(&source_event_index) = operation.source_event_indices.first() else {
+      continue;
+    };
+    // Keep the invocation key stable for selection and cached detail, while
+    // placing a terminal historical operation where its result occurred.
+    hidden_tool_sources.extend(
+      operation
+        .source_event_indices
+        .iter()
+        .copied()
+        .filter(|index| *index != timeline_source_event_index),
+    );
+    operations_by_timeline_source.insert(timeline_source_event_index, (source_event_index, operation));
+  }
+
+  let mut entries = Vec::with_capacity(events.len().saturating_sub(hidden_tool_sources.len()));
+  for source_event_index in 0..events.len() {
+    if let Some((detail_source_event_index, operation)) = operations_by_timeline_source.remove(&source_event_index) {
+      entries.push(TimelineEntry::ToolOperation {
+        source_event_index: detail_source_event_index,
+        operation,
+      });
+    } else if hidden_tool_sources.contains(&source_event_index) {
+      continue;
+    } else {
+      // This should only be reachable for non-tool records. Retaining a
+      // standalone tool record if an assembler invariant is violated is safer
+      // than silently hiding provider data.
+      entries.push(TimelineEntry::Event { source_event_index });
+    }
+  }
+  entries
+}
+
+fn timeline_entry_for_source(events: &[AgentEvent], source_event_index: usize) -> Option<TimelineEntry> {
+  timeline_entries(events).into_iter().find(|entry| match entry {
+    TimelineEntry::Event {
+      source_event_index: entry_index,
+    } => *entry_index == source_event_index,
+    TimelineEntry::ToolOperation {
+      source_event_index: entry_index,
+      operation,
+    } => *entry_index == source_event_index || operation.source_event_indices.contains(&source_event_index),
+  })
+}
+
+#[cfg(test)]
 fn event_summary(events: &[AgentEvent], index: usize, event: &AgentEvent) -> EventSummary {
+  event_summary_with_delegation_targets(events, index, event, &HashMap::new())
+}
+
+fn event_summary_with_delegation_targets(
+  _events: &[AgentEvent],
+  index: usize,
+  event: &AgentEvent,
+  delegation_targets: &HashMap<String, SessionSummary>,
+) -> EventSummary {
   let hidden = event.is_hidden();
   let title = if hidden {
     "Hidden provider content".to_string()
@@ -641,10 +1032,14 @@ fn event_summary(events: &[AgentEvent], index: usize, event: &AgentEvent) -> Eve
     MAX_TECHNICAL_SUMMARY_CHARS
   };
   let (summary, summary_truncated) = truncate_with_flag(summary, summary_max_chars);
-  let tool = (!hidden)
-    .then(|| tool_event(event).map(|tool| enriched_tool_card_summary(events, index, tool)))
-    .flatten();
+  let tool = (!hidden).then(|| tool_event(event).map(tool_card_summary)).flatten();
   let usage = (!hidden).then(|| usage_card_summary(event)).flatten();
+  let agent_activity = (!hidden)
+    .then(|| match event {
+      AgentEvent::AgentActivity(activity) => Some(agent_activity_card_summary(activity, delegation_targets)),
+      _ => None,
+    })
+    .flatten();
   EventSummary {
     event_key: encode_event_key(index),
     event_type: normalized_event_type(event).to_string(),
@@ -656,10 +1051,117 @@ fn event_summary(events: &[AgentEvent], index: usize, event: &AgentEvent) -> Eve
     summary,
     summary_truncated,
     is_hidden: hidden,
-    is_error: correlated_error(events, index, event),
+    is_error: error_for_event(event),
     tool,
     usage,
     reasoning,
+    agent_activity,
+  }
+}
+
+fn tool_operation_event_summary(source_event_index: usize, operation: &ToolOperation) -> EventSummary {
+  let tool = tool_operation_card_summary(operation);
+  let title = truncate(
+    operation
+      .tool_name
+      .as_deref()
+      .or(operation.provider_tool_name.as_deref())
+      .unwrap_or("Tool operation")
+      .to_string(),
+    120,
+  );
+  let (summary, summary_truncated) =
+    truncate_with_flag(tool_operation_summary(operation, &tool), MAX_TECHNICAL_SUMMARY_CHARS);
+  EventSummary {
+    event_key: encode_event_key(source_event_index),
+    event_type: "tool_call".to_string(),
+    provider: viewer_provider(operation.provider),
+    timestamp: if operation.is_finished() {
+      operation.updated_at.clone().or_else(|| operation.started_at.clone())
+    } else {
+      operation.started_at.clone().or_else(|| operation.updated_at.clone())
+    },
+    // A logical operation has an explicit derived status. Exposing the source
+    // record phase here would recreate the old `finished` ambiguity.
+    phase: None,
+    role: None,
+    title,
+    summary,
+    summary_truncated,
+    is_hidden: false,
+    // Preserve an unspecified provider error state. A failed assembled
+    // operation is the only case where we need to synthesize `true`.
+    is_error: operation
+      .is_error
+      .or(matches!(operation.status, ToolOperationStatus::Failed).then_some(true)),
+    tool: Some(tool),
+    usage: None,
+    reasoning: None,
+    agent_activity: None,
+  }
+}
+
+fn agent_activity_card_summary(
+  activity: &AgentActivity,
+  delegation_targets: &HashMap<String, SessionSummary>,
+) -> AgentActivityCardSummary {
+  AgentActivityCardSummary {
+    kind: normalize_one_line_text(&activity.kind, MAX_AGENT_IDENTITY_CHARS).unwrap_or_else(|| "activity".to_string()),
+    event_id: activity
+      .event_id
+      .as_deref()
+      .and_then(|value| normalize_one_line_text(value, MAX_AGENT_IDENTITY_CHARS)),
+    target_session_id: activity
+      .target_session_id
+      .as_deref()
+      .and_then(|value| normalize_one_line_text(value, MAX_AGENT_IDENTITY_CHARS)),
+    target_agent_path: activity
+      .target_agent_path
+      .as_deref()
+      .and_then(|value| normalize_one_line_text(value, MAX_AGENT_IDENTITY_CHARS)),
+    // Lookup intentionally uses the raw ID. A sanitized display string must
+    // never become a new session identity.
+    target: activity
+      .target_session_id
+      .as_deref()
+      .and_then(|target_session_id| delegation_targets.get(target_session_id))
+      .cloned(),
+  }
+}
+
+fn tool_operation_summary(operation: &ToolOperation, card: &ToolCardSummary) -> String {
+  match operation.summary.as_ref() {
+    Some(ToolSummary::Shell { command, .. }) => command.clone().unwrap_or_else(|| "Shell operation".to_string()),
+    Some(ToolSummary::Terminal {
+      session_id,
+      action,
+      chars_len,
+      wait_ms,
+    }) => match action {
+      Some(TerminalAction::Wait) => format!(
+        "Wait for terminal {}{}",
+        session_id.as_deref().unwrap_or("session"),
+        wait_ms
+          .map(|value| format!(" for up to {value} ms"))
+          .unwrap_or_default(),
+      ),
+      Some(TerminalAction::Send) => format!(
+        "Send {} characters to terminal {}",
+        chars_len.unwrap_or(0),
+        session_id.as_deref().unwrap_or("session"),
+      ),
+      None => "Terminal operation".to_string(),
+    },
+    Some(ToolSummary::CodeExecution { language }) => {
+      format!("{} code execution", language.as_deref().unwrap_or("Unknown"))
+    }
+    Some(ToolSummary::FileRead { path }) => path.clone().unwrap_or_else(|| "Read file".to_string()),
+    Some(ToolSummary::FileWrite { path, .. }) => path.clone().unwrap_or_else(|| "Write file".to_string()),
+    Some(ToolSummary::FileEdit { path, .. }) => path.clone().unwrap_or_else(|| "Edit file".to_string()),
+    Some(ToolSummary::Search { query }) => query.clone().unwrap_or_else(|| "Search".to_string()),
+    Some(ToolSummary::Web { url }) => url.clone().unwrap_or_else(|| "Web request".to_string()),
+    Some(ToolSummary::Task { title }) => title.clone().unwrap_or_else(|| "Task".to_string()),
+    None => card.tool_name.clone().unwrap_or_else(|| "Tool operation".to_string()),
   }
 }
 
@@ -716,50 +1218,20 @@ fn reasoning_card_summary(event: &AgentEvent) -> Option<ReasoningCardSummary> {
   })
 }
 
-fn enriched_tool_card_summary(events: &[AgentEvent], index: usize, event: &ToolCallEvent) -> ToolCardSummary {
-  let mut card = tool_card_summary(event);
-  let (before, after) = related_tool_indices(events, index, event);
-
-  for related_index in before.into_iter().chain(after.iter().copied()) {
-    if let Some(related) = events.get(related_index).and_then(tool_event) {
-      merge_tool_card_summary(&mut card, tool_card_summary(related));
-    }
-  }
-
-  // Terminal facts are authoritative for invocation and delta cards even if
-  // an earlier snapshot happened to include provisional values.
-  for related_index in after {
-    let Some(related) = events.get(related_index).and_then(tool_event) else {
-      continue;
-    };
-    if matches!(related.phase, Phase::Finished) {
-      let terminal = tool_card_summary(related);
-      if terminal.exit_code.is_some() {
-        card.exit_code = terminal.exit_code;
-      }
-      if terminal.bytes.is_some() {
-        card.bytes = terminal.bytes;
-      }
-      if terminal.added.is_some() {
-        card.added = terminal.added;
-      }
-      if terminal.removed.is_some() {
-        card.removed = terminal.removed;
-      }
-      break;
-    }
-  }
-
-  bound_tool_card_summary(card)
-}
-
 fn tool_card_summary(event: &ToolCallEvent) -> ToolCardSummary {
   let mut card = ToolCardSummary {
     kind: tool_kind_label(event.tool_kind).to_string(),
     tool_name: present_string(event.tool_name.as_deref()).map(str::to_string),
     tool_call_id: present_string(event.tool_call_id.as_deref()).map(str::to_string),
+    status: tool_record_status_label(event).to_string(),
+    provider_tool_name: present_string(event.effective_provider_tool_name()).map(str::to_string),
+    language: None,
     command: None,
     cwd: None,
+    terminal_session_id: None,
+    terminal_action: None,
+    chars_len: None,
+    wait_ms: None,
     path: None,
     query: None,
     url: None,
@@ -771,6 +1243,7 @@ fn tool_card_summary(event: &ToolCallEvent) -> ToolCardSummary {
   };
 
   match event.summary.as_ref() {
+    Some(ToolSummary::CodeExecution { language }) => card.language.clone_from(language),
     Some(ToolSummary::Shell {
       command,
       cwd,
@@ -779,6 +1252,17 @@ fn tool_card_summary(event: &ToolCallEvent) -> ToolCardSummary {
       card.command.clone_from(command);
       card.cwd.clone_from(cwd);
       card.exit_code = *exit_code;
+    }
+    Some(ToolSummary::Terminal {
+      session_id,
+      action,
+      chars_len,
+      wait_ms,
+    }) => {
+      card.terminal_session_id.clone_from(session_id);
+      card.terminal_action = action.map(terminal_action_label).map(str::to_string);
+      card.chars_len = *chars_len;
+      card.wait_ms = *wait_ms;
     }
     Some(ToolSummary::FileRead { path }) => card.path.clone_from(path),
     Some(ToolSummary::FileWrite { path, bytes }) => {
@@ -798,27 +1282,94 @@ fn tool_card_summary(event: &ToolCallEvent) -> ToolCardSummary {
   card
 }
 
-fn merge_tool_card_summary(target: &mut ToolCardSummary, source: ToolCardSummary) {
-  if target.kind == "unknown" && source.kind != "unknown" {
-    target.kind = source.kind;
+fn tool_operation_card_summary(operation: &ToolOperation) -> ToolCardSummary {
+  let mut card = ToolCardSummary {
+    kind: tool_kind_label(operation.tool_kind).to_string(),
+    tool_name: present_string(operation.tool_name.as_deref()).map(str::to_string),
+    tool_call_id: present_string(operation.tool_call_id.as_deref()).map(str::to_string),
+    status: tool_operation_status_label(operation.status).to_string(),
+    provider_tool_name: present_string(operation.provider_tool_name.as_deref()).map(str::to_string),
+    language: None,
+    command: None,
+    cwd: None,
+    terminal_session_id: None,
+    terminal_action: None,
+    chars_len: None,
+    wait_ms: None,
+    path: None,
+    query: None,
+    url: None,
+    task_title: None,
+    exit_code: None,
+    bytes: None,
+    added: None,
+    removed: None,
+  };
+
+  match operation.summary.as_ref() {
+    Some(ToolSummary::CodeExecution { language }) => card.language.clone_from(language),
+    Some(ToolSummary::Shell {
+      command,
+      cwd,
+      exit_code,
+    }) => {
+      card.command.clone_from(command);
+      card.cwd.clone_from(cwd);
+      card.exit_code = *exit_code;
+    }
+    Some(ToolSummary::Terminal {
+      session_id,
+      action,
+      chars_len,
+      wait_ms,
+    }) => {
+      card.terminal_session_id.clone_from(session_id);
+      card.terminal_action = action.map(terminal_action_label).map(str::to_string);
+      card.chars_len = *chars_len;
+      card.wait_ms = *wait_ms;
+    }
+    Some(ToolSummary::FileRead { path }) => card.path.clone_from(path),
+    Some(ToolSummary::FileWrite { path, bytes }) => {
+      card.path.clone_from(path);
+      card.bytes = *bytes;
+    }
+    Some(ToolSummary::FileEdit { path, added, removed }) => {
+      card.path.clone_from(path);
+      card.added = *added;
+      card.removed = *removed;
+    }
+    Some(ToolSummary::Search { query }) => card.query.clone_from(query),
+    Some(ToolSummary::Web { url }) => card.url.clone_from(url),
+    Some(ToolSummary::Task { title }) => card.task_title.clone_from(title),
+    None => {}
   }
-  fill_missing(&mut target.tool_name, source.tool_name);
-  fill_missing(&mut target.tool_call_id, source.tool_call_id);
-  fill_missing(&mut target.command, source.command);
-  fill_missing(&mut target.cwd, source.cwd);
-  fill_missing(&mut target.path, source.path);
-  fill_missing(&mut target.query, source.query);
-  fill_missing(&mut target.url, source.url);
-  fill_missing(&mut target.task_title, source.task_title);
-  target.exit_code = target.exit_code.or(source.exit_code);
-  target.bytes = target.bytes.or(source.bytes);
-  target.added = target.added.or(source.added);
-  target.removed = target.removed.or(source.removed);
+  bound_tool_card_summary(card)
 }
 
-fn fill_missing<T>(target: &mut Option<T>, source: Option<T>) {
-  if target.is_none() {
-    *target = source;
+fn terminal_action_label(action: TerminalAction) -> &'static str {
+  match action {
+    TerminalAction::Send => "send",
+    TerminalAction::Wait => "wait",
+  }
+}
+
+fn tool_operation_status_label(status: ToolOperationStatus) -> &'static str {
+  match status {
+    ToolOperationStatus::Pending => "pending",
+    ToolOperationStatus::Running => "running",
+    ToolOperationStatus::Completed => "completed",
+    ToolOperationStatus::Failed => "failed",
+  }
+}
+
+fn tool_record_status_label(event: &ToolCallEvent) -> &'static str {
+  if event.is_error == Some(true) {
+    return "failed";
+  }
+  match event.phase {
+    Phase::Started => "pending",
+    Phase::Delta | Phase::Updated => "running",
+    Phase::Finished => "completed",
   }
 }
 
@@ -826,8 +1377,13 @@ fn bound_tool_card_summary(mut card: ToolCardSummary) -> ToolCardSummary {
   card.kind = truncate(card.kind, MAX_TOOL_NAME_CHARS);
   card.tool_name = truncate_option(card.tool_name, MAX_TOOL_NAME_CHARS);
   card.tool_call_id = truncate_option(card.tool_call_id, MAX_TOOL_CARD_STRING_CHARS);
+  card.status = truncate(card.status, MAX_TOOL_NAME_CHARS);
+  card.provider_tool_name = truncate_option(card.provider_tool_name, MAX_TOOL_NAME_CHARS);
+  card.language = truncate_option(card.language, MAX_TOOL_NAME_CHARS);
   card.command = truncate_option(card.command, MAX_TOOL_CARD_STRING_CHARS);
   card.cwd = truncate_option(card.cwd, MAX_TOOL_CARD_STRING_CHARS);
+  card.terminal_session_id = truncate_option(card.terminal_session_id, MAX_TOOL_CARD_STRING_CHARS);
+  card.terminal_action = truncate_option(card.terminal_action, MAX_TOOL_NAME_CHARS);
   card.path = truncate_option(card.path, MAX_TOOL_CARD_STRING_CHARS);
   card.query = truncate_option(card.query, MAX_TOOL_CARD_STRING_CHARS);
   card.url = truncate_option(card.url, MAX_TOOL_CARD_STRING_CHARS);
@@ -841,7 +1397,9 @@ fn truncate_option(value: Option<String>, max_chars: usize) -> Option<String> {
 
 fn tool_kind_label(kind: ToolKind) -> &'static str {
   match kind {
+    ToolKind::CodeExecution => "code_execution",
     ToolKind::Shell => "shell",
+    ToolKind::Terminal => "terminal",
     ToolKind::FileRead => "file_read",
     ToolKind::FileWrite => "file_write",
     ToolKind::FileEdit => "file_edit",
@@ -913,6 +1471,10 @@ fn provider_for_event(event: &AgentEvent) -> ViewerProvider {
     AgentEvent::Error(event) => event.provider,
     AgentEvent::Unknown(event) => event.provider,
   };
+  viewer_provider(provider)
+}
+
+fn viewer_provider(provider: Provider) -> ViewerProvider {
   match provider {
     Provider::Codex => ViewerProvider::Codex,
     Provider::Pi => ViewerProvider::Pi,
@@ -969,120 +1531,11 @@ fn error_for_event(event: &AgentEvent) -> Option<bool> {
   }
 }
 
-fn correlated_error(events: &[AgentEvent], index: usize, event: &AgentEvent) -> Option<bool> {
-  let Some(tool) = tool_event(event) else {
-    return error_for_event(event);
-  };
-  let mut is_error = tool.is_error;
-  let (_, after) = related_tool_indices(events, index, tool);
-  for related_index in after {
-    let Some(related) = events.get(related_index).and_then(tool_event) else {
-      continue;
-    };
-    if matches!(related.phase, Phase::Finished) {
-      if related.is_error.is_some() {
-        is_error = related.is_error;
-      }
-      break;
-    }
-  }
-  is_error
-}
-
 fn tool_event(event: &AgentEvent) -> Option<&ToolCallEvent> {
   match event {
     AgentEvent::ToolCall(event) => Some(event),
     _ => None,
   }
-}
-
-/// Finds only the nearest lifecycle records around an event. Stopping at the
-/// first completed record or a new invocation avoids joining a later reuse of
-/// the same provider call ID.
-fn related_tool_indices(events: &[AgentEvent], index: usize, origin: &ToolCallEvent) -> (Vec<usize>, Vec<usize>) {
-  if present_string(origin.tool_call_id.as_deref()).is_none() {
-    return (Vec::new(), Vec::new());
-  }
-
-  let mut before = Vec::new();
-  if !matches!(origin.phase, Phase::Started) && !is_invocation_record(origin) {
-    for related_index in (0..index).rev() {
-      let Some(candidate) = events.get(related_index).and_then(tool_event) else {
-        continue;
-      };
-      if !same_tool_scope_and_id(origin, candidate) {
-        continue;
-      }
-      if !compatible_tool_names(origin, candidate) {
-        break;
-      }
-      if is_invocation_record(candidate) {
-        before.push(related_index);
-        break;
-      }
-      if matches!(candidate.phase, Phase::Finished) {
-        break;
-      }
-      before.push(related_index);
-      if matches!(candidate.phase, Phase::Started) {
-        break;
-      }
-    }
-  }
-
-  let mut after = Vec::new();
-  if !matches!(origin.phase, Phase::Finished) || is_invocation_record(origin) {
-    for related_index in index.saturating_add(1)..events.len() {
-      let Some(candidate) = events.get(related_index).and_then(tool_event) else {
-        continue;
-      };
-      if !same_tool_scope_and_id(origin, candidate) {
-        continue;
-      }
-      if !compatible_tool_names(origin, candidate)
-        || is_invocation_record(candidate)
-        || matches!(candidate.phase, Phase::Started)
-      {
-        break;
-      }
-      after.push(related_index);
-      if matches!(candidate.phase, Phase::Finished) {
-        break;
-      }
-    }
-  }
-
-  (before, after)
-}
-
-fn is_invocation_record(event: &ToolCallEvent) -> bool {
-  event.input.is_some() && event.output.as_ref().is_none_or(Value::is_null)
-}
-
-fn same_tool_scope_and_id(left: &ToolCallEvent, right: &ToolCallEvent) -> bool {
-  same_provider(left.provider, right.provider)
-    && left.session_id.as_deref() == right.session_id.as_deref()
-    && present_string(left.tool_call_id.as_deref()) == present_string(right.tool_call_id.as_deref())
-}
-
-fn compatible_tool_names(left: &ToolCallEvent, right: &ToolCallEvent) -> bool {
-  match (
-    present_string(left.tool_name.as_deref()),
-    present_string(right.tool_name.as_deref()),
-  ) {
-    (Some(left), Some(right)) => left == right,
-    _ => true,
-  }
-}
-
-fn same_provider(left: Provider, right: Provider) -> bool {
-  matches!(
-    (left, right),
-    (Provider::Codex, Provider::Codex)
-      | (Provider::Pi, Provider::Pi)
-      | (Provider::OpenCode, Provider::OpenCode)
-      | (Provider::Dsh, Provider::Dsh)
-  )
 }
 
 fn present_string(value: Option<&str>) -> Option<&str> {
@@ -1091,29 +1544,7 @@ fn present_string(value: Option<&str>) -> Option<&str> {
 
 fn tool_output_preview(events: &[AgentEvent], index: usize) -> Option<ToolOutputPreview> {
   let origin = events.get(index).and_then(tool_event)?;
-  if let Some(sections) = projected_event_output(origin) {
-    return Some(bound_tool_output(sections, index));
-  }
-
-  let (_, after) = related_tool_indices(events, index, origin);
-  let mut latest = None;
-  let mut latest_finished = None;
-  for related_index in after {
-    let Some(related) = events.get(related_index).and_then(tool_event) else {
-      continue;
-    };
-    let Some(sections) = projected_event_output(related) else {
-      continue;
-    };
-    latest = Some((related_index, sections));
-    if matches!(related.phase, Phase::Finished) {
-      latest_finished = latest.take();
-    }
-  }
-
-  latest_finished
-    .or(latest)
-    .map(|(source_index, sections)| bound_tool_output(sections, source_index))
+  projected_event_output(origin).map(|sections| bound_tool_output(sections, index))
 }
 
 fn projected_event_output(event: &ToolCallEvent) -> Option<Vec<ToolOutputSection>> {
@@ -1164,6 +1595,19 @@ fn project_output(value: &Value, depth: usize) -> Vec<ToolOutputSection> {
         {
           sections = project_labeled_value("Metadata", metadata, depth + 1);
         }
+        return sections;
+      }
+
+      // Semantic tool adapters, including Codex Code Mode, commonly retain
+      // response metadata next to one readable `text` field. Show that
+      // payload directly instead of turning the entire result into JSON.
+      if let Some(text) = object
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+      {
+        let mut sections = vec![text_section(None, text.to_string())];
+        append_distinct_error(&mut sections, object.get("error"), depth + 1);
         return sections;
       }
 
@@ -1491,8 +1935,9 @@ mod tests {
 
   use serde_json::json;
   use tokn_session_core::{
-    ErrorEvent, MessageDelivery, MessageEvent, MessageProvenance, Phase, ReasoningEvent, SessionHistoryStatus,
-    SessionRef, ToolCallEvent, ToolKind, UnknownEvent, UsageEvent, UsageKind,
+    AgentActivity, ErrorEvent, MessageDelivery, MessageEvent, MessageProvenance, Phase, ReasoningEvent,
+    SessionHistoryStatus, SessionRef, ToolCallEvent, ToolKind, ToolRecordKind, ToolTransport, UnknownEvent, UsageEvent,
+    UsageKind,
   };
 
   use super::*;
@@ -1702,6 +2147,162 @@ mod tests {
     assert!(second.next_cursor.is_none());
   }
 
+  #[test]
+  fn child_listing_is_paged_uses_provider_timestamp_and_keeps_agent_identity_safe() {
+    let mut newest_child = session_header("child", Some("root"), "/projects/Alpha", "3000");
+    newest_child.path = PathBuf::from("/fixtures/child-new.jsonl");
+    // Filesystem times can be rewritten by a sync or restore. The source's
+    // provider timestamp, not mtime, decides which duplicate owns this ID.
+    newest_child.updated_at = Some("1".to_string());
+    newest_child.updated_at_ms = Some(1);
+    newest_child.agent_path = Some(" /root/\u{001b}[31mresearcher\u{202e} ".to_string());
+    newest_child.agent_nickname = Some(" Hubble\n\t".to_string());
+    newest_child.agent_role = Some(" explorer ".to_string());
+
+    let mut older_duplicate = session_header("child", Some("root"), "/projects/Alpha", "2000");
+    older_duplicate.path = PathBuf::from("/fixtures/child-old.jsonl");
+    older_duplicate.updated_at = Some("9999".to_string());
+    older_duplicate.updated_at_ms = Some(9_999);
+    older_duplicate.agent_nickname = Some("older duplicate".to_string());
+
+    let mut pi_same_id = session_header("child", Some("root"), "/projects/Pi", "4000");
+    pi_same_id.path = PathBuf::from("/fixtures/pi-child.jsonl");
+    let service = ViewerService::new(Arc::new(FakeRepository {
+      listings: HashMap::from([
+        (
+          ViewerProvider::Codex,
+          Ok(vec![
+            session_header("root", None, "/projects/Alpha", "1000"),
+            older_duplicate,
+            newest_child,
+            session_header("grandchild", Some("child"), "/projects/Alpha", "2500"),
+            session_header("sibling", Some("root"), "/projects/Alpha", "1500"),
+          ]),
+        ),
+        (ViewerProvider::Pi, Ok(vec![pi_same_id])),
+      ]),
+      loaded: Mutex::new(None),
+    }));
+
+    let roots = service
+      .list_sessions(ListSessionsRequest {
+        query: SessionQuery {
+          providers: vec![ViewerProvider::Codex],
+          search: None,
+        },
+        cursor: None,
+        offset: None,
+        limit: None,
+      })
+      .unwrap();
+    assert_eq!(roots.sessions.len(), 1);
+    assert_eq!(roots.sessions[0].session_id, "root");
+    assert!(!roots.sessions[0].is_subagent);
+    assert_eq!(roots.sessions[0].child_count, 2);
+
+    let children = service
+      .list_session_children(ListSessionChildrenRequest {
+        parent_session_key: roots.sessions[0].session_key.clone(),
+        cursor: None,
+        offset: None,
+        limit: Some(1),
+      })
+      .unwrap();
+    assert_eq!(children.sessions.len(), 1);
+    let child_cursor = children.next_cursor.clone().expect("a second direct child is paged");
+    // Last-update time controls the visible order, independently from
+    // provider-time canonicalization of duplicate identities.
+    assert_eq!(children.sessions[0].session_id, "sibling");
+
+    let second_child_page = service
+      .list_session_children(ListSessionChildrenRequest {
+        parent_session_key: roots.sessions[0].session_key.clone(),
+        cursor: Some(child_cursor),
+        offset: None,
+        limit: Some(1),
+      })
+      .unwrap();
+    assert_eq!(second_child_page.sessions.len(), 1);
+    let child = &second_child_page.sessions[0];
+    assert_eq!(child.session_id, "child");
+    assert!(child.is_subagent);
+    assert_eq!(child.child_count, 1);
+    assert_eq!(child.agent_path.as_deref(), Some("/root/researcher"));
+    assert_eq!(child.agent_nickname.as_deref(), Some("Hubble"));
+    assert_eq!(child.agent_role.as_deref(), Some("explorer"));
+    assert!(second_child_page.next_cursor.is_none());
+
+    let grandchildren = service
+      .list_session_children(ListSessionChildrenRequest {
+        parent_session_key: child.session_key.clone(),
+        cursor: None,
+        offset: None,
+        limit: None,
+      })
+      .unwrap();
+    assert_eq!(grandchildren.sessions.len(), 1);
+    assert_eq!(grandchildren.sessions[0].session_id, "grandchild");
+    assert_eq!(grandchildren.sessions[0].child_count, 0);
+  }
+
+  #[test]
+  fn relation_index_promotes_orphans_and_breaks_cycles_without_losing_sessions() {
+    let service = ViewerService::new(Arc::new(FakeRepository {
+      listings: HashMap::from([(
+        ViewerProvider::Codex,
+        Ok(vec![
+          session_header("orphan", Some("missing"), "/projects/Alpha", "4000"),
+          session_header("cycle-a", Some("cycle-b"), "/projects/Alpha", "3000"),
+          session_header("cycle-b", Some("cycle-a"), "/projects/Alpha", "2000"),
+        ]),
+      )]),
+      loaded: Mutex::new(None),
+    }));
+
+    let roots = service
+      .list_sessions(ListSessionsRequest {
+        query: SessionQuery::default(),
+        cursor: None,
+        offset: None,
+        limit: None,
+      })
+      .unwrap();
+    let root_ids = roots
+      .sessions
+      .iter()
+      .map(|session| session.session_id.as_str())
+      .collect::<Vec<_>>();
+    assert!(root_ids.contains(&"orphan"));
+    assert!(root_ids.contains(&"cycle-b"));
+    assert!(roots.sessions.iter().all(|session| !session.is_subagent));
+
+    let cycle_root = roots
+      .sessions
+      .iter()
+      .find(|session| session.session_id == "cycle-b")
+      .expect("a cycle node becomes a root");
+    let children = service
+      .list_session_children(ListSessionChildrenRequest {
+        parent_session_key: cycle_root.session_key.clone(),
+        cursor: None,
+        offset: None,
+        limit: None,
+      })
+      .unwrap();
+    assert_eq!(children.sessions.len(), 1);
+    assert_eq!(children.sessions[0].session_id, "cycle-a");
+
+    let descendant_children = service
+      .list_session_children(ListSessionChildrenRequest {
+        parent_session_key: children.sessions[0].session_key.clone(),
+        cursor: None,
+        offset: None,
+        limit: None,
+      })
+      .unwrap();
+    assert!(descendant_children.sessions.is_empty());
+  }
+
   #[cfg(unix)]
   #[test]
   fn listing_isolates_a_non_utf8_source_path_to_its_provider_warning() {
@@ -1732,9 +2333,10 @@ mod tests {
   }
 
   #[test]
-  fn session_metadata_is_sanitized_bounded_and_separate_from_agent_identity() {
+  fn session_metadata_and_agent_identity_are_sanitized_and_bounded() {
     let mut header = session_header("session-id", None, "/projects/Alpha", "1000");
-    header.agent_nickname = Some("worker-name".to_string());
+    header.agent_nickname = Some("worker\u{202e}-name".to_string());
+    header.agent_role = Some(format!("role {}", "x".repeat(MAX_AGENT_IDENTITY_CHARS + 20)));
     header.title = Some(" \u{001b}[31mBuild\u{202e}\n\tthe viewer\u{001b}[0m ".to_string());
     header.preview = Some(format!("Prompt {}", "x".repeat(MAX_SESSION_PREVIEW_CHARS + 20)));
 
@@ -1746,7 +2348,12 @@ mod tests {
       MAX_SESSION_PREVIEW_CHARS
     );
     assert!(summary.preview.as_ref().unwrap().ends_with('\u{2026}'));
-    assert_ne!(summary.title.as_deref(), Some("worker-name"));
+    assert_eq!(summary.agent_nickname.as_deref(), Some("worker-name"));
+    assert_eq!(
+      summary.agent_role.as_ref().unwrap().chars().count(),
+      MAX_AGENT_IDENTITY_CHARS
+    );
+    assert!(summary.agent_role.as_ref().unwrap().ends_with('\u{2026}'));
   }
 
   #[test]
@@ -1943,6 +2550,157 @@ mod tests {
   }
 
   #[test]
+  fn event_page_resolves_agent_activity_to_its_canonical_direct_child() {
+    let parent = session_header("parent", None, "/projects/Alpha", "2026-08-31T00:00:00Z");
+    let mut child = session_header("child", Some("parent"), "/projects/Alpha", "2026-08-31T00:02:00Z");
+    child.title = Some("Current child".to_string());
+    child.agent_nickname = Some("Hubble".to_string());
+    child.agent_role = Some("researcher".to_string());
+
+    let mut stale_child = session_header("child", Some("parent"), "/projects/Alpha", "2026-08-31T00:01:00Z");
+    stale_child.path = PathBuf::from("/fixtures/child-stale.jsonl");
+    stale_child.title = Some("Stale child".to_string());
+
+    let service = ViewerService::new(Arc::new(FakeRepository {
+      listings: HashMap::from([(ViewerProvider::Codex, Ok(vec![parent, stale_child, child]))]),
+      loaded: Mutex::new(Some(loaded_session_for(
+        "parent",
+        vec![agent_activity("child", Some("/root/researcher"))],
+      ))),
+    }));
+
+    let page = service
+      .load_event_page(EventPageRequest {
+        session_key: key_for_header("parent"),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+
+    let activity = page.events[0]
+      .agent_activity
+      .as_ref()
+      .expect("agent activity card should be projected");
+    assert_eq!(activity.kind, "started");
+    assert_eq!(activity.target_session_id.as_deref(), Some("child"));
+    assert_eq!(activity.target_agent_path.as_deref(), Some("/root/researcher"));
+    let target = activity.target.as_ref().expect("direct child should be safe to open");
+    assert_eq!(target.session_id, "child");
+    assert_eq!(target.title.as_deref(), Some("Current child"));
+    assert_eq!(target.agent_nickname.as_deref(), Some("Hubble"));
+    assert_eq!(target.agent_role.as_deref(), Some("researcher"));
+    assert!(target.is_subagent);
+    assert_eq!(
+      decode_session_key(&target.session_key).unwrap().source_path,
+      PathBuf::from("/fixtures/child.jsonl")
+    );
+  }
+
+  #[test]
+  fn event_page_keeps_non_child_agent_activity_target_unlinked() {
+    let parent = session_header("parent", None, "/projects/Alpha", "2026-08-31T00:00:00Z");
+    let unrelated = session_header(
+      "target",
+      Some("other-parent"),
+      "/projects/Alpha",
+      "2026-08-31T00:01:00Z",
+    );
+    let service = ViewerService::new(Arc::new(FakeRepository {
+      listings: HashMap::from([(ViewerProvider::Codex, Ok(vec![parent, unrelated]))]),
+      loaded: Mutex::new(Some(loaded_session_for(
+        "parent",
+        vec![agent_activity("target", Some("/root/not-a-child"))],
+      ))),
+    }));
+
+    let page = service
+      .load_event_page(EventPageRequest {
+        session_key: key_for_header("parent"),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+
+    let activity = page.events[0]
+      .agent_activity
+      .as_ref()
+      .expect("agent activity card should remain visible");
+    assert_eq!(activity.target_session_id.as_deref(), Some("target"));
+    assert_eq!(activity.target_agent_path.as_deref(), Some("/root/not-a-child"));
+    assert!(activity.target.is_none());
+  }
+
+  #[test]
+  fn event_page_keeps_agent_activity_unlinked_for_a_noncanonical_parent_source() {
+    let mut stale_parent = session_header("parent", None, "/projects/Alpha", "2026-08-31T00:00:00Z");
+    stale_parent.path = PathBuf::from("/fixtures/parent-stale.jsonl");
+    let current_parent = session_header("parent", None, "/projects/Alpha", "2026-08-31T00:01:00Z");
+    let child = session_header("child", Some("parent"), "/projects/Alpha", "2026-08-31T00:02:00Z");
+    let service = ViewerService::new(Arc::new(FakeRepository {
+      listings: HashMap::from([(ViewerProvider::Codex, Ok(vec![stale_parent, current_parent, child]))]),
+      loaded: Mutex::new(Some(loaded_session_for(
+        "parent",
+        vec![agent_activity("child", Some("/root/researcher"))],
+      ))),
+    }));
+
+    let stale_parent_key = encode_session_key(&SessionLocator {
+      version: 1,
+      provider: ViewerProvider::Codex,
+      session_id: "parent".to_string(),
+      source_path: PathBuf::from("/fixtures/parent-stale.jsonl"),
+    })
+    .unwrap();
+    let page = service
+      .load_event_page(EventPageRequest {
+        session_key: stale_parent_key,
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+
+    let activity = page.events[0]
+      .agent_activity
+      .as_ref()
+      .expect("agent activity card should remain visible");
+    assert!(activity.target.is_none());
+  }
+
+  #[test]
+  fn event_page_keeps_agent_activity_unlinked_when_header_lookup_fails() {
+    let service = ViewerService::new(Arc::new(FakeRepository {
+      listings: HashMap::from([(ViewerProvider::Codex, Err("session catalog unavailable".to_string()))]),
+      loaded: Mutex::new(Some(loaded_session_for(
+        "parent",
+        vec![agent_activity("child", Some("/root/researcher"))],
+      ))),
+    }));
+
+    let page = service
+      .load_event_page(EventPageRequest {
+        session_key: key_for_header("parent"),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+
+    let activity = page.events[0]
+      .agent_activity
+      .as_ref()
+      .expect("agent activity card should remain visible");
+    assert_eq!(activity.target_session_id.as_deref(), Some("child"));
+    assert!(activity.target.is_none());
+  }
+
+  #[test]
   fn listing_orders_providers_by_explicit_update_time_not_creation_time() {
     let listings = HashMap::from([
       (
@@ -2012,16 +2770,21 @@ mod tests {
     let tool = AgentEvent::ToolCall(ToolCallEvent {
       provider: Provider::Codex,
       session_id: Some("fixture".to_string()),
+      turn_id: None,
       message_id: None,
       parent_id: None,
+      record_kind: ToolRecordKind::Snapshot,
       tool_call_id: Some("call-1".to_string()),
+      provider_tool_name: Some("shell".to_string()),
       tool_name: Some("shell".to_string()),
       tool_kind: ToolKind::Shell,
+      transport: Some(ToolTransport::Native),
       summary: None,
       phase: Phase::Finished,
       input: None,
       output: None,
       is_error: Some(false),
+      native: None,
       timestamp: None,
     });
     let page = service_with_session(loaded_session(vec![tool]))
@@ -2167,7 +2930,7 @@ mod tests {
   }
 
   #[test]
-  fn tool_card_strings_are_bounded_and_lifecycle_facts_are_correlated() {
+  fn tool_operation_cards_are_bounded_and_replace_lifecycle_fragments() {
     let long_command = "c".repeat(MAX_TOOL_CARD_STRING_CHARS + 100);
     let events = vec![
       tool_call(
@@ -2210,24 +2973,35 @@ mod tests {
       ),
     ];
 
-    let invocation = event_summary(&events, 0, &events[0]);
-    let result = event_summary(&events, 2, &events[2]);
-    let invocation_tool = invocation.tool.as_ref().unwrap();
-    let result_tool = result.tool.as_ref().unwrap();
+    let page = service_with_session(loaded_session(events))
+      .load_event_page(EventPageRequest {
+        session_key: key_for("fixture"),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+    assert_eq!(page.total_events, 2);
+    assert_eq!(page.events.len(), 2);
+    assert_eq!(page.events[0].event_type, "message");
+    let operation = &page.events[1];
+    let operation_tool = operation.tool.as_ref().unwrap();
 
     assert_eq!(
-      invocation_tool.command.as_ref().unwrap().chars().count(),
+      operation_tool.command.as_ref().unwrap().chars().count(),
       MAX_TOOL_CARD_STRING_CHARS
     );
-    assert!(invocation_tool.command.as_ref().unwrap().ends_with('\u{2026}'));
-    assert_eq!(invocation_tool.exit_code, Some(7));
-    assert_eq!(invocation.is_error, Some(true));
-    assert_eq!(result_tool.command, invocation_tool.command);
-    assert_eq!(result_tool.cwd.as_deref(), Some("/work"));
+    assert!(operation_tool.command.as_ref().unwrap().ends_with('\u{2026}'));
+    assert_eq!(operation_tool.exit_code, Some(7));
+    assert_eq!(operation_tool.status, "failed");
+    assert_eq!(operation.is_error, Some(true));
+    assert_eq!(operation_tool.cwd.as_deref(), Some("/work"));
+    assert_eq!(decode_event_key(&operation.event_key).unwrap(), 0);
   }
 
   #[test]
-  fn tool_detail_prefers_final_correlated_output_and_reports_its_source() {
+  fn tool_operation_detail_exposes_final_output_without_a_private_viewer_join() {
     let mut invocation = tool_call(
       Provider::Codex,
       "exec_command",
@@ -2240,6 +3014,7 @@ mod tests {
     let AgentEvent::ToolCall(invocation_event) = &mut invocation else {
       unreachable!();
     };
+    invocation_event.record_kind = ToolRecordKind::Invocation;
     invocation_event.input = Some(json!({"cmd": "cargo test"}));
     let events = vec![
       invocation,
@@ -2270,15 +3045,129 @@ mod tests {
       .unwrap();
     let output = detail.tool_output.unwrap();
 
-    assert_eq!(output.source_event_key, encode_event_key(2));
+    assert_eq!(output.source_event_key, encode_event_key(0));
     assert!(!output.truncated);
     assert_eq!(output.sections.len(), 1);
     assert_eq!(output.sections[0].text, "final");
     assert_eq!(output.sections[0].format, "text");
+    assert_eq!(detail.event["source_event_indices"], json!([0, 1, 2]));
   }
 
   #[test]
-  fn output_correlation_never_uses_missing_ids_or_crosses_a_reused_invocation() {
+  fn terminal_operation_keeps_semantic_output_and_both_code_mode_records() {
+    let mut invocation = tool_call(
+      Provider::Codex,
+      "write_stdin",
+      "call-write",
+      ToolKind::Terminal,
+      Some(ToolSummary::Terminal {
+        session_id: Some("90855".to_string()),
+        action: Some(TerminalAction::Wait),
+        chars_len: Some(0),
+        wait_ms: Some(30_000),
+      }),
+      Phase::Started,
+      None,
+    );
+    let AgentEvent::ToolCall(invocation_call) = &mut invocation else {
+      unreachable!();
+    };
+    invocation_call.provider_tool_name = Some("exec".to_string());
+    invocation_call.transport = Some(ToolTransport::CodeExecution);
+    invocation_call.input = Some(json!({
+      "session_id": 90855,
+      "chars": "",
+      "yield_time_ms": 30_000,
+    }));
+    invocation_call.native = Some(json!({
+      "type": "custom_tool_call",
+      "input": "const r = await tools.write_stdin(...);",
+    }));
+
+    let mut result = tool_call(
+      Provider::Codex,
+      "write_stdin",
+      "call-write",
+      ToolKind::Terminal,
+      None,
+      Phase::Finished,
+      Some(json!({
+        "session_id": 90855,
+        "wall_time_seconds": 30.001,
+        "text": "Refreshing checks status",
+      })),
+    );
+    let AgentEvent::ToolCall(result_call) = &mut result else {
+      unreachable!();
+    };
+    result_call.provider_tool_name = Some("exec".to_string());
+    result_call.transport = Some(ToolTransport::CodeExecution);
+    result_call.native = Some(json!({
+      "type": "custom_tool_call_output",
+      "output": ["Script completed", "{...}"],
+    }));
+
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("code-mode.jsonl");
+    std::fs::write(&source_path, "fixture\n").unwrap();
+    let session_key = encode_session_key(&SessionLocator {
+      version: 1,
+      provider: ViewerProvider::Codex,
+      session_id: "fixture".to_string(),
+      source_path,
+    })
+    .unwrap();
+    let service = service_with_session(loaded_session(vec![invocation, result]));
+    let page = service
+      .load_event_page(EventPageRequest {
+        session_key: session_key.clone(),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+
+    assert_eq!(page.total_events, 1);
+    let card = page.events[0].tool.as_ref().unwrap();
+    assert_eq!(card.kind, "terminal");
+    assert_eq!(card.status, "completed");
+    assert_eq!(card.provider_tool_name.as_deref(), Some("exec"));
+    assert_eq!(card.terminal_session_id.as_deref(), Some("90855"));
+    assert_eq!(card.terminal_action.as_deref(), Some("wait"));
+    assert_eq!(card.wait_ms, Some(30_000));
+
+    let detail = service
+      .load_event_detail(LoadEventDetailRequest {
+        session_key,
+        event_key: page.events[0].event_key.clone(),
+      })
+      .unwrap();
+    assert_eq!(detail.event["output"]["text"], "Refreshing checks status");
+    assert!(detail.event.get("native").is_none());
+    assert_eq!(
+      detail.tool_output.as_ref().unwrap().sections[0].text,
+      "Refreshing checks status"
+    );
+    assert_eq!(
+      detail.native.as_ref().unwrap()["source_records"]
+        .as_array()
+        .unwrap()
+        .len(),
+      2
+    );
+    assert_eq!(
+      detail.native.as_ref().unwrap()["source_records"][0]["native"]["type"],
+      "custom_tool_call"
+    );
+    assert_eq!(
+      detail.native.as_ref().unwrap()["source_records"][1]["native"]["type"],
+      "custom_tool_call_output"
+    );
+  }
+
+  #[test]
+  fn tool_operation_assembly_keeps_missing_and_ambiguous_ids_separate() {
     let missing_ids = vec![
       tool_call(
         Provider::Codex,
@@ -2299,33 +3188,43 @@ mod tests {
         Some(Value::String("wrong".to_string())),
       ),
     ];
-    assert!(tool_output_preview(&missing_ids, 0).is_none());
+    assert_eq!(tokn_session_core::assemble_tool_operations(&missing_ids).len(), 2);
 
-    let reused_id = vec![
-      with_tool_input(
-        tool_call(
-          Provider::Codex,
-          "exec_command",
-          "reused",
-          ToolKind::Shell,
-          None,
-          Phase::Finished,
-          None,
-        ),
-        json!({"cmd": "first"}),
+    let mut first = with_tool_input(
+      tool_call(
+        Provider::Codex,
+        "exec_command",
+        "reused",
+        ToolKind::Shell,
+        None,
+        Phase::Started,
+        None,
       ),
-      with_tool_input(
-        tool_call(
-          Provider::Codex,
-          "exec_command",
-          "reused",
-          ToolKind::Shell,
-          None,
-          Phase::Finished,
-          None,
-        ),
-        json!({"cmd": "second"}),
+      json!({"cmd": "first"}),
+    );
+    let mut second = with_tool_input(
+      tool_call(
+        Provider::Codex,
+        "exec_command",
+        "reused",
+        ToolKind::Shell,
+        None,
+        Phase::Started,
+        None,
       ),
+      json!({"cmd": "second"}),
+    );
+    let AgentEvent::ToolCall(first_tool) = &mut first else {
+      unreachable!();
+    };
+    first_tool.record_kind = ToolRecordKind::Invocation;
+    let AgentEvent::ToolCall(second_tool) = &mut second else {
+      unreachable!();
+    };
+    second_tool.record_kind = ToolRecordKind::Invocation;
+    let events = vec![
+      first,
+      second,
       tool_call(
         Provider::Codex,
         "exec_command",
@@ -2333,12 +3232,14 @@ mod tests {
         ToolKind::Shell,
         None,
         Phase::Finished,
-        Some(Value::String("belongs to the second invocation".to_string())),
+        Some(Value::String("ambiguous result".to_string())),
       ),
     ];
-    assert!(tool_output_preview(&reused_id, 0).is_none());
-    let second = tool_output_preview(&reused_id, 1).unwrap();
-    assert_eq!(second.source_event_key, encode_event_key(2));
+    let entries = timeline_entries(&events);
+    assert_eq!(entries.len(), 3);
+    assert!(matches!(entries[0], TimelineEntry::ToolOperation { .. }));
+    assert!(matches!(entries[1], TimelineEntry::ToolOperation { .. }));
+    assert!(matches!(entries[2], TimelineEntry::ToolOperation { .. }));
   }
 
   #[test]
@@ -2995,16 +3896,26 @@ mod tests {
     AgentEvent::ToolCall(ToolCallEvent {
       provider,
       session_id: Some("fixture".to_string()),
+      turn_id: None,
       message_id: None,
       parent_id: None,
+      record_kind: match phase {
+        Phase::Started => ToolRecordKind::Invocation,
+        Phase::Delta | Phase::Updated => ToolRecordKind::Progress,
+        Phase::Finished if output.is_some() => ToolRecordKind::Result,
+        Phase::Finished => ToolRecordKind::Snapshot,
+      },
       tool_call_id: Some(tool_call_id.to_string()),
+      provider_tool_name: Some(tool_name.to_string()),
       tool_name: Some(tool_name.to_string()),
       tool_kind,
+      transport: Some(ToolTransport::Native),
       summary,
       phase,
       input: None,
       output,
       is_error,
+      native: None,
       timestamp: None,
     })
   }
@@ -3039,11 +3950,31 @@ mod tests {
   }
 
   fn loaded_session(events: Vec<AgentEvent>) -> LoadedSession {
+    loaded_session_for("fixture", events)
+  }
+
+  fn loaded_session_for(id: &str, events: Vec<AgentEvent>) -> LoadedSession {
     LoadedSession {
-      reference: session_ref("fixture", None, "/projects/fixture", "2026-06-01T00:00:00Z"),
+      reference: session_ref(id, None, "/projects/fixture", "2026-06-01T00:00:00Z"),
       events,
       history_status: SessionHistoryStatus::Complete,
     }
+  }
+
+  fn agent_activity(target_session_id: &str, target_agent_path: Option<&str>) -> AgentEvent {
+    AgentEvent::AgentActivity(AgentActivity {
+      provider: Provider::Codex,
+      session_id: Some("parent".to_string()),
+      event_id: Some("activity-1".to_string()),
+      actor_session_id: None,
+      actor_agent_path: None,
+      target_session_id: Some(target_session_id.to_string()),
+      target_agent_path: target_agent_path.map(str::to_string),
+      kind: "started".to_string(),
+      occurred_at_ms: Some(1_788_112_800_000),
+      native: None,
+      timestamp: Some("2026-08-31T00:03:00Z".to_string()),
+    })
   }
 
   fn key_for(session_id: &str) -> String {
@@ -3052,6 +3983,16 @@ mod tests {
       provider: ViewerProvider::Codex,
       session_id: session_id.to_string(),
       source_path: PathBuf::from("/fixtures/session.jsonl"),
+    })
+    .unwrap()
+  }
+
+  fn key_for_header(session_id: &str) -> String {
+    encode_session_key(&SessionLocator {
+      version: 1,
+      provider: ViewerProvider::Codex,
+      session_id: session_id.to_string(),
+      source_path: PathBuf::from(format!("/fixtures/{session_id}.jsonl")),
     })
     .unwrap()
   }

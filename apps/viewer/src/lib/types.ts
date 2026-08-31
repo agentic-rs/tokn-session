@@ -29,7 +29,9 @@ export type EventPhase = "started" | "delta" | "updated" | "finished";
 export type MessageRole = "user" | "assistant" | "system" | "tool" | "unknown";
 
 export type ToolKind =
+  | "code_execution"
   | "shell"
+  | "terminal"
   | "file_read"
   | "file_write"
   | "file_edit"
@@ -38,12 +40,22 @@ export type ToolKind =
   | "task"
   | "unknown";
 
+export type ToolOperationStatus = "pending" | "running" | "completed" | "failed";
+
 export interface ToolCardSummary {
   kind: ToolKind | string;
   tool_name: string | null;
   tool_call_id: string | null;
+  /** Derived operation state; absent only when connected to an older backend. */
+  status?: ToolOperationStatus | string;
+  provider_tool_name?: string | null;
+  language?: string | null;
   command: string | null;
   cwd: string | null;
+  terminal_session_id?: string | null;
+  terminal_action?: "send" | "wait" | string | null;
+  chars_len?: number | null;
+  wait_ms?: number | null;
   path: string | null;
   query: string | null;
   url: string | null;
@@ -103,6 +115,8 @@ export interface SessionSummary {
   session_key: string;
   session_id: string;
   parent_session_id: string | null;
+  /** True only when the source-neutral parent link resolved safely. */
+  is_subagent: boolean;
   provider: ViewerProvider;
   title: string | null;
   preview: string | null;
@@ -111,6 +125,10 @@ export interface SessionSummary {
   updated_at_ms: number | null;
   timestamp: string | null;
   agent_path: string | null;
+  agent_nickname: string | null;
+  agent_role: string | null;
+  /** Direct descendants discovered from headers; this is not runtime status. */
+  child_count: number;
   /** Null for metadata-only listings; event pages provide total_events. */
   message_count: number | null;
   event_count: number | null;
@@ -140,6 +158,42 @@ export interface ListSessionsResponse {
   source_errors: SourceError[];
 }
 
+export interface ListSessionChildrenRequest {
+  parent_session_key: string;
+  cursor?: string;
+  offset?: number;
+  limit?: number;
+}
+
+export interface ListSessionChildrenResponse {
+  sessions: SessionSummary[];
+  next_cursor: string | null;
+}
+
+/** Local sidebar state for one lazily loaded direct-child page sequence. */
+export interface SessionChildrenState {
+  sessions: SessionSummary[];
+  next_cursor: string | null;
+  is_loading: boolean;
+  is_loading_more: boolean;
+  error: string | null;
+}
+
+/**
+ * Compact, historical delegation metadata for an `agent_activity` event.
+ *
+ * `target` is present only when the backend can prove that the activity
+ * points at a known direct child in the same provider. It is deliberately not
+ * a live subagent-state assertion.
+ */
+export interface AgentActivityCardSummary {
+  kind: string;
+  event_id: string | null;
+  target_session_id: string | null;
+  target_agent_path: string | null;
+  target: SessionSummary | null;
+}
+
 export interface EventSummary {
   event_key: string;
   type: EventType | string;
@@ -152,6 +206,8 @@ export interface EventSummary {
   summary_truncated: boolean;
   is_hidden: boolean;
   is_error: boolean | null;
+  /** Optional while the viewer remains compatible with older backends. */
+  agent_activity?: AgentActivityCardSummary | null;
   tool: ToolCardSummary | null;
   usage: UsageCardSummary | null;
   reasoning: ReasoningCardSummary | null;

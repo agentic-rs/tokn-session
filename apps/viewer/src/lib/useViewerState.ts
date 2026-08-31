@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { listSessions, loadEventDetail, loadEventPage } from "./tauri";
+import { listSessionChildren, listSessions, loadEventDetail, loadEventPage } from "./tauri";
 import {
   EVENT_PAGE_SIZE,
   SESSION_PAGE_SIZE,
   errorMessage,
   eventButtonId,
+  findKnownSession,
   mergeEvents,
   mergeSessions,
   preserveEventSelection,
@@ -14,6 +15,7 @@ import {
   PROVIDERS,
   type EventDetail,
   type EventSummary,
+  type SessionChildrenState,
   type SessionHistoryStatus,
   type SessionSummary,
   type SourceError,
@@ -74,6 +76,12 @@ export function useViewerState() {
   const providerKey = PROVIDERS.filter((provider) => enabledProviders.has(provider)).join(",");
 
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [sessionChildren, setSessionChildren] = useState<Map<string, SessionChildrenState>>(
+    () => new Map(),
+  );
+  const sessionChildrenRef = useRef<Map<string, SessionChildrenState>>(new Map());
+  const sessionChildrenGeneration = useRef(0);
+  const sessionChildRequests = useRef(new Map<string, number>());
   const [selectedSessionKey, setSelectedSessionKey] = useState<string | null>(null);
   const selectedSessionKeyRef = useRef<string | null>(null);
   const [sessionsLoading, setSessionsLoading] = useState(true);
@@ -114,6 +122,7 @@ export function useViewerState() {
   const detailCache = useRef(new Map<string, EventDetail>());
   const detailLoads = useRef(new Map<string, Promise<EventDetail>>());
   const detailGeneration = useRef(0);
+  const [detailRevision, setDetailRevision] = useState(0);
   const [expandedEventKey, setExpandedEventKey] = useState<string | null>(null);
   const [expandedDetail, setExpandedDetail] = useState<EventDetail | null>(null);
   const [expandedDetailOwnerKey, setExpandedDetailOwnerKey] = useState<string | null>(null);
@@ -145,6 +154,24 @@ export function useViewerState() {
     });
     detailLoads.current.set(cacheKey, request);
     return request;
+  }, []);
+
+  const invalidateEventDetails = useCallback(() => {
+    detailGeneration.current += 1;
+    detailCache.current.clear();
+    detailLoads.current.clear();
+    detailRequest.current += 1;
+    expandedDetailRequest.current += 1;
+    detailOwnerKeyRef.current = null;
+    setDetailOwnerKey(null);
+    setDetail(null);
+    setDetailLoading(false);
+    setDetailError(null);
+    setExpandedDetailOwnerKey(null);
+    setExpandedDetail(null);
+    setExpandedDetailLoading(false);
+    setExpandedDetailError(null);
+    setDetailRevision((revision) => revision + 1);
   }, []);
 
   const applyEventSelection = useCallback((eventKey: string | null, openInspector: boolean) => {
@@ -217,9 +244,144 @@ export function useViewerState() {
     });
   }, []);
 
+  const updateSessionChildren = useCallback(
+    (
+      parentSessionKey: string,
+      update: (current: SessionChildrenState | undefined) => SessionChildrenState,
+    ) => {
+      const next = new Map(sessionChildrenRef.current);
+      next.set(parentSessionKey, update(next.get(parentSessionKey)));
+      sessionChildrenRef.current = next;
+      setSessionChildren(next);
+    },
+    [],
+  );
+
+  const clearSessionChildren = useCallback(() => {
+    sessionChildrenGeneration.current += 1;
+    sessionChildRequests.current.clear();
+    const next = new Map<string, SessionChildrenState>();
+    sessionChildrenRef.current = next;
+    setSessionChildren(next);
+  }, []);
+
+  const requestSessionChildPage = useCallback(
+    (parentSessionKey: string, cursor: string | null, retry: boolean) => {
+      const current = sessionChildrenRef.current.get(parentSessionKey);
+      if (cursor !== null) {
+        if (
+          !current
+          || current.next_cursor !== cursor
+          || current.is_loading
+          || current.is_loading_more
+        ) {
+          return;
+        }
+      } else if (current && (current.is_loading || current.is_loading_more || !retry)) {
+        return;
+      }
+
+      const generation = sessionChildrenGeneration.current;
+      const requestId = (sessionChildRequests.current.get(parentSessionKey) ?? 0) + 1;
+      sessionChildRequests.current.set(parentSessionKey, requestId);
+      updateSessionChildren(parentSessionKey, (existing) => ({
+        sessions: existing?.sessions ?? [],
+        next_cursor: existing?.next_cursor ?? null,
+        is_loading: cursor === null,
+        is_loading_more: cursor !== null,
+        error: null,
+      }));
+
+      void listSessionChildren({
+        parent_session_key: parentSessionKey,
+        cursor: cursor ?? undefined,
+        limit: SESSION_PAGE_SIZE,
+      })
+        .then((response) => {
+          if (
+            sessionChildrenGeneration.current !== generation
+            || sessionChildRequests.current.get(parentSessionKey) !== requestId
+          ) {
+            return;
+          }
+          updateSessionChildren(parentSessionKey, (existing) => ({
+            // An activity card can optimistically materialize one exact child
+            // before this lazy page arrives. Merge both initial and later
+            // pages so that navigation never makes that child disappear.
+            sessions: mergeSessions(existing?.sessions ?? [], response.sessions),
+            next_cursor: response.next_cursor,
+            is_loading: false,
+            is_loading_more: false,
+            error: null,
+          }));
+        })
+        .catch((error: unknown) => {
+          if (
+            sessionChildrenGeneration.current !== generation
+            || sessionChildRequests.current.get(parentSessionKey) !== requestId
+          ) {
+            return;
+          }
+          updateSessionChildren(parentSessionKey, (existing) => ({
+            sessions: existing?.sessions ?? [],
+            next_cursor: existing?.next_cursor ?? null,
+            is_loading: false,
+            is_loading_more: false,
+            error: errorMessage(error),
+          }));
+        })
+        .finally(() => {
+          if (
+            sessionChildrenGeneration.current === generation
+            && sessionChildRequests.current.get(parentSessionKey) === requestId
+          ) {
+            sessionChildRequests.current.delete(parentSessionKey);
+          }
+        });
+    },
+    [updateSessionChildren],
+  );
+
+  const loadSessionChildren = useCallback((parentSessionKey: string) => {
+    requestSessionChildPage(parentSessionKey, null, false);
+  }, [requestSessionChildPage]);
+
+  const retrySessionChildren = useCallback((parentSessionKey: string) => {
+    const current = sessionChildrenRef.current.get(parentSessionKey);
+    requestSessionChildPage(parentSessionKey, current?.next_cursor ?? null, true);
+  }, [requestSessionChildPage]);
+
+  const loadMoreSessionChildren = useCallback((parentSessionKey: string) => {
+    const cursor = sessionChildrenRef.current.get(parentSessionKey)?.next_cursor;
+    if (cursor) {
+      requestSessionChildPage(parentSessionKey, cursor, false);
+    }
+  }, [requestSessionChildPage]);
+
+  const openSubagent = useCallback((parentSessionKey: string, target: SessionSummary) => {
+    // The target came from an activity event in this exact parent timeline.
+    // Ignore a stale card after the user has already selected another session.
+    if (selectedSessionKeyRef.current !== parentSessionKey) {
+      return;
+    }
+    updateSessionChildren(parentSessionKey, (existing) => ({
+      sessions: mergeSessions(existing?.sessions ?? [], [target]),
+      next_cursor: existing?.next_cursor ?? null,
+      is_loading: existing?.is_loading ?? false,
+      is_loading_more: existing?.is_loading_more ?? false,
+      error: existing?.error ?? null,
+    }));
+    // Fetch the normal sidebar page in the background. It retains the
+    // injected target and restores any siblings omitted from the card.
+    requestSessionChildPage(parentSessionKey, null, true);
+    applySessionSelection(target.session_key);
+    setMobileSidebarOpen(false);
+  }, [applySessionSelection, requestSessionChildPage, updateSessionChildren]);
+
   useEffect(() => {
     const requestId = ++sessionsRequest.current;
     setSessionsLoadingMore(false);
+    clearSessionChildren();
     if (enabledProviders.size === 0) {
       setSessions([]);
       setSessionsCursor(null);
@@ -264,7 +426,7 @@ export function useViewerState() {
           setSessionsLoading(false);
         }
       });
-  }, [applySessionSelection, debouncedSearch, enabledProviders, providerKey, sessionsAttempt]);
+  }, [applySessionSelection, clearSessionChildren, debouncedSearch, enabledProviders, providerKey, sessionsAttempt]);
 
   useEffect(() => {
     const requestId = ++eventsRequest.current;
@@ -299,6 +461,7 @@ export function useViewerState() {
         if (eventsRequest.current !== requestId) {
           return;
         }
+        invalidateEventDetails();
         setEvents(response.events);
         setOlderCursor(response.previous_cursor);
         setNewerCursor(response.next_cursor);
@@ -320,7 +483,7 @@ export function useViewerState() {
           setEventsLoading(false);
         }
       });
-  }, [applyEventSelection, eventsAttempt, selectedSessionKey]);
+  }, [applyEventSelection, eventsAttempt, invalidateEventDetails, selectedSessionKey]);
 
   useEffect(() => {
     const requestId = ++detailRequest.current;
@@ -362,7 +525,14 @@ export function useViewerState() {
           setDetailLoading(false);
         }
       });
-  }, [detailAttempt, inspectorOpen, requestDetail, selectedEventKey, selectedSessionKey]);
+  }, [
+    detailAttempt,
+    detailRevision,
+    inspectorOpen,
+    requestDetail,
+    selectedEventKey,
+    selectedSessionKey,
+  ]);
 
   useEffect(() => {
     const requestId = ++expandedDetailRequest.current;
@@ -402,7 +572,14 @@ export function useViewerState() {
           setExpandedDetailLoading(false);
         }
       });
-  }, [events, expandedDetailAttempt, expandedEventKey, requestDetail, selectedSessionKey]);
+  }, [
+    detailRevision,
+    events,
+    expandedDetailAttempt,
+    expandedEventKey,
+    requestDetail,
+    selectedSessionKey,
+  ]);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -420,8 +597,8 @@ export function useViewerState() {
   }, [closeInspector, inspectorOpen, mobileSidebarOpen]);
 
   const selectedSession = useMemo(
-    () => sessions.find((session) => session.session_key === selectedSessionKey) ?? null,
-    [selectedSessionKey, sessions],
+    () => findKnownSession(sessions, sessionChildren, selectedSessionKey),
+    [selectedSessionKey, sessionChildren, sessions],
   );
   const eventsAreOwned = selectedSessionKey !== null && eventsOwnerKey === selectedSessionKey;
   const visibleEvents = eventsAreOwned ? events : [];
@@ -547,6 +724,7 @@ export function useViewerState() {
         if (eventsRequest.current !== requestGeneration) {
           return;
         }
+        invalidateEventDetails();
         setEvents((current) => mergeEvents(current, response.events, "before"));
         setOlderCursor(response.previous_cursor);
         setTotalEvents(response.total_events);
@@ -561,7 +739,7 @@ export function useViewerState() {
           setOlderLoading(false);
         }
       });
-  }, [olderCursor, olderLoading, selectedSessionKey]);
+  }, [invalidateEventDetails, olderCursor, olderLoading, selectedSessionKey]);
 
   const loadNewerEvents = useCallback(() => {
     if (
@@ -585,6 +763,7 @@ export function useViewerState() {
         if (eventsRequest.current !== requestGeneration) {
           return;
         }
+        invalidateEventDetails();
         setEvents((current) => mergeEvents(current, response.events, "after"));
         setNewerCursor(response.next_cursor);
         setTotalEvents(response.total_events);
@@ -599,7 +778,7 @@ export function useViewerState() {
           setNewerLoading(false);
         }
       });
-  }, [newerCursor, newerLoading, selectedSessionKey]);
+  }, [invalidateEventDetails, newerCursor, newerLoading, selectedSessionKey]);
 
   return {
     search,
@@ -607,6 +786,11 @@ export function useViewerState() {
     enabledProviders,
     toggleProvider,
     sessions,
+    sessionChildren,
+    loadSessionChildren,
+    retrySessionChildren,
+    loadMoreSessionChildren,
+    openSubagent,
     selectedSession,
     selectedSessionKey,
     selectSession,

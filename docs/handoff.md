@@ -264,24 +264,36 @@ the project.
 
 `apps/viewer` is a read-only Tauri 2/React desktop viewer for historical Pi,
 Codex, OpenCode, and DSH sessions. It aggregates root sessions into one
-searchable, provider-filterable sidebar, renders normalized events as a
-conversation, and keeps reasoning, tools, metadata, errors, and unknown events
-inspectable without adding a message composer. A failure in one provider is
-reported without preventing the other providers from loading.
+searchable, provider-filterable sidebar, lazily expands known subagents into a
+tree, renders the selected session's normalized events as a conversation, and
+keeps reasoning, tools, metadata, errors, and unknown events inspectable
+without adding a message composer. A failure in one provider is reported
+without preventing the other providers from loading.
 
 Visible user and assistant messages, expanded reasoning, and readable inspector
 content render GitHub-flavored Markdown. Raw HTML is disabled, images become
 inert placeholders, and links cannot navigate the WebView.
 
-Known shell, file, search, web, and task events have source-neutral tool cards
-with compact command, path, query, status, and change facts. Expanding a tool
-loads a bounded plain-text or JSON output preview without opening the inspector;
-the inspector remains available as a separate action. The detail projection can
-follow a non-empty provider tool-call id to a later result, because Codex, Pi,
-and DSH may persist invocation and output as separate normalized events. It does
-not combine those lifecycle records into one timeline event or correlate records
-that lack an id. Inline output retains at most 64 KiB with both its head and tail
-visible and never renders provider output as Markdown or HTML.
+Known code-execution, terminal, shell, file, search, web, and task events have
+source-neutral tool cards with compact command, path, query, status, and change
+facts. Providers still contribute an append-only fact stream, but the shared
+core `ToolOperationAssembler` turns safely correlated invocation, progress, and
+result records into one logical historical operation. The viewer consequently
+shows one card, with a derived `pending`/`running`/`completed`/`failed` state;
+its normalized Inspector view contains the semantic input and final output,
+while the Native tab shows any provider-native envelopes the adapter retained
+from contributing records. Completed cards sit at their terminal source record
+so intervening assistant activity remains chronological. Missing or overlapping
+call IDs deliberately remain separate rather than being guessed.
+
+Expanding a tool loads a bounded plain-text or JSON output preview without
+opening the inspector; the inspector remains available as a separate action.
+Semantic results with a readable `text` field display that text directly rather
+than surrounding response metadata. Inline output retains at most 64 KiB with
+both its head and tail visible and never renders provider output as Markdown or
+HTML. Codex Code Mode wrappers are decoded only for the generated single-call
+`write_stdin` and `exec_command` shapes; arbitrary JavaScript remains a raw
+Code Execution operation.
 
 Usage events have dedicated token cards. The card labels model-call,
 operation-total, and replaceable session-snapshot scopes so users do not sum
@@ -311,12 +323,13 @@ searches from repeating the same scan. The selected session's normalized
 use the counted `list_sessions` API.
 
 Session rows prefer a non-placeholder provider title, then the first meaningful
-user-prompt preview, then `Untitled session`. The shortened session id is shown
-separately and the full id remains available through the row's accessible label
-and tooltip. Titles and previews are normalized to bounded, single-line text
-before IPC; ANSI escapes, control characters, and bidirectional override or
-isolate marks are removed. Search matches title and preview as well as session
-id, project, cwd, and agent path.
+user-prompt preview, then a child agent nickname, role, or path, and finally
+`Untitled session`. The shortened session id is shown separately and the full
+id remains available through the row's accessible label and tooltip. Titles,
+previews, and agent labels are normalized to bounded, single-line text before
+IPC; ANSI escapes, control characters, and bidirectional override or isolate
+marks are removed. Root search matches title and preview as well as session id,
+project, cwd, and agent identity.
 
 Event paging currently bounds the data sent across IPC, not all source-reader
 memory: a provider parser may still load the full selected session before
@@ -333,6 +346,19 @@ render directly in the timeline. Other event summaries and hidden/redacted
 content retain the compact 500-character budget. Longer messages can still be
 loaded through the normalized inspector detail, subject to its 512 KiB
 representation cap.
+
+The root roster stays paged and does not eagerly serialize every descendant.
+Each expandable session uses a separate bounded, metadata-only direct-child
+query. Parent-child edges are resolved within one provider after duplicate IDs
+are canonicalized by newest provider timestamp (then path); orphaned and cyclic
+records remain visible as roots instead of disappearing. `agent_path`, nickname,
+and role cross the viewer boundary as sanitized bounded labels. A parent
+timeline shows a historical delegation card only when an `agent_activity` target
+id resolves to its canonical, same-provider direct child; unknown, ambiguous,
+cross-provider, or non-child targets remain visible but are not navigable.
+Opening that card materializes the verified child in the sidebar and selects its
+independent timeline. Child searches are not yet included in root search, and
+historical headers or activity cards do not claim live subagent status.
 
 Codex normalization follows the first session header's `history_mode`. Legacy
 rollouts keep their response-item and legacy-event projection, while paginated
@@ -459,12 +485,18 @@ assistant text is final because those persisted message records do not expose a
 separate commentary channel. Current Codex `final_answer` and legacy `final`
 phases both normalize to `final`; user and other messages use `unspecified`.
 
-Tool calls now carry semantic display metadata:
+Tool calls carry explicit operation roles and semantic display metadata:
 
-- `tool_kind`: `shell`, `file_read`, `file_write`, `file_edit`, `search`, `web`, `task`, or `unknown`
+- `record_kind`: `invocation`, `progress`, `result`, or provider-state `snapshot`
+- `tool_name`, plus optional `provider_tool_name` and `transport` when a provider wrapper differs from the semantic operation
+- `tool_kind`: `code_execution`, `terminal`, `shell`, `file_read`, `file_write`, `file_edit`, `search`, `web`, `task`, or `unknown`
 - `summary`: compact facts for known tool families, such as shell command/exit code or file edit path and rough line counts
+- `native`: the original provider record when an adapter has projected cleaner semantic fields
 
-Raw `input` and `output` remain in the IR for debugging and provider-native detail.
+Raw `input` and `output` remain in the IR for debugging and provider-native
+detail. Historical pretty rendering and the desktop viewer use the shared
+operation projection; JSONL and live event consumers retain the atomic source
+records so results can update naturally as they arrive.
 
 Reasoning is intentionally flat:
 

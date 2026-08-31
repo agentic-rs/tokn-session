@@ -1,12 +1,18 @@
 import { describe, expect, it } from "vitest";
 import type { SessionSummary } from "./types";
-import { sessionDisplayTitle, shortSessionId } from "./state";
+import {
+  findKnownSession,
+  knownSessionAncestors,
+  sessionDisplayTitle,
+  shortSessionId,
+} from "./state";
 
 function session(overrides: Partial<SessionSummary> = {}): SessionSummary {
   return {
     session_key: "key",
     session_id: "01991dce-7f6a-7000-8000-000000000001",
     parent_session_id: null,
+    is_subagent: false,
     provider: "codex",
     title: null,
     preview: null,
@@ -15,6 +21,9 @@ function session(overrides: Partial<SessionSummary> = {}): SessionSummary {
     updated_at_ms: null,
     timestamp: null,
     agent_path: null,
+    agent_nickname: null,
+    agent_role: null,
+    child_count: 0,
     message_count: null,
     event_count: null,
     history_status: null,
@@ -35,9 +44,54 @@ describe("session identity", () => {
       .toBe("Untitled session");
   });
 
+  it("uses an agent label for an otherwise untitled child", () => {
+    expect(sessionDisplayTitle(session({
+      parent_session_id: "parent",
+      is_subagent: true,
+      agent_nickname: "Hubble",
+    }))).toBe("Hubble");
+  });
+
   it("keeps short ids intact and abbreviates long ids", () => {
     expect(shortSessionId("session-12")).toBe("session-12");
     expect(shortSessionId("01991dce-7f6a-7000-8000-000000000001"))
       .toBe("01991dce…");
+  });
+
+  it("finds a loaded child and its ancestor path without relying on raw IDs", () => {
+    const root = session({ session_key: "codex:root", session_id: "same-id", child_count: 1 });
+    const child = session({
+      session_key: "codex:child",
+      session_id: "same-id",
+      parent_session_id: root.session_id,
+      is_subagent: true,
+      child_count: 1,
+    });
+    const grandchild = session({
+      session_key: "codex:grandchild",
+      session_id: "grandchild",
+      parent_session_id: child.session_id,
+      is_subagent: true,
+    });
+    const children = new Map([
+      [root.session_key, {
+        sessions: [child],
+        next_cursor: null,
+        is_loading: false,
+        is_loading_more: false,
+        error: null,
+      }],
+      [child.session_key, {
+        sessions: [grandchild],
+        next_cursor: null,
+        is_loading: false,
+        is_loading_more: false,
+        error: null,
+      }],
+    ]);
+
+    expect(findKnownSession([root], children, grandchild.session_key)).toBe(grandchild);
+    expect(knownSessionAncestors([root], children, grandchild.session_key))
+      .toEqual([root.session_key, child.session_key]);
   });
 });

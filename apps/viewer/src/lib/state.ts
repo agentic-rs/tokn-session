@@ -1,4 +1,11 @@
-import type { EventDetail, EventSummary, JsonValue, SessionSummary, ViewerProvider } from "./types";
+import type {
+  EventDetail,
+  EventSummary,
+  JsonValue,
+  SessionChildrenState,
+  SessionSummary,
+  ViewerProvider,
+} from "./types";
 
 export const SESSION_PAGE_SIZE = 60;
 export const EVENT_PAGE_SIZE = 80;
@@ -69,7 +76,27 @@ export function eventButtonId(eventKey: string): string {
 }
 
 export function sessionDisplayTitle(session: SessionSummary): string {
-  return session.title?.trim() || session.preview?.trim() || UNTITLED_SESSION;
+  return session.title?.trim()
+    || session.preview?.trim()
+    || (session.is_subagent ? subagentLabel(session) : UNTITLED_SESSION);
+}
+
+/** A stable fallback label for a child whose provider did not persist a title. */
+export function subagentLabel(session: SessionSummary): string {
+  return session.agent_nickname?.trim()
+    || session.agent_role?.trim()
+    || session.agent_path?.trim()
+    || "Subagent";
+}
+
+export function subagentDetail(session: SessionSummary): string | null {
+  const details = [session.agent_role?.trim(), session.agent_path?.trim()].filter(
+    (value): value is string => Boolean(value),
+  );
+  if (details.length === 0) {
+    return null;
+  }
+  return [...new Set(details)].join(" · ");
 }
 
 export function shortSessionId(sessionId: string): string {
@@ -127,6 +154,78 @@ export function preserveSessionSelection(
     return currentKey;
   }
   return sessions[0]?.session_key ?? null;
+}
+
+/** Finds a selected root or any child page that has already been loaded. */
+export function findKnownSession(
+  roots: SessionSummary[],
+  children_by_parent: ReadonlyMap<string, SessionChildrenState>,
+  session_key: string | null,
+): SessionSummary | null {
+  if (!session_key) {
+    return null;
+  }
+  const visited = new Set<string>();
+  function visit(session: SessionSummary): SessionSummary | null {
+    if (session.session_key === session_key) {
+      return session;
+    }
+    if (visited.has(session.session_key)) {
+      return null;
+    }
+    visited.add(session.session_key);
+    const children = children_by_parent.get(session.session_key)?.sessions ?? [];
+    for (const child of children) {
+      const match = visit(child);
+      if (match) {
+        return match;
+      }
+    }
+    return null;
+  }
+  for (const root of roots) {
+    const match = visit(root);
+    if (match) {
+      return match;
+    }
+  }
+  return null;
+}
+
+/** Returns already-loaded ancestor keys so a selected child is never hidden. */
+export function knownSessionAncestors(
+  roots: SessionSummary[],
+  children_by_parent: ReadonlyMap<string, SessionChildrenState>,
+  session_key: string | null,
+): string[] {
+  if (!session_key) {
+    return [];
+  }
+  const visited = new Set<string>();
+  function visit(session: SessionSummary, ancestors: string[]): string[] | null {
+    if (session.session_key === session_key) {
+      return ancestors;
+    }
+    if (visited.has(session.session_key)) {
+      return null;
+    }
+    visited.add(session.session_key);
+    const children = children_by_parent.get(session.session_key)?.sessions ?? [];
+    for (const child of children) {
+      const result = visit(child, [...ancestors, session.session_key]);
+      if (result) {
+        return result;
+      }
+    }
+    return null;
+  }
+  for (const root of roots) {
+    const result = visit(root, []);
+    if (result) {
+      return result;
+    }
+  }
+  return [];
 }
 
 export function preserveEventSelection(

@@ -1,17 +1,19 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { eventButtonId } from "./state";
-import { listSessions, loadEventDetail, loadEventPage } from "./tauri";
+import { listSessionChildren, listSessions, loadEventDetail, loadEventPage } from "./tauri";
 import type { EventDetail, EventPageResponse, SessionSummary } from "./types";
 import { useViewerState } from "./useViewerState";
 
 vi.mock("./tauri", () => ({
+  listSessionChildren: vi.fn(() => new Promise(() => undefined)),
   listSessions: vi.fn(() => new Promise(() => undefined)),
   loadEventDetail: vi.fn(() => new Promise(() => undefined)),
   loadEventPage: vi.fn(() => new Promise(() => undefined)),
 }));
 
 beforeEach(() => {
+  vi.mocked(listSessionChildren).mockReset().mockImplementation(() => new Promise(() => undefined));
   vi.mocked(listSessions).mockReset().mockImplementation(() => new Promise(() => undefined));
   vi.mocked(loadEventPage).mockReset().mockImplementation(() => new Promise(() => undefined));
   vi.mocked(loadEventDetail).mockReset().mockImplementation(() => new Promise(() => undefined));
@@ -35,6 +37,7 @@ function session(sessionKey: string): SessionSummary {
     session_key: sessionKey,
     session_id: sessionKey,
     parent_session_id: null,
+    is_subagent: false,
     provider: "codex",
     title: sessionKey,
     preview: null,
@@ -43,6 +46,9 @@ function session(sessionKey: string): SessionSummary {
     updated_at_ms: 1,
     timestamp: "2026-08-31T00:00:00Z",
     agent_path: null,
+    agent_nickname: null,
+    agent_role: null,
+    child_count: 0,
     message_count: null,
     event_count: 1,
     history_status: "complete",
@@ -85,6 +91,23 @@ function toolEventPage(): EventPageResponse {
     previous_cursor: null,
     total_events: 1,
     history_status: "complete",
+  };
+}
+
+function pendingToolEventPage(): EventPageResponse {
+  const page = toolEventPage();
+  const event = page.events[0]!;
+  return {
+    ...page,
+    events: [{
+      ...event,
+      phase: "started",
+      summary: "shell running cargo test",
+      tool: {
+        ...event.tool!,
+        exit_code: null,
+      },
+    }],
   };
 }
 
@@ -165,6 +188,7 @@ describe("useViewerState expanded tool detail", () => {
         session_key: "codex:session-1",
         session_id: "session-1",
         parent_session_id: null,
+        is_subagent: false,
         provider: "codex",
         title: "Tool session",
         preview: "Run the checks",
@@ -173,6 +197,9 @@ describe("useViewerState expanded tool detail", () => {
         updated_at_ms: 1,
         timestamp: "2026-08-31T00:00:00Z",
         agent_path: null,
+        agent_nickname: null,
+        agent_role: null,
+        child_count: 0,
         message_count: null,
         event_count: 1,
         history_status: "complete",
@@ -295,6 +322,63 @@ describe("useViewerState expanded tool detail", () => {
     });
     expect(loadEventDetail).toHaveBeenCalledTimes(2);
   });
+
+  it("refreshes expanded and Inspector detail after a same-session event update", async () => {
+    const stale = deferred<EventDetail>();
+    const fresh = deferred<EventDetail>();
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [session("codex:session-1")],
+      next_cursor: null,
+      source_errors: [],
+    });
+    vi.mocked(loadEventPage)
+      .mockResolvedValueOnce(pendingToolEventPage())
+      .mockResolvedValueOnce(toolEventPage());
+    vi.mocked(loadEventDetail)
+      .mockImplementationOnce(() => stale.promise)
+      .mockImplementationOnce(() => fresh.promise);
+    const { result } = renderHook(() => useViewerState());
+
+    await waitFor(() => expect(result.current.events).toHaveLength(1));
+    act(() => result.current.selectEvent("event.v1.1"));
+    act(() => result.current.toggleEventExpanded("event.v1.1"));
+    await waitFor(() => expect(loadEventDetail).toHaveBeenCalledTimes(1));
+
+    act(() => result.current.retryEvents());
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(loadEventDetail).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      fresh.resolve(toolDetail("fresh output"));
+      await fresh.promise;
+    });
+    await waitFor(() => {
+      expect(result.current.detail?.tool_output?.sections[0]?.text).toBe("fresh output");
+      expect(result.current.expandedDetail?.tool_output?.sections[0]?.text).toBe("fresh output");
+    });
+
+    await act(async () => {
+      stale.resolve(toolDetail("stale output"));
+      await stale.promise;
+    });
+    expect(result.current.detail?.tool_output?.sections[0]?.text).toBe("fresh output");
+    expect(result.current.expandedDetail?.tool_output?.sections[0]?.text).toBe("fresh output");
+
+    act(() => result.current.toggleEventExpanded("event.v1.1"));
+    await waitFor(() => expect(result.current.expandedEventKey).toBeNull());
+    act(() => result.current.toggleEventExpanded("event.v1.1"));
+    await waitFor(() => {
+      expect(result.current.expandedDetail?.tool_output?.sections[0]?.text).toBe("fresh output");
+    });
+
+    act(() => result.current.closeInspector());
+    await waitFor(() => expect(result.current.inspectorOpen).toBe(false));
+    act(() => result.current.toggleInspector());
+    await waitFor(() => {
+      expect(result.current.detail?.tool_output?.sections[0]?.text).toBe("fresh output");
+    });
+    expect(loadEventDetail).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("useViewerState expanded reasoning detail", () => {
@@ -351,5 +435,83 @@ describe("useViewerState expanded reasoning detail", () => {
     await waitFor(() => expect(result.current.expandedEventKey).toBe("event.v1.opaque"));
     expect(result.current.expandedDetailLoading).toBe(false);
     expect(loadEventDetail).not.toHaveBeenCalled();
+  });
+});
+
+describe("useViewerState subagent discovery", () => {
+  it("loads direct child metadata lazily and lets a child own the event timeline", async () => {
+    const root = session("codex:root");
+    root.child_count = 1;
+    const child = session("codex:child");
+    child.parent_session_id = root.session_id;
+    child.is_subagent = true;
+    child.agent_nickname = "Hubble";
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [root],
+      next_cursor: null,
+      source_errors: [],
+    });
+    vi.mocked(listSessionChildren).mockResolvedValue({
+      sessions: [child],
+      next_cursor: null,
+    });
+
+    const { result } = renderHook(() => useViewerState());
+    await waitFor(() => expect(result.current.selectedSession?.session_key).toBe(root.session_key));
+    expect(listSessionChildren).not.toHaveBeenCalled();
+
+    act(() => result.current.loadSessionChildren(root.session_key));
+    await waitFor(() => {
+      expect(result.current.sessionChildren.get(root.session_key)?.sessions).toEqual([child]);
+    });
+    expect(listSessionChildren).toHaveBeenCalledWith({
+      parent_session_key: root.session_key,
+      cursor: undefined,
+      limit: 60,
+    });
+
+    act(() => result.current.selectSession(child.session_key));
+    await waitFor(() => expect(result.current.selectedSession?.session_key).toBe(child.session_key));
+  });
+
+  it("opens a delegation child before its lazy sidebar page arrives", async () => {
+    const root = session("codex:delegating-root");
+    root.child_count = 1;
+    const child = session("codex:delegated-child");
+    child.parent_session_id = root.session_id;
+    child.is_subagent = true;
+    child.agent_nickname = "Hubble";
+    const childPage = deferred<{ sessions: SessionSummary[]; next_cursor: string | null }>();
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [root],
+      next_cursor: null,
+      source_errors: [],
+    });
+    vi.mocked(loadEventPage).mockResolvedValue(toolEventPage());
+    vi.mocked(listSessionChildren).mockImplementation(() => childPage.promise);
+
+    const { result } = renderHook(() => useViewerState());
+    await waitFor(() => expect(result.current.selectedSession?.session_key).toBe(root.session_key));
+
+    act(() => result.current.openSubagent(root.session_key, child));
+
+    await waitFor(() => {
+      expect(result.current.selectedSession?.session_key).toBe(child.session_key);
+      expect(result.current.sessionChildren.get(root.session_key)?.sessions).toEqual([child]);
+    });
+    expect(listSessionChildren).toHaveBeenCalledWith({
+      parent_session_key: root.session_key,
+      cursor: undefined,
+      limit: 60,
+    });
+
+    await act(async () => {
+      childPage.resolve({ sessions: [], next_cursor: null });
+      await childPage.promise;
+    });
+
+    await waitFor(() => {
+      expect(result.current.sessionChildren.get(root.session_key)?.sessions).toEqual([child]);
+    });
   });
 });

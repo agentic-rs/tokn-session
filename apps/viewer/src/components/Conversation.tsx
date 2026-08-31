@@ -11,6 +11,7 @@ import {
   providerLabel,
   sessionDisplayTitle,
   shortSessionId,
+  subagentDetail,
 } from "../lib/state";
 import { InspectorIcon, PanelIcon } from "./Icons";
 import { EventCard } from "./EventCard";
@@ -38,6 +39,7 @@ interface ConversationProps {
   on_inspector_toggle: () => void;
   on_event_select: (event_key: string) => void;
   on_event_toggle: (event_key: string) => void;
+  on_open_subagent: (parent_session_key: string, target: SessionSummary) => void;
   on_load_older: () => void;
   on_load_newer: () => void;
   on_retry: () => void;
@@ -66,6 +68,7 @@ export function Conversation({
   on_inspector_toggle,
   on_event_select,
   on_event_toggle,
+  on_open_subagent,
   on_load_older,
   on_load_newer,
   on_retry,
@@ -104,6 +107,7 @@ export function Conversation({
   }
 
   const knownCount = total_events ?? session?.event_count ?? session?.message_count ?? null;
+  const childDetail = session?.is_subagent ? subagentDetail(session) : null;
   const countLabel = total_events !== null || session?.event_count !== null
     ? knownCount !== null
       ? `${knownCount} events`
@@ -134,6 +138,14 @@ export function Conversation({
               </span>
             </div>
             <p title={`${session.cwd ?? "Unassigned project"}\nSession ${session.session_id}`}>
+              {session.is_subagent ? (
+                <>
+                  <span title={childDetail ?? undefined}>
+                    {childDetail ? `Subagent · ${childDetail}` : "Subagent"}
+                  </span>
+                  <span aria-hidden="true"> · </span>
+                </>
+              ) : null}
               {session.project ?? session.cwd ?? "Unassigned project"}
               <span aria-hidden="true"> · </span>
               <span
@@ -242,6 +254,11 @@ export function Conversation({
                 key={`${session.session_key}:${event.event_key}`}
                 on_select={on_event_select}
                 on_toggle={on_event_toggle}
+                on_open_subagent={(target) => {
+                  if (session) {
+                    on_open_subagent(session.session_key, target);
+                  }
+                }}
                 on_retry_detail={on_retry_expanded_detail}
               />
             ))}

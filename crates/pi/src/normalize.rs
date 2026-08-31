@@ -3,8 +3,8 @@ use serde_json::Value;
 use crate::event::{PiContentBlock, PiMessage, PiMessageItem, PiSessionItem, PiSessionLine, PiUserContent};
 use tokn_session_core::{
   AgentEvent, ErrorEvent, MessageDelivery, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role,
-  SessionStarted, ToolCallEvent, UnknownEvent, UsageKind, tool_kind_for_name, tool_summary_for_input,
-  tool_summary_for_io,
+  SessionStarted, ToolCallEvent, ToolRecordKind, ToolTransport, UnknownEvent, UsageKind, tool_kind_for_name,
+  tool_summary_for_input, tool_summary_for_io,
 };
 
 pub struct PiNormalizer {
@@ -310,16 +310,21 @@ fn normalize_assistant_message(
         events.push(AgentEvent::ToolCall(ToolCallEvent {
           provider: Provider::Pi,
           session_id: session_id.clone(),
+          turn_id: None,
           message_id: meta.id.clone(),
           parent_id: meta.parent_id.clone(),
+          record_kind: ToolRecordKind::Invocation,
           tool_call_id: content.id,
+          provider_tool_name: Some(name.clone()),
           tool_name: Some(name.clone()),
           tool_kind: tool_kind_for_name(&name),
+          transport: Some(ToolTransport::Native),
           summary: tool_summary_for_input(&name, &content.arguments),
           phase: Phase::Started,
           input: Some(content.arguments),
           output: None,
           is_error: None,
+          native: Some(native),
           timestamp: timestamp.clone(),
         }));
       }
@@ -367,19 +372,24 @@ fn normalize_tool_result_message(
   vec![AgentEvent::ToolCall(ToolCallEvent {
     provider: Provider::Pi,
     session_id,
+    turn_id: None,
     message_id: meta.id.clone(),
     parent_id: meta.parent_id.clone(),
+    record_kind: ToolRecordKind::Result,
     tool_call_id: message.tool_call_id,
+    provider_tool_name: tool_name.clone(),
     tool_name: tool_name.clone(),
     tool_kind: tool_name
       .as_deref()
       .map(tool_kind_for_name)
       .unwrap_or(tokn_session_core::ToolKind::Unknown),
+    transport: Some(ToolTransport::Native),
     summary: tool_summary_for_io(tool_name.as_deref(), details.as_ref(), Some(&output)),
     phase: Phase::Finished,
     input: None,
     output: Some(output),
     is_error: message.is_error,
+    native: None,
     timestamp,
   })]
 }

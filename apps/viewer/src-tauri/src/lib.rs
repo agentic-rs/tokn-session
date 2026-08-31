@@ -11,6 +11,7 @@ pub fn run() {
     .manage(ViewerService::native())
     .invoke_handler(tauri::generate_handler![
       commands::sessions::list_sessions,
+      commands::sessions::list_session_children,
       commands::events::load_event_page,
       commands::events::load_event_detail,
     ])

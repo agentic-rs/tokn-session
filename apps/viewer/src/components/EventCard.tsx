@@ -1,6 +1,17 @@
 import { useState } from "react";
-import type { EventDetail, EventSummary, ToolCardSummary } from "../lib/types";
-import { formatTimestamp } from "../lib/state";
+import type {
+  AgentActivityCardSummary,
+  EventDetail,
+  EventSummary,
+  SessionSummary,
+  ToolCardSummary,
+} from "../lib/types";
+import {
+  formatTimestamp,
+  sessionDisplayTitle,
+  shortSessionId,
+  subagentDetail,
+} from "../lib/state";
 import {
   ChevronIcon,
   ReasoningIcon,
@@ -24,6 +35,7 @@ interface EventCardProps {
   detail_loading: boolean;
   on_select: (event_key: string) => void;
   on_toggle: (event_key: string) => void;
+  on_open_subagent?: (target: SessionSummary) => void;
   on_retry_detail: () => void;
 }
 
@@ -58,6 +70,15 @@ function toolHeading(event: EventSummary): TechnicalCardHeading {
 
   const fallback = toolFallbackName(event, tool);
   switch (tool.kind) {
+    case "code_execution":
+      return {
+        action: "Code",
+        primary: tool.language?.trim()
+          ? `${humanize(tool.language)} code`
+          : fallback,
+        secondary: tool.provider_tool_name?.trim() || null,
+        monospace: false,
+      };
     case "shell":
       return {
         action: "Shell",
@@ -65,6 +86,23 @@ function toolHeading(event: EventSummary): TechnicalCardHeading {
         secondary: tool.cwd,
         monospace: tool.command !== null,
       };
+    case "terminal": {
+      const session = tool.terminal_session_id?.trim();
+      const action = tool.terminal_action;
+      const primary = action === "wait"
+        ? `Wait for ${session ? `terminal ${session}` : "terminal"}`
+        : action === "send"
+          ? `Send ${tool.chars_len ?? 0} characters${session ? ` to terminal ${session}` : ""}`
+          : fallback;
+      return {
+        action: "Terminal",
+        primary,
+        secondary: tool.wait_ms === null || tool.wait_ms === undefined
+          ? null
+          : `Up to ${formatDuration(tool.wait_ms)}`,
+        monospace: false,
+      };
+    }
     case "file_read":
       return {
         action: "Read",
@@ -117,6 +155,31 @@ function toolHeading(event: EventSummary): TechnicalCardHeading {
   }
 }
 
+function agentActivityHeading(event: EventSummary): TechnicalCardHeading {
+  const activity = event.agent_activity;
+  const target = activity?.target ?? null;
+  if (target) {
+    const detail = subagentDetail(target);
+    return {
+      action: "Subagent",
+      primary: sessionDisplayTitle(target),
+      secondary: detail ?? `Session ${shortSessionId(target.session_id)}`,
+      monospace: false,
+    };
+  }
+
+  const targetLabel = activity?.target_agent_path?.trim()
+    || activity?.target_session_id?.trim()
+    || event.title
+    || "Agent activity";
+  return {
+    action: "Subagent",
+    primary: targetLabel,
+    secondary: null,
+    monospace: false,
+  };
+}
+
 function changeSummary(tool: ToolCardSummary): string | null {
   const changes = [
     tool.added === null ? null : `+${tool.added}`,
@@ -133,6 +196,16 @@ function formatBytes(bytes: number): string {
     return `${(bytes / 1_000).toFixed(bytes < 10_000 ? 1 : 0)} KB`;
   }
   return `${(bytes / 1_000_000).toFixed(bytes < 10_000_000 ? 1 : 0)} MB`;
+}
+
+function formatDuration(milliseconds: number): string {
+  if (milliseconds < 1_000) {
+    return `${milliseconds} ms`;
+  }
+  if (milliseconds % 1_000 === 0) {
+    return `${milliseconds / 1_000} s`;
+  }
+  return `${(milliseconds / 1_000).toFixed(1)} s`;
 }
 
 function eventIcon(event: EventSummary) {
@@ -174,6 +247,9 @@ function cardHeading(event: EventSummary): TechnicalCardHeading | null {
   if (event.type === "tool_call") {
     return toolHeading(event);
   }
+  if (event.type === "agent_activity" && event.agent_activity) {
+    return agentActivityHeading(event);
+  }
   if (event.type === "usage" && event.usage) {
     return usageHeading(event.usage);
   }
@@ -188,6 +264,14 @@ function usesControlledExpansion(event: EventSummary): boolean {
 }
 
 function eventStatus(event: EventSummary): { label: string; tone: string } | null {
+  if (event.type === "agent_activity") {
+    const kind = event.agent_activity?.kind.trim();
+    if (!kind) {
+      return null;
+    }
+    const tone = /^(failed|interrupted|blocked)$/i.test(kind) ? "error" : "neutral";
+    return { label: humanize(kind), tone };
+  }
   if (event.type !== "tool_call") {
     if (!event.phase || (event.type === "reasoning" && event.phase === "finished")) {
       return null;
@@ -202,6 +286,18 @@ function eventStatus(event: EventSummary): { label: string; tone: string } | nul
   if (event.is_error) {
     return { label: "failed", tone: "error" };
   }
+  switch (event.tool?.status) {
+    case "failed":
+      return { label: "failed", tone: "error" };
+    case "pending":
+      return { label: "pending", tone: "neutral" };
+    case "running":
+      return { label: "running", tone: "neutral" };
+    case "completed":
+      return null;
+    default:
+      break;
+  }
   if (event.tool?.exit_code !== null && event.tool?.exit_code !== undefined) {
     return { label: `exit ${event.tool.exit_code}`, tone: "success" };
   }
@@ -209,6 +305,40 @@ function eventStatus(event: EventSummary): { label: string; tone: string } | nul
     return { label: event.phase === "started" ? "running" : event.phase, tone: "neutral" };
   }
   return null;
+}
+
+function AgentActivityBody({
+  activity,
+  event,
+}: {
+  activity: AgentActivityCardSummary | null | undefined;
+  event: EventSummary;
+}) {
+  const target = activity?.target ?? null;
+  if (!activity) {
+    return <p>{event.summary || "No activity summary available."}</p>;
+  }
+  if (target) {
+    return (
+      <div className="delegation-card">
+        <p>
+          Recorded {humanize(activity.kind).toLowerCase()} activity for this subagent.
+        </p>
+        <span className="delegation-card__session" title={`Session ${target.session_id}`}>
+          Session {shortSessionId(target.session_id)}
+        </span>
+      </div>
+    );
+  }
+  if (activity.target_session_id || activity.target_agent_path) {
+    return (
+      <p>
+        Child session is not available in this viewer.
+        {activity.target_session_id ? ` Recorded target: ${activity.target_session_id}.` : ""}
+      </p>
+    );
+  }
+  return <p>{event.summary || "No child session was recorded for this activity."}</p>;
 }
 
 function ToolOutput({
@@ -251,7 +381,8 @@ function ToolOutput({
 
   const output = detail?.tool_output ?? null;
   if (!output || output.sections.length === 0) {
-    const isPending = event.phase !== null && event.phase !== "finished";
+    const isPending = event.tool?.status === "pending" || event.tool?.status === "running"
+      || (event.tool?.status === undefined && event.phase !== null && event.phase !== "finished");
     return (
       <p className="tool-output__empty" role="status">
         {isPending ? "Output is not available yet." : "No output was captured for this tool call."}
@@ -281,9 +412,6 @@ function ToolOutput({
           Inspect the event for the complete bounded detail.
         </p>
       ) : null}
-      {output.source_event_key !== event.event_key ? (
-        <p className="tool-output__source">Output matched from the related result event.</p>
-      ) : null}
     </div>
   );
 }
@@ -298,6 +426,7 @@ export function EventCard({
   detail_loading,
   on_select,
   on_toggle,
+  on_open_subagent,
   on_retry_detail,
 }: EventCardProps) {
   const [isLocallyExpanded, setIsLocallyExpanded] = useState(
@@ -344,6 +473,7 @@ export function EventCard({
   const regionId = `${button_id}-details`;
   const labelId = `${button_id}-label`;
   const cardIsExpanded = usesControlledExpansion(event) ? is_expanded : isLocallyExpanded;
+  const subagentTarget = event.type === "agent_activity" ? event.agent_activity?.target ?? null : null;
   return (
     <article
       className="technical-event"
@@ -394,15 +524,27 @@ export function EventCard({
           </time>
           <ChevronIcon className={cardIsExpanded ? "chevron chevron--open" : "chevron"} />
         </button>
-        <button
-          aria-label={`Inspect ${title}`}
-          className="technical-event__inspect"
-          id={button_id}
-          onClick={() => on_select(event.event_key)}
-          type="button"
-        >
-          {event.summary_truncated && !event.is_hidden ? "Full detail" : "Inspect"}
-        </button>
+        <div className="technical-event__actions">
+          {subagentTarget ? (
+            <button
+              aria-label={`Open subagent ${sessionDisplayTitle(subagentTarget)}`}
+              className="technical-event__open-subagent"
+              onClick={() => on_open_subagent?.(subagentTarget)}
+              type="button"
+            >
+              Open
+            </button>
+          ) : null}
+          <button
+            aria-label={`Inspect ${title}`}
+            className="technical-event__inspect"
+            id={button_id}
+            onClick={() => on_select(event.event_key)}
+            type="button"
+          >
+            {event.summary_truncated && !event.is_hidden ? "Full detail" : "Inspect"}
+          </button>
+        </div>
       </div>
       {cardIsExpanded ? (
         <div
@@ -429,6 +571,8 @@ export function EventCard({
               is_loading={detail_loading}
               on_retry={on_retry_detail}
             />
+          ) : event.type === "agent_activity" ? (
+            <AgentActivityBody activity={event.agent_activity} event={event} />
           ) : (
             <p>{event.is_hidden ? "Hidden extension event" : event.summary || "No summary available."}</p>
           )}

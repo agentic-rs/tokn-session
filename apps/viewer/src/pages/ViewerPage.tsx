@@ -15,12 +15,16 @@ export function ViewerPage() {
           has_more={viewer.sessionsCursor !== null}
           is_loading={viewer.sessionsLoading}
           is_loading_more={viewer.sessionsLoadingMore}
+          on_children_load={viewer.loadSessionChildren}
+          on_children_load_more={viewer.loadMoreSessionChildren}
+          on_children_retry={viewer.retrySessionChildren}
           on_load_more={viewer.loadMoreSessions}
           on_provider_toggle={viewer.toggleProvider}
           on_retry={viewer.retrySessions}
           on_search_change={viewer.setSearch}
           on_session_select={viewer.selectSession}
           search={viewer.search}
+          session_children={viewer.sessionChildren}
           selected_session_key={viewer.selectedSessionKey}
           sessions={viewer.sessions}
           source_errors={viewer.sourceErrors}
@@ -53,6 +57,7 @@ export function ViewerPage() {
         is_loading_older={viewer.olderLoading}
         on_event_select={viewer.selectEvent}
         on_event_toggle={viewer.toggleEventExpanded}
+        on_open_subagent={viewer.openSubagent}
         on_inspector_toggle={viewer.toggleInspector}
         on_load_newer={viewer.loadNewerEvents}
         on_load_older={viewer.loadOlderEvents}

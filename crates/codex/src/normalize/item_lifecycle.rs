@@ -4,7 +4,10 @@ use tokn_session_core::{
   ToolSummary, patch_summary, tool_kind_for_name, tool_summary_for_io,
 };
 
-use super::{codex_message_delivery, command_text, message_event, path_field, string_field, unknown_event};
+use super::{
+  codex_message_delivery, command_text, message_event, path_field, string_field, tool_record_kind_for_phase,
+  unknown_event,
+};
 
 fn string_array(value: &Value) -> Option<Vec<String>> {
   value
@@ -312,11 +315,15 @@ fn normalize_command_item(
   Some(vec![AgentEvent::ToolCall(ToolCallEvent {
     provider: Provider::Codex,
     session_id,
+    turn_id: None,
     message_id: None,
     parent_id: None,
+    record_kind: tool_record_kind_for_phase(phase),
     tool_call_id: Some(call_id),
+    provider_tool_name: None,
     tool_name: Some("exec_command".to_string()),
     tool_kind: ToolKind::Shell,
+    transport: None,
     summary: Some(ToolSummary::Shell {
       command: command_text(Some(&command)),
       cwd: path_field(item, "cwd"),
@@ -326,6 +333,7 @@ fn normalize_command_item(
     input: (!is_finished).then_some(command),
     output,
     is_error: is_finished.then(|| status != "completed" || exit_code.is_some_and(|code| code != 0)),
+    native: None,
     timestamp,
   })])
 }
@@ -364,11 +372,15 @@ fn normalize_dynamic_tool_item(
   Some(vec![AgentEvent::ToolCall(ToolCallEvent {
     provider: Provider::Codex,
     session_id,
+    turn_id: None,
     message_id: None,
     parent_id: None,
+    record_kind: tool_record_kind_for_phase(phase),
     tool_call_id: Some(call_id),
+    provider_tool_name: None,
     tool_name: Some(name.clone()),
     tool_kind: tool_kind_for_name(&name),
+    transport: None,
     summary: (!is_finished)
       .then(|| tool_summary_for_io(Some(&name), Some(&arguments), None))
       .flatten(),
@@ -382,6 +394,7 @@ fn normalize_dynamic_tool_item(
       })
     }),
     is_error: is_finished.then(|| status == "failed" || success == Some(false)),
+    native: None,
     timestamp,
   })])
 }
@@ -404,11 +417,15 @@ fn normalize_file_change_item(
   Some(vec![AgentEvent::ToolCall(ToolCallEvent {
     provider: Provider::Codex,
     session_id,
+    turn_id: None,
     message_id: None,
     parent_id: None,
+    record_kind: tool_record_kind_for_phase(phase),
     tool_call_id: Some(call_id),
+    provider_tool_name: None,
     tool_name: Some("apply_patch".to_string()),
     tool_kind: ToolKind::FileEdit,
+    transport: None,
     summary: Some(patch_summary(&changes)),
     phase,
     input: (!is_finished).then_some(changes),
@@ -423,6 +440,7 @@ fn normalize_file_change_item(
     } else {
       None
     },
+    native: None,
     timestamp,
   })])
 }
@@ -458,11 +476,15 @@ fn normalize_mcp_item(
   Some(vec![AgentEvent::ToolCall(ToolCallEvent {
     provider: Provider::Codex,
     session_id,
+    turn_id: None,
     message_id: None,
     parent_id: None,
+    record_kind: tool_record_kind_for_phase(phase),
     tool_call_id: Some(call_id),
+    provider_tool_name: None,
     tool_name: Some(name.clone()),
     tool_kind: tool_kind_for_name(&name),
+    transport: None,
     summary: (!is_finished)
       .then(|| tool_summary_for_io(Some(&name), Some(&arguments), None))
       .flatten(),
@@ -470,6 +492,7 @@ fn normalize_mcp_item(
     input: (!is_finished).then_some(arguments),
     output: is_finished.then_some(output),
     is_error: is_finished.then(|| status == "failed" || result_is_error),
+    native: None,
     timestamp,
   })])
 }
@@ -508,11 +531,15 @@ fn normalize_collab_item(
   Some(vec![AgentEvent::ToolCall(ToolCallEvent {
     provider: Provider::Codex,
     session_id,
+    turn_id: None,
     message_id: None,
     parent_id: None,
+    record_kind: tool_record_kind_for_phase(phase),
     tool_call_id: Some(call_id),
+    provider_tool_name: None,
     tool_name: Some(tool_name.clone()),
     tool_kind: ToolKind::Task,
+    transport: None,
     summary: Some(ToolSummary::Task {
       title: string_field(item, "prompt").or_else(|| Some(tool_name.clone())),
     }),
@@ -526,6 +553,7 @@ fn normalize_collab_item(
       })
     }),
     is_error: is_finished.then(|| status == "failed"),
+    native: None,
     timestamp,
   })])
 }
@@ -605,11 +633,15 @@ fn normalize_image_view_item(
   Some(vec![AgentEvent::ToolCall(ToolCallEvent {
     provider: Provider::Codex,
     session_id,
+    turn_id: None,
     message_id: None,
     parent_id: None,
+    record_kind: tool_record_kind_for_phase(phase),
     tool_call_id: Some(call_id),
+    provider_tool_name: None,
     tool_name: Some("view_image".to_string()),
     tool_kind: ToolKind::FileRead,
+    transport: None,
     summary: Some(ToolSummary::FileRead {
       path: Some(path.clone()),
     }),
@@ -617,6 +649,7 @@ fn normalize_image_view_item(
     input: Some(json!({ "path": path })),
     output: None,
     is_error: None,
+    native: None,
     timestamp,
   })])
 }
@@ -650,11 +683,15 @@ fn normalize_image_generation_item(
   Some(vec![AgentEvent::ToolCall(ToolCallEvent {
     provider: Provider::Codex,
     session_id,
+    turn_id: None,
     message_id: None,
     parent_id: None,
+    record_kind: tool_record_kind_for_phase(phase),
     tool_call_id: Some(call_id),
+    provider_tool_name: None,
     tool_name: Some("image_generation".to_string()),
     tool_kind: ToolKind::Unknown,
+    transport: None,
     summary: None,
     phase,
     input: revised_prompt.map(Value::String),
@@ -666,6 +703,7 @@ fn normalize_image_generation_item(
       })
     }),
     is_error: is_finished.then(|| matches!(status.as_str(), "failed" | "error")),
+    native: None,
     timestamp,
   })])
 }
@@ -705,16 +743,21 @@ fn normalize_extension_item(
       Some(vec![AgentEvent::ToolCall(ToolCallEvent {
         provider: Provider::Codex,
         session_id,
+        turn_id: None,
         message_id: None,
         parent_id: None,
+        record_kind: tool_record_kind_for_phase(phase),
         tool_call_id: Some(call_id),
+        provider_tool_name: None,
         tool_name: Some("sleep".to_string()),
         tool_kind: ToolKind::Unknown,
+        transport: None,
         summary: None,
         phase,
         input: (!is_finished).then(|| json!({ "duration_ms": duration_ms })),
         output: is_finished.then(|| json!({ "duration_ms": duration_ms })),
         is_error: None,
+        native: None,
         timestamp,
       })])
     }
@@ -756,11 +799,15 @@ fn search_tool_event(
   vec![AgentEvent::ToolCall(ToolCallEvent {
     provider: Provider::Codex,
     session_id,
+    turn_id: None,
     message_id: None,
     parent_id: None,
+    record_kind: tool_record_kind_for_phase(phase),
     tool_call_id: Some(call_id),
+    provider_tool_name: None,
     tool_name: Some("web_search".to_string()),
     tool_kind: ToolKind::Search,
+    transport: None,
     summary: Some(ToolSummary::Search {
       query: Some(query.clone()),
     }),
@@ -773,6 +820,7 @@ fn search_tool_event(
       })
     }),
     is_error: None,
+    native: None,
     timestamp,
   })]
 }

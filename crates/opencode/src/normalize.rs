@@ -3,7 +3,8 @@ use serde_json::{Value, json};
 use tokn_opencode_protocol::v1::{MessageItem, PartItem, TokenUsage, ToolState, ToolStateItem};
 use tokn_session_core::{
   AgentEvent, ErrorEvent, MessageDelivery, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role,
-  SessionStarted, ToolCallEvent, UnknownEvent, UsageEvent, UsageKind, tool_kind_for_optional_name, tool_summary_for_io,
+  SessionStarted, ToolCallEvent, ToolRecordKind, ToolTransport, UnknownEvent, UsageEvent, UsageKind,
+  tool_kind_for_optional_name, tool_summary_for_io,
 };
 
 pub struct OpenCodeNormalizer {
@@ -432,7 +433,7 @@ pub(crate) fn tool_event(
   time_created: Option<i64>,
 ) -> AgentEvent {
   let (state, native) = state.into_parts();
-  let (phase, input, output, is_error) = match state {
+  let (record_kind, phase, input, output, is_error) = match state {
     ToolStateItem::Pending(state) => {
       let input = match (state.input, state.raw) {
         (Some(input), Some(raw)) => Some(json!({ "input": input, "raw": raw })),
@@ -440,9 +441,10 @@ pub(crate) fn tool_event(
         (None, Some(raw)) => Some(json!({ "raw": raw })),
         (None, None) => None,
       };
-      (Phase::Started, input, None, None)
+      (ToolRecordKind::Invocation, Phase::Started, input, None, None)
     }
     ToolStateItem::Running(state) => (
+      ToolRecordKind::Progress,
       Phase::Updated,
       state.input,
       present_output(state.title, None, state.metadata, None),
@@ -451,6 +453,7 @@ pub(crate) fn tool_event(
     ToolStateItem::Completed(state) => {
       let is_error = metadata_exit_is_error(state.metadata.as_ref());
       (
+        ToolRecordKind::Snapshot,
         Phase::Finished,
         state.input,
         present_output(state.title, state.output, state.metadata, None),
@@ -458,27 +461,39 @@ pub(crate) fn tool_event(
       )
     }
     ToolStateItem::Error(state) => (
+      ToolRecordKind::Snapshot,
       Phase::Finished,
       state.input,
       present_output(None, state.error.map(Value::String), state.metadata, state.raw),
       Some(true),
     ),
-    ToolStateItem::Unknown(_) => (Phase::Updated, None, Some(native), None),
+    ToolStateItem::Unknown(_) => (
+      ToolRecordKind::Snapshot,
+      Phase::Updated,
+      None,
+      Some(native.clone()),
+      None,
+    ),
   };
 
   AgentEvent::ToolCall(ToolCallEvent {
     provider: Provider::OpenCode,
     session_id: Some(session_id),
+    turn_id: None,
     message_id: Some(message_id),
     parent_id,
+    record_kind,
     tool_call_id: call_id,
+    provider_tool_name: tool.clone(),
     tool_kind: tool_kind_for_optional_name(tool.as_deref()),
     summary: tool_summary_for_io(tool.as_deref(), input.as_ref(), output.as_ref()),
     tool_name: tool,
+    transport: Some(ToolTransport::Native),
     phase,
     input,
     output,
     is_error,
+    native: Some(native),
     timestamp: timestamp(time_created),
   })
 }
