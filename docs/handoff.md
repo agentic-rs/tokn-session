@@ -264,10 +264,11 @@ the project.
 
 `apps/viewer` is a read-only Tauri 2/React desktop viewer for historical Pi,
 Codex, OpenCode, and DSH sessions. It aggregates root sessions into one
-searchable, provider-filterable sidebar, renders normalized events as a
-conversation, and keeps reasoning, tools, metadata, errors, and unknown events
-inspectable without adding a message composer. A failure in one provider is
-reported without preventing the other providers from loading.
+searchable, provider-filterable sidebar, lazily expands known subagents into a
+tree, renders the selected session's normalized events as a conversation, and
+keeps reasoning, tools, metadata, errors, and unknown events inspectable
+without adding a message composer. A failure in one provider is reported
+without preventing the other providers from loading.
 
 Visible user and assistant messages, expanded reasoning, and readable inspector
 content render GitHub-flavored Markdown. Raw HTML is disabled, images become
@@ -311,12 +312,13 @@ searches from repeating the same scan. The selected session's normalized
 use the counted `list_sessions` API.
 
 Session rows prefer a non-placeholder provider title, then the first meaningful
-user-prompt preview, then `Untitled session`. The shortened session id is shown
-separately and the full id remains available through the row's accessible label
-and tooltip. Titles and previews are normalized to bounded, single-line text
-before IPC; ANSI escapes, control characters, and bidirectional override or
-isolate marks are removed. Search matches title and preview as well as session
-id, project, cwd, and agent path.
+user-prompt preview, then a child agent nickname, role, or path, and finally
+`Untitled session`. The shortened session id is shown separately and the full
+id remains available through the row's accessible label and tooltip. Titles,
+previews, and agent labels are normalized to bounded, single-line text before
+IPC; ANSI escapes, control characters, and bidirectional override or isolate
+marks are removed. Root search matches title and preview as well as session id,
+project, cwd, and agent identity.
 
 Event paging currently bounds the data sent across IPC, not all source-reader
 memory: a provider parser may still load the full selected session before
@@ -333,6 +335,17 @@ render directly in the timeline. Other event summaries and hidden/redacted
 content retain the compact 500-character budget. Longer messages can still be
 loaded through the normalized inspector detail, subject to its 512 KiB
 representation cap.
+
+The root roster stays paged and does not eagerly serialize every descendant.
+Each expandable session uses a separate bounded, metadata-only direct-child
+query. Parent-child edges are resolved within one provider after duplicate IDs
+are canonicalized by newest provider timestamp (then path); orphaned and cyclic
+records remain visible as roots instead of disappearing. `agent_path`, nickname,
+and role cross the viewer boundary as sanitized bounded labels. Selecting a
+child loads only that child's independent timeline: parent timelines do not yet
+include synthetic delegation summaries, child searches are not yet included in
+root search, and
+historical headers do not claim live subagent status.
 
 Codex normalization follows the first session header's `history_mode`. Legacy
 rollouts keep their response-item and legacy-event projection, while paginated

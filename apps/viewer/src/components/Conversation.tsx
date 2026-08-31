@@ -11,6 +11,7 @@ import {
   providerLabel,
   sessionDisplayTitle,
   shortSessionId,
+  subagentDetail,
 } from "../lib/state";
 import { InspectorIcon, PanelIcon } from "./Icons";
 import { EventCard } from "./EventCard";
@@ -104,6 +105,7 @@ export function Conversation({
   }
 
   const knownCount = total_events ?? session?.event_count ?? session?.message_count ?? null;
+  const childDetail = session?.is_subagent ? subagentDetail(session) : null;
   const countLabel = total_events !== null || session?.event_count !== null
     ? knownCount !== null
       ? `${knownCount} events`
@@ -134,6 +136,14 @@ export function Conversation({
               </span>
             </div>
             <p title={`${session.cwd ?? "Unassigned project"}\nSession ${session.session_id}`}>
+              {session.is_subagent ? (
+                <>
+                  <span title={childDetail ?? undefined}>
+                    {childDetail ? `Subagent · ${childDetail}` : "Subagent"}
+                  </span>
+                  <span aria-hidden="true"> · </span>
+                </>
+              ) : null}
               {session.project ?? session.cwd ?? "Unassigned project"}
               <span aria-hidden="true"> · </span>
               <span

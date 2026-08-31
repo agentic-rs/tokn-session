@@ -1,4 +1,4 @@
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SessionSummary } from "../lib/types";
 import { Sidebar } from "./Sidebar";
@@ -10,6 +10,7 @@ function session(overrides: Partial<SessionSummary> = {}): SessionSummary {
     session_key: "codex:session",
     session_id: "01991dce-7f6a-7000-8000-000000000001",
     parent_session_id: null,
+    is_subagent: false,
     provider: "codex",
     title: null,
     preview: null,
@@ -18,6 +19,9 @@ function session(overrides: Partial<SessionSummary> = {}): SessionSummary {
     updated_at_ms: null,
     timestamp: null,
     agent_path: null,
+    agent_nickname: null,
+    agent_role: null,
+    child_count: 0,
     message_count: null,
     event_count: null,
     history_status: null,
@@ -33,12 +37,16 @@ function renderSidebar(sessions: SessionSummary[]) {
       has_more={false}
       is_loading={false}
       is_loading_more={false}
+      on_children_load={vi.fn()}
+      on_children_load_more={vi.fn()}
+      on_children_retry={vi.fn()}
       on_load_more={vi.fn()}
       on_provider_toggle={vi.fn()}
       on_retry={vi.fn()}
       on_search_change={vi.fn()}
       on_session_select={vi.fn()}
       search=""
+      session_children={new Map()}
       selected_session_key={null}
       sessions={sessions}
       source_errors={[]}
@@ -94,5 +102,104 @@ describe("Sidebar session identity", () => {
     expect(within(untitled).getByText("Untitled session")).toHaveClass("session-row__title");
     expect(within(untitled).getByText("12345678…")).toHaveClass("session-row__id");
     expect(untitled).toHaveAttribute("title", `Untitled session\n${untitledId}`);
+  });
+
+  it("loads missing child metadata only after an expansion commits", async () => {
+    const onChildrenLoad = vi.fn();
+    const parent = session({
+      session_key: "codex:parent",
+      session_id: "parent-0000",
+      title: "Root task",
+      child_count: 1,
+    });
+
+    render(
+      <Sidebar
+        enabled_providers={new Set(["codex"])}
+        error={null}
+        has_more={false}
+        is_loading={false}
+        is_loading_more={false}
+        on_children_load={onChildrenLoad}
+        on_children_load_more={vi.fn()}
+        on_children_retry={vi.fn()}
+        on_load_more={vi.fn()}
+        on_provider_toggle={vi.fn()}
+        on_retry={vi.fn()}
+        on_search_change={vi.fn()}
+        on_session_select={vi.fn()}
+        search=""
+        session_children={new Map()}
+        selected_session_key={null}
+        sessions={[parent]}
+        source_errors={[]}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Show 1 subagent for Root task" }));
+    await waitFor(() => expect(onChildrenLoad).toHaveBeenCalledWith(parent.session_key));
+  });
+
+  it("renders cached nested subagents as independently selectable tree items", () => {
+    const onChildrenLoad = vi.fn();
+    const onSessionSelect = vi.fn();
+    const parent = session({
+      session_key: "codex:parent",
+      session_id: "parent-0000",
+      title: "Root task",
+      child_count: 1,
+    });
+    const child = session({
+      session_key: "codex:child",
+      session_id: "child-0000",
+      parent_session_id: "parent-0000",
+      is_subagent: true,
+      title: null,
+      agent_nickname: "Hubble",
+      agent_path: "/root/researcher",
+    });
+
+    render(
+      <Sidebar
+        enabled_providers={new Set(["codex"])}
+        error={null}
+        has_more={false}
+        is_loading={false}
+        is_loading_more={false}
+        on_children_load={onChildrenLoad}
+        on_children_load_more={vi.fn()}
+        on_children_retry={vi.fn()}
+        on_load_more={vi.fn()}
+        on_provider_toggle={vi.fn()}
+        on_retry={vi.fn()}
+        on_search_change={vi.fn()}
+        on_session_select={onSessionSelect}
+        search=""
+        session_children={new Map([[
+          parent.session_key,
+          {
+            sessions: [child],
+            next_cursor: null,
+            is_loading: false,
+            is_loading_more: false,
+            error: null,
+          },
+        ]])}
+        selected_session_key={null}
+        sessions={[parent]}
+        source_errors={[]}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: /subagent Hubble/i })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show 1 subagent for Root task" }));
+    expect(onChildrenLoad).not.toHaveBeenCalled();
+
+    const childRow = screen.getByRole("button", {
+      name: `subagent Hubble, Codex session ${child.session_id}`,
+    });
+    expect(childRow).toHaveTextContent("/root/researcher");
+    fireEvent.click(childRow);
+    expect(onSessionSelect).toHaveBeenCalledWith(child.session_key);
   });
 });

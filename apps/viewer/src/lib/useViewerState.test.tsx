@@ -1,17 +1,19 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { eventButtonId } from "./state";
-import { listSessions, loadEventDetail, loadEventPage } from "./tauri";
+import { listSessionChildren, listSessions, loadEventDetail, loadEventPage } from "./tauri";
 import type { EventDetail, EventPageResponse, SessionSummary } from "./types";
 import { useViewerState } from "./useViewerState";
 
 vi.mock("./tauri", () => ({
+  listSessionChildren: vi.fn(() => new Promise(() => undefined)),
   listSessions: vi.fn(() => new Promise(() => undefined)),
   loadEventDetail: vi.fn(() => new Promise(() => undefined)),
   loadEventPage: vi.fn(() => new Promise(() => undefined)),
 }));
 
 beforeEach(() => {
+  vi.mocked(listSessionChildren).mockReset().mockImplementation(() => new Promise(() => undefined));
   vi.mocked(listSessions).mockReset().mockImplementation(() => new Promise(() => undefined));
   vi.mocked(loadEventPage).mockReset().mockImplementation(() => new Promise(() => undefined));
   vi.mocked(loadEventDetail).mockReset().mockImplementation(() => new Promise(() => undefined));
@@ -35,6 +37,7 @@ function session(sessionKey: string): SessionSummary {
     session_key: sessionKey,
     session_id: sessionKey,
     parent_session_id: null,
+    is_subagent: false,
     provider: "codex",
     title: sessionKey,
     preview: null,
@@ -43,6 +46,9 @@ function session(sessionKey: string): SessionSummary {
     updated_at_ms: 1,
     timestamp: "2026-08-31T00:00:00Z",
     agent_path: null,
+    agent_nickname: null,
+    agent_role: null,
+    child_count: 0,
     message_count: null,
     event_count: 1,
     history_status: "complete",
@@ -165,6 +171,7 @@ describe("useViewerState expanded tool detail", () => {
         session_key: "codex:session-1",
         session_id: "session-1",
         parent_session_id: null,
+        is_subagent: false,
         provider: "codex",
         title: "Tool session",
         preview: "Run the checks",
@@ -173,6 +180,9 @@ describe("useViewerState expanded tool detail", () => {
         updated_at_ms: 1,
         timestamp: "2026-08-31T00:00:00Z",
         agent_path: null,
+        agent_nickname: null,
+        agent_role: null,
+        child_count: 0,
         message_count: null,
         event_count: 1,
         history_status: "complete",
@@ -351,5 +361,42 @@ describe("useViewerState expanded reasoning detail", () => {
     await waitFor(() => expect(result.current.expandedEventKey).toBe("event.v1.opaque"));
     expect(result.current.expandedDetailLoading).toBe(false);
     expect(loadEventDetail).not.toHaveBeenCalled();
+  });
+});
+
+describe("useViewerState subagent discovery", () => {
+  it("loads direct child metadata lazily and lets a child own the event timeline", async () => {
+    const root = session("codex:root");
+    root.child_count = 1;
+    const child = session("codex:child");
+    child.parent_session_id = root.session_id;
+    child.is_subagent = true;
+    child.agent_nickname = "Hubble";
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [root],
+      next_cursor: null,
+      source_errors: [],
+    });
+    vi.mocked(listSessionChildren).mockResolvedValue({
+      sessions: [child],
+      next_cursor: null,
+    });
+
+    const { result } = renderHook(() => useViewerState());
+    await waitFor(() => expect(result.current.selectedSession?.session_key).toBe(root.session_key));
+    expect(listSessionChildren).not.toHaveBeenCalled();
+
+    act(() => result.current.loadSessionChildren(root.session_key));
+    await waitFor(() => {
+      expect(result.current.sessionChildren.get(root.session_key)?.sessions).toEqual([child]);
+    });
+    expect(listSessionChildren).toHaveBeenCalledWith({
+      parent_session_key: root.session_key,
+      cursor: undefined,
+      limit: 60,
+    });
+
+    act(() => result.current.selectSession(child.session_key));
+    await waitFor(() => expect(result.current.selectedSession?.session_key).toBe(child.session_key));
   });
 });

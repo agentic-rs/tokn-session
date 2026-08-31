@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   EventPageResponse,
+  ListSessionChildrenRequest,
+  ListSessionChildrenResponse,
   ListSessionsRequest,
   ListSessionsResponse,
   LoadEventDetailRequest,
@@ -10,6 +12,12 @@ import type {
 
 export function listSessions(request: ListSessionsRequest): Promise<ListSessionsResponse> {
   return invoke<ListSessionsResponse>("list_sessions", { request });
+}
+
+export function listSessionChildren(
+  request: ListSessionChildrenRequest,
+): Promise<ListSessionChildrenResponse> {
+  return invoke<ListSessionChildrenResponse>("list_session_children", { request });
 }
 
 export function loadEventPage(request: LoadEventPageRequest): Promise<EventPageResponse> {

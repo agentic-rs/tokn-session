@@ -66,6 +66,25 @@ pub struct ListSessionsResponse {
   pub source_errors: Vec<SourceError>,
 }
 
+/// A bounded, metadata-only page of direct descendants for one session.
+///
+/// The sidebar loads these on demand rather than materializing an entire
+/// session family in the root listing. That keeps a single unusually broad
+/// delegation tree from making the initial IPC response unbounded.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ListSessionChildrenRequest {
+  pub parent_session_key: String,
+  pub cursor: Option<String>,
+  pub offset: Option<usize>,
+  pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListSessionChildrenResponse {
+  pub sessions: Vec<SessionSummary>,
+  pub next_cursor: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct SourceError {
   pub provider: ViewerProvider,
@@ -84,7 +103,16 @@ pub struct SessionSummary {
   pub updated_at_ms: Option<i64>,
   pub timestamp: Option<String>,
   pub parent_session_id: Option<String>,
+  /// True only when the parent relation resolves to a canonical header in the
+  /// same provider. Orphaned and cycle-broken records retain their raw parent
+  /// ID but remain visible as roots.
+  pub is_subagent: bool,
   pub agent_path: Option<String>,
+  pub agent_nickname: Option<String>,
+  pub agent_role: Option<String>,
+  /// Number of direct, canonical descendants known from metadata-only
+  /// discovery. It is intentionally not a runtime state or event count.
+  pub child_count: usize,
   /// Unknown for metadata-only listings. Loading an event page returns the
   /// authoritative normalized event count for the selected session.
   pub message_count: Option<usize>,

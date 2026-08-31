@@ -103,6 +103,8 @@ export interface SessionSummary {
   session_key: string;
   session_id: string;
   parent_session_id: string | null;
+  /** True only when the source-neutral parent link resolved safely. */
+  is_subagent: boolean;
   provider: ViewerProvider;
   title: string | null;
   preview: string | null;
@@ -111,6 +113,10 @@ export interface SessionSummary {
   updated_at_ms: number | null;
   timestamp: string | null;
   agent_path: string | null;
+  agent_nickname: string | null;
+  agent_role: string | null;
+  /** Direct descendants discovered from headers; this is not runtime status. */
+  child_count: number;
   /** Null for metadata-only listings; event pages provide total_events. */
   message_count: number | null;
   event_count: number | null;
@@ -138,6 +144,27 @@ export interface ListSessionsResponse {
   sessions: SessionSummary[];
   next_cursor: string | null;
   source_errors: SourceError[];
+}
+
+export interface ListSessionChildrenRequest {
+  parent_session_key: string;
+  cursor?: string;
+  offset?: number;
+  limit?: number;
+}
+
+export interface ListSessionChildrenResponse {
+  sessions: SessionSummary[];
+  next_cursor: string | null;
+}
+
+/** Local sidebar state for one lazily loaded direct-child page sequence. */
+export interface SessionChildrenState {
+  sessions: SessionSummary[];
+  next_cursor: string | null;
+  is_loading: boolean;
+  is_loading_more: boolean;
+  error: string | null;
 }
 
 export interface EventSummary {

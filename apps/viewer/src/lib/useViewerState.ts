@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { listSessions, loadEventDetail, loadEventPage } from "./tauri";
+import { listSessionChildren, listSessions, loadEventDetail, loadEventPage } from "./tauri";
 import {
   EVENT_PAGE_SIZE,
   SESSION_PAGE_SIZE,
   errorMessage,
   eventButtonId,
+  findKnownSession,
   mergeEvents,
   mergeSessions,
   preserveEventSelection,
@@ -14,6 +15,7 @@ import {
   PROVIDERS,
   type EventDetail,
   type EventSummary,
+  type SessionChildrenState,
   type SessionHistoryStatus,
   type SessionSummary,
   type SourceError,
@@ -74,6 +76,12 @@ export function useViewerState() {
   const providerKey = PROVIDERS.filter((provider) => enabledProviders.has(provider)).join(",");
 
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [sessionChildren, setSessionChildren] = useState<Map<string, SessionChildrenState>>(
+    () => new Map(),
+  );
+  const sessionChildrenRef = useRef<Map<string, SessionChildrenState>>(new Map());
+  const sessionChildrenGeneration = useRef(0);
+  const sessionChildRequests = useRef(new Map<string, number>());
   const [selectedSessionKey, setSelectedSessionKey] = useState<string | null>(null);
   const selectedSessionKeyRef = useRef<string | null>(null);
   const [sessionsLoading, setSessionsLoading] = useState(true);
@@ -217,9 +225,123 @@ export function useViewerState() {
     });
   }, []);
 
+  const updateSessionChildren = useCallback(
+    (
+      parentSessionKey: string,
+      update: (current: SessionChildrenState | undefined) => SessionChildrenState,
+    ) => {
+      const next = new Map(sessionChildrenRef.current);
+      next.set(parentSessionKey, update(next.get(parentSessionKey)));
+      sessionChildrenRef.current = next;
+      setSessionChildren(next);
+    },
+    [],
+  );
+
+  const clearSessionChildren = useCallback(() => {
+    sessionChildrenGeneration.current += 1;
+    sessionChildRequests.current.clear();
+    const next = new Map<string, SessionChildrenState>();
+    sessionChildrenRef.current = next;
+    setSessionChildren(next);
+  }, []);
+
+  const requestSessionChildPage = useCallback(
+    (parentSessionKey: string, cursor: string | null, retry: boolean) => {
+      const current = sessionChildrenRef.current.get(parentSessionKey);
+      if (cursor !== null) {
+        if (
+          !current
+          || current.next_cursor !== cursor
+          || current.is_loading
+          || current.is_loading_more
+        ) {
+          return;
+        }
+      } else if (current && (current.is_loading || current.is_loading_more || !retry)) {
+        return;
+      }
+
+      const generation = sessionChildrenGeneration.current;
+      const requestId = (sessionChildRequests.current.get(parentSessionKey) ?? 0) + 1;
+      sessionChildRequests.current.set(parentSessionKey, requestId);
+      updateSessionChildren(parentSessionKey, (existing) => ({
+        sessions: existing?.sessions ?? [],
+        next_cursor: existing?.next_cursor ?? null,
+        is_loading: cursor === null,
+        is_loading_more: cursor !== null,
+        error: null,
+      }));
+
+      void listSessionChildren({
+        parent_session_key: parentSessionKey,
+        cursor: cursor ?? undefined,
+        limit: SESSION_PAGE_SIZE,
+      })
+        .then((response) => {
+          if (
+            sessionChildrenGeneration.current !== generation
+            || sessionChildRequests.current.get(parentSessionKey) !== requestId
+          ) {
+            return;
+          }
+          updateSessionChildren(parentSessionKey, (existing) => ({
+            sessions: cursor === null
+              ? response.sessions
+              : mergeSessions(existing?.sessions ?? [], response.sessions),
+            next_cursor: response.next_cursor,
+            is_loading: false,
+            is_loading_more: false,
+            error: null,
+          }));
+        })
+        .catch((error: unknown) => {
+          if (
+            sessionChildrenGeneration.current !== generation
+            || sessionChildRequests.current.get(parentSessionKey) !== requestId
+          ) {
+            return;
+          }
+          updateSessionChildren(parentSessionKey, (existing) => ({
+            sessions: existing?.sessions ?? [],
+            next_cursor: existing?.next_cursor ?? null,
+            is_loading: false,
+            is_loading_more: false,
+            error: errorMessage(error),
+          }));
+        })
+        .finally(() => {
+          if (
+            sessionChildrenGeneration.current === generation
+            && sessionChildRequests.current.get(parentSessionKey) === requestId
+          ) {
+            sessionChildRequests.current.delete(parentSessionKey);
+          }
+        });
+    },
+    [updateSessionChildren],
+  );
+
+  const loadSessionChildren = useCallback((parentSessionKey: string) => {
+    requestSessionChildPage(parentSessionKey, null, false);
+  }, [requestSessionChildPage]);
+
+  const retrySessionChildren = useCallback((parentSessionKey: string) => {
+    const current = sessionChildrenRef.current.get(parentSessionKey);
+    requestSessionChildPage(parentSessionKey, current?.next_cursor ?? null, true);
+  }, [requestSessionChildPage]);
+
+  const loadMoreSessionChildren = useCallback((parentSessionKey: string) => {
+    const cursor = sessionChildrenRef.current.get(parentSessionKey)?.next_cursor;
+    if (cursor) {
+      requestSessionChildPage(parentSessionKey, cursor, false);
+    }
+  }, [requestSessionChildPage]);
+
   useEffect(() => {
     const requestId = ++sessionsRequest.current;
     setSessionsLoadingMore(false);
+    clearSessionChildren();
     if (enabledProviders.size === 0) {
       setSessions([]);
       setSessionsCursor(null);
@@ -264,7 +386,7 @@ export function useViewerState() {
           setSessionsLoading(false);
         }
       });
-  }, [applySessionSelection, debouncedSearch, enabledProviders, providerKey, sessionsAttempt]);
+  }, [applySessionSelection, clearSessionChildren, debouncedSearch, enabledProviders, providerKey, sessionsAttempt]);
 
   useEffect(() => {
     const requestId = ++eventsRequest.current;
@@ -420,8 +542,8 @@ export function useViewerState() {
   }, [closeInspector, inspectorOpen, mobileSidebarOpen]);
 
   const selectedSession = useMemo(
-    () => sessions.find((session) => session.session_key === selectedSessionKey) ?? null,
-    [selectedSessionKey, sessions],
+    () => findKnownSession(sessions, sessionChildren, selectedSessionKey),
+    [selectedSessionKey, sessionChildren, sessions],
   );
   const eventsAreOwned = selectedSessionKey !== null && eventsOwnerKey === selectedSessionKey;
   const visibleEvents = eventsAreOwned ? events : [];
@@ -607,6 +729,10 @@ export function useViewerState() {
     enabledProviders,
     toggleProvider,
     sessions,
+    sessionChildren,
+    loadSessionChildren,
+    retrySessionChildren,
+    loadMoreSessionChildren,
     selectedSession,
     selectedSessionKey,
     selectSession,

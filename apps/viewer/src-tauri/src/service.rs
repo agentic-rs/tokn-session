@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -12,11 +12,11 @@ use tokn_session_core::{
 use tokn_session_render::render_event_summary;
 
 use crate::model::{
-  EventDetail, EventPage, EventPageRequest, EventSummary, ListSessionsRequest, ListSessionsResponse,
-  LoadEventDetailRequest, PageDirection, ReasoningCardSummary, SessionLocator, SessionSummary, SourceError,
-  ToolCardSummary, ToolOutputPreview, ToolOutputSection, UsageCardSummary, ViewerProvider, bounded_limit,
-  decode_event_cursor, decode_event_key, decode_list_cursor, decode_session_key, encode_event_cursor, encode_event_key,
-  encode_list_cursor, encode_session_key, parse_updated_at_ms, requested_offset,
+  EventDetail, EventPage, EventPageRequest, EventSummary, ListSessionChildrenRequest, ListSessionChildrenResponse,
+  ListSessionsRequest, ListSessionsResponse, LoadEventDetailRequest, PageDirection, ReasoningCardSummary,
+  SessionLocator, SessionSummary, SourceError, ToolCardSummary, ToolOutputPreview, ToolOutputSection, UsageCardSummary,
+  ViewerProvider, bounded_limit, decode_event_cursor, decode_event_key, decode_list_cursor, decode_session_key,
+  encode_event_cursor, encode_event_key, encode_list_cursor, encode_session_key, parse_updated_at_ms, requested_offset,
 };
 use crate::repository::{NativeRepository, ViewerRepository};
 
@@ -24,6 +24,7 @@ const MAX_DETAIL_VALUE_BYTES: usize = 512 * 1024;
 const MAX_MESSAGE_SUMMARY_CHARS: usize = 16 * 1024;
 const MAX_SESSION_PREVIEW_CHARS: usize = 240;
 const MAX_SESSION_TITLE_CHARS: usize = 160;
+const MAX_AGENT_IDENTITY_CHARS: usize = 160;
 const MAX_REASONING_CARD_PREVIEW_CHARS: usize = 240;
 const MAX_TECHNICAL_SUMMARY_CHARS: usize = 500;
 const MAX_TOOL_CARD_STRING_CHARS: usize = 500;
@@ -60,6 +61,20 @@ struct FileRevision {
   len: u64,
   modified: Option<SystemTime>,
   created: Option<SystemTime>,
+}
+
+#[derive(Clone)]
+struct SessionListCandidate {
+  provider: ViewerProvider,
+  header: SessionHeader,
+  child_count: usize,
+  is_subagent: bool,
+}
+
+struct SessionRelationIndex {
+  headers: Vec<SessionHeader>,
+  parent_indices: Vec<Option<usize>>,
+  child_counts: Vec<usize>,
 }
 
 impl ViewerService {
@@ -105,64 +120,82 @@ impl ViewerService {
         }
       };
 
-      for header in headers {
-        // The global roster intentionally shows roots. Descendants will be
-        // loaded within a selected root's conversation tree in a later slice.
-        if header.parent_session_id.is_some() {
+      let relations = session_relation_index(provider, headers, &mut source_errors);
+      for (index, header) in relations.headers.into_iter().enumerate() {
+        // A child is hidden from the root roster only when its parent is a
+        // present, canonical header and its relation does not make a cycle.
+        // That deliberately keeps orphaned and cyclic records discoverable.
+        if relations.parent_indices[index].is_some() {
           continue;
         }
-        if let Err(message) = validate_session_header(provider, &header) {
-          record_source_error(&mut source_errors, provider, message);
-          continue;
-        }
-        candidates.push((provider, header));
+        candidates.push(SessionListCandidate {
+          provider,
+          header,
+          child_count: relations.child_counts[index],
+          is_subagent: false,
+        });
       }
     }
 
     if let Some(search) = search.as_deref() {
       let mut matches = Vec::new();
-      for (provider, header) in candidates {
-        let summary = match session_summary(provider, header.clone()) {
+      for candidate in candidates {
+        let summary = match session_summary_with_child_count(
+          candidate.provider,
+          candidate.header.clone(),
+          candidate.child_count,
+          candidate.is_subagent,
+        ) {
           Ok(summary) => summary,
           Err(message) => {
-            record_source_error(&mut source_errors, provider, message);
+            record_source_error(&mut source_errors, candidate.provider, message);
             continue;
           }
         };
         if matches_search(&summary, Some(search)) {
-          matches.push((provider, header));
+          matches.push(candidate);
           continue;
         }
         if summary.preview.is_some() {
           continue;
         }
-        let hydrated = self.hydrate_session_header(provider, header);
-        let summary = match session_summary(provider, hydrated.clone()) {
+        let hydrated = self.hydrate_session_header(candidate.provider, candidate.header.clone());
+        let summary = match session_summary_with_child_count(
+          candidate.provider,
+          hydrated.clone(),
+          candidate.child_count,
+          candidate.is_subagent,
+        ) {
           Ok(summary) => summary,
           Err(message) => {
-            record_source_error(&mut source_errors, provider, message);
+            record_source_error(&mut source_errors, candidate.provider, message);
             continue;
           }
         };
         if matches_search(&summary, Some(search)) {
-          matches.push((provider, hydrated));
+          matches.push(SessionListCandidate {
+            header: hydrated,
+            ..candidate
+          });
         }
       }
-      sort_session_headers(&mut matches);
+      sort_session_candidates(&mut matches);
       let start = offset.min(matches.len());
       let end = start.saturating_add(limit).min(matches.len());
       let next_cursor = (end < matches.len()).then(|| encode_list_cursor(end));
       let mut sessions = Vec::with_capacity(end - start);
-      for (provider, header) in matches[start..end].iter().cloned() {
-        let header =
-          if present_string(header.title.as_deref()).is_none() && present_string(header.preview.as_deref()).is_none() {
-            self.hydrate_session_header(provider, header)
-          } else {
-            header
-          };
-        match session_summary(provider, header) {
+      for candidate in matches[start..end].iter().cloned() {
+        let header = if present_string(candidate.header.title.as_deref()).is_none()
+          && present_string(candidate.header.preview.as_deref()).is_none()
+        {
+          self.hydrate_session_header(candidate.provider, candidate.header)
+        } else {
+          candidate.header
+        };
+        match session_summary_with_child_count(candidate.provider, header, candidate.child_count, candidate.is_subagent)
+        {
           Ok(summary) => sessions.push(summary),
-          Err(message) => record_source_error(&mut source_errors, provider, message),
+          Err(message) => record_source_error(&mut source_errors, candidate.provider, message),
         }
       }
       return Ok(ListSessionsResponse {
@@ -172,21 +205,22 @@ impl ViewerService {
       });
     }
 
-    sort_session_headers(&mut candidates);
+    sort_session_candidates(&mut candidates);
     let start = offset.min(candidates.len());
     let end = start.saturating_add(limit).min(candidates.len());
     let next_cursor = (end < candidates.len()).then(|| encode_list_cursor(end));
     let mut sessions = Vec::with_capacity(end - start);
-    for (provider, header) in candidates[start..end].iter().cloned() {
-      let header =
-        if present_string(header.title.as_deref()).is_none() && present_string(header.preview.as_deref()).is_none() {
-          self.hydrate_session_header(provider, header)
-        } else {
-          header
-        };
-      match session_summary(provider, header) {
+    for candidate in candidates[start..end].iter().cloned() {
+      let header = if present_string(candidate.header.title.as_deref()).is_none()
+        && present_string(candidate.header.preview.as_deref()).is_none()
+      {
+        self.hydrate_session_header(candidate.provider, candidate.header)
+      } else {
+        candidate.header
+      };
+      match session_summary_with_child_count(candidate.provider, header, candidate.child_count, candidate.is_subagent) {
         Ok(summary) => sessions.push(summary),
-        Err(message) => record_source_error(&mut source_errors, provider, message),
+        Err(message) => record_source_error(&mut source_errors, candidate.provider, message),
       }
     }
 
@@ -195,6 +229,60 @@ impl ViewerService {
       next_cursor,
       source_errors,
     })
+  }
+
+  /// Lists a bounded page of direct child headers without reading any child
+  /// conversation body. The opaque parent key binds the request to one
+  /// provider and one source record, so raw provider-local IDs never connect
+  /// sessions from different providers.
+  pub fn list_session_children(
+    &self,
+    request: ListSessionChildrenRequest,
+  ) -> Result<ListSessionChildrenResponse, String> {
+    let limit = bounded_limit(request.limit)?;
+    let offset = requested_offset(request.cursor.as_deref(), request.offset, decode_list_cursor)?.unwrap_or(0);
+    let parent_locator = decode_session_key(&request.parent_session_key)?;
+    let headers = self.repository.list_session_headers(parent_locator.provider)?;
+    let mut ignored_errors = Vec::new();
+    let relations = session_relation_index(parent_locator.provider, headers, &mut ignored_errors);
+    let parent_index = relations
+      .headers
+      .iter()
+      .position(|header| locator_for_header(parent_locator.provider, header) == parent_locator)
+      .ok_or_else(|| "session key no longer matches its source record".to_string())?;
+
+    let mut candidates = relations
+      .headers
+      .into_iter()
+      .enumerate()
+      .filter_map(|(index, header)| {
+        (relations.parent_indices[index] == Some(parent_index)).then_some(SessionListCandidate {
+          provider: parent_locator.provider,
+          header,
+          child_count: relations.child_counts[index],
+          is_subagent: true,
+        })
+      })
+      .collect::<Vec<_>>();
+    sort_session_candidates(&mut candidates);
+
+    let start = offset.min(candidates.len());
+    let end = start.saturating_add(limit).min(candidates.len());
+    let next_cursor = (end < candidates.len()).then(|| encode_list_cursor(end));
+    let sessions = candidates[start..end]
+      .iter()
+      .cloned()
+      .map(|candidate| {
+        session_summary_with_child_count(
+          candidate.provider,
+          candidate.header,
+          candidate.child_count,
+          candidate.is_subagent,
+        )
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(ListSessionChildrenResponse { sessions, next_cursor })
   }
 
   fn hydrate_session_header(&self, provider: ViewerProvider, mut header: SessionHeader) -> SessionHeader {
@@ -438,16 +526,96 @@ fn validate_session_header(provider: ViewerProvider, header: &SessionHeader) -> 
   encode_session_key(&locator_for_header(provider, header)).map(|_| ())
 }
 
-fn sort_session_headers(candidates: &mut [(ViewerProvider, SessionHeader)]) {
-  candidates.sort_by(|(left_provider, left), (right_provider, right)| {
+fn session_relation_index(
+  provider: ViewerProvider,
+  headers: Vec<SessionHeader>,
+  source_errors: &mut Vec<SourceError>,
+) -> SessionRelationIndex {
+  let mut valid_headers = Vec::with_capacity(headers.len());
+  for header in headers {
+    if let Err(message) = validate_session_header(provider, &header) {
+      record_source_error(source_errors, provider, message);
+      continue;
+    }
+    valid_headers.push(header);
+  }
+  let headers = canonical_session_headers(valid_headers);
+  let indices_by_id = headers
+    .iter()
+    .enumerate()
+    .map(|(index, header)| (header.id.as_str(), index))
+    .collect::<HashMap<_, _>>();
+  let mut parent_indices = vec![None; headers.len()];
+
+  for (child_index, header) in headers.iter().enumerate() {
+    let Some(parent_id) = header.parent_session_id.as_deref() else {
+      continue;
+    };
+    let Some(&parent_index) = indices_by_id.get(parent_id) else {
+      continue;
+    };
+    if parent_index == child_index || relation_would_cycle(&parent_indices, child_index, parent_index) {
+      continue;
+    }
+    parent_indices[child_index] = Some(parent_index);
+  }
+
+  let mut child_counts = vec![0; headers.len()];
+  for parent_index in parent_indices.iter().flatten() {
+    child_counts[*parent_index] += 1;
+  }
+
+  SessionRelationIndex {
+    headers,
+    parent_indices,
+    child_counts,
+  }
+}
+
+fn canonical_session_headers(mut headers: Vec<SessionHeader>) -> Vec<SessionHeader> {
+  // Match the client tree loader's policy: when a provider has more than one
+  // header with the same ID, the newest provider timestamp owns that
+  // provider-local identity. Filesystem mtime is deliberately not involved:
+  // it can change long after the provider wrote the rollout. The source path
+  // remains part of the opaque key, but cannot resolve an ambiguous parent ID
+  // on its own.
+  headers.sort_by(|left, right| {
     right
-      .updated_at_ms
-      .cmp(&left.updated_at_ms)
-      .then_with(|| right.timestamp.cmp(&left.timestamp))
-      .then_with(|| left_provider.as_str().cmp(right_provider.as_str()))
-      .then_with(|| left.id.cmp(&right.id))
-      .then_with(|| left.path.cmp(&right.path))
+      .timestamp
+      .cmp(&left.timestamp)
+      .then_with(|| right.path.cmp(&left.path))
   });
+  let mut canonical_ids = HashSet::new();
+  headers.retain(|header| canonical_ids.insert(header.id.clone()));
+  headers.sort_by(compare_session_headers);
+  headers
+}
+
+fn relation_would_cycle(parent_indices: &[Option<usize>], child_index: usize, parent_index: usize) -> bool {
+  let mut current = Some(parent_index);
+  while let Some(index) = current {
+    if index == child_index {
+      return true;
+    }
+    current = parent_indices[index];
+  }
+  false
+}
+
+fn sort_session_candidates(candidates: &mut [SessionListCandidate]) {
+  candidates.sort_by(|left, right| {
+    compare_session_headers(&left.header, &right.header)
+      .then_with(|| left.provider.as_str().cmp(right.provider.as_str()))
+  });
+}
+
+fn compare_session_headers(left: &SessionHeader, right: &SessionHeader) -> std::cmp::Ordering {
+  right
+    .updated_at_ms
+    .cmp(&left.updated_at_ms)
+    .then_with(|| right.timestamp.cmp(&left.timestamp))
+    .then_with(|| left.id.cmp(&right.id))
+    .then_with(|| left.path.cmp(&right.path))
 }
 
 fn locator_for_header(provider: ViewerProvider, header: &SessionHeader) -> SessionLocator {
@@ -459,11 +627,24 @@ fn locator_for_header(provider: ViewerProvider, header: &SessionHeader) -> Sessi
   }
 }
 
+#[cfg(test)]
 fn session_summary(provider: ViewerProvider, header: SessionHeader) -> Result<SessionSummary, String> {
+  session_summary_with_child_count(provider, header, 0, false)
+}
+
+fn session_summary_with_child_count(
+  provider: ViewerProvider,
+  header: SessionHeader,
+  child_count: usize,
+  is_subagent: bool,
+) -> Result<SessionSummary, String> {
   let locator = locator_for_header(provider, &header);
   let project = header.cwd.as_deref().and_then(path_name).map(str::to_string);
   let title = normalize_session_text(header.title, MAX_SESSION_TITLE_CHARS);
   let preview = normalize_session_text(header.preview, MAX_SESSION_PREVIEW_CHARS);
+  let agent_path = normalize_session_text(header.agent_path, MAX_AGENT_IDENTITY_CHARS);
+  let agent_nickname = normalize_session_text(header.agent_nickname, MAX_AGENT_IDENTITY_CHARS);
+  let agent_role = normalize_session_text(header.agent_role, MAX_AGENT_IDENTITY_CHARS);
   Ok(SessionSummary {
     session_key: encode_session_key(&locator)?,
     session_id: header.id,
@@ -477,7 +658,11 @@ fn session_summary(provider: ViewerProvider, header: SessionHeader) -> Result<Se
       .or_else(|| parse_updated_at_ms(header.updated_at.as_deref())),
     timestamp: header.timestamp,
     parent_session_id: header.parent_session_id,
-    agent_path: header.agent_path,
+    is_subagent,
+    agent_path,
+    agent_nickname,
+    agent_role,
+    child_count,
     message_count: None,
     // The listing adapters deliberately inspect only headers. Loading every
     // normalized body here would make the bounded UI query unbounded.
@@ -504,6 +689,8 @@ fn matches_search(session: &SessionSummary, search: Option<&str>) -> bool {
     session.project.as_deref(),
     session.cwd.as_deref(),
     session.agent_path.as_deref(),
+    session.agent_nickname.as_deref(),
+    session.agent_role.as_deref(),
   ]
   .into_iter()
   .flatten()
@@ -1702,6 +1889,162 @@ mod tests {
     assert!(second.next_cursor.is_none());
   }
 
+  #[test]
+  fn child_listing_is_paged_uses_provider_timestamp_and_keeps_agent_identity_safe() {
+    let mut newest_child = session_header("child", Some("root"), "/projects/Alpha", "3000");
+    newest_child.path = PathBuf::from("/fixtures/child-new.jsonl");
+    // Filesystem times can be rewritten by a sync or restore. The source's
+    // provider timestamp, not mtime, decides which duplicate owns this ID.
+    newest_child.updated_at = Some("1".to_string());
+    newest_child.updated_at_ms = Some(1);
+    newest_child.agent_path = Some(" /root/\u{001b}[31mresearcher\u{202e} ".to_string());
+    newest_child.agent_nickname = Some(" Hubble\n\t".to_string());
+    newest_child.agent_role = Some(" explorer ".to_string());
+
+    let mut older_duplicate = session_header("child", Some("root"), "/projects/Alpha", "2000");
+    older_duplicate.path = PathBuf::from("/fixtures/child-old.jsonl");
+    older_duplicate.updated_at = Some("9999".to_string());
+    older_duplicate.updated_at_ms = Some(9_999);
+    older_duplicate.agent_nickname = Some("older duplicate".to_string());
+
+    let mut pi_same_id = session_header("child", Some("root"), "/projects/Pi", "4000");
+    pi_same_id.path = PathBuf::from("/fixtures/pi-child.jsonl");
+    let service = ViewerService::new(Arc::new(FakeRepository {
+      listings: HashMap::from([
+        (
+          ViewerProvider::Codex,
+          Ok(vec![
+            session_header("root", None, "/projects/Alpha", "1000"),
+            older_duplicate,
+            newest_child,
+            session_header("grandchild", Some("child"), "/projects/Alpha", "2500"),
+            session_header("sibling", Some("root"), "/projects/Alpha", "1500"),
+          ]),
+        ),
+        (ViewerProvider::Pi, Ok(vec![pi_same_id])),
+      ]),
+      loaded: Mutex::new(None),
+    }));
+
+    let roots = service
+      .list_sessions(ListSessionsRequest {
+        query: SessionQuery {
+          providers: vec![ViewerProvider::Codex],
+          search: None,
+        },
+        cursor: None,
+        offset: None,
+        limit: None,
+      })
+      .unwrap();
+    assert_eq!(roots.sessions.len(), 1);
+    assert_eq!(roots.sessions[0].session_id, "root");
+    assert!(!roots.sessions[0].is_subagent);
+    assert_eq!(roots.sessions[0].child_count, 2);
+
+    let children = service
+      .list_session_children(ListSessionChildrenRequest {
+        parent_session_key: roots.sessions[0].session_key.clone(),
+        cursor: None,
+        offset: None,
+        limit: Some(1),
+      })
+      .unwrap();
+    assert_eq!(children.sessions.len(), 1);
+    let child_cursor = children.next_cursor.clone().expect("a second direct child is paged");
+    // Last-update time controls the visible order, independently from
+    // provider-time canonicalization of duplicate identities.
+    assert_eq!(children.sessions[0].session_id, "sibling");
+
+    let second_child_page = service
+      .list_session_children(ListSessionChildrenRequest {
+        parent_session_key: roots.sessions[0].session_key.clone(),
+        cursor: Some(child_cursor),
+        offset: None,
+        limit: Some(1),
+      })
+      .unwrap();
+    assert_eq!(second_child_page.sessions.len(), 1);
+    let child = &second_child_page.sessions[0];
+    assert_eq!(child.session_id, "child");
+    assert!(child.is_subagent);
+    assert_eq!(child.child_count, 1);
+    assert_eq!(child.agent_path.as_deref(), Some("/root/researcher"));
+    assert_eq!(child.agent_nickname.as_deref(), Some("Hubble"));
+    assert_eq!(child.agent_role.as_deref(), Some("explorer"));
+    assert!(second_child_page.next_cursor.is_none());
+
+    let grandchildren = service
+      .list_session_children(ListSessionChildrenRequest {
+        parent_session_key: child.session_key.clone(),
+        cursor: None,
+        offset: None,
+        limit: None,
+      })
+      .unwrap();
+    assert_eq!(grandchildren.sessions.len(), 1);
+    assert_eq!(grandchildren.sessions[0].session_id, "grandchild");
+    assert_eq!(grandchildren.sessions[0].child_count, 0);
+  }
+
+  #[test]
+  fn relation_index_promotes_orphans_and_breaks_cycles_without_losing_sessions() {
+    let service = ViewerService::new(Arc::new(FakeRepository {
+      listings: HashMap::from([(
+        ViewerProvider::Codex,
+        Ok(vec![
+          session_header("orphan", Some("missing"), "/projects/Alpha", "4000"),
+          session_header("cycle-a", Some("cycle-b"), "/projects/Alpha", "3000"),
+          session_header("cycle-b", Some("cycle-a"), "/projects/Alpha", "2000"),
+        ]),
+      )]),
+      loaded: Mutex::new(None),
+    }));
+
+    let roots = service
+      .list_sessions(ListSessionsRequest {
+        query: SessionQuery::default(),
+        cursor: None,
+        offset: None,
+        limit: None,
+      })
+      .unwrap();
+    let root_ids = roots
+      .sessions
+      .iter()
+      .map(|session| session.session_id.as_str())
+      .collect::<Vec<_>>();
+    assert!(root_ids.contains(&"orphan"));
+    assert!(root_ids.contains(&"cycle-b"));
+    assert!(roots.sessions.iter().all(|session| !session.is_subagent));
+
+    let cycle_root = roots
+      .sessions
+      .iter()
+      .find(|session| session.session_id == "cycle-b")
+      .expect("a cycle node becomes a root");
+    let children = service
+      .list_session_children(ListSessionChildrenRequest {
+        parent_session_key: cycle_root.session_key.clone(),
+        cursor: None,
+        offset: None,
+        limit: None,
+      })
+      .unwrap();
+    assert_eq!(children.sessions.len(), 1);
+    assert_eq!(children.sessions[0].session_id, "cycle-a");
+
+    let descendant_children = service
+      .list_session_children(ListSessionChildrenRequest {
+        parent_session_key: children.sessions[0].session_key.clone(),
+        cursor: None,
+        offset: None,
+        limit: None,
+      })
+      .unwrap();
+    assert!(descendant_children.sessions.is_empty());
+  }
+
   #[cfg(unix)]
   #[test]
   fn listing_isolates_a_non_utf8_source_path_to_its_provider_warning() {
@@ -1732,9 +2075,10 @@ mod tests {
   }
 
   #[test]
-  fn session_metadata_is_sanitized_bounded_and_separate_from_agent_identity() {
+  fn session_metadata_and_agent_identity_are_sanitized_and_bounded() {
     let mut header = session_header("session-id", None, "/projects/Alpha", "1000");
-    header.agent_nickname = Some("worker-name".to_string());
+    header.agent_nickname = Some("worker\u{202e}-name".to_string());
+    header.agent_role = Some(format!("role {}", "x".repeat(MAX_AGENT_IDENTITY_CHARS + 20)));
     header.title = Some(" \u{001b}[31mBuild\u{202e}\n\tthe viewer\u{001b}[0m ".to_string());
     header.preview = Some(format!("Prompt {}", "x".repeat(MAX_SESSION_PREVIEW_CHARS + 20)));
 
@@ -1746,7 +2090,12 @@ mod tests {
       MAX_SESSION_PREVIEW_CHARS
     );
     assert!(summary.preview.as_ref().unwrap().ends_with('\u{2026}'));
-    assert_ne!(summary.title.as_deref(), Some("worker-name"));
+    assert_eq!(summary.agent_nickname.as_deref(), Some("worker-name"));
+    assert_eq!(
+      summary.agent_role.as_ref().unwrap().chars().count(),
+      MAX_AGENT_IDENTITY_CHARS
+    );
+    assert!(summary.agent_role.as_ref().unwrap().ends_with('\u{2026}'));
   }
 
   #[test]

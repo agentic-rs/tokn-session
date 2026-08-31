@@ -2,8 +2,9 @@
 
 The viewer is a read-only Tauri desktop app for browsing historical Pi, Codex,
 OpenCode, and DeepSeek Harness (DSH) sessions in one place. It shows root
-sessions in a searchable, provider-filterable sidebar and renders their
-normalized event streams as conversations with inspectable technical events.
+sessions in a searchable, provider-filterable sidebar, expands their known
+subagents on demand, and renders each selected normalized event stream as a
+conversation with inspectable technical events.
 It does not create sessions, append messages, or modify provider data.
 
 ## Development
@@ -29,11 +30,16 @@ pnpm tauri build
 
 The sidebar discovers root sessions from every provider at startup. Use the
 provider pills to include or exclude sources, type in the search box to match a
-title, first user prompt, session id, project, or working directory, and select
-a row to load its newest normalized events. Rows prefer the provider's native
-title, fall back to a preview of the first meaningful user prompt, and otherwise
-show **Untitled session**. The shortened id beside the title remains a separate
-identity field; the full id is available to assistive technology and on hover.
+root title, first user prompt, session id, project, or working directory, and
+select a row to load its newest normalized events. A disclosure control loads
+that session's direct subagents as metadata only; nested controls continue the
+tree, and selecting a child opens the child's independent timeline. This does
+not merge child events into the parent conversation or infer live completion
+states. Rows prefer the provider's native title, fall back to a preview of the
+first meaningful user prompt, then an agent label for known subagents, and
+otherwise show **Untitled session**. The shortened id beside the title remains a
+separate identity field; the full id is available to assistive technology and
+on hover.
 Earlier history is loaded on demand. Technical event headers expand in place,
 while their **Inspect** action opens the full inspector. Messages and reasoning
 have a readable **Content** view, while **Normalized** and **Native** expose the
@@ -89,8 +95,12 @@ in-flight scan. Codex can also
 read title metadata from its optional private `state_5.sqlite` in read-only
 mode; rows are correlated by both thread id and rollout path, and incompatible
 or unavailable private state fails softly. The selected session's normalized
-event count arrives with its first event page. Session and event responses are
-listed in bounded pages; conversational Markdown previews are capped before IPC,
+event count arrives with its first event page. Root, direct-subagent, and event
+responses are listed in bounded pages. Direct-subagent pages resolve edges only
+within one provider, canonicalize duplicate provider IDs by newest provider
+timestamp (then path), and keep missing-parent or cyclic records visible rather
+than hiding them.
+Conversational Markdown previews are capped before IPC,
 tool-card fields are also capped, and full event detail is loaded only when
 requested. Inline tool output keeps at most 64 KiB using a head-and-tail preview;
 the full normalized and native inspector representations retain their separate
