@@ -511,6 +511,8 @@ mod tests {
         agent_path: None,
         agent_nickname: None,
         agent_role: None,
+        title: None,
+        preview: None,
         path: PathBuf::from("child.jsonl"),
         cwd: None,
         timestamp: None,

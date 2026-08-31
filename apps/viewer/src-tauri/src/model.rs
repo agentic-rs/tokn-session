@@ -77,7 +77,8 @@ pub struct SessionSummary {
   pub session_key: String,
   pub session_id: String,
   pub provider: ViewerProvider,
-  pub title: String,
+  pub title: Option<String>,
+  pub preview: Option<String>,
   pub project: Option<String>,
   pub cwd: Option<String>,
   pub updated_at_ms: Option<i64>,
@@ -200,7 +201,7 @@ pub struct ToolOutputSection {
   pub format: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub(crate) struct SessionLocator {
   pub version: u8,
   pub provider: ViewerProvider,

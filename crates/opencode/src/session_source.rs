@@ -5,7 +5,7 @@ use crate::normalize::OpenCodeNormalizer;
 use crate::row::{OpenCodeMessageRow, OpenCodePartRow, OpenCodeSessionRow};
 use crate::schema::OpenCodeCapabilities;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
-use tokn_opencode_protocol::v1::{MessageData, PartData, SessionModel};
+use tokn_opencode_protocol::v1::{MessageData, MessageItem, PartData, PartItem, SessionModel};
 use tokn_session_core::{LoadedSession, SessionHeader, SessionHistoryStatus, SessionRef};
 
 pub struct OpenCodeSessionSource {
@@ -18,23 +18,21 @@ impl OpenCodeSessionSource {
   }
 
   pub fn list_sessions(&self) -> Result<Vec<SessionRef>, String> {
-    let (connection, _) = self.connect()?;
-    self.list_session_refs(&connection, true)
+    let (connection, capabilities) = self.connect()?;
+    self.list_session_refs(&connection, capabilities, true)
   }
 
-  /// Lists only catalog metadata. The returned `SessionRef` values carry a
-  /// placeholder `message_count` of zero because relation discovery does not
-  /// query the message table; public metadata consumers should use the
-  /// client's `SessionHeader` API, which omits counts entirely.
+  /// Lists catalog metadata without counting or reading messages. Callers can
+  /// hydrate selected untitled headers when they need a user-text preview.
   pub fn list_session_relations(&self) -> Result<Vec<SessionRef>, String> {
-    let (connection, _) = self.connect()?;
-    self.list_session_refs(&connection, false)
+    let (connection, capabilities) = self.connect()?;
+    self.list_session_refs(&connection, capabilities, false)
   }
 
   pub fn list_session_headers(&self) -> Result<Vec<SessionHeader>, String> {
-    let (connection, _) = self.connect()?;
+    let (connection, capabilities) = self.connect()?;
     let database_path = self.database_path()?;
-    list_session_catalog(&connection)?
+    list_session_catalog(&connection, capabilities)?
       .into_iter()
       .map(|row| {
         let updated_at_ms = row.time_updated.or(row.time_created);
@@ -44,6 +42,8 @@ impl OpenCodeSessionSource {
           agent_path: None,
           agent_nickname: None,
           agent_role: None,
+          title: row.title,
+          preview: row.preview,
           path: database_path.clone(),
           cwd: row.directory,
           timestamp: timestamp(row.time_created),
@@ -54,10 +54,33 @@ impl OpenCodeSessionSource {
       .collect()
   }
 
-  fn list_session_refs(&self, connection: &Connection, include_message_count: bool) -> Result<Vec<SessionRef>, String> {
+  /// Populate presentation metadata that is not available from OpenCode's
+  /// session catalog alone. The exact session row is refreshed first in case
+  /// OpenCode generated its title after the catalog was listed; only a still
+  /// untitled session needs to inspect message parts for a preview.
+  pub fn hydrate_session_header(&self, mut header: SessionHeader) -> Result<SessionHeader, String> {
+    let connection = connect_database(&header.path)?;
+    let capabilities = OpenCodeCapabilities::detect(&connection)?;
+    let session = load_session_row(&connection, capabilities, &header.id)?
+      .ok_or_else(|| format!("no opencode session found for `{}`", header.id))?;
+    header.title = native_title(session.title);
+    header.preview = if header.title.is_none() {
+      first_user_preview(&connection, &header.id)?
+    } else {
+      None
+    };
+    Ok(header)
+  }
+
+  fn list_session_refs(
+    &self,
+    connection: &Connection,
+    capabilities: OpenCodeCapabilities,
+    include_message_count: bool,
+  ) -> Result<Vec<SessionRef>, String> {
     let database_path = self.database_path()?;
     let mut sessions = Vec::new();
-    for row in list_session_catalog(connection)? {
+    for row in list_session_catalog(connection, capabilities)? {
       let message_count = if include_message_count {
         message_count(connection, &row.id)?
       } else {
@@ -69,6 +92,8 @@ impl OpenCodeSessionSource {
         agent_path: None,
         agent_nickname: None,
         agent_role: None,
+        title: row.title,
+        preview: row.preview,
         path: database_path.clone(),
         cwd: row.directory,
         // Preserve legacy counted-list output. The metadata-only SessionHeader
@@ -94,12 +119,20 @@ impl OpenCodeSessionSource {
     let capabilities = OpenCodeCapabilities::detect(&connection)?;
     let session = load_session_row(&connection, capabilities, session_id)?
       .ok_or_else(|| format!("no opencode session found for `{session_id}`"))?;
+    let title = native_title(session.title.clone());
+    let preview = if title.is_none() {
+      first_user_preview(&connection, &session.id)?
+    } else {
+      None
+    };
     let reference = SessionRef {
       id: session.id.clone(),
       parent_session_id: session.parent_id.clone(),
       agent_path: None,
       agent_nickname: None,
       agent_role: None,
+      title,
+      preview,
       path: database_path,
       cwd: session.directory.clone(),
       timestamp: timestamp(session.time_updated.or(session.time_created)),
@@ -161,17 +194,23 @@ struct SessionCatalogRow {
   id: String,
   parent_id: Option<String>,
   directory: Option<String>,
+  title: Option<String>,
+  preview: Option<String>,
   time_created: Option<i64>,
   time_updated: Option<i64>,
 }
 
-fn list_session_catalog(connection: &Connection) -> Result<Vec<SessionCatalogRow>, String> {
+fn list_session_catalog(
+  connection: &Connection,
+  capabilities: OpenCodeCapabilities,
+) -> Result<Vec<SessionCatalogRow>, String> {
   let mut statement = connection
-    .prepare(
-      "select id, parent_id, directory, time_created, time_updated
+    .prepare(&format!(
+      "select {}
        from session
        order by time_created desc, id desc",
-    )
+      capabilities.session_catalog_projection()
+    ))
     .map_err(|err| format!("failed to prepare opencode session query: {err}"))?;
   let rows = statement
     .query_map([], |row| {
@@ -179,8 +218,10 @@ fn list_session_catalog(connection: &Connection) -> Result<Vec<SessionCatalogRow
         id: row.get(0)?,
         parent_id: row.get(1)?,
         directory: row.get(2)?,
-        time_created: row.get(3)?,
-        time_updated: row.get(4)?,
+        title: native_title(row.get(3)?),
+        preview: None,
+        time_created: row.get(4)?,
+        time_updated: row.get(5)?,
       })
     })
     .map_err(|err| format!("failed to query opencode sessions: {err}"))?;
@@ -280,15 +321,57 @@ fn load_session_row(
 }
 
 fn read_session_row(row: &Row<'_>) -> rusqlite::Result<OpenCodeSessionRow> {
-  let model: Option<String> = row.get(3)?;
+  let model: Option<String> = row.get(4)?;
   Ok(OpenCodeSessionRow {
     id: row.get(0)?,
     parent_id: row.get(1)?,
     directory: row.get(2)?,
+    title: row.get(3)?,
     model: parse_optional_model(model),
-    time_created: row.get(4)?,
-    time_updated: row.get(5)?,
+    time_created: row.get(5)?,
+    time_updated: row.get(6)?,
   })
+}
+
+fn first_user_preview(connection: &Connection, session_id: &str) -> Result<Option<String>, String> {
+  let mut statement = connection
+    .prepare(
+      "select message.data, part.data
+       from message
+       join part on part.message_id = message.id and part.session_id = message.session_id
+       where message.session_id = ?1
+       order by message.time_created asc, message.id asc, part.time_created asc, part.id asc",
+    )
+    .map_err(|err| format!("failed to prepare opencode preview query for `{session_id}`: {err}"))?;
+  let rows = statement
+    .query_map(params![session_id], |row| {
+      Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })
+    .map_err(|err| format!("failed to query opencode preview for `{session_id}`: {err}"))?;
+
+  for row in rows {
+    let (message, part) =
+      row.map_err(|err| format!("failed to read opencode preview row for `{session_id}`: {err}"))?;
+    let Ok(message) = serde_json::from_str::<MessageData>(&message) else {
+      continue;
+    };
+    if !matches!(message.item(), MessageItem::User(_)) {
+      continue;
+    }
+    let Ok(part) = serde_json::from_str::<PartData>(&part) else {
+      continue;
+    };
+    let preview = match part.item() {
+      PartItem::Text(part) if part.synthetic != Some(true) && part.ignored != Some(true) => Some(part.text.as_str()),
+      PartItem::Subtask(part) => part.prompt.as_deref(),
+      _ => None,
+    };
+    if let Some(preview) = preview.and_then(non_blank) {
+      return Ok(Some(preview.to_string()));
+    }
+  }
+
+  Ok(None)
 }
 
 fn load_messages(connection: &Connection, session_id: &str) -> Result<Vec<OpenCodeMessageRow>, String> {
@@ -363,6 +446,38 @@ fn parse_optional_model(value: Option<String>) -> Option<SessionModel> {
   value.and_then(|value| serde_json::from_str(&value).ok())
 }
 
+fn native_title(title: Option<String>) -> Option<String> {
+  title
+    .as_deref()
+    .and_then(non_blank)
+    .filter(|title| !is_default_title(title))
+    .map(str::to_string)
+}
+
+fn non_blank(value: &str) -> Option<&str> {
+  let value = value.trim();
+  (!value.is_empty()).then_some(value)
+}
+
+fn is_default_title(title: &str) -> bool {
+  let Some(timestamp) = title
+    .strip_prefix("New session - ")
+    .or_else(|| title.strip_prefix("Child session - "))
+  else {
+    return false;
+  };
+  let bytes = timestamp.as_bytes();
+  bytes.len() == 24
+    && bytes.iter().enumerate().all(|(index, byte)| match index {
+      4 | 7 => *byte == b'-',
+      10 => *byte == b'T',
+      13 | 16 => *byte == b':',
+      19 => *byte == b'.',
+      23 => *byte == b'Z',
+      _ => byte.is_ascii_digit(),
+    })
+}
+
 fn timestamp(value: Option<i64>) -> Option<String> {
   value.map(|value| value.to_string())
 }
@@ -378,7 +493,7 @@ mod tests {
 
   use crate::schema::OpenCodeCapabilities;
 
-  use super::{OpenCodeSessionSource, load_messages, load_session_row, resolve_database_path};
+  use super::{OpenCodeSessionSource, load_messages, load_session_row, native_title, resolve_database_path};
 
   #[test]
   fn resolves_persisted_database_paths_with_opencode_precedence() {
@@ -516,11 +631,21 @@ mod tests {
     assert_eq!(relations.len(), 1);
     assert_eq!(relations[0].id, "ses_without_model");
     assert_eq!(relations[0].message_count, 0);
+    assert_eq!(relations[0].title, None);
+    assert_eq!(relations[0].preview, None);
     assert_eq!(headers[0].timestamp.as_deref(), Some("1"));
     assert_eq!(headers[0].updated_at.as_deref(), Some("2"));
     assert_eq!(headers[0].updated_at_ms, Some(2));
+    assert_eq!(headers[0].title, None);
+    assert_eq!(headers[0].preview, None);
+    let hydrated = source
+      .hydrate_session_header(headers[0].clone())
+      .expect("legacy header should hydrate its preview");
+    assert_eq!(hydrated.preview.as_deref(), Some("hello"));
     assert_eq!(session.reference.id, "ses_without_model");
     assert_eq!(session.reference.cwd.as_deref(), Some("/tmp/without-model"));
+    assert_eq!(session.reference.title, None);
+    assert_eq!(session.reference.preview.as_deref(), Some("hello"));
     assert!(session.events.iter().any(|event| matches!(
       event,
       AgentEvent::ProviderChanged(event)
@@ -576,6 +701,94 @@ mod tests {
 
     assert_eq!(model.id.as_deref(), Some("gpt-5"));
     assert_eq!(model.provider_id.as_deref(), Some("openai"));
+  }
+
+  #[test]
+  fn keeps_native_titles_but_filters_exact_opencode_placeholders() {
+    assert_eq!(
+      native_title(Some("  Useful session title  ".to_string())).as_deref(),
+      Some("Useful session title")
+    );
+    assert_eq!(native_title(Some("   ".to_string())), None);
+    assert_eq!(
+      native_title(Some("New session - 2026-06-06T12:34:56.789Z".to_string())),
+      None
+    );
+    assert_eq!(
+      native_title(Some("Child session - 2026-06-06T12:34:56.789Z".to_string())),
+      None
+    );
+    assert_eq!(
+      native_title(Some("New session - custom".to_string())).as_deref(),
+      Some("New session - custom")
+    );
+  }
+
+  #[test]
+  fn uses_first_real_user_text_when_native_title_is_a_placeholder() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let database_path = directory.path().join("opencode.db");
+    let connection = Connection::open(&database_path).expect("database should open");
+    connection
+      .execute_batch(
+        r#"create table session (
+           id text primary key,
+           parent_id text,
+           directory text not null,
+           title text not null,
+           time_created integer not null,
+           time_updated integer not null
+         );
+         create table message (
+           id text primary key,
+           session_id text not null,
+           time_created integer,
+           data text not null
+         );
+         create table part (
+           id text primary key,
+           message_id text not null,
+           session_id text not null,
+           time_created integer,
+           data text not null
+         );
+         insert into session (
+           id, parent_id, directory, title, time_created, time_updated
+         ) values
+           ('ses_placeholder', null, '/tmp/placeholder', 'New session - 2026-06-06T12:34:56.789Z', 1, 3),
+           ('ses_named', null, '/tmp/named', 'Generated title', 2, 4);
+         insert into message (id, session_id, time_created, data) values
+           ('msg_assistant', 'ses_placeholder', 1, '{"role":"assistant"}'),
+           ('msg_user', 'ses_placeholder', 2, '{"role":"user"}');
+         insert into part (id, message_id, session_id, time_created, data) values
+           ('prt_assistant', 'msg_assistant', 'ses_placeholder', 1, '{"type":"text","text":"not the user"}'),
+           ('prt_synthetic', 'msg_user', 'ses_placeholder', 2, '{"type":"text","text":"generated context","synthetic":true}'),
+           ('prt_user', 'msg_user', 'ses_placeholder', 3, '{"type":"text","text":"  actual request  "}');"#,
+      )
+      .expect("fixture schema with title should be created");
+    drop(connection);
+
+    let source = OpenCodeSessionSource::new(Some(database_path));
+    let headers = source.list_session_headers().expect("title catalog should be listable");
+    let named = headers
+      .iter()
+      .find(|header| header.id == "ses_named")
+      .expect("named session should exist");
+    let placeholder = headers
+      .iter()
+      .find(|header| header.id == "ses_placeholder")
+      .expect("placeholder session should exist");
+
+    assert_eq!(named.title.as_deref(), Some("Generated title"));
+    assert_eq!(named.preview, None);
+    assert_eq!(placeholder.title, None);
+    assert_eq!(placeholder.preview, None);
+
+    let hydrated = source
+      .hydrate_session_header(placeholder.clone())
+      .expect("placeholder header should hydrate");
+    assert_eq!(hydrated.title, None);
+    assert_eq!(hydrated.preview.as_deref(), Some("actual request"));
   }
 
   #[test]

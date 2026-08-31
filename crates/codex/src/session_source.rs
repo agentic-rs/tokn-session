@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -5,7 +6,16 @@ use std::path::{Path, PathBuf};
 
 use crate::event::CodexLine;
 use crate::normalize::{CodexHistoryBoundary, CodexNormalizer};
-use tokn_session_core::{LoadedSession, SessionHistoryStatus, SessionRef};
+use rusqlite::{Connection, OpenFlags, params_from_iter};
+use serde::Deserialize;
+use tokn_codex_protocol::{ContentItem, ResponseItem, RolloutItem};
+use tokn_session_core::{LoadedSession, SessionHeader, SessionHistoryStatus, SessionRef};
+
+const STATE_DB_FILENAME: &str = "state_5.sqlite";
+const SESSION_INDEX_FILENAME: &str = "session_index.jsonl";
+const PREVIEW_SCAN_LIMIT: usize = 210;
+const SQLITE_ID_BATCH_SIZE: usize = 500;
+const USER_MESSAGE_BEGIN: &str = "## My request for Codex:";
 
 pub struct CodexSessionSource {
   session_dir: Option<PathBuf>,
@@ -17,11 +27,26 @@ impl CodexSessionSource {
   }
 
   pub fn list_sessions(&self) -> Result<Vec<SessionRef>, String> {
-    self.list_session_refs(inspect_session)
+    let mut references = self.list_session_refs(inspect_session)?;
+    self.apply_indexed_metadata(&mut references);
+    Ok(references)
   }
 
   pub fn list_session_relations(&self) -> Result<Vec<SessionRef>, String> {
-    self.list_session_refs(inspect_session_header)
+    let mut references = self.list_session_refs(inspect_session_header)?;
+    self.apply_indexed_metadata(&mut references);
+    Ok(references)
+  }
+
+  /// Resolves prompt-derived metadata for one already-discovered session.
+  ///
+  /// Bulk listing deliberately does not scan rollout bodies. Callers can use
+  /// this for a visible or search-relevant header and cache the result.
+  pub fn hydrate_session_header(&self, mut header: SessionHeader) -> Result<SessionHeader, String> {
+    if header.preview.is_none() {
+      header.preview = inspect_session_preview(&header.path)?;
+    }
+    Ok(header)
   }
 
   fn list_session_refs(&self, inspect: fn(&Path) -> Result<SessionRef, String>) -> Result<Vec<SessionRef>, String> {
@@ -46,7 +71,8 @@ impl CodexSessionSource {
   }
 
   pub fn load_session_path(&self, path: &Path) -> Result<LoadedSession, String> {
-    let reference = inspect_session(&path)?;
+    let mut reference = inspect_session(path)?;
+    self.apply_indexed_metadata(std::slice::from_mut(&mut reference));
     let file = File::open(&path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
     let reader = BufReader::new(file);
     let mut normalizer = CodexNormalizer::new_historical();
@@ -93,11 +119,34 @@ impl CodexSessionSource {
       return Ok(vec![root.clone()]);
     }
 
-    let configured_home = std::env::var_os("CODEX_HOME");
-    let platform_home = dirs::home_dir();
-    let codex_home = resolve_codex_home(configured_home.as_deref(), platform_home.as_deref())?;
+    let codex_home = default_codex_home()?;
     Ok(vec![codex_home.join("sessions"), codex_home.join("archived_sessions")])
   }
+
+  fn apply_indexed_metadata(&self, references: &mut [SessionRef]) {
+    // An explicit session directory is not necessarily owned by the active
+    // Codex home, so associating it with that home's private index is unsafe.
+    if self.session_dir.is_some() || references.is_empty() {
+      return;
+    }
+
+    let Some(codex_home) = default_codex_home().ok() else {
+      return;
+    };
+    let metadata = indexed_metadata(&codex_home, references);
+    for reference in references {
+      let Some(native) = metadata.get(&reference.id) else {
+        continue;
+      };
+      apply_indexed_metadata_to_reference(reference, native);
+    }
+  }
+}
+
+fn default_codex_home() -> Result<PathBuf, String> {
+  let configured_home = std::env::var_os("CODEX_HOME");
+  let platform_home = dirs::home_dir();
+  resolve_codex_home(configured_home.as_deref(), platform_home.as_deref())
 }
 
 fn resolve_codex_home(configured_home: Option<&OsStr>, platform_home: Option<&Path>) -> Result<PathBuf, String> {
@@ -132,6 +181,218 @@ fn resolve_codex_home(configured_home: Option<&OsStr>, platform_home: Option<&Pa
   Ok(platform_home.join(".codex"))
 }
 
+#[derive(Debug, Default)]
+struct IndexedSessionMetadata {
+  name: Option<String>,
+  legacy_name: Option<String>,
+  title: Option<String>,
+  preview: Option<String>,
+  rollout_path: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+struct CodexConfigFile {
+  sqlite_home: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SessionIndexEntry {
+  id: String,
+  thread_name: String,
+}
+
+fn indexed_metadata(codex_home: &Path, references: &[SessionRef]) -> HashMap<String, IndexedSessionMetadata> {
+  let ids: HashSet<_> = references.iter().map(|reference| reference.id.as_str()).collect();
+  let paths_by_id: HashMap<_, Vec<_>> = references.iter().fold(HashMap::new(), |mut paths, reference| {
+    paths
+      .entry(reference.id.as_str())
+      .or_insert_with(Vec::new)
+      .push(reference.path.as_path());
+    paths
+  });
+  let mut metadata = read_state_metadata(codex_home, &paths_by_id).unwrap_or_default();
+
+  // `session_index.jsonl` predates the state database. It remains a useful
+  // fallback for explicit names that have not been migrated into `threads`.
+  let mut legacy_names = HashMap::new();
+  if let Ok(file) = File::open(codex_home.join(SESSION_INDEX_FILENAME)) {
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+      let Ok(entry) = serde_json::from_str::<SessionIndexEntry>(&line) else {
+        continue;
+      };
+      if !ids.contains(entry.id.as_str()) {
+        continue;
+      }
+      let Some(name) = clean_discovery_text(&entry.thread_name) else {
+        continue;
+      };
+      // The index is append-only, so a later valid row replaces an earlier
+      // name for the same thread.
+      legacy_names.insert(entry.id, name);
+    }
+  }
+  for (id, name) in legacy_names {
+    metadata.entry(id).or_default().legacy_name = Some(name);
+  }
+
+  metadata
+}
+
+fn read_state_metadata(
+  codex_home: &Path,
+  paths_by_id: &HashMap<&str, Vec<&Path>>,
+) -> rusqlite::Result<HashMap<String, IndexedSessionMetadata>> {
+  let sqlite_home = resolve_sqlite_home(codex_home);
+  let database_path = sqlite_home.join(STATE_DB_FILENAME);
+  if !database_path.is_file() {
+    return Ok(HashMap::new());
+  }
+
+  // This is an intentionally private, optional adapter. Read-only flags and
+  // schema capability checks ensure the viewer never creates or migrates a
+  // Codex database and simply falls back when the private schema changes.
+  let connection = Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+  let columns = sqlite_columns(&connection, "threads")?;
+  if !columns.contains("id")
+    || !columns.contains("rollout_path")
+    || !["name", "title", "preview", "first_user_message"]
+      .iter()
+      .any(|column| columns.contains(*column))
+  {
+    return Ok(HashMap::new());
+  }
+
+  let mut metadata = HashMap::new();
+  let ids: Vec<_> = paths_by_id.keys().copied().collect();
+  for chunk in ids.chunks(SQLITE_ID_BATCH_SIZE) {
+    let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
+    let select = ["name", "title", "preview", "first_user_message", "rollout_path"]
+      .map(|column| {
+        if columns.contains(column) {
+          column.to_string()
+        } else {
+          format!("null as {column}")
+        }
+      })
+      .join(", ");
+    let query = format!("select id, {select} from threads where id in ({placeholders})");
+    let mut statement = connection.prepare(&query)?;
+    let rows = statement.query_map(params_from_iter(chunk.iter()), |row| {
+      Ok((
+        row.get::<_, String>(0)?,
+        row.get::<_, Option<String>>(1)?,
+        row.get::<_, Option<String>>(2)?,
+        row.get::<_, Option<String>>(3)?,
+        row.get::<_, Option<String>>(4)?,
+        row.get::<_, Option<String>>(5)?,
+      ))
+    })?;
+
+    for row in rows {
+      let (id, name, title, preview, first_user_message, rollout_path) = row?;
+      let Some(reference_paths) = paths_by_id.get(id.as_str()) else {
+        continue;
+      };
+      let Some(rollout_path) = rollout_path.as_deref().and_then(non_blank).map(PathBuf::from) else {
+        continue;
+      };
+      if !reference_paths
+        .iter()
+        .any(|reference_path| paths_refer_to_same_file(&rollout_path, reference_path))
+      {
+        continue;
+      }
+
+      metadata.insert(
+        id,
+        IndexedSessionMetadata {
+          name: name.as_deref().and_then(clean_discovery_text),
+          legacy_name: None,
+          title: title.as_deref().and_then(clean_discovery_text),
+          preview: preview
+            .as_deref()
+            .and_then(clean_discovery_text)
+            .or_else(|| first_user_message.as_deref().and_then(clean_discovery_text)),
+          rollout_path: Some(rollout_path),
+        },
+      );
+    }
+  }
+
+  Ok(metadata)
+}
+
+fn apply_indexed_metadata_to_reference(reference: &mut SessionRef, metadata: &IndexedSessionMetadata) {
+  let state_matches = metadata
+    .rollout_path
+    .as_deref()
+    .is_some_and(|path| paths_refer_to_same_file(path, &reference.path));
+  reference.title = if state_matches {
+    metadata
+      .name
+      .clone()
+      .or_else(|| metadata.legacy_name.clone())
+      .or_else(|| metadata.title.clone())
+  } else {
+    metadata.legacy_name.clone()
+  };
+  if state_matches {
+    reference.preview = metadata.preview.clone().or_else(|| reference.preview.clone());
+  }
+}
+
+fn sqlite_columns(connection: &Connection, table: &str) -> rusqlite::Result<HashSet<String>> {
+  let mut statement = connection.prepare("select name from pragma_table_info(?1)")?;
+  statement
+    .query_map([table], |row| row.get(0))?
+    .collect::<rusqlite::Result<HashSet<_>>>()
+}
+
+fn resolve_sqlite_home(codex_home: &Path) -> PathBuf {
+  let configured = std::fs::read_to_string(codex_home.join("config.toml"))
+    .ok()
+    .and_then(|contents| toml::from_str::<CodexConfigFile>(&contents).ok())
+    .and_then(|config| config.sqlite_home)
+    .and_then(|value| non_blank(&value).map(str::to_string));
+  if let Some(configured) = configured {
+    return resolve_metadata_path(OsStr::new(&configured), codex_home);
+  }
+
+  if let Some(configured) = std::env::var_os("CODEX_SQLITE_HOME").filter(|value| !value.is_empty()) {
+    let base = std::env::current_dir().unwrap_or_else(|_| codex_home.to_path_buf());
+    return resolve_metadata_path(&configured, &base);
+  }
+
+  codex_home.to_path_buf()
+}
+
+fn resolve_metadata_path(value: &OsStr, base: &Path) -> PathBuf {
+  if let Some(value) = value.to_str()
+    && let Some(rest) = value.strip_prefix("~/").or_else(|| value.strip_prefix(r"~\"))
+    && let Some(home) = dirs::home_dir()
+  {
+    return home.join(rest);
+  }
+  if value == OsStr::new("~")
+    && let Some(home) = dirs::home_dir()
+  {
+    return home;
+  }
+
+  let path = PathBuf::from(value);
+  if path.is_absolute() { path } else { base.join(path) }
+}
+
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+  if left == right {
+    return true;
+  }
+  match (left.canonicalize(), right.canonicalize()) {
+    (Ok(left), Ok(right)) => left == right,
+    _ => false,
+  }
+}
+
 fn collect_jsonl_files(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
   if !dir.exists() {
     return Ok(());
@@ -155,6 +416,7 @@ fn inspect_session(path: &Path) -> Result<SessionRef, String> {
   let reader = BufReader::new(file);
   let mut message_count = 0;
   let mut history_boundary = CodexHistoryBoundary::new();
+  let mut saw_session_meta = false;
 
   for line in reader.lines() {
     let line = line.map_err(|err| format!("failed to read {}: {err}", path.display()))?;
@@ -167,6 +429,10 @@ fn inspect_session(path: &Path) -> Result<SessionRef, String> {
     let counts_as_message = counts_as_display_message(value);
 
     let accepted = history_boundary.accepts(parsed_line.item());
+    saw_session_meta |= matches!(parsed_line.item(), RolloutItem::SessionMeta(_));
+    if accepted && saw_session_meta && reference.preview.is_none() {
+      reference.preview = preview_from_item(parsed_line.item(), history_boundary.status());
+    }
     if history_boundary.status() == SessionHistoryStatus::SubagentBodyUnavailable {
       message_count = 0;
     }
@@ -188,6 +454,8 @@ fn inspect_session_header(path: &Path) -> Result<SessionRef, String> {
     agent_path: None,
     agent_nickname: None,
     agent_role: None,
+    title: None,
+    preview: None,
     path: path.to_path_buf(),
     cwd: None,
     timestamp: None,
@@ -239,6 +507,146 @@ fn inspect_session_header(path: &Path) -> Result<SessionRef, String> {
   Ok(reference)
 }
 
+fn inspect_session_preview(path: &Path) -> Result<Option<String>, String> {
+  let file = File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+  let reader = BufReader::new(file);
+  let mut boundary = CodexHistoryBoundary::new();
+  let mut saw_session_meta = false;
+  let mut scanned = 0;
+
+  for line in reader.lines() {
+    let line = line.map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    if line.trim().is_empty() {
+      continue;
+    }
+    scanned += 1;
+    if scanned > PREVIEW_SCAN_LIMIT {
+      break;
+    }
+
+    // Discovery is best effort: a future or partially-written record should
+    // not hide a later stable user-message record within the bounded scan.
+    let Ok(parsed_line) = serde_json::from_str::<CodexLine>(&line) else {
+      continue;
+    };
+    let accepted = boundary.accepts(parsed_line.item());
+    saw_session_meta |= matches!(parsed_line.item(), RolloutItem::SessionMeta(_));
+    if !accepted || !saw_session_meta {
+      continue;
+    }
+    if let Some(preview) = preview_from_item(parsed_line.item(), boundary.status()) {
+      return Ok(Some(preview));
+    }
+  }
+
+  Ok(None)
+}
+
+fn preview_from_item(item: &RolloutItem, history_status: SessionHistoryStatus) -> Option<String> {
+  match item {
+    RolloutItem::EventMessage(event) => event_message_preview(&event.native),
+    RolloutItem::ResponseItem(ResponseItem::Message(message)) if message.role.as_deref() == Some("user") => {
+      content_preview(&message.content)
+    }
+    RolloutItem::ResponseItem(ResponseItem::AgentMessage(message))
+      if history_status == SessionHistoryStatus::FilteredSubagent =>
+    {
+      content_preview(&message.content)
+    }
+    RolloutItem::InterAgentCommunication(message)
+      if history_status == SessionHistoryStatus::FilteredSubagent && message.trigger_turn == Some(true) =>
+    {
+      message.content.as_deref().and_then(clean_user_prompt)
+    }
+    _ => None,
+  }
+}
+
+fn event_message_preview(event: &serde_json::Value) -> Option<String> {
+  match event.get("type").and_then(serde_json::Value::as_str) {
+    Some("user_message") => event
+      .get("message")
+      .and_then(serde_json::Value::as_str)
+      .and_then(clean_user_prompt)
+      .or_else(|| {
+        if has_non_empty_array(event, "images") || has_non_empty_array(event, "local_images") {
+          Some("[Image]".to_string())
+        } else if has_non_empty_array(event, "audio") || has_non_empty_array(event, "local_audio") {
+          Some("[Audio]".to_string())
+        } else {
+          None
+        }
+      }),
+    Some("item_completed") => event.get("item").and_then(completed_user_message_preview),
+    _ => None,
+  }
+}
+
+fn completed_user_message_preview(item: &serde_json::Value) -> Option<String> {
+  let item_type = item.get("type").and_then(serde_json::Value::as_str)?;
+  if !matches!(item_type, "UserMessage" | "user_message") {
+    return None;
+  }
+  let content = item.get("content").and_then(serde_json::Value::as_array)?;
+  let text = content
+    .iter()
+    .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+    .collect::<Vec<_>>()
+    .join(" ");
+  clean_user_prompt(&text).or_else(|| {
+    if content.iter().any(|part| {
+      matches!(
+        part.get("type").and_then(serde_json::Value::as_str),
+        Some("image" | "local_image")
+      )
+    }) {
+      Some("[Image]".to_string())
+    } else if content.iter().any(|part| {
+      matches!(
+        part.get("type").and_then(serde_json::Value::as_str),
+        Some("audio" | "local_audio")
+      )
+    }) {
+      Some("[Audio]".to_string())
+    } else {
+      None
+    }
+  })
+}
+
+fn content_preview(content: &[ContentItem]) -> Option<String> {
+  let text = content
+    .iter()
+    .filter_map(|part| part.text.as_deref())
+    .collect::<Vec<_>>()
+    .join(" ");
+  clean_user_prompt(&text)
+}
+
+fn has_non_empty_array(value: &serde_json::Value, field: &str) -> bool {
+  value
+    .get(field)
+    .and_then(serde_json::Value::as_array)
+    .is_some_and(|values| !values.is_empty())
+}
+
+fn clean_user_prompt(value: &str) -> Option<String> {
+  let value = value
+    .find(USER_MESSAGE_BEGIN)
+    .map(|index| &value[index + USER_MESSAGE_BEGIN.len()..])
+    .unwrap_or(value);
+  clean_discovery_text(value)
+}
+
+fn clean_discovery_text(value: &str) -> Option<String> {
+  non_blank(value).map(str::to_string)
+}
+
+fn non_blank(value: &str) -> Option<&str> {
+  let value = value.trim();
+  (!value.is_empty()).then_some(value)
+}
+
 fn counts_as_display_message(value: &serde_json::Value) -> bool {
   match value.get("type").and_then(|value| value.as_str()) {
     Some("response_item") => value.get("payload").is_some_and(|payload| {
@@ -275,6 +683,8 @@ fn session_id_from_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use rusqlite::params;
+  use tempfile::tempdir;
   use tokn_session_core::AgentEvent;
 
   #[test]
@@ -287,6 +697,7 @@ mod tests {
     assert_eq!(reference.agent_nickname.as_deref(), Some("Hubble"));
     assert_eq!(reference.agent_role.as_deref(), Some("explorer"));
     assert_eq!(reference.timestamp.as_deref(), Some("2026-07-29T00:01:00Z"));
+    assert_eq!(reference.preview.as_deref(), Some("investigate this"));
     assert_eq!(reference.message_count, 1);
   }
 
@@ -311,7 +722,175 @@ mod tests {
 
     assert_eq!(reference.parent_session_id.as_deref(), Some("tree-root"));
     assert_eq!(reference.agent_path.as_deref(), Some("/root/researcher"));
+    assert_eq!(reference.preview, None);
     assert_eq!(reference.message_count, 0);
+  }
+
+  #[test]
+  fn hydrates_one_root_preview_without_bulk_relation_scans() {
+    let source = CodexSessionSource::new(Some(fixtures_dir()));
+    let path = fixtures_dir().join("basic_session.jsonl");
+    let header = header_from_reference(inspect_session_header(&path).expect("header should load"));
+
+    let hydrated = source.hydrate_session_header(header).expect("preview should hydrate");
+
+    assert_eq!(hydrated.preview.as_deref(), Some("build a tiny test"));
+  }
+
+  #[test]
+  fn hydrates_paginated_user_item_preview() {
+    let source = CodexSessionSource::new(Some(fixtures_dir()));
+    let path = fixtures_dir().join("item_lifecycle_session.jsonl");
+    let header = header_from_reference(inspect_session_header(&path).expect("header should load"));
+
+    let hydrated = source.hydrate_session_header(header).expect("preview should hydrate");
+
+    // Provider adapters retain meaningful internal whitespace. Presentation
+    // clients apply their own single-line sanitization consistently across
+    // providers.
+    assert_eq!(hydrated.preview.as_deref(), Some("hello  world"));
+  }
+
+  #[test]
+  fn hydration_uses_owned_subagent_prompt_after_history_boundary() {
+    let source = CodexSessionSource::new(Some(fixtures_dir()));
+    let path = fixtures_dir().join("tree_child.jsonl");
+    let header = header_from_reference(inspect_session_header(&path).expect("header should load"));
+
+    let hydrated = source.hydrate_session_header(header).expect("preview should hydrate");
+
+    assert_eq!(hydrated.preview.as_deref(), Some("investigate this"));
+  }
+
+  #[test]
+  fn hydration_never_uses_copied_parent_prompt_without_boundary() {
+    let source = CodexSessionSource::new(Some(fixtures_dir()));
+    let path = fixtures_dir().join("tree_child_no_boundary.jsonl");
+    let header = header_from_reference(inspect_session_header(&path).expect("header should load"));
+
+    let hydrated = source
+      .hydrate_session_header(header)
+      .expect("bounded hydration should succeed");
+
+    assert_eq!(hydrated.preview, None);
+  }
+
+  #[test]
+  fn reads_private_state_metadata_read_only_and_checks_rollout_path() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let codex_home = directory.path().join("codex-home");
+    let sqlite_home = directory.path().join("state");
+    std::fs::create_dir_all(&codex_home).expect("Codex home should be created");
+    std::fs::create_dir_all(&sqlite_home).expect("SQLite home should be created");
+    std::fs::write(
+      codex_home.join("config.toml"),
+      format!("sqlite_home = {:?}\n", sqlite_home.display().to_string()),
+    )
+    .expect("config should be written");
+
+    let matched_rollout = directory.path().join("matched.jsonl");
+    let duplicate_rollout = directory.path().join("matched-copy.jsonl");
+    let stale_rollout = directory.path().join("stale.jsonl");
+    let blank_rollout = directory.path().join("blank.jsonl");
+    let foreign_rollout = directory.path().join("foreign.jsonl");
+    for path in [
+      &matched_rollout,
+      &duplicate_rollout,
+      &stale_rollout,
+      &blank_rollout,
+      &foreign_rollout,
+    ] {
+      std::fs::write(path, "").expect("rollout should be created");
+    }
+
+    let database = Connection::open(sqlite_home.join(STATE_DB_FILENAME)).expect("state database should open");
+    database
+      .execute_batch(
+        "create table threads (
+           id text primary key,
+           name text,
+           title text,
+           preview text,
+           first_user_message text,
+           rollout_path text
+         );",
+      )
+      .expect("threads schema should be created");
+    database
+      .execute(
+        "insert into threads (id, name, title, preview, first_user_message, rollout_path)
+         values (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+          "matched",
+          "  Explicit   name  ",
+          "Generated title",
+          "  first\nrequest  ",
+          "unused fallback",
+          matched_rollout.to_string_lossy()
+        ],
+      )
+      .expect("matching metadata should be inserted");
+    database
+      .execute(
+        "insert into threads (id, name, title, preview, first_user_message, rollout_path)
+         values (?1, null, ?2, ?3, null, ?4)",
+        params![
+          "stale",
+          "Wrong title",
+          "Wrong preview",
+          foreign_rollout.to_string_lossy()
+        ],
+      )
+      .expect("stale metadata should be inserted");
+    database
+      .execute(
+        "insert into threads (id, name, title, preview, first_user_message, rollout_path)
+         values (?1, null, ?2, ?3, null, ?4)",
+        params!["blank", "Uncorrelated title", "Uncorrelated preview", "   "],
+      )
+      .expect("blank-path metadata should be inserted");
+    drop(database);
+
+    std::fs::write(
+      codex_home.join(SESSION_INDEX_FILENAME),
+      concat!(
+        "{\"id\":\"legacy\",\"thread_name\":\"Old name\"}\n",
+        "{\"id\":\"legacy\",\"thread_name\":\"Latest name\"}\n"
+      ),
+    )
+    .expect("legacy index should be written");
+    let legacy_rollout = directory.path().join("legacy.jsonl");
+    std::fs::write(&legacy_rollout, "").expect("legacy rollout should be created");
+
+    let references = vec![
+      session_reference("matched", matched_rollout.clone()),
+      session_reference("matched", duplicate_rollout),
+      session_reference("stale", stale_rollout),
+      session_reference("blank", blank_rollout),
+      session_reference("legacy", legacy_rollout),
+    ];
+    let metadata = indexed_metadata(&codex_home, &references);
+
+    let matched = metadata.get("matched").expect("matching state row should resolve");
+    assert_eq!(matched.name.as_deref(), Some("Explicit   name"));
+    assert_eq!(matched.title.as_deref(), Some("Generated title"));
+    assert_eq!(matched.preview.as_deref(), Some("first\nrequest"));
+    assert!(!metadata.contains_key("stale"));
+    assert!(!metadata.contains_key("blank"));
+    assert_eq!(
+      metadata.get("legacy").and_then(|value| value.legacy_name.as_deref()),
+      Some("Latest name")
+    );
+
+    let mut matching_reference = session_reference("matched", matched_rollout);
+    apply_indexed_metadata_to_reference(&mut matching_reference, matched);
+    assert_eq!(matching_reference.title.as_deref(), Some("Explicit   name"));
+    assert_eq!(matching_reference.preview.as_deref(), Some("first\nrequest"));
+
+    let mut duplicate_reference = references[1].clone();
+    apply_indexed_metadata_to_reference(&mut duplicate_reference, matched);
+    assert_eq!(duplicate_reference.title, None);
+    assert_eq!(duplicate_reference.preview, None);
   }
 
   #[test]
@@ -440,6 +1019,39 @@ mod tests {
 
     assert!(error.contains("CODEX_HOME"));
     assert!(error.contains("--session-dir"));
+  }
+
+  fn header_from_reference(reference: SessionRef) -> SessionHeader {
+    SessionHeader {
+      id: reference.id,
+      parent_session_id: reference.parent_session_id,
+      agent_path: reference.agent_path,
+      agent_nickname: reference.agent_nickname,
+      agent_role: reference.agent_role,
+      title: reference.title,
+      preview: reference.preview,
+      path: reference.path,
+      cwd: reference.cwd,
+      timestamp: reference.timestamp,
+      updated_at: None,
+      updated_at_ms: None,
+    }
+  }
+
+  fn session_reference(id: &str, path: PathBuf) -> SessionRef {
+    SessionRef {
+      id: id.to_string(),
+      parent_session_id: None,
+      agent_path: None,
+      agent_nickname: None,
+      agent_role: None,
+      title: None,
+      preview: None,
+      path,
+      cwd: None,
+      timestamp: None,
+      message_count: 0,
+    }
   }
 
   fn fixtures_dir() -> PathBuf {

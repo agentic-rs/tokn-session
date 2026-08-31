@@ -79,7 +79,8 @@ export interface SessionSummary {
   session_id: string;
   parent_session_id: string | null;
   provider: ViewerProvider;
-  title: string;
+  title: string | null;
+  preview: string | null;
   project: string | null;
   cwd: string | null;
   updated_at_ms: number | null;

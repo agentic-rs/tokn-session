@@ -10,6 +10,11 @@ pub struct SessionHeader {
   pub agent_path: Option<String>,
   pub agent_nickname: Option<String>,
   pub agent_role: Option<String>,
+  /// Provider-native user-facing title, when the provider persists one.
+  pub title: Option<String>,
+  /// Best available first-message preview. This remains separate from
+  /// `title` so clients can choose an explicit title before prompt text.
+  pub preview: Option<String>,
   pub path: PathBuf,
   pub cwd: Option<String>,
   /// Provider-native session creation time, retained without reinterpretation.
@@ -28,6 +33,8 @@ pub struct SessionRef {
   pub agent_path: Option<String>,
   pub agent_nickname: Option<String>,
   pub agent_role: Option<String>,
+  pub title: Option<String>,
+  pub preview: Option<String>,
   pub path: PathBuf,
   pub cwd: Option<String>,
   pub timestamp: Option<String>,

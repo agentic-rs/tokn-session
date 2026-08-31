@@ -6,6 +6,7 @@ use rusqlite::Connection;
 pub(crate) struct OpenCodeCapabilities {
   pub(crate) has_session_agent: bool,
   pub(crate) has_session_model: bool,
+  pub(crate) has_session_title: bool,
   pub(crate) has_session_workspace_id: bool,
 }
 
@@ -44,15 +45,25 @@ impl OpenCodeCapabilities {
     Ok(Self {
       has_session_agent: session.contains("agent"),
       has_session_model: session.contains("model"),
+      has_session_title: session.contains("title"),
       has_session_workspace_id: session.contains("workspace_id"),
     })
   }
 
   pub(crate) fn session_projection(self) -> &'static str {
-    if self.has_session_model {
-      "id, parent_id, directory, model, time_created, time_updated"
+    match (self.has_session_title, self.has_session_model) {
+      (true, true) => "id, parent_id, directory, title, model, time_created, time_updated",
+      (true, false) => "id, parent_id, directory, title, null as model, time_created, time_updated",
+      (false, true) => "id, parent_id, directory, null as title, model, time_created, time_updated",
+      (false, false) => "id, parent_id, directory, null as title, null as model, time_created, time_updated",
+    }
+  }
+
+  pub(crate) fn session_catalog_projection(self) -> &'static str {
+    if self.has_session_title {
+      "id, parent_id, directory, title, time_created, time_updated"
     } else {
-      "id, parent_id, directory, null as model, time_created, time_updated"
+      "id, parent_id, directory, null as title, time_created, time_updated"
     }
   }
 }
@@ -129,21 +140,28 @@ mod tests {
     let capabilities = OpenCodeCapabilities::detect(&connection).expect("base schema should be supported");
     assert!(!capabilities.has_session_agent);
     assert!(!capabilities.has_session_model);
+    assert!(!capabilities.has_session_title);
     assert!(!capabilities.has_session_workspace_id);
     assert!(capabilities.session_projection().contains("null as model"));
+    assert!(capabilities.session_projection().contains("null as title"));
+    assert!(capabilities.session_catalog_projection().contains("null as title"));
 
     connection
       .execute_batch(
         "alter table session add column agent text;
          alter table session add column model text;
+         alter table session add column title text;
          alter table session add column workspace_id text;",
       )
       .expect("optional columns should be added");
     let capabilities = OpenCodeCapabilities::detect(&connection).expect("extended schema should be supported");
     assert!(capabilities.has_session_agent);
     assert!(capabilities.has_session_model);
+    assert!(capabilities.has_session_title);
     assert!(capabilities.has_session_workspace_id);
     assert!(capabilities.session_projection().contains(", model,"));
+    assert!(capabilities.session_projection().contains(", title,"));
+    assert!(capabilities.session_catalog_projection().contains(", title,"));
   }
 
   #[test]

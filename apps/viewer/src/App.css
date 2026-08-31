@@ -513,6 +513,12 @@ button:disabled {
   white-space: nowrap;
 }
 
+.session-row__id,
+.conversation__session-id {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-variant-numeric: tabular-nums;
+}
+
 .sidebar-state {
   display: flex;
   align-items: flex-start;

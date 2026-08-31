@@ -7,9 +7,7 @@ use tokn_dsh_protocol::{ContentBlock, EventRecord, UserMessage};
 use tokn_session_core::MetadataKind;
 
 pub(crate) fn classify(native: &Value) -> Option<(MetadataKind, String)> {
-  // Validate the durable envelope as well as the plugin's required data.
-  serde_json::from_value::<EventRecord<Value>>(native.clone()).ok()?;
-  let record: KnownMetadata = serde_json::from_value(native.clone()).ok()?;
+  let record = decode(native)?;
   Some(match record {
     KnownMetadata::Title { title, .. } => (MetadataKind::Session, format!("title: {title}")),
     KnownMetadata::Permission { preset } => (MetadataKind::Configuration, format!("permission preset: {preset}")),
@@ -53,6 +51,22 @@ pub(crate) fn classify(native: &Value) -> Option<(MetadataKind, String)> {
       (MetadataKind::Diagnostic, format!("search model request {}", body.model))
     }
   })
+}
+
+/// Read a durable DSH title only when both its event envelope and complete
+/// title payload match the known contract. Unknown or malformed plugin data is
+/// ignored so an earlier valid last-writer value remains usable.
+pub(crate) fn session_title(native: &Value) -> Option<String> {
+  match decode(native)? {
+    KnownMetadata::Title { title, .. } => Some(title),
+    _ => None,
+  }
+}
+
+fn decode(native: &Value) -> Option<KnownMetadata> {
+  // Validate the durable envelope as well as the plugin's required data.
+  serde_json::from_value::<EventRecord<Value>>(native.clone()).ok()?;
+  serde_json::from_value(native.clone()).ok()
 }
 
 // Unread fields below are intentionally deserialized for validation. Their

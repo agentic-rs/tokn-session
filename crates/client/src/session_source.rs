@@ -45,6 +45,15 @@ impl SessionSourceClient {
     }
   }
 
+  pub(crate) fn hydrate_session_header(&self, header: SessionHeader) -> Result<SessionHeader, String> {
+    match self {
+      Self::Dsh(source) => source.hydrate_session_header(header),
+      Self::Codex(source) => source.hydrate_session_header(header),
+      Self::OpenCode(source) => source.hydrate_session_header(header),
+      Self::Pi(source) => source.hydrate_session_header(header),
+    }
+  }
+
   pub(crate) fn list_session_relations(&self) -> Result<Vec<SessionRef>, String> {
     match self {
       Self::Dsh(source) => source.list_session_relations(),
@@ -146,6 +155,8 @@ fn file_header(reference: SessionRef) -> SessionHeader {
     agent_path: reference.agent_path,
     agent_nickname: reference.agent_nickname,
     agent_role: reference.agent_role,
+    title: reference.title,
+    preview: reference.preview,
     path: reference.path,
     cwd: reference.cwd,
     timestamp: reference.timestamp,

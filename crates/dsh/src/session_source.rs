@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use tokn_dsh_protocol::{DshSessionItem, DshSessionLine, SessionHeader};
-use tokn_session_core::{LoadedSession, SessionHistoryStatus, SessionRef};
+use tokn_dsh_protocol::{DshSessionItem, DshSessionLine, SessionHeader as DshSessionHeader};
+use tokn_session_core::{LoadedSession, SessionHeader, SessionHistoryStatus, SessionRef};
 
 use crate::{normalize, storage};
 
@@ -20,13 +20,17 @@ impl DshSessionSource {
       // Unlike silently dropping unreadable sessions, an actionable path error
       // makes unsupported versions and damaged compressed files discoverable.
       let mut count = 0;
-      let header = visit_session(&path, |line| {
-        if is_message(&line) {
+      let mut summary = DshSessionSummary::default();
+      let header = visit_session_records(&path, |line, is_direct| {
+        summary.observe(&line, is_direct);
+        if is_direct && is_message(&line) {
           count += 1;
         }
       })?;
       let mut reference = reference(&path, &header);
       reference.message_count = count;
+      reference.title = summary.title;
+      reference.preview = summary.preview;
       references.push(reference);
     }
     sort_refs(&mut references);
@@ -45,6 +49,19 @@ impl DshSessionSource {
     }
     sort_refs(&mut references);
     Ok(references)
+  }
+
+  /// Populate presentation metadata stored after DSH's first session row.
+  ///
+  /// Relation discovery deliberately remains a header-only operation. Callers
+  /// can hydrate only the rows they intend to display, and this streaming scan
+  /// works for both JSONL and concatenated Zstandard logs.
+  pub fn hydrate_session_header(&self, mut header: SessionHeader) -> Result<SessionHeader, String> {
+    let mut summary = DshSessionSummary::default();
+    visit_session_records(&header.path, |line, is_direct| summary.observe(&line, is_direct))?;
+    header.title = summary.title;
+    header.preview = summary.preview;
+    Ok(header)
   }
 
   pub fn load_session(&self, id_or_path: &str) -> Result<LoadedSession, String> {
@@ -76,9 +93,17 @@ impl DshSessionSource {
 
   pub fn load_session_path(&self, path: &Path) -> Result<LoadedSession, String> {
     let mut lines = Vec::new();
-    let header = visit_session(path, |line| lines.push(line))?;
+    let mut summary = DshSessionSummary::default();
+    let header = visit_session_records(path, |line, is_direct| {
+      summary.observe(&line, is_direct);
+      if is_direct {
+        lines.push(line);
+      }
+    })?;
     let mut reference = reference(path, &header);
     reference.message_count = message_count(&lines);
+    reference.title = summary.title;
+    reference.preview = summary.preview;
     let history_status = if header.origin.as_deref() == Some("subagent") && header.seed_length.unwrap_or(0) > 0 {
       SessionHistoryStatus::FilteredSubagent
     } else {
@@ -138,7 +163,7 @@ fn collect(root: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
   Ok(())
 }
 
-fn header(line: DshSessionLine, path: &Path) -> Result<SessionHeader, String> {
+fn header(line: DshSessionLine, path: &Path) -> Result<DshSessionHeader, String> {
   let DshSessionItem::Session(header) = line.into_item() else {
     return Err(format!("invalid dsh session header in {}", path.display()));
   };
@@ -152,7 +177,7 @@ fn header(line: DshSessionLine, path: &Path) -> Result<SessionHeader, String> {
   Ok(header)
 }
 
-fn visit_session(path: &Path, mut visit: impl FnMut(DshSessionLine)) -> Result<SessionHeader, String> {
+fn visit_session_records(path: &Path, mut visit: impl FnMut(DshSessionLine, bool)) -> Result<DshSessionHeader, String> {
   let mut reader = storage::reader(path)?;
   let mut buffer = String::new();
   reader
@@ -183,21 +208,18 @@ fn visit_session(path: &Path, mut visit: impl FnMut(DshSessionLine)) -> Result<S
     {
       // seedLength is immutable fork ancestry, unlike end-seed, which also
       // appears on every resume and must not hide the session's own past turns.
-      if line
+      let is_direct = !line
         .native()
         .get("seq")
         .and_then(serde_json::Value::as_u64)
-        .is_some_and(|seq| seq < seed_length)
-      {
-        continue;
-      }
-      visit(line);
+        .is_some_and(|seq| seq < seed_length);
+      visit(line, is_direct);
     }
   }
   Ok(header)
 }
 
-fn reference(path: &Path, header: &SessionHeader) -> SessionRef {
+fn reference(path: &Path, header: &DshSessionHeader) -> SessionRef {
   SessionRef {
     id: header.id.clone(),
     parent_session_id: if header.origin.as_deref() == Some("subagent") {
@@ -208,11 +230,59 @@ fn reference(path: &Path, header: &SessionHeader) -> SessionRef {
     agent_path: None,
     agent_nickname: None,
     agent_role: None,
+    title: None,
+    preview: None,
     path: path.to_path_buf(),
     cwd: header.cwd.clone(),
     timestamp: Some(header.created_at.to_string()),
     message_count: 0,
   }
+}
+
+#[derive(Default)]
+struct DshSessionSummary {
+  title: Option<String>,
+  preview: Option<String>,
+}
+
+impl DshSessionSummary {
+  fn observe(&mut self, line: &DshSessionLine, is_direct: bool) {
+    // DSH's title projection is a pure last-valid-event-wins fold. Title
+    // events inherited in a subagent seed still name that fork, while the
+    // fallback preview intentionally starts with the subagent's direct input.
+    if let Some(title) = crate::metadata::session_title(line.native()).and_then(non_blank) {
+      self.title = Some(title);
+    }
+    if is_direct && self.preview.is_none() {
+      self.preview = dsh_user_preview(line);
+    }
+  }
+}
+
+fn dsh_user_preview(line: &DshSessionLine) -> Option<String> {
+  let DshSessionItem::Event(tokn_dsh_protocol::SessionEvent::UserMessage(event)) = line.item() else {
+    return None;
+  };
+  if event.data.role != "user" || event.data.source.kind != "user" {
+    return None;
+  }
+  non_blank(
+    event
+      .data
+      .content
+      .iter()
+      .filter_map(|block| match block {
+        tokn_dsh_protocol::ContentBlock::Text(text) => Some(text.text.as_str()),
+        _ => None,
+      })
+      .collect::<Vec<_>>()
+      .join("\n"),
+  )
+}
+
+fn non_blank(value: String) -> Option<String> {
+  let value = value.trim();
+  (!value.is_empty()).then(|| value.to_string())
 }
 
 fn message_count(lines: &[DshSessionLine]) -> usize {

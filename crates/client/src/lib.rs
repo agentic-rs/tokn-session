@@ -22,6 +22,14 @@ impl AgentClient {
     session_source::session_source(source, session_dir)?.list_session_headers()
   }
 
+  /// Resolves presentation metadata that requires inspecting one session body.
+  ///
+  /// Call this only for visible or search-relevant headers. Bulk discovery is
+  /// intentionally kept body-free for latency-sensitive clients.
+  pub fn hydrate_session_header(source: Source, header: SessionHeader) -> Result<SessionHeader, String> {
+    session_source::session_source(source, None)?.hydrate_session_header(header)
+  }
+
   /// Lists sessions with provider-specific message counts.
   ///
   /// This preserves the CLI's counted-list behavior and may scan every session
