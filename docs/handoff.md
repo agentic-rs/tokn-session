@@ -269,12 +269,27 @@ conversation, and keeps reasoning, tools, metadata, errors, and unknown events
 inspectable without adding a message composer. A failure in one provider is
 reported without preventing the other providers from loading.
 
+Visible user and assistant messages, expanded reasoning, and readable inspector
+content render GitHub-flavored Markdown. Raw HTML is disabled, images become
+inert placeholders, and links cannot navigate the WebView.
+
+Known shell, file, search, web, and task events have source-neutral tool cards
+with compact command, path, query, status, and change facts. Expanding a tool
+loads a bounded plain-text or JSON output preview without opening the inspector;
+the inspector remains available as a separate action. The detail projection can
+follow a non-empty provider tool-call id to a later result, because Codex, Pi,
+and DSH may persist invocation and output as separate normalized events. It does
+not combine those lifecycle records into one timeline event or correlate records
+that lack an id. Inline output retains at most 64 KiB with both its head and tail
+visible and never renders provider output as Markdown or HTML.
+
 The Tauri backend calls `tokn-session-client`, `tokn-session-core`, and
 `tokn-session-render` directly from async commands; it does not parse CLI
 output or depend on Relay. The frontend receives source-neutral snake-case
 DTOs with opaque, source-aware session keys. Session and event pages keep IPC
-responses bounded, while expanded native event detail is fetched lazily and
-hidden Pi content stays redacted. Sidebar discovery uses
+responses bounded, including tool-card command and query fields, while expanded
+native event detail and inline tool output are fetched lazily and hidden Pi
+content stays redacted. Sidebar discovery uses
 `AgentClient::list_session_headers`, which reads file headers or OpenCode
 catalog rows without computing conversation counts; the selected session's
 normalized `total_events` arrives with its first event page. The existing CLI
@@ -289,6 +304,12 @@ authoritative incremental parsing are follow-up work. Each normalized and
 provider-native inspector representation is capped at 512 KiB before IPC;
 oversized values are replaced by structured JSON truncation metadata. A full,
 uncapped export path is not implemented yet.
+
+Visible message previews retain up to 16 KiB characters so Markdown blocks can
+render directly in the timeline. Other event summaries and hidden/redacted
+content retain the compact 500-character budget. Longer messages can still be
+loaded through the normalized inspector detail, subject to its 512 KiB
+representation cap.
 
 Codex normalization follows the first session header's `history_mode`. Legacy
 rollouts keep their response-item and legacy-event projection, while paginated

@@ -4,6 +4,7 @@ use crate::event::{PiContentBlock, PiMessage, PiMessageItem, PiSessionItem, PiSe
 use tokn_session_core::{
   AgentEvent, ErrorEvent, MessageDelivery, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role,
   SessionStarted, ToolCallEvent, UnknownEvent, UsageKind, tool_kind_for_name, tool_summary_for_input,
+  tool_summary_for_io,
 };
 
 pub struct PiNormalizer {
@@ -311,7 +312,7 @@ fn normalize_assistant_message(
           tool_name: Some(name.clone()),
           tool_kind: tool_kind_for_name(&name),
           summary: tool_summary_for_input(&name, &content.arguments),
-          phase: Phase::Finished,
+          phase: Phase::Started,
           input: Some(content.arguments),
           output: None,
           is_error: None,
@@ -348,9 +349,15 @@ fn normalize_tool_result_message(
     .timestamp
     .clone()
     .or_else(|| message.timestamp.map(|value| value.to_string()));
-  let output = message
-    .details
-    .unwrap_or_else(|| Value::Array(message.content.into_iter().map(content_block_to_value).collect()));
+  let content = Value::Array(message.content.into_iter().map(json_value).collect());
+  let details = message.details;
+  let output = match details.as_ref() {
+    Some(details) => serde_json::json!({
+      "content": content,
+      "details": details,
+    }),
+    None => content,
+  };
   let tool_name = message.tool_name;
 
   vec![AgentEvent::ToolCall(ToolCallEvent {
@@ -364,9 +371,7 @@ fn normalize_tool_result_message(
       .as_deref()
       .map(tool_kind_for_name)
       .unwrap_or(tokn_session_core::ToolKind::Unknown),
-    summary: tool_name
-      .as_deref()
-      .and_then(|tool_name| tool_summary_for_input(tool_name, &output)),
+    summary: tool_summary_for_io(tool_name.as_deref(), details.as_ref(), Some(&output)),
     phase: Phase::Finished,
     input: None,
     output: Some(output),
@@ -408,22 +413,6 @@ fn ensure_message_events(
     return vec![unknown_event(session_id, Some("message".to_string()), None, timestamp)];
   }
   events
-}
-
-fn content_block_to_value(block: PiContentBlock) -> Value {
-  match block {
-    PiContentBlock::Text(content) => serde_json::json!({
-        "type": "text",
-        "text": content.text,
-    }),
-    PiContentBlock::Image(content) => serde_json::json!({
-        "type": "image",
-        "data": content.data,
-        "mime_type": content.mime_type,
-    }),
-    PiContentBlock::Unknown(content) => content.native,
-    content => json_value(content),
-  }
 }
 
 fn unknown_event(
@@ -480,13 +469,13 @@ mod tests {
       matches!(&events[4], AgentEvent::Reasoning(event) if event.text.as_deref() == Some("checking files") && event.signature.as_deref() == Some("sig-1"))
     );
     assert!(
-      matches!(&events[5], AgentEvent::ToolCall(event) if event.tool_call_id.as_deref() == Some("call-1") && matches!(event.tool_kind, ToolKind::FileRead))
+      matches!(&events[5], AgentEvent::ToolCall(event) if event.tool_call_id.as_deref() == Some("call-1") && matches!(event.tool_kind, ToolKind::FileRead) && matches!(event.phase, Phase::Started))
     );
     assert!(
       matches!(&events[6], AgentEvent::Message(event) if matches!(event.role, Role::Assistant) && matches!(event.delivery, MessageDelivery::Final) && event.text == "done")
     );
     assert!(
-      matches!(&events[7], AgentEvent::ToolCall(event) if event.tool_call_id.as_deref() == Some("call-1") && event.is_error == Some(false))
+      matches!(&events[7], AgentEvent::ToolCall(event) if event.tool_call_id.as_deref() == Some("call-1") && event.is_error == Some(false) && matches!(event.phase, Phase::Finished))
     );
     assert!(
       matches!(&events[8], AgentEvent::Unknown(event) if event.native_type.as_deref() == Some("message.bashExecution"))
@@ -502,6 +491,95 @@ mod tests {
       Some(ToolSummary::FileRead {
         path: Some(ref path)
       }) if path == "README.md"
+    ));
+
+    let AgentEvent::ToolCall(result) = &events[7] else {
+      panic!("expected tool result");
+    };
+    assert!(result.input.is_none());
+    assert!(matches!(
+      result.summary,
+      Some(ToolSummary::FileRead {
+        path: Some(ref path)
+      }) if path == "README.md"
+    ));
+    let output = result.output.as_ref().expect("tool result should retain output");
+    assert_eq!(output["content"][0]["text"], "project readme");
+    assert_eq!(output["details"]["path"], "README.md");
+  }
+
+  #[test]
+  fn tool_result_without_details_keeps_content_as_output() {
+    let events = normalize_fixture(
+      r#"{"type":"session","id":"pi-session"}
+{"type":"message","id":"tool-1","message":{"role":"toolResult","toolCallId":"call-1","toolName":"bash","content":[{"type":"text","text":"hello"}],"isError":false}}"#,
+    );
+
+    let AgentEvent::ToolCall(result) = &events[1] else {
+      panic!("expected tool result");
+    };
+    assert_eq!(
+      result.output.as_ref(),
+      Some(&serde_json::json!([{ "type": "text", "text": "hello" }]))
+    );
+    assert!(matches!(
+      result.summary,
+      Some(ToolSummary::Shell {
+        command: None,
+        cwd: None,
+        exit_code: None,
+      })
+    ));
+  }
+
+  #[test]
+  fn tool_result_preserves_content_block_casing_and_extra_fields() {
+    let events = normalize_fixture(
+      r#"{"type":"session","id":"pi-session"}
+{"type":"message","id":"tool-1","message":{"role":"toolResult","toolCallId":"call-1","toolName":"read","content":[{"type":"image","data":"aGVsbG8=","mimeType":"image/png","providerMetadata":{"assetId":"asset-1"}},{"type":"text","text":"caption","annotations":["generated"]}],"details":{"path":"diagram.png"},"isError":false}}"#,
+    );
+
+    let AgentEvent::ToolCall(result) = &events[1] else {
+      panic!("expected tool result");
+    };
+    let output = result.output.as_ref().expect("tool result should retain output");
+    assert_eq!(output["content"][0]["mimeType"], "image/png");
+    assert!(output["content"][0].get("mime_type").is_none());
+    assert_eq!(output["content"][0]["providerMetadata"]["assetId"], "asset-1");
+    assert_eq!(output["content"][1]["annotations"][0], "generated");
+    assert_eq!(output["details"]["path"], "diagram.png");
+  }
+
+  #[test]
+  fn edit_result_metadata_does_not_become_a_file_path() {
+    let events = normalize_fixture(
+      r#"{"type":"session","id":"pi-session"}
+{"type":"message","id":"assistant-1","message":{"role":"assistant","content":[{"type":"toolCall","id":"call-1","name":"edit","arguments":{"path":"src/lib.rs","oldText":"before","newText":"after"}}]}}
+{"type":"message","id":"tool-1","message":{"role":"toolResult","toolCallId":"call-1","toolName":"edit","content":[{"type":"text","text":"Updated src/lib.rs"}],"details":{"diff":"-before\n+after","patch":"*** Begin Patch","firstChangedLine":1},"isError":false}}"#,
+    );
+
+    let AgentEvent::ToolCall(invocation) = &events[1] else {
+      panic!("expected edit invocation");
+    };
+    assert!(matches!(
+      invocation.summary,
+      Some(ToolSummary::FileEdit {
+        path: Some(ref path),
+        ..
+      }) if path == "src/lib.rs"
+    ));
+
+    let AgentEvent::ToolCall(result) = &events[2] else {
+      panic!("expected edit result");
+    };
+    assert_eq!(invocation.tool_call_id, result.tool_call_id);
+    assert!(matches!(
+      result.summary,
+      Some(ToolSummary::FileEdit {
+        path: None,
+        added: None,
+        removed: None,
+      })
     ));
   }
 

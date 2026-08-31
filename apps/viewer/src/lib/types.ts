@@ -28,6 +28,47 @@ export type EventType =
 export type EventPhase = "started" | "delta" | "updated" | "finished";
 export type MessageRole = "user" | "assistant" | "system" | "tool" | "unknown";
 
+export type ToolKind =
+  | "shell"
+  | "file_read"
+  | "file_write"
+  | "file_edit"
+  | "search"
+  | "web"
+  | "task"
+  | "unknown";
+
+export interface ToolCardSummary {
+  kind: ToolKind | string;
+  tool_name: string | null;
+  tool_call_id: string | null;
+  command: string | null;
+  cwd: string | null;
+  path: string | null;
+  query: string | null;
+  url: string | null;
+  task_title: string | null;
+  exit_code: number | null;
+  bytes: number | null;
+  added: number | null;
+  removed: number | null;
+}
+
+export type ToolOutputFormat = "text" | "json";
+
+export interface ToolOutputSection {
+  label: string | null;
+  text: string;
+  format: ToolOutputFormat;
+}
+
+export interface ToolOutputPreview {
+  sections: ToolOutputSection[];
+  truncated: boolean;
+  original_size_bytes: number;
+  source_event_key: string;
+}
+
 export type SessionHistoryStatus =
   | "complete"
   | "filtered_subagent"
@@ -85,6 +126,7 @@ export interface EventSummary {
   summary_truncated: boolean;
   is_hidden: boolean;
   is_error: boolean | null;
+  tool: ToolCardSummary | null;
 }
 
 export type EventPageDirection = "forward" | "backward";
@@ -115,6 +157,7 @@ export interface EventDetail {
   event: JsonValue;
   native: JsonValue | null;
   is_hidden: boolean;
+  tool_output: ToolOutputPreview | null;
 }
 
 export interface AsyncState<T> {

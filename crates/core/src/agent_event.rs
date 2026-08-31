@@ -354,12 +354,15 @@ pub fn tool_kind_for_name(name: &str) -> ToolKind {
   let normalized = name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase();
   match normalized.as_str() {
     "bash" | "exec" | "exec_command" | "local_shell" | "shell" | "terminal" => ToolKind::Shell,
-    "read" | "read_file" | "view" => ToolKind::FileRead,
+    "ls" | "list_dir" | "list_directory" | "read" | "read_file" | "view" => ToolKind::FileRead,
     "write" | "write_file" | "create_file" => ToolKind::FileWrite,
     "edit" | "apply_patch" | "patch" | "str_replace" => ToolKind::FileEdit,
-    "grep" | "rg" | "search" | "find" | "web_search" => ToolKind::Search,
-    "open" | "fetch" => ToolKind::Web,
-    "task" | "todo" | "update_plan" => ToolKind::Task,
+    "code_search" | "file_search" | "find" | "glob" | "grep" | "rg" | "search" | "tool_search" | "web_search" => {
+      ToolKind::Search
+    }
+    "fetch" | "fetch_content" | "get_search_content" | "open" | "web_fetch" => ToolKind::Web,
+    "followup_task" | "send_message" | "spawn_agent" | "subagent" | "task" | "todo" | "update_plan" | "wait"
+    | "wait_agent" => ToolKind::Task,
     _ => ToolKind::Unknown,
   }
 }
@@ -385,7 +388,12 @@ pub fn tool_summary_for_io(name: Option<&str>, input: Option<&Value>, output: Op
     }),
     ToolKind::FileWrite => Some(ToolSummary::FileWrite {
       path: input.and_then(path_field),
-      bytes: None,
+      bytes: input.and_then(|input| {
+        input
+          .get("content")
+          .and_then(Value::as_str)
+          .map(|content| content.len() as u64)
+      }),
     }),
     ToolKind::FileEdit => Some(ToolSummary::FileEdit {
       path: input.and_then(patch_path),
@@ -397,13 +405,20 @@ pub fn tool_summary_for_io(name: Option<&str>, input: Option<&Value>, output: Op
         string_field(input, "query")
           .or_else(|| string_field(input, "q"))
           .or_else(|| string_field(input, "pattern"))
+          .or_else(|| joined_string_array_field(input, "queries"))
       }),
     }),
     ToolKind::Web => Some(ToolSummary::Web {
       url: input.and_then(|input| string_field(input, "url").or_else(|| string_field(input, "ref_id"))),
     }),
     ToolKind::Task => Some(ToolSummary::Task {
-      title: input.and_then(|input| string_field(input, "title").or_else(|| string_field(input, "step"))),
+      title: input.and_then(|input| {
+        string_field(input, "title")
+          .or_else(|| string_field(input, "task_name"))
+          .or_else(|| string_field(input, "prompt"))
+          .or_else(|| string_field(input, "message"))
+          .or_else(|| string_field(input, "step"))
+      }),
     }),
     ToolKind::Unknown => None,
   }
@@ -428,11 +443,14 @@ fn output_exit_code(value: &Value) -> Option<i64> {
     .get("metadata")
     .and_then(|metadata| metadata.get("exit"))
     .and_then(Value::as_i64)
+    .or_else(|| value.get("exit_code").and_then(Value::as_i64))
+    .or_else(|| value.get("exitCode").and_then(Value::as_i64))
+    .or_else(|| value.get("details").and_then(output_exit_code))
 }
 
 fn patch_path(value: &Value) -> Option<String> {
-  first_object_key(value)
-    .or_else(|| path_field(value))
+  path_field(value)
+    .or_else(|| first_change_map_path(value))
     .or_else(|| value.as_str().and_then(patch_text_path))
     .or_else(|| {
       value
@@ -454,15 +472,25 @@ fn patch_line_count(value: &Value, marker: char) -> Option<u64> {
 }
 
 fn first_unified_diff(value: &Value) -> Option<&str> {
-  value
-    .as_object()
-    .and_then(|changes| changes.values().next())
-    .and_then(|change| change.get("unified_diff"))
-    .and_then(Value::as_str)
+  value.as_object().and_then(|changes| {
+    changes
+      .values()
+      .find_map(|change| change.get("unified_diff").and_then(Value::as_str))
+  })
 }
 
-fn first_object_key(value: &Value) -> Option<String> {
-  value.as_object().and_then(|object| object.keys().next()).cloned()
+fn first_change_map_path(value: &Value) -> Option<String> {
+  value.as_object().and_then(|changes| {
+    changes.iter().find_map(|(path, change)| {
+      let change = change.as_object()?;
+      let has_unified_diff = change.get("unified_diff").is_some_and(Value::is_string);
+      let has_known_type = matches!(
+        change.get("type").and_then(Value::as_str),
+        Some("add" | "delete" | "update")
+      );
+      (has_unified_diff || has_known_type).then(|| path.clone())
+    })
+  })
 }
 
 fn patch_text_path(patch: &str) -> Option<String> {
@@ -494,4 +522,150 @@ fn string_array_field(value: &Value, field: &str) -> Option<Vec<String>> {
       .map(str::to_string)
       .collect::<Vec<_>>()
   })
+}
+
+fn joined_string_array_field(value: &Value, field: &str) -> Option<String> {
+  string_array_field(value, field).and_then(|items| (!items.is_empty()).then(|| items.join(", ")))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn classifies_known_tool_families_without_treating_user_input_as_a_task() {
+    for name in ["ls", "list_dir", "list_directory"] {
+      assert!(matches!(tool_kind_for_name(name), ToolKind::FileRead));
+    }
+    for name in ["code_search", "file_search", "glob", "tool_search"] {
+      assert!(matches!(tool_kind_for_name(name), ToolKind::Search));
+    }
+    for name in ["fetch_content", "get_search_content", "web_fetch"] {
+      assert!(matches!(tool_kind_for_name(name), ToolKind::Web));
+    }
+    for name in [
+      "subagent",
+      "spawn_agent",
+      "followup_task",
+      "send_message",
+      "wait",
+      "wait_agent",
+    ] {
+      assert!(matches!(tool_kind_for_name(name), ToolKind::Task));
+    }
+
+    assert!(matches!(tool_kind_for_name("ask_user_question"), ToolKind::Unknown));
+  }
+
+  #[test]
+  fn summarizes_multi_query_searches_and_file_write_bytes() {
+    let search = serde_json::json!({ "queries": ["alpha", "beta"] });
+    assert!(matches!(
+      tool_summary_for_input("code_search", &search),
+      Some(ToolSummary::Search { query: Some(query) }) if query == "alpha, beta"
+    ));
+
+    let write = serde_json::json!({ "path": "notes.txt", "content": "hello 🦀" });
+    assert!(matches!(
+      tool_summary_for_input("write", &write),
+      Some(ToolSummary::FileWrite {
+        path: Some(path),
+        bytes: Some(10),
+      }) if path == "notes.txt"
+    ));
+  }
+
+  #[test]
+  fn summarizes_collaboration_tasks_from_provider_specific_fields() {
+    for (name, input, expected) in [
+      (
+        "spawn_agent",
+        serde_json::json!({ "task_name": "reviewer" }),
+        "reviewer",
+      ),
+      (
+        "subagent",
+        serde_json::json!({ "prompt": "Review the diff" }),
+        "Review the diff",
+      ),
+      (
+        "send_message",
+        serde_json::json!({ "message": "Please retry" }),
+        "Please retry",
+      ),
+      ("update_plan", serde_json::json!({ "step": "Run tests" }), "Run tests"),
+    ] {
+      assert!(matches!(
+        tool_summary_for_input(name, &input),
+        Some(ToolSummary::Task { title: Some(title) }) if title == expected
+      ));
+    }
+  }
+
+  #[test]
+  fn shell_result_summary_reads_exit_metadata_through_a_provider_wrapper() {
+    let output = serde_json::json!({
+      "content": [{ "type": "text", "text": "failed" }],
+      "details": { "metadata": { "exit": 2 } },
+    });
+
+    assert!(matches!(
+      tool_summary_for_io(Some("bash"), None, Some(&output)),
+      Some(ToolSummary::Shell {
+        command: None,
+        cwd: None,
+        exit_code: Some(2),
+      })
+    ));
+  }
+
+  #[test]
+  fn file_edit_summary_prefers_an_explicit_path_over_edit_fields() {
+    let input = serde_json::json!({
+      "oldText": "before",
+      "newText": "after",
+      "path": "src/lib.rs",
+    });
+
+    assert!(matches!(
+      tool_summary_for_input("edit", &input),
+      Some(ToolSummary::FileEdit {
+        path: Some(path),
+        added: None,
+        removed: None,
+      }) if path == "src/lib.rs"
+    ));
+  }
+
+  #[test]
+  fn file_edit_summary_keeps_change_map_path_and_counts() {
+    let input = serde_json::json!({
+      "src/main.rs": {
+        "unified_diff": "@@ -1 +1 @@\n-before\n+after\n",
+      },
+    });
+
+    assert!(matches!(
+      tool_summary_for_input("apply_patch", &input),
+      Some(ToolSummary::FileEdit {
+        path: Some(path),
+        added: Some(1),
+        removed: Some(1),
+      }) if path == "src/main.rs"
+    ));
+
+    let add = serde_json::json!({
+      "src/new.rs": {
+        "type": "add",
+        "content": "fn main() {}\n",
+      },
+    });
+    assert!(matches!(
+      tool_summary_for_input("apply_patch", &add),
+      Some(ToolSummary::FileEdit {
+        path: Some(path),
+        ..
+      }) if path == "src/new.rs"
+    ));
+  }
 }
