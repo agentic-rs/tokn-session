@@ -1,9 +1,9 @@
 use crate::row::{OpenCodeMessageRow, OpenCodePartRow, OpenCodeSessionRow};
 use serde_json::{Value, json};
-use tokn_opencode_protocol::v1::{MessageItem, PartItem, ToolState, ToolStateItem};
+use tokn_opencode_protocol::v1::{MessageItem, PartItem, TokenUsage, ToolState, ToolStateItem};
 use tokn_session_core::{
   AgentEvent, ErrorEvent, MessageDelivery, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role,
-  SessionStarted, ToolCallEvent, UnknownEvent, tool_kind_for_optional_name, tool_summary_for_io,
+  SessionStarted, ToolCallEvent, UnknownEvent, UsageEvent, UsageKind, tool_kind_for_optional_name, tool_summary_for_io,
 };
 
 pub struct OpenCodeNormalizer {
@@ -73,9 +73,15 @@ impl OpenCodeNormalizer {
             timestamp: timestamp(time_created),
           }));
         }
-        for part in parts {
-          events.extend(self.normalize_assistant_part(&id, &message.parent_id, part));
-        }
+        events.extend(self.normalize_assistant_turn(
+          &id,
+          &message.parent_id,
+          time_created,
+          message.tokens.as_ref(),
+          &native,
+          true,
+          parts,
+        ));
       }
       MessageItem::Unknown(item) if item.native_type.as_deref() == Some("system") => {
         events.extend(self.text_message(id, parent_id, Role::System, time_created, parts));
@@ -93,9 +99,16 @@ impl OpenCodeNormalizer {
             timestamp: timestamp(time_created),
           }));
         }
-        for part in parts {
-          events.extend(self.normalize_assistant_part(&id, &parent_id, part));
-        }
+        let recovered_tokens = recover_token_usage(&native);
+        events.extend(self.normalize_assistant_turn(
+          &id,
+          &parent_id,
+          time_created,
+          recovered_tokens.as_ref(),
+          &native,
+          false,
+          parts,
+        ));
         events.push(self.unknown_message(item, time_created));
       }
       MessageItem::Unknown(item) => {
@@ -229,6 +242,7 @@ impl OpenCodeNormalizer {
         phase: Phase::Finished,
         text: Some(part.text),
         summary: None,
+        redacted: None,
         encrypted_content: None,
         signature: None,
         timestamp: timestamp(time_created),
@@ -250,6 +264,161 @@ impl OpenCodeNormalizer {
         timestamp(time_created),
       )],
     }
+  }
+
+  /// OpenCode writes token snapshots both on the assistant message and on its
+  /// `step-finish` parts. A turn may contain several steps, so the final valid
+  /// step snapshot is authoritative. The assistant-message snapshot remains a
+  /// compatibility fallback for incomplete or older rows.
+  fn normalize_assistant_turn(
+    &self,
+    message_id: &str,
+    parent_id: &Option<String>,
+    message_time_created: Option<i64>,
+    message_tokens: Option<&TokenUsage>,
+    message_native: &Value,
+    report_invalid_message_usage: bool,
+    parts: Vec<OpenCodePartRow>,
+  ) -> Vec<AgentEvent> {
+    let mut malformed_usage = Vec::new();
+    let fallback_usage = message_tokens.and_then(|tokens| {
+      let native = usage_native(message_native);
+      match usage_event(
+        Some(self.session_id.clone()),
+        Some(message_id.to_string()),
+        None,
+        Some(message_id.to_string()),
+        tokens,
+        native.clone(),
+        timestamp(message_time_created),
+      ) {
+        Some(event) => Some(event),
+        None => {
+          if report_invalid_message_usage {
+            malformed_usage.push(unknown_event(
+              Some(self.session_id.clone()),
+              Some("usage".to_string()),
+              Some(native),
+              timestamp(message_time_created),
+            ));
+          }
+          None
+        }
+      }
+    });
+
+    let mut latest_step_usage = None;
+    for part in &parts {
+      let (tokens, report_invalid_step_usage) = match part.data.item() {
+        PartItem::StepFinish(step) => (step.tokens.clone(), true),
+        PartItem::Unknown(item) if item.native_type.as_deref() == Some("step-finish") => {
+          (recover_token_usage(part.data.native()), false)
+        }
+        _ => continue,
+      };
+      let Some(tokens) = tokens.as_ref() else {
+        continue;
+      };
+
+      let native = usage_native(part.data.native());
+      match usage_event(
+        Some(self.session_id.clone()),
+        Some(message_id.to_string()),
+        Some(part.id.clone()),
+        Some(part.id.clone()),
+        tokens,
+        native.clone(),
+        timestamp(part.time_created),
+      ) {
+        Some(event) => latest_step_usage = Some(event),
+        None if report_invalid_step_usage => malformed_usage.push(unknown_event(
+          Some(self.session_id.clone()),
+          Some("usage".to_string()),
+          Some(native),
+          timestamp(part.time_created),
+        )),
+        None => {}
+      }
+    }
+
+    let mut events = Vec::new();
+    for part in parts {
+      events.extend(self.normalize_assistant_part(message_id, parent_id, part));
+    }
+    events.extend(malformed_usage);
+    if let Some(usage) = latest_step_usage.or(fallback_usage) {
+      events.push(usage);
+    }
+    events
+  }
+}
+
+/// Normalize OpenCode's per-model-call token counters. OpenCode separates
+/// cache reads/writes from the base input count, while the shared IR requires
+/// `input_tokens` to include those cache tokens exactly once.
+pub(crate) fn usage_event(
+  session_id: Option<String>,
+  message_id: Option<String>,
+  step_id: Option<String>,
+  record_id: Option<String>,
+  tokens: &TokenUsage,
+  native: Value,
+  timestamp: Option<String>,
+) -> Option<AgentEvent> {
+  let input = token_counter(tokens.input)?;
+  let output = token_counter(tokens.output)?;
+  let cache_read = optional_token_counter(tokens.cache.as_ref().and_then(|cache| cache.read))?;
+  let cache_write = optional_token_counter(tokens.cache.as_ref().and_then(|cache| cache.write))?;
+  let total = optional_token_counter(tokens.total)?;
+  let reasoning = optional_token_counter(tokens.reasoning)?;
+  let input_tokens = input
+    .checked_add(cache_read.unwrap_or(0))?
+    .checked_add(cache_write.unwrap_or(0))?;
+
+  Some(AgentEvent::Usage(UsageEvent {
+    kind: UsageKind::ModelCall,
+    provider: Provider::OpenCode,
+    session_id,
+    turn_id: None,
+    step_id,
+    message_id,
+    record_id,
+    input_tokens,
+    output_tokens: output,
+    // Do not synthesize a total. OpenCode's reported total can include a
+    // distinct reasoning count, and is authoritative when it is present.
+    total_tokens: total,
+    cache_read_tokens: cache_read,
+    cache_write_tokens: cache_write,
+    reasoning_tokens: reasoning,
+    native,
+    timestamp,
+  }))
+}
+
+fn usage_native(native: &Value) -> Value {
+  native.get("tokens").cloned().unwrap_or(Value::Null)
+}
+
+/// A malformed non-accounting field turns the tolerant wire item into an
+/// `Unknown`, but valid token objects can still be normalized alongside the
+/// retained unknown record.
+fn recover_token_usage(native: &Value) -> Option<TokenUsage> {
+  native
+    .get("tokens")
+    .filter(|tokens| !tokens.is_null())
+    .and_then(|tokens| serde_json::from_value(tokens.clone()).ok())
+}
+
+fn token_counter(value: Option<f64>) -> Option<u64> {
+  let value = value?;
+  (value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value < u64::MAX as f64).then_some(value as u64)
+}
+
+fn optional_token_counter(value: Option<f64>) -> Option<Option<u64>> {
+  match value {
+    Some(value) => token_counter(Some(value)).map(Some),
+    None => Some(None),
   }
 }
 
@@ -387,8 +556,8 @@ fn unknown_event(
 #[cfg(test)]
 mod tests {
   use serde_json::{Value, json};
-  use tokn_opencode_protocol::v1::{MessageData, PartData};
-  use tokn_session_core::{AgentEvent, MessageDelivery, Phase, Role};
+  use tokn_opencode_protocol::v1::{MessageData, PartData, TokenUsage};
+  use tokn_session_core::{AgentEvent, MessageDelivery, Phase, Role, UsageKind};
 
   use super::OpenCodeNormalizer;
   use crate::row::{OpenCodeMessageRow, OpenCodePartRow};
@@ -556,6 +725,265 @@ mod tests {
       event.output.as_ref().and_then(|output| output.get("raw")),
       Some(&Value::String("{\"command\":\"cargo test\"}".to_string()))
     );
+  }
+
+  #[test]
+  fn usage_prefers_the_last_valid_step_finish_over_assistant_fallback() {
+    let mut normalizer = OpenCodeNormalizer::new("ses_1".to_string());
+    let fallback = json!({
+      "input": 1,
+      "output": 2,
+      "reasoning": 3,
+      "cache": {"read": 4, "write": 5},
+      "total": 15
+    });
+    let final_step = json!({
+      "input": 10,
+      "output": 11,
+      "reasoning": 12,
+      "cache": {"read": 13, "write": 14},
+      // Keep a provider-reported total even when it differs from the derived
+      // counters: it can include provider-specific accounting.
+      "total": 999
+    });
+    let events = normalizer.normalize_message(message_row(
+      "msg_assistant",
+      json!({
+        "role": "assistant",
+        "tokens": fallback.clone(),
+      }),
+      vec![
+        part_row(
+          "prt_first",
+          json!({
+            "type": "step-finish",
+            "tokens": {
+              "input": 6,
+              "output": 7,
+              "reasoning": 8,
+              "cache": {"read": 9, "write": 10},
+              "total": 40
+            }
+          }),
+        ),
+        part_row("prt_text", json!({"type": "text", "text": "still visible"})),
+        part_row(
+          "prt_final",
+          json!({
+            "type": "step-finish",
+            "tokens": final_step.clone(),
+          }),
+        ),
+      ],
+    ));
+
+    let usage: Vec<_> = events
+      .iter()
+      .filter_map(|event| match event {
+        AgentEvent::Usage(usage) => Some(usage),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(usage.len(), 1);
+    let usage = usage[0];
+    assert_eq!(usage.kind, UsageKind::ModelCall);
+    assert_eq!(usage.message_id.as_deref(), Some("msg_assistant"));
+    assert_eq!(usage.step_id.as_deref(), Some("prt_final"));
+    assert_eq!(usage.record_id.as_deref(), Some("prt_final"));
+    assert_eq!(usage.input_tokens, 37);
+    assert_eq!(usage.output_tokens, 11);
+    assert_eq!(usage.cache_read_tokens, Some(13));
+    assert_eq!(usage.cache_write_tokens, Some(14));
+    assert_eq!(usage.reasoning_tokens, Some(12));
+    assert_eq!(usage.total_tokens, Some(999));
+    assert_eq!(usage.native, final_step);
+    assert!(
+      events
+        .iter()
+        .any(|event| { matches!(event, AgentEvent::Message(message) if message.text == "still visible") })
+    );
+  }
+
+  #[test]
+  fn usage_falls_back_to_assistant_message_tokens() {
+    let mut normalizer = OpenCodeNormalizer::new("ses_1".to_string());
+    let fallback = json!({
+      "input": 21,
+      "output": 22,
+      "reasoning": 23,
+      "cache": {"read": 24, "write": 25},
+      "total": 26
+    });
+    let events = normalizer.normalize_message(message_row(
+      "msg_assistant",
+      json!({"role": "assistant", "tokens": fallback.clone()}),
+      vec![part_row("prt_step", json!({"type": "step-finish"}))],
+    ));
+
+    let usage: Vec<_> = events
+      .iter()
+      .filter_map(|event| match event {
+        AgentEvent::Usage(usage) => Some(usage),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(usage.len(), 1);
+    let usage = usage[0];
+    assert_eq!(usage.message_id.as_deref(), Some("msg_assistant"));
+    assert_eq!(usage.step_id, None);
+    assert_eq!(usage.record_id.as_deref(), Some("msg_assistant"));
+    assert_eq!(usage.input_tokens, 70);
+    assert_eq!(usage.output_tokens, 22);
+    assert_eq!(usage.total_tokens, Some(26));
+    assert_eq!(usage.native, fallback);
+  }
+
+  #[test]
+  fn usage_recovers_from_an_unknown_assistant_with_valid_tokens() {
+    let mut normalizer = OpenCodeNormalizer::new("ses_1".to_string());
+    let events = normalizer.normalize_message(message_row(
+      "msg_assistant",
+      json!({
+        "role": "assistant",
+        // This unrelated malformed field makes the wire message unknown.
+        "providerID": 42,
+        "tokens": {
+          "input": 2,
+          "output": 3,
+          "reasoning": 4,
+          "cache": {"read": 5, "write": 6}
+        }
+      }),
+      Vec::new(),
+    ));
+
+    let usage: Vec<_> = events
+      .iter()
+      .filter_map(|event| match event {
+        AgentEvent::Usage(usage) => Some(usage),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].input_tokens, 13);
+    assert_eq!(usage[0].output_tokens, 3);
+    assert_eq!(usage[0].reasoning_tokens, Some(4));
+    assert!(events.iter().any(|event| {
+      matches!(event, AgentEvent::Unknown(event) if event.native_type.as_deref() == Some("message.role.assistant"))
+    }));
+  }
+
+  #[test]
+  fn malformed_usage_stays_visible_without_hiding_assistant_content() {
+    let mut normalizer = OpenCodeNormalizer::new("ses_1".to_string());
+    let malformed = json!({
+      "input": 1.5,
+      "output": 2,
+      "reasoning": 0,
+      "cache": {"read": 0, "write": 0}
+    });
+    let events = normalizer.normalize_message(message_row(
+      "msg_assistant",
+      json!({"role": "assistant"}),
+      vec![
+        part_row("prt_text", json!({"type": "text", "text": "answer remains visible"})),
+        part_row("prt_step", json!({"type": "step-finish", "tokens": malformed.clone()})),
+      ],
+    ));
+
+    assert!(
+      events
+        .iter()
+        .any(|event| { matches!(event, AgentEvent::Message(message) if message.text == "answer remains visible") })
+    );
+    assert!(!events.iter().any(|event| matches!(event, AgentEvent::Usage(_))));
+    assert!(events.iter().any(|event| {
+      matches!(event, AgentEvent::Unknown(event)
+        if event.native_type.as_deref() == Some("usage")
+          && event.native.as_ref() == Some(&malformed))
+    }));
+  }
+
+  #[test]
+  fn usage_keeps_the_last_valid_step_when_a_later_step_is_malformed() {
+    let mut normalizer = OpenCodeNormalizer::new("ses_1".to_string());
+    let events = normalizer.normalize_message(message_row(
+      "msg_assistant",
+      json!({
+        "role": "assistant",
+        "tokens": {
+          "input": 100,
+          "output": 100,
+          "reasoning": 0,
+          "cache": {"read": 0, "write": 0}
+        }
+      }),
+      vec![
+        part_row(
+          "prt_valid",
+          json!({
+            "type": "step-finish",
+            "tokens": {
+              "input": 2,
+              "output": 3,
+              "reasoning": 0,
+              "cache": {"read": 4, "write": 5}
+            }
+          }),
+        ),
+        part_row(
+          "prt_invalid",
+          json!({
+            "type": "step-finish",
+            "tokens": {
+              "input": -1,
+              "output": 3,
+              "reasoning": 0,
+              "cache": {"read": 0, "write": 0}
+            }
+          }),
+        ),
+      ],
+    ));
+
+    let usage: Vec<_> = events
+      .iter()
+      .filter_map(|event| match event {
+        AgentEvent::Usage(usage) => Some(usage),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].step_id.as_deref(), Some("prt_valid"));
+    assert_eq!(usage[0].input_tokens, 11);
+    assert!(
+      events
+        .iter()
+        .any(|event| { matches!(event, AgentEvent::Unknown(event) if event.native_type.as_deref() == Some("usage")) })
+    );
+  }
+
+  #[test]
+  fn usage_rejects_non_finite_negative_fractional_and_out_of_range_counters() {
+    for input in [f64::NAN, f64::INFINITY, -1.0, 1.5, u64::MAX as f64] {
+      let tokens = TokenUsage {
+        input: Some(input),
+        output: Some(1.0),
+        ..Default::default()
+      };
+      assert!(
+        super::usage_event(
+          Some("ses_1".to_string()),
+          Some("msg_1".to_string()),
+          None,
+          Some("msg_1".to_string()),
+          &tokens,
+          Value::Null,
+          Some("1".to_string()),
+        )
+        .is_none()
+      );
+    }
   }
 
   fn message_row(id: &str, data: Value, parts: Vec<OpenCodePartRow>) -> OpenCodeMessageRow {

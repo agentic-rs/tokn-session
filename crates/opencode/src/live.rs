@@ -5,7 +5,7 @@ use tokn_session_core::{
   UnknownEvent,
 };
 
-use crate::normalize::{timestamp, tool_event};
+use crate::normalize::{timestamp, tool_event, usage_event};
 
 pub struct OpenCodeLiveNormalizer;
 
@@ -42,6 +42,7 @@ impl OpenCodeLiveNormalizer {
         phase: Phase::Finished,
         text: Some(part.text),
         summary: None,
+        redacted: None,
         encrypted_content: None,
         signature: None,
         timestamp: timestamp(raw_timestamp),
@@ -65,13 +66,40 @@ impl OpenCodeLiveNormalizer {
         message: error_message(error.error),
         timestamp: timestamp(raw_timestamp),
       }))],
-      event @ (RunEvent::StepStart(_) | RunEvent::StepFinish(_)) => {
-        vec![unknown_live_event(
-          session_id,
-          event.native_type().map(str::to_string),
-          native,
-          raw_timestamp,
-        )]
+      RunEvent::StepStart(_) => vec![unknown_live_event(
+        session_id,
+        Some("step_start".to_string()),
+        native,
+        raw_timestamp,
+      )],
+      RunEvent::StepFinish(part) => {
+        let native_usage = native.get("part").and_then(|part| part.get("tokens")).cloned();
+        let usage = native_usage
+          .zip(part.tokens.as_ref())
+          .and_then(|(native_usage, tokens)| {
+            let step_id = part.identity.id.clone();
+            usage_event(
+              session_id.clone(),
+              part.identity.message_id.clone(),
+              step_id.clone(),
+              step_id,
+              tokens,
+              native_usage,
+              timestamp(raw_timestamp),
+            )
+          });
+        match usage {
+          Some(event) => vec![wrap_agent_event(event)],
+          // A live `step_finish` used to be emitted as an unknown event. Keep
+          // that lossless fallback for missing or invalid accounting rather
+          // than fabricating a zero-valued usage card.
+          None => vec![unknown_live_event(
+            session_id,
+            Some("step_finish".to_string()),
+            native,
+            raw_timestamp,
+          )],
+        }
       }
       RunEvent::Unknown(item) => vec![unknown_live_event(session_id, item.native_type, native, raw_timestamp)],
     })
@@ -110,7 +138,7 @@ fn error_message(value: Value) -> String {
 
 #[cfg(test)]
 mod tests {
-  use tokn_session_core::{AgentEvent, LiveSessionEvent, MessageDelivery, ToolSummary};
+  use tokn_session_core::{AgentEvent, LiveSessionEvent, MessageDelivery, ToolSummary, UsageKind};
 
   use super::OpenCodeLiveNormalizer;
 
@@ -152,6 +180,55 @@ mod tests {
     };
     assert_eq!(command.as_deref(), Some("cargo test"));
     assert_eq!(*exit_code, Some(0));
+  }
+
+  #[test]
+  fn normalizes_valid_step_finish_usage() {
+    let tokens = serde_json::json!({
+      "input": 10,
+      "output": 11,
+      "reasoning": 12,
+      "cache": {"read": 13, "write": 14},
+      "total": 999
+    });
+    let events = OpenCodeLiveNormalizer::normalize_line(&format!(
+      r#"{{"type":"step_finish","timestamp":1710000000002,"sessionID":"ses_123","part":{{"id":"prt_step","sessionID":"ses_123","messageID":"msg_2","type":"step-finish","tokens":{tokens}}}}}"#
+    ))
+    .unwrap();
+
+    assert_eq!(events.len(), 1);
+    let LiveSessionEvent::Event(AgentEvent::Usage(usage)) = &events[0] else {
+      panic!("expected live usage event");
+    };
+    assert_eq!(usage.kind, UsageKind::ModelCall);
+    assert_eq!(usage.session_id.as_deref(), Some("ses_123"));
+    assert_eq!(usage.message_id.as_deref(), Some("msg_2"));
+    assert_eq!(usage.step_id.as_deref(), Some("prt_step"));
+    assert_eq!(usage.record_id.as_deref(), Some("prt_step"));
+    assert_eq!(usage.input_tokens, 37);
+    assert_eq!(usage.output_tokens, 11);
+    assert_eq!(usage.cache_read_tokens, Some(13));
+    assert_eq!(usage.cache_write_tokens, Some(14));
+    assert_eq!(usage.reasoning_tokens, Some(12));
+    assert_eq!(usage.total_tokens, Some(999));
+    assert_eq!(usage.native, tokens);
+    assert_eq!(usage.timestamp.as_deref(), Some("1710000000002"));
+  }
+
+  #[test]
+  fn keeps_missing_or_invalid_step_finish_usage_unknown() {
+    for line in [
+      r#"{"type":"step_finish","timestamp":1710000000002,"sessionID":"ses_123","part":{"id":"prt_missing","type":"step-finish"}}"#,
+      r#"{"type":"step_finish","timestamp":1710000000003,"sessionID":"ses_123","part":{"id":"prt_invalid","type":"step-finish","tokens":{"input":-1,"output":2,"reasoning":0,"cache":{"read":0,"write":0}}}}"#,
+    ] {
+      let events = OpenCodeLiveNormalizer::normalize_line(line).unwrap();
+      let LiveSessionEvent::Unknown(event) = &events[0] else {
+        panic!("expected unknown live event");
+      };
+      assert_eq!(event.native_type.as_deref(), Some("step_finish"));
+      assert_eq!(event.session_id.as_deref(), Some("ses_123"));
+      assert!(event.native.is_some());
+    }
   }
 
   #[test]

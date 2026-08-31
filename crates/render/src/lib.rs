@@ -786,6 +786,7 @@ mod tests {
         phase: Phase::Finished,
         text: Some("thinking".to_string()),
         summary: Some("summary".to_string()),
+        redacted: None,
         encrypted_content: Some("ciphertext".to_string()),
         signature: None,
         timestamp: None,

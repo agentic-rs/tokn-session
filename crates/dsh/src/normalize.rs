@@ -422,6 +422,7 @@ impl Normalizer {
       phase,
       text: Some(text),
       summary: None,
+      redacted: None,
       encrypted_content: None,
       signature: None,
       timestamp: time,

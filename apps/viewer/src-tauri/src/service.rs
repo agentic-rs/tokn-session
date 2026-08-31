@@ -7,16 +7,16 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokn_session_client::SessionHeader;
 use tokn_session_core::{
-  AgentEvent, LifecycleOutcome, LoadedSession, Phase, Provider, Role, ToolCallEvent, ToolKind, ToolSummary,
+  AgentEvent, LifecycleOutcome, LoadedSession, Phase, Provider, Role, ToolCallEvent, ToolKind, ToolSummary, UsageKind,
 };
 use tokn_session_render::render_event_summary;
 
 use crate::model::{
   EventDetail, EventPage, EventPageRequest, EventSummary, ListSessionsRequest, ListSessionsResponse,
-  LoadEventDetailRequest, PageDirection, SessionLocator, SessionSummary, SourceError, ToolCardSummary,
-  ToolOutputPreview, ToolOutputSection, ViewerProvider, bounded_limit, decode_event_cursor, decode_event_key,
-  decode_list_cursor, decode_session_key, encode_event_cursor, encode_event_key, encode_list_cursor,
-  encode_session_key, parse_updated_at_ms, requested_offset,
+  LoadEventDetailRequest, PageDirection, ReasoningCardSummary, SessionLocator, SessionSummary, SourceError,
+  ToolCardSummary, ToolOutputPreview, ToolOutputSection, UsageCardSummary, ViewerProvider, bounded_limit,
+  decode_event_cursor, decode_event_key, decode_list_cursor, decode_session_key, encode_event_cursor, encode_event_key,
+  encode_list_cursor, encode_session_key, parse_updated_at_ms, requested_offset,
 };
 use crate::repository::{NativeRepository, ViewerRepository};
 
@@ -24,6 +24,7 @@ const MAX_DETAIL_VALUE_BYTES: usize = 512 * 1024;
 const MAX_MESSAGE_SUMMARY_CHARS: usize = 16 * 1024;
 const MAX_SESSION_PREVIEW_CHARS: usize = 240;
 const MAX_SESSION_TITLE_CHARS: usize = 160;
+const MAX_REASONING_CARD_PREVIEW_CHARS: usize = 240;
 const MAX_TECHNICAL_SUMMARY_CHARS: usize = 500;
 const MAX_TOOL_CARD_STRING_CHARS: usize = 500;
 const MAX_TOOL_NAME_CHARS: usize = 120;
@@ -303,6 +304,19 @@ impl ViewerService {
         tool_output: None,
       });
     }
+    if matches!(event, AgentEvent::Reasoning(reasoning) if reasoning.redacted == Some(true)) {
+      return Ok(EventDetail {
+        event_key: request.event_key,
+        event: json!({
+          "type": "reasoning",
+          "provider": provider_for_event(event).as_str(),
+          "redacted": true,
+        }),
+        native: None,
+        is_hidden: false,
+        tool_output: None,
+      });
+    }
 
     let native = native_detail(event)
       .map(|value| bounded_detail_value(value, "provider_native"))
@@ -497,7 +511,12 @@ fn matches_search(session: &SessionSummary, search: Option<&str>) -> bool {
 }
 
 fn normalize_session_text(value: Option<String>, max_chars: usize) -> Option<String> {
-  let value = value?;
+  value
+    .as_deref()
+    .and_then(|value| normalize_one_line_text(value, max_chars))
+}
+
+fn normalize_one_line_text(value: &str, max_chars: usize) -> Option<String> {
   let mut normalized = String::with_capacity(value.len().min(max_chars.saturating_mul(4)));
   let mut characters = value.chars().peekable();
   let mut normalized_chars = 0;
@@ -598,24 +617,21 @@ fn event_summary(events: &[AgentEvent], index: usize, event: &AgentEvent) -> Eve
   } else {
     truncate(event_title(event), 120)
   };
+  let reasoning = (!hidden).then(|| reasoning_card_summary(event)).flatten();
   let summary = if hidden {
     render_event_summary(event)
   } else {
     match event {
       AgentEvent::Message(message) => message.text.clone(),
-      AgentEvent::Reasoning(reasoning) => reasoning
-        .summary
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
-        .or_else(|| {
-          reasoning
-            .text
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_owned)
+      AgentEvent::Reasoning(_) => reasoning
+        .as_ref()
+        .and_then(|card| {
+          card
+            .is_redacted
+            .then_some("Reasoning redacted by provider".to_string())
+            .or_else(|| card.preview.clone())
         })
-        .unwrap_or_else(|| render_event_summary(event)),
+        .unwrap_or_else(|| "Reasoning".to_string()),
       _ => render_event_summary(event),
     }
   };
@@ -628,6 +644,7 @@ fn event_summary(events: &[AgentEvent], index: usize, event: &AgentEvent) -> Eve
   let tool = (!hidden)
     .then(|| tool_event(event).map(|tool| enriched_tool_card_summary(events, index, tool)))
     .flatten();
+  let usage = (!hidden).then(|| usage_card_summary(event)).flatten();
   EventSummary {
     event_key: encode_event_key(index),
     event_type: normalized_event_type(event).to_string(),
@@ -641,7 +658,62 @@ fn event_summary(events: &[AgentEvent], index: usize, event: &AgentEvent) -> Eve
     is_hidden: hidden,
     is_error: correlated_error(events, index, event),
     tool,
+    usage,
+    reasoning,
   }
+}
+
+fn usage_card_summary(event: &AgentEvent) -> Option<UsageCardSummary> {
+  let AgentEvent::Usage(usage) = event else {
+    return None;
+  };
+
+  Some(UsageCardSummary {
+    kind: usage_kind_label(usage.kind).to_string(),
+    input_tokens: usage.input_tokens.to_string(),
+    output_tokens: usage.output_tokens.to_string(),
+    total_tokens: usage.total_tokens.map(|value| value.to_string()),
+    cache_read_tokens: usage.cache_read_tokens.map(|value| value.to_string()),
+    cache_write_tokens: usage.cache_write_tokens.map(|value| value.to_string()),
+    reasoning_tokens: usage.reasoning_tokens.map(|value| value.to_string()),
+    turn_id: present_string(usage.turn_id.as_deref()).map(str::to_string),
+    step_id: present_string(usage.step_id.as_deref()).map(str::to_string),
+  })
+}
+
+fn usage_kind_label(kind: UsageKind) -> &'static str {
+  match kind {
+    UsageKind::ModelCall => "model_call",
+    UsageKind::OperationTotal => "operation_total",
+    UsageKind::SessionSnapshot => "session_snapshot",
+  }
+}
+
+fn reasoning_card_summary(event: &AgentEvent) -> Option<ReasoningCardSummary> {
+  let AgentEvent::Reasoning(reasoning) = event else {
+    return None;
+  };
+
+  let summary_preview = reasoning
+    .summary
+    .as_deref()
+    .and_then(|value| normalize_one_line_text(value, MAX_REASONING_CARD_PREVIEW_CHARS));
+  let text_preview = reasoning
+    .text
+    .as_deref()
+    .and_then(|value| normalize_one_line_text(value, MAX_REASONING_CARD_PREVIEW_CHARS));
+  let is_redacted = reasoning.redacted == Some(true);
+  let has_summary = reasoning.summary.is_some();
+  let has_text = reasoning.text.is_some();
+  let preview = (!is_redacted).then(|| summary_preview.or(text_preview)).flatten();
+
+  Some(ReasoningCardSummary {
+    preview,
+    has_summary,
+    has_text,
+    has_encrypted_content: reasoning.encrypted_content.is_some(),
+    is_redacted,
+  })
 }
 
 fn enriched_tool_card_summary(events: &[AgentEvent], index: usize, event: &ToolCallEvent) -> ToolCardSummary {
@@ -1420,7 +1492,7 @@ mod tests {
   use serde_json::json;
   use tokn_session_core::{
     ErrorEvent, MessageDelivery, MessageEvent, MessageProvenance, Phase, ReasoningEvent, SessionHistoryStatus,
-    SessionRef, ToolCallEvent, ToolKind, UnknownEvent,
+    SessionRef, ToolCallEvent, ToolKind, UnknownEvent, UsageEvent, UsageKind,
   };
 
   use super::*;
@@ -2366,7 +2438,7 @@ mod tests {
   }
 
   #[test]
-  fn reasoning_summaries_preserve_multiline_markdown() {
+  fn reasoning_summaries_keep_only_the_safe_card_preview() {
     let markdown = "## Approach\n\n- inspect the source\n- verify the result\n";
     let event = AgentEvent::Reasoning(ReasoningEvent {
       provenance: None,
@@ -2377,14 +2449,193 @@ mod tests {
       phase: Phase::Finished,
       text: Some("Longer private reasoning".to_string()),
       summary: Some(markdown.to_string()),
+      redacted: None,
       encrypted_content: None,
       signature: None,
       timestamp: None,
     });
     let summary = event_summary(std::slice::from_ref(&event), 0, &event);
 
-    assert_eq!(summary.summary, markdown);
+    assert_eq!(summary.summary, "## Approach - inspect the source - verify the result");
     assert!(!summary.summary_truncated);
+    assert_eq!(
+      summary.reasoning.as_ref().and_then(|card| card.preview.as_deref()),
+      Some(summary.summary.as_str())
+    );
+    assert!(
+      !serde_json::to_string(&summary)
+        .unwrap()
+        .contains("Longer private reasoning")
+    );
+  }
+
+  #[test]
+  fn usage_cards_preserve_scopes_optional_values_and_u64_precision() {
+    let mut model_call = usage_event(UsageKind::ModelCall, Provider::Codex);
+    let AgentEvent::Usage(model_call_usage) = &mut model_call else {
+      panic!("fixture must be a usage event");
+    };
+    model_call_usage.input_tokens = u64::MAX;
+    model_call_usage.output_tokens = 0;
+    model_call_usage.total_tokens = None;
+    model_call_usage.cache_read_tokens = Some(0);
+    model_call_usage.cache_write_tokens = None;
+    model_call_usage.reasoning_tokens = Some(u64::MAX);
+    model_call_usage.turn_id = Some("turn-1".to_string());
+    model_call_usage.step_id = Some("step-1".to_string());
+
+    let mut operation_total = usage_event(UsageKind::OperationTotal, Provider::OpenCode);
+    let AgentEvent::Usage(operation_total_usage) = &mut operation_total else {
+      panic!("fixture must be a usage event");
+    };
+    operation_total_usage.input_tokens = 7;
+    operation_total_usage.output_tokens = 11;
+    operation_total_usage.total_tokens = Some(19);
+    operation_total_usage.cache_read_tokens = Some(3);
+    operation_total_usage.cache_write_tokens = Some(5);
+    operation_total_usage.reasoning_tokens = Some(0);
+    operation_total_usage.turn_id = Some("  ".to_string());
+    operation_total_usage.step_id = None;
+
+    let mut session_snapshot = usage_event(UsageKind::SessionSnapshot, Provider::Dsh);
+    let AgentEvent::Usage(session_snapshot_usage) = &mut session_snapshot else {
+      panic!("fixture must be a usage event");
+    };
+    session_snapshot_usage.input_tokens = 0;
+    session_snapshot_usage.output_tokens = 0;
+    session_snapshot_usage.total_tokens = Some(0);
+
+    let events = vec![model_call, operation_total, session_snapshot];
+    let summaries: Vec<EventSummary> = events
+      .iter()
+      .enumerate()
+      .map(|(index, event)| event_summary(&events, index, event))
+      .collect();
+
+    let model_call = summaries[0].usage.as_ref().expect("model-call card");
+    assert_eq!(model_call.kind, "model_call");
+    assert_eq!(model_call.input_tokens, u64::MAX.to_string());
+    assert_eq!(model_call.output_tokens, "0");
+    assert_eq!(model_call.total_tokens, None);
+    assert_eq!(model_call.cache_read_tokens.as_deref(), Some("0"));
+    assert_eq!(model_call.cache_write_tokens, None);
+    assert_eq!(model_call.reasoning_tokens, Some(u64::MAX.to_string()));
+    assert_eq!(model_call.turn_id.as_deref(), Some("turn-1"));
+    assert_eq!(model_call.step_id.as_deref(), Some("step-1"));
+
+    let operation_total = summaries[1].usage.as_ref().expect("operation-total card");
+    assert_eq!(operation_total.kind, "operation_total");
+    assert_eq!(operation_total.total_tokens.as_deref(), Some("19"));
+    assert_eq!(operation_total.cache_read_tokens.as_deref(), Some("3"));
+    assert_eq!(operation_total.cache_write_tokens.as_deref(), Some("5"));
+    assert_eq!(operation_total.reasoning_tokens.as_deref(), Some("0"));
+    assert_eq!(operation_total.turn_id, None);
+    assert_eq!(operation_total.step_id, None);
+
+    let session_snapshot = summaries[2].usage.as_ref().expect("session-snapshot card");
+    assert_eq!(session_snapshot.kind, "session_snapshot");
+    assert_eq!(session_snapshot.input_tokens, "0");
+    assert_eq!(session_snapshot.output_tokens, "0");
+    assert_eq!(session_snapshot.total_tokens.as_deref(), Some("0"));
+
+    let serialized = serde_json::to_value(&summaries[0]).unwrap();
+    assert!(serialized["usage"]["input_tokens"].is_string());
+    assert_eq!(serialized["usage"]["input_tokens"], u64::MAX.to_string());
+    assert!(serialized["usage"]["total_tokens"].is_null());
+    assert_eq!(serialized["usage"]["cache_read_tokens"], "0");
+  }
+
+  #[test]
+  fn reasoning_cards_classify_safe_content_and_redaction() {
+    let events = vec![
+      reasoning_event(
+        Some("Summary\nwith \u{001b}[31mcolor\u{001b}[0m"),
+        Some("Detailed reasoning"),
+        Some("encrypted-secret"),
+        Some("signature-secret"),
+        None,
+      ),
+      reasoning_event(None, Some("Text-only reasoning"), None, None, None),
+      reasoning_event(None, None, Some("ciphertext-secret"), Some("signature-secret"), None),
+      reasoning_event(
+        Some("redacted-summary-secret"),
+        Some("redacted-text-secret"),
+        Some("redacted-ciphertext-secret"),
+        Some("redacted-signature-secret"),
+        Some(true),
+      ),
+    ];
+    let summaries: Vec<EventSummary> = events
+      .iter()
+      .enumerate()
+      .map(|(index, event)| event_summary(&events, index, event))
+      .collect();
+
+    let rich = summaries[0].reasoning.as_ref().expect("reasoning card");
+    assert_eq!(rich.preview.as_deref(), Some("Summary with color"));
+    assert!(rich.has_summary);
+    assert!(rich.has_text);
+    assert!(rich.has_encrypted_content);
+    assert!(!rich.is_redacted);
+    let rich_json = serde_json::to_string(&summaries[0]).unwrap();
+    assert!(!rich_json.contains("encrypted-secret"));
+    assert!(!rich_json.contains("signature-secret"));
+
+    let text_only = summaries[1].reasoning.as_ref().expect("text-only reasoning card");
+    assert_eq!(text_only.preview.as_deref(), Some("Text-only reasoning"));
+    assert!(!text_only.has_summary);
+    assert!(text_only.has_text);
+    assert!(!text_only.has_encrypted_content);
+    assert!(!text_only.is_redacted);
+
+    let encrypted = summaries[2].reasoning.as_ref().expect("encrypted reasoning card");
+    assert_eq!(encrypted.preview, None);
+    assert!(!encrypted.has_summary);
+    assert!(!encrypted.has_text);
+    assert!(encrypted.has_encrypted_content);
+    assert!(!encrypted.is_redacted);
+    let encrypted_json = serde_json::to_string(&summaries[2]).unwrap();
+    assert!(!encrypted_json.contains("ciphertext-secret"));
+    assert!(!encrypted_json.contains("signature-secret"));
+
+    let redacted = summaries[3].reasoning.as_ref().expect("redacted reasoning card");
+    assert_eq!(redacted.preview, None);
+    assert!(redacted.has_summary);
+    assert!(redacted.has_text);
+    assert!(redacted.has_encrypted_content);
+    assert!(redacted.is_redacted);
+    let redacted_json = serde_json::to_string(&summaries[3]).unwrap();
+    assert!(!redacted_json.contains("redacted-summary-secret"));
+    assert!(!redacted_json.contains("redacted-text-secret"));
+    assert!(!redacted_json.contains("redacted-ciphertext-secret"));
+    assert!(!redacted_json.contains("redacted-signature-secret"));
+  }
+
+  #[test]
+  fn reasoning_card_previews_are_single_line_and_bounded() {
+    let event = reasoning_event(
+      Some(&format!(
+        "\u{001b}[31mFirst\nsecond\u{202e} {}",
+        "x".repeat(MAX_REASONING_CARD_PREVIEW_CHARS)
+      )),
+      None,
+      None,
+      None,
+      None,
+    );
+    let summary = event_summary(std::slice::from_ref(&event), 0, &event);
+    let preview = summary
+      .reasoning
+      .as_ref()
+      .and_then(|reasoning| reasoning.preview.as_deref())
+      .expect("safe preview");
+
+    assert_eq!(preview.chars().count(), MAX_REASONING_CARD_PREVIEW_CHARS);
+    assert!(preview.starts_with("First second "));
+    assert!(preview.ends_with('\u{2026}'));
+    assert!(!preview.contains('\n'));
+    assert!(!preview.contains('\u{001b}'));
+    assert!(!preview.contains('\u{202e}'));
   }
 
   #[test]
@@ -2530,6 +2781,51 @@ mod tests {
   }
 
   #[test]
+  fn redacted_reasoning_details_never_expose_readable_or_native_payloads() {
+    let event = AgentEvent::Reasoning(ReasoningEvent {
+      provenance: Some(MessageProvenance {
+        source: json!({"kind": "fixture"}),
+        display: None,
+        native: Some(json!({"native-secret": "provider-withheld native"})),
+        surface_op: None,
+        source_event_seqs: None,
+      }),
+      provider: Provider::Pi,
+      session_id: Some("fixture".to_string()),
+      message_id: Some("reasoning".to_string()),
+      parent_id: None,
+      phase: Phase::Finished,
+      text: Some("provider-withheld text".to_string()),
+      summary: Some("provider-withheld summary".to_string()),
+      redacted: Some(true),
+      encrypted_content: Some("provider-withheld encrypted content".to_string()),
+      signature: Some("provider-withheld signature".to_string()),
+      timestamp: None,
+    });
+    let detail = service_with_session(loaded_session(vec![event]))
+      .load_event_detail(LoadEventDetailRequest {
+        session_key: key_for("fixture"),
+        event_key: encode_event_key(0),
+      })
+      .unwrap();
+
+    let serialized = serde_json::to_string(&detail).unwrap();
+    assert!(!detail.is_hidden);
+    assert_eq!(detail.event["type"], "reasoning");
+    assert_eq!(detail.event["redacted"], true);
+    assert!(detail.native.is_none());
+    for secret in [
+      "provider-withheld text",
+      "provider-withheld summary",
+      "provider-withheld encrypted content",
+      "provider-withheld signature",
+      "provider-withheld native",
+    ] {
+      assert!(!serialized.contains(secret));
+    }
+  }
+
+  #[test]
   fn non_hidden_detail_separates_native_from_normalized_data() {
     let event = AgentEvent::Unknown(UnknownEvent {
       provider: Provider::Codex,
@@ -2632,6 +2928,49 @@ mod tests {
       delivery: MessageDelivery::Final,
       phase: Phase::Finished,
       text: text.to_string(),
+      timestamp: None,
+    })
+  }
+
+  fn usage_event(kind: UsageKind, provider: Provider) -> AgentEvent {
+    AgentEvent::Usage(UsageEvent {
+      kind,
+      provider,
+      session_id: Some("fixture".to_string()),
+      turn_id: None,
+      step_id: None,
+      message_id: None,
+      record_id: None,
+      input_tokens: 0,
+      output_tokens: 0,
+      total_tokens: None,
+      cache_read_tokens: None,
+      cache_write_tokens: None,
+      reasoning_tokens: None,
+      native: json!({}),
+      timestamp: None,
+    })
+  }
+
+  fn reasoning_event(
+    summary: Option<&str>,
+    text: Option<&str>,
+    encrypted_content: Option<&str>,
+    signature: Option<&str>,
+    redacted: Option<bool>,
+  ) -> AgentEvent {
+    AgentEvent::Reasoning(ReasoningEvent {
+      provenance: None,
+      provider: Provider::Pi,
+      session_id: Some("fixture".to_string()),
+      message_id: Some("reasoning".to_string()),
+      parent_id: None,
+      phase: Phase::Finished,
+      text: text.map(str::to_string),
+      summary: summary.map(str::to_string),
+      redacted,
+      encrypted_content: encrypted_content.map(str::to_string),
+      signature: signature.map(str::to_string),
       timestamp: None,
     })
   }
