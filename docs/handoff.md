@@ -23,6 +23,7 @@ cd apps/discord-pet && bun run login
 cd apps/discord-pet && bun run start
 cd apps/pet && bun run start
 cd apps/terminal-pet && bun run start
+cd apps/viewer && pnpm tauri dev
 ```
 
 The old `tokn-session sessions list/show` shape is intentionally unsupported.
@@ -259,9 +260,42 @@ strict TypeScript and Bun tests. The checked-in Hachiware frames are explicitly
 prototype-only fan art and must be replaced before publishing or distributing
 the project.
 
+## Desktop Session Viewer
+
+`apps/viewer` is a read-only Tauri 2/React desktop viewer for historical Pi,
+Codex, OpenCode, and DSH sessions. It aggregates root sessions into one
+searchable, provider-filterable sidebar, renders normalized events as a
+conversation, and keeps reasoning, tools, metadata, errors, and unknown events
+inspectable without adding a message composer. A failure in one provider is
+reported without preventing the other providers from loading.
+
+The Tauri backend calls `tokn-session-client`, `tokn-session-core`, and
+`tokn-session-render` directly from async commands; it does not parse CLI
+output or depend on Relay. The frontend receives source-neutral snake-case
+DTOs with opaque, source-aware session keys. Session and event pages keep IPC
+responses bounded, while expanded native event detail is fetched lazily and
+hidden Pi content stays redacted. Sidebar discovery uses
+`AgentClient::list_session_headers`, which reads file headers or OpenCode
+catalog rows without computing conversation counts; the selected session's
+normalized `total_events` arrives with its first event page. The existing CLI
+continues to use the counted `list_sessions` API.
+
+Event paging currently bounds the data sent across IPC, not all source-reader
+memory: a provider parser may still load the full selected session before
+producing a page. A one-entry normalized-session cache avoids reparsing between
+page and inspector requests and invalidates on source revision changes,
+including OpenCode's SQLite WAL/SHM sidecars. Live filesystem invalidation and
+authoritative incremental parsing are follow-up work. Each normalized and
+provider-native inspector representation is capped at 512 KiB before IPC;
+oversized values are replaced by structured JSON truncation metadata. A full,
+uncapped export path is not implemented yet.
+
 ## Provider Sources
 
-- Pi reads JSONL from `~/.pi/agent/sessions` unless `--session-dir` is passed.
+- Pi session roots resolve in this order: `--session-dir`,
+  `$PI_CODING_AGENT_SESSION_DIR`, `$PI_CODING_AGENT_DIR/sessions`, then the
+  platform home directory's `.pi/agent/sessions`. Pi environment overrides
+  expand a leading `~` like the upstream agent.
 - DSH reads `session.jsonl` and `session.jsonl.zstd` recursively from
   `$DSH_HOME/sessions` or `~/.dsh/sessions`, with `--session-dir` overriding it.
   `show` accepts paths and exact/unambiguous-prefix IDs; `browse` and tree scope
@@ -269,8 +303,15 @@ the project.
   corrupt/truncated frames, invalid packed runs, and unsupported format versions
   are reported, never repaired. This is historical-only; DSH SQLite, relay,
   create/append, and input are not implemented.
-- Codex reads JSONL from `~/.codex/sessions` and `~/.codex/archived_sessions` unless `--session-dir` is passed.
-- OpenCode reads SQLite from `~/.local/share/opencode/opencode.db` unless `--session-dir` is passed.
+- Codex reads JSONL from `sessions` and `archived_sessions` below a valid,
+  non-empty `$CODEX_HOME`, falling back to the platform home directory's
+  `.codex`; `--session-dir` still overrides discovery directly.
+- OpenCode uses `--session-dir` first, then `$OPENCODE_DB`; absolute database
+  overrides are used directly and relative overrides resolve below the
+  OpenCode data directory. That data directory is `$XDG_DATA_HOME/opencode`,
+  falling back to the upstream home-directory `.local/share/opencode` path.
+  In-memory databases are rejected because historical discovery requires
+  persisted sessions.
 - OpenCode opens its database with a WAL-aware read-only SQLite URI so active WAL data is visible without application writes; if that cannot open, it falls back to immutable read-only mode. Viewing sessions never runs migrations.
 - OpenCode validates the required `session`, `message`, and `part` tables and columns, then detects optional session columns from the actual SQLite schema.
 - OpenCode accepts schemas both with and without the optional `session.model` column; it never runs migrations against the user database.
@@ -504,11 +545,15 @@ OpenCode has the first live-output normalizer: `OpenCodeLiveNormalizer` parses `
   delivery acknowledgement; subscribers that are disconnected can miss events.
 - The terminal pet cannot distinguish every runtime state authoritatively until
   provider task lifecycle and interaction events are represented in `AgentEvent`.
+- The desktop viewer is historical and read-only. It does not yet refresh when
+  provider storage changes while the app is open.
 
 ## Useful Smokes
 
 GitHub Actions CI runs Rust formatting, workspace check/test, the CLI build,
-and all three Bun app check suites on pushes to `main` and pull requests.
+the pnpm viewer check, and all three Bun app check suites on pushes to `main`
+and pull requests. The Rust job installs Tauri's Linux WebKit/GTK build
+dependencies because the viewer backend is a workspace member.
 
 ```sh
 cargo run -p tokn-session-cli -- list --source codex --limit 1
@@ -523,6 +568,9 @@ cd apps/pet && bun run check
 cd apps/pet && bun run start -- --help
 cd apps/terminal-pet && bun run check
 cd apps/terminal-pet && bun run snapshot
+cd apps/viewer && pnpm install --frozen-lockfile
+cd apps/viewer && pnpm run check
+cd apps/viewer && pnpm tauri dev
 ```
 
 ## Next Likely Work
@@ -531,6 +579,8 @@ cd apps/terminal-pet && bun run snapshot
 - Decide whether live stream consumption should live in `client` as callbacks/iterators or in the CLI command path.
 - Extend provider fixture coverage with OpenCode SQLite normalization.
 - Add CLI golden tests for tiny fixture-backed `list` and `show` outputs.
+- Add live storage invalidation and incremental source paging to the desktop
+  viewer after the historical read-only surface stabilizes.
 - Map Codex lifecycle next and teach terminal pet to use authoritative lifecycle
   instead of heuristics. Pi live boundaries require a bridge feature; do not
   infer them from historical assistant/tool records. OpenCode accounting and

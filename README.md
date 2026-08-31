@@ -1,0 +1,33 @@
+# tokn-session
+
+`tokn-session` is a provider-agnostic session layer for agent tools. It can
+discover and normalize historical sessions from Pi, Codex, OpenCode, and
+DeepSeek Harness (DSH), while preserving provider-native detail needed for
+display and debugging.
+
+The Rust CLI currently supports listing, showing, and browsing sessions, plus
+the initial configurable create/append path. A relay provides normalized live
+events to the terminal and Discord pet applications.
+
+```sh
+cargo run -p tokn-session-cli -- list --source codex --limit 5
+cargo run -p tokn-session-cli -- show --source pi <session-id>
+cargo run -p tokn-session-cli -- browse --source dsh
+```
+
+## Desktop viewer
+
+`apps/viewer` is a read-only Tauri app that presents root sessions from all
+four providers in one searchable interface. It reuses the Rust session crates
+directly rather than parsing CLI output.
+
+```sh
+cd apps/viewer
+pnpm install
+pnpm run check
+pnpm tauri dev
+```
+
+See [apps/viewer/README.md](apps/viewer/README.md) for build instructions and
+architecture, and [docs/handoff.md](docs/handoff.md) for detailed current
+implementation status.

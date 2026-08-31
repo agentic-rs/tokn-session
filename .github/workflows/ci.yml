@@ -18,6 +18,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            wget
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -37,6 +51,32 @@ jobs:
 
       - name: Build CLI
         run: cargo build -p tokn-session-cli
+
+  viewer:
+    name: Session viewer
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/viewer/pnpm-lock.yaml
+
+      - name: Check session viewer
+        working-directory: apps/viewer
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run check
 
   bun-apps:
     name: Bun apps

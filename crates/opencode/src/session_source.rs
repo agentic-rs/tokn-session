@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::normalize::OpenCodeNormalizer;
@@ -5,7 +6,7 @@ use crate::row::{OpenCodeMessageRow, OpenCodePartRow, OpenCodeSessionRow};
 use crate::schema::OpenCodeCapabilities;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use tokn_opencode_protocol::v1::{MessageData, PartData, SessionModel};
-use tokn_session_core::{LoadedSession, SessionHistoryStatus, SessionRef};
+use tokn_session_core::{LoadedSession, SessionHeader, SessionHistoryStatus, SessionRef};
 
 pub struct OpenCodeSessionSource {
   session_dir: Option<PathBuf>,
@@ -18,39 +19,61 @@ impl OpenCodeSessionSource {
 
   pub fn list_sessions(&self) -> Result<Vec<SessionRef>, String> {
     let (connection, _) = self.connect()?;
-    let mut statement = connection
-      .prepare(
-        "select id, parent_id, directory, time_created, time_updated
-         from session
-         order by time_created desc, id desc",
-      )
-      .map_err(|err| format!("failed to prepare opencode session query: {err}"))?;
-    let rows = statement
-      .query_map([], |row| {
-        Ok((
-          row.get::<_, String>(0)?,
-          row.get::<_, Option<String>>(1)?,
-          row.get::<_, Option<String>>(2)?,
-          row.get::<_, Option<i64>>(3)?,
-          row.get::<_, Option<i64>>(4)?,
-        ))
-      })
-      .map_err(|err| format!("failed to query opencode sessions: {err}"))?;
+    self.list_session_refs(&connection, true)
+  }
 
+  /// Lists only catalog metadata. The returned `SessionRef` values carry a
+  /// placeholder `message_count` of zero because relation discovery does not
+  /// query the message table; public metadata consumers should use the
+  /// client's `SessionHeader` API, which omits counts entirely.
+  pub fn list_session_relations(&self) -> Result<Vec<SessionRef>, String> {
+    let (connection, _) = self.connect()?;
+    self.list_session_refs(&connection, false)
+  }
+
+  pub fn list_session_headers(&self) -> Result<Vec<SessionHeader>, String> {
+    let (connection, _) = self.connect()?;
+    let database_path = self.database_path()?;
+    list_session_catalog(&connection)?
+      .into_iter()
+      .map(|row| {
+        let updated_at_ms = row.time_updated.or(row.time_created);
+        Ok(SessionHeader {
+          id: row.id,
+          parent_session_id: row.parent_id,
+          agent_path: None,
+          agent_nickname: None,
+          agent_role: None,
+          path: database_path.clone(),
+          cwd: row.directory,
+          timestamp: timestamp(row.time_created),
+          updated_at: timestamp(updated_at_ms),
+          updated_at_ms,
+        })
+      })
+      .collect()
+  }
+
+  fn list_session_refs(&self, connection: &Connection, include_message_count: bool) -> Result<Vec<SessionRef>, String> {
+    let database_path = self.database_path()?;
     let mut sessions = Vec::new();
-    for row in rows {
-      let (id, parent_id, directory, time_created, time_updated) =
-        row.map_err(|err| format!("failed to read opencode session row: {err}"))?;
-      let message_count = message_count(&connection, &id)?;
+    for row in list_session_catalog(connection)? {
+      let message_count = if include_message_count {
+        message_count(connection, &row.id)?
+      } else {
+        0
+      };
       sessions.push(SessionRef {
-        id,
-        parent_session_id: parent_id,
+        id: row.id,
+        parent_session_id: row.parent_id,
         agent_path: None,
         agent_nickname: None,
         agent_role: None,
-        path: self.database_path()?,
-        cwd: directory,
-        timestamp: timestamp(time_updated.or(time_created)),
+        path: database_path.clone(),
+        cwd: row.directory,
+        // Preserve legacy counted-list output. The metadata-only SessionHeader
+        // API exposes creation and update time separately.
+        timestamp: timestamp(row.time_updated.or(row.time_created)),
         message_count,
       });
     }
@@ -105,7 +128,7 @@ impl OpenCodeSessionSource {
     }
 
     let matches: Vec<_> = self
-      .list_sessions()?
+      .list_session_relations()?
       .into_iter()
       .filter(|session| session.id == id_or_path || session.id.starts_with(id_or_path))
       .collect();
@@ -124,22 +147,87 @@ impl OpenCodeSessionSource {
   }
 
   pub fn database_path(&self) -> Result<PathBuf, String> {
-    if let Some(path) = &self.session_dir {
-      if path.is_dir() {
-        return Ok(path.join("opencode.db"));
-      }
-      return Ok(path.clone());
-    }
-
-    let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
-    Ok(
-      PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("opencode")
-        .join("opencode.db"),
+    resolve_database_path(
+      self.session_dir.clone(),
+      std::env::var_os("OPENCODE_DB"),
+      std::env::var_os("XDG_DATA_HOME"),
+      std::env::var_os("HOME"),
+      std::env::var_os("USERPROFILE"),
     )
   }
+}
+
+struct SessionCatalogRow {
+  id: String,
+  parent_id: Option<String>,
+  directory: Option<String>,
+  time_created: Option<i64>,
+  time_updated: Option<i64>,
+}
+
+fn list_session_catalog(connection: &Connection) -> Result<Vec<SessionCatalogRow>, String> {
+  let mut statement = connection
+    .prepare(
+      "select id, parent_id, directory, time_created, time_updated
+       from session
+       order by time_created desc, id desc",
+    )
+    .map_err(|err| format!("failed to prepare opencode session query: {err}"))?;
+  let rows = statement
+    .query_map([], |row| {
+      Ok(SessionCatalogRow {
+        id: row.get(0)?,
+        parent_id: row.get(1)?,
+        directory: row.get(2)?,
+        time_created: row.get(3)?,
+        time_updated: row.get(4)?,
+      })
+    })
+    .map_err(|err| format!("failed to query opencode sessions: {err}"))?;
+
+  rows
+    .map(|row| row.map_err(|err| format!("failed to read opencode session row: {err}")))
+    .collect()
+}
+
+fn resolve_database_path(
+  explicit: Option<PathBuf>,
+  opencode_db: Option<OsString>,
+  xdg_data_home: Option<OsString>,
+  home: Option<OsString>,
+  user_profile: Option<OsString>,
+) -> Result<PathBuf, String> {
+  if let Some(path) = explicit {
+    return Ok(if path.is_dir() { path.join("opencode.db") } else { path });
+  }
+
+  let opencode_db = non_empty(opencode_db);
+  if opencode_db.as_deref() == Some(std::ffi::OsStr::new(":memory:")) {
+    return Err("OPENCODE_DB=:memory: has no persisted sessions to discover".to_string());
+  }
+  let opencode_db = opencode_db.map(PathBuf::from);
+  if let Some(path) = opencode_db.as_ref().filter(|path| path.is_absolute()) {
+    return Ok(path.clone());
+  }
+
+  let data_root = non_empty(xdg_data_home)
+    .map(PathBuf::from)
+    .or_else(|| {
+      non_empty(home)
+        .or_else(|| non_empty(user_profile))
+        .map(|home| PathBuf::from(home).join(".local").join("share"))
+    })
+    .ok_or_else(|| "set XDG_DATA_HOME, HOME, USERPROFILE, or --session-dir to locate opencode sessions".to_string())?;
+  let data_dir = data_root.join("opencode");
+
+  match opencode_db {
+    Some(path) => Ok(data_dir.join(path)),
+    None => Ok(data_dir.join("opencode.db")),
+  }
+}
+
+fn non_empty(value: Option<OsString>) -> Option<OsString> {
+  value.filter(|value| !value.is_empty())
 }
 
 fn connect_database(path: &Path) -> Result<Connection, String> {
@@ -281,6 +369,8 @@ fn timestamp(value: Option<i64>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+  use std::path::PathBuf;
+
   use rusqlite::{Connection, params};
   use tempfile::tempdir;
   use tokn_opencode_protocol::v1::{MessageItem, PartItem};
@@ -288,7 +378,70 @@ mod tests {
 
   use crate::schema::OpenCodeCapabilities;
 
-  use super::{OpenCodeSessionSource, load_messages, load_session_row};
+  use super::{OpenCodeSessionSource, load_messages, load_session_row, resolve_database_path};
+
+  #[test]
+  fn resolves_persisted_database_paths_with_opencode_precedence() {
+    let directory = tempdir().unwrap();
+    let explicit_directory = directory.path().join("explicit");
+    std::fs::create_dir(&explicit_directory).unwrap();
+    let explicit = resolve_database_path(
+      Some(explicit_directory.clone()),
+      Some(":memory:".into()),
+      None,
+      None,
+      None,
+    )
+    .unwrap();
+    assert_eq!(explicit, explicit_directory.join("opencode.db"));
+
+    let absolute = directory.path().join("custom.db");
+    assert_eq!(
+      resolve_database_path(None, Some(absolute.clone().into_os_string()), None, None, None).unwrap(),
+      absolute,
+    );
+
+    let xdg_root = PathBuf::from("xdg-data");
+    assert_eq!(
+      resolve_database_path(
+        None,
+        Some("custom.db".into()),
+        Some(xdg_root.clone().into_os_string()),
+        Some("ignored-home".into()),
+        None,
+      )
+      .unwrap(),
+      xdg_root.join("opencode/custom.db"),
+    );
+    assert_eq!(
+      resolve_database_path(
+        None,
+        None,
+        Some(xdg_root.clone().into_os_string()),
+        Some("ignored-home".into()),
+        None,
+      )
+      .unwrap(),
+      xdg_root.join("opencode/opencode.db"),
+    );
+
+    assert_eq!(
+      resolve_database_path(None, None, None, Some("home".into()), Some("profile".into())).unwrap(),
+      PathBuf::from("home/.local/share/opencode/opencode.db"),
+    );
+    assert_eq!(
+      resolve_database_path(None, None, None, None, Some("profile".into())).unwrap(),
+      PathBuf::from("profile/.local/share/opencode/opencode.db"),
+    );
+  }
+
+  #[test]
+  fn rejects_in_memory_database_for_persisted_discovery() {
+    let error = resolve_database_path(None, Some(":memory:".into()), Some("xdg-data".into()), None, None).unwrap_err();
+
+    assert!(error.contains(":memory:"));
+    assert!(error.contains("no persisted sessions"));
+  }
 
   #[test]
   fn lists_and_loads_database_without_model_column() {
@@ -347,6 +500,12 @@ mod tests {
     let sessions = source
       .list_sessions()
       .expect("schema without model should remain listable");
+    let relations = source
+      .list_session_relations()
+      .expect("catalog metadata should remain listable without counts");
+    let headers = source
+      .list_session_headers()
+      .expect("catalog headers should keep creation and update time separate");
     let session = source
       .load_session_exact("ses_without_model")
       .expect("schema without model should remain loadable");
@@ -354,6 +513,12 @@ mod tests {
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].id, "ses_without_model");
     assert_eq!(sessions[0].message_count, 1);
+    assert_eq!(relations.len(), 1);
+    assert_eq!(relations[0].id, "ses_without_model");
+    assert_eq!(relations[0].message_count, 0);
+    assert_eq!(headers[0].timestamp.as_deref(), Some("1"));
+    assert_eq!(headers[0].updated_at.as_deref(), Some("2"));
+    assert_eq!(headers[0].updated_at_ms, Some(2));
     assert_eq!(session.reference.id, "ses_without_model");
     assert_eq!(session.reference.cwd.as_deref(), Some("/tmp/without-model"));
     assert!(session.events.iter().any(|event| matches!(

@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -92,10 +93,43 @@ impl CodexSessionSource {
       return Ok(vec![root.clone()]);
     }
 
-    let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
-    let codex_home = PathBuf::from(home).join(".codex");
+    let configured_home = std::env::var_os("CODEX_HOME");
+    let platform_home = dirs::home_dir();
+    let codex_home = resolve_codex_home(configured_home.as_deref(), platform_home.as_deref())?;
     Ok(vec![codex_home.join("sessions"), codex_home.join("archived_sessions")])
   }
+}
+
+fn resolve_codex_home(configured_home: Option<&OsStr>, platform_home: Option<&Path>) -> Result<PathBuf, String> {
+  if let Some(configured_home) = configured_home.filter(|value| !value.is_empty()) {
+    let path = PathBuf::from(configured_home);
+    let metadata = std::fs::metadata(&path).map_err(|err| {
+      if err.kind() == std::io::ErrorKind::NotFound {
+        format!(
+          "CODEX_HOME points to `{}`, but that path does not exist; create the directory, set CODEX_HOME to a valid Codex home, or pass --session-dir",
+          path.display()
+        )
+      } else {
+        format!("failed to inspect CODEX_HOME `{}`: {err}", path.display())
+      }
+    })?;
+
+    if !metadata.is_dir() {
+      return Err(format!(
+        "CODEX_HOME points to `{}`, but that path is not a directory; set CODEX_HOME to a valid Codex home or pass --session-dir",
+        path.display()
+      ));
+    }
+
+    return path
+      .canonicalize()
+      .map_err(|err| format!("failed to canonicalize CODEX_HOME `{}`: {err}", path.display()));
+  }
+
+  let platform_home = platform_home
+    .filter(|path| !path.as_os_str().is_empty())
+    .ok_or_else(|| "could not determine the user home directory; set CODEX_HOME or pass --session-dir".to_string())?;
+  Ok(platform_home.join(".codex"))
 }
 
 fn collect_jsonl_files(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -340,6 +374,72 @@ mod tests {
       })
       .collect();
     assert_eq!(messages, vec!["review this action", "allow"]);
+  }
+
+  #[test]
+  fn explicit_session_directory_bypasses_default_discovery() {
+    let explicit = PathBuf::from("explicit-codex-session-directory");
+    let source = CodexSessionSource::new(Some(explicit.clone()));
+
+    assert_eq!(source.roots().expect("explicit root should resolve"), vec![explicit]);
+  }
+
+  #[test]
+  fn configured_codex_home_precedes_platform_home_and_is_canonicalized() {
+    let configured = fixtures_dir();
+    let platform_home = Path::new("platform-home-must-not-win");
+
+    let resolved = resolve_codex_home(Some(configured.as_os_str()), Some(platform_home))
+      .expect("fixture directory should be a valid CODEX_HOME");
+
+    assert_eq!(
+      resolved,
+      configured.canonicalize().expect("fixtures should canonicalize")
+    );
+  }
+
+  #[test]
+  fn empty_codex_home_uses_cross_platform_home_input() {
+    // This models the Windows profile path that dirs::home_dir obtains from the
+    // platform known-folder API even when HOME is not set.
+    let platform_home = Path::new(r"C:\Users\Alice");
+
+    let resolved = resolve_codex_home(Some(OsStr::new("")), Some(platform_home))
+      .expect("empty CODEX_HOME should be treated as unset");
+
+    assert_eq!(resolved, platform_home.join(".codex"));
+  }
+
+  #[test]
+  fn missing_configured_codex_home_is_actionable() {
+    let missing = fixtures_dir().join("missing-codex-home");
+
+    let error = resolve_codex_home(Some(missing.as_os_str()), Some(Path::new("unused-home")))
+      .expect_err("missing CODEX_HOME should fail");
+
+    assert!(error.contains("CODEX_HOME"));
+    assert!(error.contains("does not exist"));
+    assert!(error.contains("--session-dir"));
+  }
+
+  #[test]
+  fn file_configured_as_codex_home_is_actionable() {
+    let file = fixtures_dir().join("tree_child.jsonl");
+
+    let error = resolve_codex_home(Some(file.as_os_str()), Some(Path::new("unused-home")))
+      .expect_err("a file cannot be CODEX_HOME");
+
+    assert!(error.contains("CODEX_HOME"));
+    assert!(error.contains("not a directory"));
+    assert!(error.contains("--session-dir"));
+  }
+
+  #[test]
+  fn missing_platform_home_has_an_actionable_fallback() {
+    let error = resolve_codex_home(None, None).expect_err("a home is required without CODEX_HOME");
+
+    assert!(error.contains("CODEX_HOME"));
+    assert!(error.contains("--session-dir"));
   }
 
   fn fixtures_dir() -> PathBuf {

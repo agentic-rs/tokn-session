@@ -1,0 +1,124 @@
+export type JsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
+export const PROVIDERS = ["codex", "pi", "opencode", "dsh"] as const;
+
+export type ViewerProvider = (typeof PROVIDERS)[number];
+
+export type EventType =
+  | "session_started"
+  | "provider_changed"
+  | "session_settings_applied"
+  | "message"
+  | "reasoning"
+  | "goal_updated"
+  | "agent_activity"
+  | "tool_call"
+  | "lifecycle"
+  | "usage"
+  | "metadata"
+  | "error"
+  | "unknown";
+
+export type EventPhase = "started" | "delta" | "updated" | "finished";
+export type MessageRole = "user" | "assistant" | "system" | "tool" | "unknown";
+
+export type SessionHistoryStatus =
+  | "complete"
+  | "filtered_subagent"
+  | "subagent_body_unavailable";
+
+export interface SessionSummary {
+  session_key: string;
+  session_id: string;
+  parent_session_id: string | null;
+  provider: ViewerProvider;
+  title: string;
+  project: string | null;
+  cwd: string | null;
+  updated_at_ms: number | null;
+  timestamp: string | null;
+  agent_path: string | null;
+  /** Null for metadata-only listings; event pages provide total_events. */
+  message_count: number | null;
+  event_count: number | null;
+  history_status: SessionHistoryStatus | null;
+}
+
+export interface SessionListQuery {
+  providers?: ViewerProvider[];
+  search?: string;
+}
+
+export interface ListSessionsRequest {
+  query: SessionListQuery;
+  cursor?: string;
+  offset?: number;
+  limit?: number;
+}
+
+export interface SourceError {
+  provider: ViewerProvider;
+  message: string;
+}
+
+export interface ListSessionsResponse {
+  sessions: SessionSummary[];
+  next_cursor: string | null;
+  source_errors: SourceError[];
+}
+
+export interface EventSummary {
+  event_key: string;
+  type: EventType | string;
+  provider: ViewerProvider;
+  timestamp: string | null;
+  phase: EventPhase | string | null;
+  role: MessageRole | string | null;
+  title: string;
+  summary: string;
+  summary_truncated: boolean;
+  is_hidden: boolean;
+  is_error: boolean | null;
+}
+
+export type EventPageDirection = "forward" | "backward";
+
+export interface LoadEventPageRequest {
+  session_key: string;
+  cursor?: string;
+  offset?: number;
+  direction?: EventPageDirection;
+  limit?: number;
+}
+
+export interface EventPageResponse {
+  events: EventSummary[];
+  next_cursor: string | null;
+  previous_cursor: string | null;
+  total_events: number;
+  history_status: SessionHistoryStatus;
+}
+
+export interface LoadEventDetailRequest {
+  session_key: string;
+  event_key: string;
+}
+
+export interface EventDetail {
+  event_key: string;
+  event: JsonValue;
+  native: JsonValue | null;
+  is_hidden: boolean;
+}
+
+export interface AsyncState<T> {
+  data: T;
+  error: string | null;
+  is_loading: boolean;
+}

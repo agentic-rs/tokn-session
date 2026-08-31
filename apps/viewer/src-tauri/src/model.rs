@@ -1,0 +1,349 @@
+use std::path::PathBuf;
+
+use chrono::DateTime;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokn_session_client::Source;
+use tokn_session_core::SessionHistoryStatus;
+
+pub const DEFAULT_PAGE_LIMIT: usize = 50;
+pub const MAX_PAGE_LIMIT: usize = 200;
+const MAX_SESSION_KEY_BYTES: usize = 64 * 1024;
+const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewerProvider {
+  Codex,
+  Pi,
+  OpenCode,
+  Dsh,
+}
+
+impl ViewerProvider {
+  pub const ALL: [Self; 4] = [Self::Codex, Self::Pi, Self::OpenCode, Self::Dsh];
+
+  pub fn as_str(self) -> &'static str {
+    match self {
+      Self::Codex => "codex",
+      Self::Pi => "pi",
+      Self::OpenCode => "opencode",
+      Self::Dsh => "dsh",
+    }
+  }
+
+  pub fn source(self) -> Source {
+    match self {
+      Self::Codex => Source::Codex,
+      Self::Pi => Source::Pi,
+      Self::OpenCode => Source::OpenCode,
+      Self::Dsh => Source::Dsh,
+    }
+  }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct SessionQuery {
+  #[serde(default)]
+  pub providers: Vec<ViewerProvider>,
+  pub search: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ListSessionsRequest {
+  #[serde(default)]
+  pub query: SessionQuery,
+  pub cursor: Option<String>,
+  pub offset: Option<usize>,
+  pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListSessionsResponse {
+  pub sessions: Vec<SessionSummary>,
+  pub next_cursor: Option<String>,
+  pub source_errors: Vec<SourceError>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SourceError {
+  pub provider: ViewerProvider,
+  pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionSummary {
+  pub session_key: String,
+  pub session_id: String,
+  pub provider: ViewerProvider,
+  pub title: String,
+  pub project: Option<String>,
+  pub cwd: Option<String>,
+  pub updated_at_ms: Option<i64>,
+  pub timestamp: Option<String>,
+  pub parent_session_id: Option<String>,
+  pub agent_path: Option<String>,
+  /// Unknown for metadata-only listings. Loading an event page returns the
+  /// authoritative normalized event count for the selected session.
+  pub message_count: Option<usize>,
+  pub event_count: Option<usize>,
+  pub history_status: Option<HistoryStatus>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryStatus {
+  Complete,
+  FilteredSubagent,
+  SubagentBodyUnavailable,
+}
+
+impl From<SessionHistoryStatus> for HistoryStatus {
+  fn from(value: SessionHistoryStatus) -> Self {
+    match value {
+      SessionHistoryStatus::Complete => Self::Complete,
+      SessionHistoryStatus::FilteredSubagent => Self::FilteredSubagent,
+      SessionHistoryStatus::SubagentBodyUnavailable => Self::SubagentBodyUnavailable,
+    }
+  }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PageDirection {
+  #[default]
+  Forward,
+  Backward,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct EventPageRequest {
+  pub session_key: String,
+  pub cursor: Option<String>,
+  pub offset: Option<usize>,
+  #[serde(default)]
+  pub direction: PageDirection,
+  pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EventPage {
+  pub events: Vec<EventSummary>,
+  pub next_cursor: Option<String>,
+  pub previous_cursor: Option<String>,
+  pub total_events: usize,
+  pub history_status: HistoryStatus,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EventSummary {
+  pub event_key: String,
+  #[serde(rename = "type")]
+  pub event_type: String,
+  pub provider: ViewerProvider,
+  pub timestamp: Option<String>,
+  pub phase: Option<String>,
+  pub role: Option<String>,
+  pub title: String,
+  pub summary: String,
+  pub summary_truncated: bool,
+  pub is_hidden: bool,
+  pub is_error: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct LoadEventDetailRequest {
+  pub session_key: String,
+  pub event_key: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EventDetail {
+  pub event_key: String,
+  pub event: Value,
+  pub native: Option<Value>,
+  pub is_hidden: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct SessionLocator {
+  pub version: u8,
+  pub provider: ViewerProvider,
+  pub session_id: String,
+  pub source_path: PathBuf,
+}
+
+pub(crate) fn encode_session_key(locator: &SessionLocator) -> Result<String, String> {
+  let bytes = serde_json::to_vec(locator).map_err(|error| format!("failed to encode session key: {error}"))?;
+  if bytes.len() > MAX_SESSION_KEY_BYTES {
+    return Err("session source identity is too large".to_string());
+  }
+  Ok(format!("session.v1.{}", hex_encode(&bytes)))
+}
+
+pub(crate) fn decode_session_key(key: &str) -> Result<SessionLocator, String> {
+  let encoded = key
+    .strip_prefix("session.v1.")
+    .ok_or_else(|| "unsupported session key".to_string())?;
+  let bytes = hex_decode(encoded)?;
+  let locator: SessionLocator =
+    serde_json::from_slice(&bytes).map_err(|_| "invalid session key payload".to_string())?;
+  if locator.version != 1 || locator.session_id.is_empty() || locator.source_path.as_os_str().is_empty() {
+    return Err("invalid session key payload".to_string());
+  }
+  Ok(locator)
+}
+
+pub(crate) fn encode_list_cursor(offset: usize) -> String {
+  format!("sessions.v1.{offset:x}")
+}
+
+pub(crate) fn decode_list_cursor(cursor: &str) -> Result<usize, String> {
+  decode_cursor(cursor, "sessions.v1.")
+}
+
+pub(crate) fn encode_event_cursor(offset: usize) -> String {
+  format!("events.v1.{offset:x}")
+}
+
+pub(crate) fn decode_event_cursor(cursor: &str) -> Result<usize, String> {
+  decode_cursor(cursor, "events.v1.")
+}
+
+pub(crate) fn encode_event_key(index: usize) -> String {
+  format!("event.v1.{index:x}")
+}
+
+pub(crate) fn decode_event_key(key: &str) -> Result<usize, String> {
+  decode_cursor(key, "event.v1.")
+}
+
+pub(crate) fn bounded_limit(limit: Option<usize>) -> Result<usize, String> {
+  let limit = limit.unwrap_or(DEFAULT_PAGE_LIMIT);
+  if limit == 0 {
+    return Err("limit must be greater than zero".to_string());
+  }
+  Ok(limit.min(MAX_PAGE_LIMIT))
+}
+
+pub(crate) fn requested_offset(
+  cursor: Option<&str>,
+  offset: Option<usize>,
+  decode: fn(&str) -> Result<usize, String>,
+) -> Result<Option<usize>, String> {
+  match (cursor, offset) {
+    (Some(_), Some(_)) => Err("cursor and offset cannot be used together".to_string()),
+    (Some(cursor), None) => decode(cursor).map(Some),
+    (None, offset) => Ok(offset),
+  }
+}
+
+pub(crate) fn parse_updated_at_ms(timestamp: Option<&str>) -> Option<i64> {
+  let timestamp = timestamp?.trim();
+  if timestamp.is_empty() {
+    return None;
+  }
+  timestamp
+    .parse::<i64>()
+    .ok()
+    .or_else(|| {
+      DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|value| value.timestamp_millis())
+    })
+    .filter(|value| (-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(value))
+}
+
+fn decode_cursor(cursor: &str, prefix: &str) -> Result<usize, String> {
+  let encoded = cursor
+    .strip_prefix(prefix)
+    .filter(|value| !value.is_empty())
+    .ok_or_else(|| "invalid pagination cursor".to_string())?;
+  usize::from_str_radix(encoded, 16).map_err(|_| "invalid pagination cursor".to_string())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+  const HEX: &[u8; 16] = b"0123456789abcdef";
+  let mut encoded = String::with_capacity(bytes.len() * 2);
+  for byte in bytes {
+    encoded.push(HEX[(byte >> 4) as usize] as char);
+    encoded.push(HEX[(byte & 0x0f) as usize] as char);
+  }
+  encoded
+}
+
+fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
+  if value.len() & 1 == 1 || value.len() / 2 > MAX_SESSION_KEY_BYTES {
+    return Err("invalid session key encoding".to_string());
+  }
+  value
+    .as_bytes()
+    .chunks_exact(2)
+    .map(|pair| {
+      let high = hex_nibble(pair[0]).ok_or_else(|| "invalid session key encoding".to_string())?;
+      let low = hex_nibble(pair[1]).ok_or_else(|| "invalid session key encoding".to_string())?;
+      Ok(high << 4 | low)
+    })
+    .collect()
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+  match value {
+    b'0'..=b'9' => Some(value - b'0'),
+    b'a'..=b'f' => Some(value - b'a' + 10),
+    b'A'..=b'F' => Some(value - b'A' + 10),
+    _ => None,
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn session_keys_round_trip_source_identity() {
+    let locator = SessionLocator {
+      version: 1,
+      provider: ViewerProvider::OpenCode,
+      session_id: "session/a".to_string(),
+      source_path: PathBuf::from("/stores/one/opencode.db"),
+    };
+
+    let key = encode_session_key(&locator).expect("key should encode");
+
+    assert!(!key.contains("session/a"));
+    assert_eq!(decode_session_key(&key).unwrap(), locator);
+  }
+
+  #[test]
+  fn keys_reject_unknown_versions_and_malformed_payloads() {
+    assert!(decode_session_key("session.v2.00").is_err());
+    assert!(decode_session_key("session.v1.not-hex").is_err());
+
+    let locator = SessionLocator {
+      version: 2,
+      provider: ViewerProvider::Pi,
+      session_id: "session".to_string(),
+      source_path: PathBuf::from("/tmp/session.jsonl"),
+    };
+    assert!(decode_session_key(&encode_session_key(&locator).unwrap()).is_err());
+  }
+
+  #[test]
+  fn timestamps_retain_provider_milliseconds_and_parse_rfc3339() {
+    assert_eq!(parse_updated_at_ms(Some("1787157590000")), Some(1_787_157_590_000));
+    assert_eq!(
+      parse_updated_at_ms(Some("2026-06-04T00:00:00Z")),
+      Some(1_780_531_200_000)
+    );
+    assert_eq!(parse_updated_at_ms(Some("not-a-time")), None);
+    assert_eq!(parse_updated_at_ms(Some("9007199254740992")), None);
+  }
+
+  #[test]
+  fn limit_is_bounded_and_cursor_cannot_mix_with_offset() {
+    assert_eq!(bounded_limit(Some(MAX_PAGE_LIMIT + 1)).unwrap(), MAX_PAGE_LIMIT);
+    assert!(bounded_limit(Some(0)).is_err());
+    assert!(requested_offset(Some("sessions.v1.1"), Some(1), decode_list_cursor).is_err());
+  }
+}

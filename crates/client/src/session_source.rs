@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokn_session_codex::CodexSessionSource;
-use tokn_session_core::{LoadedSession, LoadedSessionTree, SessionRef};
+use tokn_session_core::{LoadedSession, LoadedSessionTree, SessionHeader, SessionRef};
 use tokn_session_dsh::DshSessionSource;
 use tokn_session_opencode::OpenCodeSessionSource;
 use tokn_session_pi::PiSessionSource;
@@ -17,6 +18,24 @@ pub(crate) enum SessionSourceClient {
 }
 
 impl SessionSourceClient {
+  pub(crate) fn list_session_headers(&self) -> Result<Vec<SessionHeader>, String> {
+    let mut headers = match self {
+      Self::Dsh(source) => file_headers(source.list_session_relations()?),
+      Self::Codex(source) => file_headers(source.list_session_relations()?),
+      Self::OpenCode(source) => source.list_session_headers()?,
+      Self::Pi(source) => file_headers(source.list_session_relations()?),
+    };
+    headers.sort_by(|left, right| {
+      right
+        .updated_at_ms
+        .cmp(&left.updated_at_ms)
+        .then_with(|| right.updated_at.cmp(&left.updated_at))
+        .then_with(|| right.timestamp.cmp(&left.timestamp))
+        .then_with(|| right.path.cmp(&left.path))
+    });
+    Ok(headers)
+  }
+
   pub(crate) fn list_sessions(&self) -> Result<Vec<SessionRef>, String> {
     match self {
       Self::Dsh(source) => source.list_sessions(),
@@ -30,7 +49,7 @@ impl SessionSourceClient {
     match self {
       Self::Dsh(source) => source.list_session_relations(),
       Self::Codex(source) => source.list_session_relations(),
-      Self::OpenCode(source) => source.list_sessions(),
+      Self::OpenCode(source) => source.list_session_relations(),
       Self::Pi(source) => source.list_session_relations(),
     }
   }
@@ -109,6 +128,36 @@ impl SessionSourceClient {
       Self::OpenCode(source) => source.load_session_exact(&reference.id),
       Self::Pi(source) => source.load_session_path(&reference.path),
     }
+  }
+}
+
+fn file_headers(references: Vec<SessionRef>) -> Vec<SessionHeader> {
+  references.into_iter().map(file_header).collect()
+}
+
+fn file_header(reference: SessionRef) -> SessionHeader {
+  let updated_at_ms = std::fs::metadata(&reference.path)
+    .ok()
+    .and_then(|metadata| metadata.modified().ok())
+    .and_then(system_time_ms);
+  SessionHeader {
+    id: reference.id,
+    parent_session_id: reference.parent_session_id,
+    agent_path: reference.agent_path,
+    agent_nickname: reference.agent_nickname,
+    agent_role: reference.agent_role,
+    path: reference.path,
+    cwd: reference.cwd,
+    timestamp: reference.timestamp,
+    updated_at: updated_at_ms.map(|value| value.to_string()),
+    updated_at_ms,
+  }
+}
+
+fn system_time_ms(value: SystemTime) -> Option<i64> {
+  match value.duration_since(UNIX_EPOCH) {
+    Ok(duration) => i64::try_from(duration.as_millis()).ok(),
+    Err(error) => i64::try_from(error.duration().as_millis()).ok().map(|value| -value),
   }
 }
 
