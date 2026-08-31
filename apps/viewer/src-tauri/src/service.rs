@@ -624,11 +624,11 @@ fn apply_cached_session_header(
 fn source_revision(locator: &SessionLocator) -> Option<SourceRevision> {
   let mut paths = vec![locator.source_path.clone()];
   if locator.provider == ViewerProvider::OpenCode {
-    for suffix in ["-wal", "-shm"] {
-      let mut sidecar = locator.source_path.as_os_str().to_os_string();
-      sidecar.push(suffix);
-      paths.push(sidecar.into());
-    }
+    // The SHM sidecar is a reader-writable WAL index. It can change during our
+    // own reads without any session content changing, so only track the WAL.
+    let mut wal = locator.source_path.as_os_str().to_os_string();
+    wal.push("-wal");
+    paths.push(wal.into());
   }
 
   let primary = file_revision(&paths[0])?;
@@ -3625,6 +3625,30 @@ mod tests {
       })
       .unwrap();
     assert_eq!(loads.load(Ordering::SeqCst), 2);
+  }
+
+  #[test]
+  fn opencode_source_revisions_ignore_the_transient_shm_index() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("opencode.db");
+    let wal = directory.path().join("opencode.db-wal");
+    let shm = directory.path().join("opencode.db-shm");
+    std::fs::write(&database, b"database").unwrap();
+    std::fs::write(&wal, b"wal").unwrap();
+    std::fs::write(&shm, b"shm").unwrap();
+    let locator = SessionLocator {
+      version: 1,
+      provider: ViewerProvider::OpenCode,
+      session_id: "fixture".to_string(),
+      source_path: database,
+    };
+
+    let revision = source_revision(&locator);
+    std::fs::write(&shm, b"reader-owned shm change").unwrap();
+    assert_eq!(source_revision(&locator), revision);
+
+    std::fs::write(&wal, b"durable wal change").unwrap();
+    assert_ne!(source_revision(&locator), revision);
   }
 
   #[test]

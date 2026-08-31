@@ -340,7 +340,6 @@ impl OpenCodeSessionSummary {
 struct OpenCodeDatabaseVersion {
   database: CatalogFileVersion,
   wal: Option<CatalogFileVersion>,
-  shm: Option<CatalogFileVersion>,
 }
 
 impl OpenCodeState {
@@ -421,10 +420,11 @@ impl OpenCodeState {
   fn database_version(&self) -> Option<OpenCodeDatabaseVersion> {
     let database_path = self.source.database_path().ok()?;
     let database = file_version(&database_path)?;
+    // SHM is a reader-writable WAL index, not durable session content. Including
+    // it would invalidate this cache because of the relay's own reads.
     Some(OpenCodeDatabaseVersion {
       database,
       wal: file_version(&sqlite_sidecar_path(&database_path, "-wal")),
-      shm: file_version(&sqlite_sidecar_path(&database_path, "-shm")),
     })
   }
 
@@ -434,6 +434,8 @@ impl OpenCodeState {
     };
     path == &database_path
       || path == sqlite_sidecar_path(&database_path, "-wal")
+      // A directory watcher can report SHM creation before it reports the WAL.
+      // Treat that as a wake-up, but database_version deliberately ignores SHM.
       || path == sqlite_sidecar_path(&database_path, "-shm")
       || path == self.root_path
       || database_path.parent().is_some_and(|parent| path == parent)
@@ -1122,16 +1124,28 @@ mod tests {
   }
 
   #[test]
-  fn ignores_unrelated_opencode_paths() {
+  fn opencode_wakes_for_sidecars_but_versions_only_durable_data() {
     let fixture = TempDir::new().unwrap();
     let database = fixture.path().join("opencode.db");
+    let wal = fixture.path().join("opencode.db-wal");
+    let shm = fixture.path().join("opencode.db-shm");
+    std::fs::write(&database, b"database").unwrap();
+    std::fs::write(&wal, b"wal").unwrap();
+    std::fs::write(&shm, b"shm").unwrap();
     let state = OpenCodeState::new(fixture.path().to_path_buf());
 
     assert!(state.matches_path(&database));
-    assert!(state.matches_path(&fixture.path().join("opencode.db-wal")));
+    assert!(state.matches_path(&wal));
+    assert!(state.matches_path(&shm));
     assert!(state.matches_path(fixture.path()));
     assert!(!state.matches_path(&fixture.path().join("opencode.log")));
     assert!(!state.matches_path(&fixture.path().join("storage/snapshot")));
+
+    let version = state.database_version();
+    std::fs::write(&shm, b"reader-owned shm change").unwrap();
+    assert_eq!(state.database_version(), version);
+    std::fs::write(&wal, b"durable wal change").unwrap();
+    assert_ne!(state.database_version(), version);
   }
 
   #[test]
