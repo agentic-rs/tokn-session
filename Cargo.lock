@@ -4114,10 +4114,13 @@ name = "tokn-session-codex"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "tokn-codex-protocol",
  "tokn-session-core",
+ "toml 1.1.4+spec-1.1.0",
 ]
 
 [[package]]
@@ -4158,6 +4161,7 @@ dependencies = [
  "dirs",
  "serde",
  "serde_json",
+ "tempfile",
  "tokn-pi-protocol",
  "tokn-session-core",
 ]

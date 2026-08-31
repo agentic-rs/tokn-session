@@ -291,9 +291,22 @@ responses bounded, including tool-card command and query fields, while expanded
 native event detail and inline tool output are fetched lazily and hidden Pi
 content stays redacted. Sidebar discovery uses
 `AgentClient::list_session_headers`, which reads file headers or OpenCode
-catalog rows without computing conversation counts; the selected session's
-normalized `total_events` arrives with its first event page. The existing CLI
-continues to use the counted `list_sessions` API.
+catalog rows without computing conversation counts. Indexed native titles are
+available during that cheap pass. The viewer lazily hydrates visible untitled
+rows with a provider-specific history scan; prompt-text searches may hydrate
+additional candidates to determine whether they match. Hydrated metadata is
+cached by source revision, and per-session in-flight gates prevent overlapping
+searches from repeating the same scan. The selected session's normalized
+`total_events` arrives with its first event page. The existing CLI continues to
+use the counted `list_sessions` API.
+
+Session rows prefer a non-placeholder provider title, then the first meaningful
+user-prompt preview, then `Untitled session`. The shortened session id is shown
+separately and the full id remains available through the row's accessible label
+and tooltip. Titles and previews are normalized to bounded, single-line text
+before IPC; ANSI escapes, control characters, and bidirectional override or
+isolate marks are removed. Search matches title and preview as well as session
+id, project, cwd, and agent path.
 
 Event paging currently bounds the data sent across IPC, not all source-reader
 memory: a provider parser may still load the full selected session before
@@ -345,11 +358,22 @@ subtype-specific unknown events.
 - OpenCode validates the required `session`, `message`, and `part` tables and columns, then detects optional session columns from the actual SQLite schema.
 - OpenCode accepts schemas both with and without the optional `session.model` column; it never runs migrations against the user database.
 
-`SessionRef` carries optional `parent_session_id`, `agent_path`,
-`agent_nickname`, and `agent_role`. Codex takes owning identity only from the
-first valid `session_meta`, because subagent rollouts can contain copied parent
-headers. Pi resolves `parentSession` paths to parent IDs, and OpenCode uses its
-session `parent_id`.
+`SessionRef` and `SessionHeader` carry optional `title` and `preview` fields in
+addition to relationship and agent identity. Codex uses a read-only, fail-soft
+lookup of the optional private `state_5.sqlite` title metadata, correlated by
+both thread id and rollout path, with legacy `session_index.jsonl` names and a
+bounded rollout scan as fallbacks. Its state location follows `config.toml`
+`sqlite_home`, `CODEX_SQLITE_HOME`, then Codex home. Pi takes the latest
+`session_info.name` and first meaningful user prompt. DSH takes the latest valid
+`session/title` event and first direct user message. OpenCode reads its optional
+session title column, filters strict generated `New session` and `Child session`
+placeholders, and lazily queries the first user text or subtask when needed.
+
+Relationship metadata still includes optional `parent_session_id`,
+`agent_path`, `agent_nickname`, and `agent_role`. Codex takes owning identity
+only from the first valid `session_meta`, because subagent rollouts can contain
+copied parent headers. Pi resolves `parentSession` paths to parent IDs, and
+OpenCode uses its session `parent_id`.
 
 For Codex, only `parent_thread_id` establishes a subagent relationship.
 `forked_from_id` records that a user fork was created from another thread, but

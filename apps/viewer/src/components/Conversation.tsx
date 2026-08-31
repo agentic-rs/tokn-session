@@ -5,7 +5,13 @@ import type {
   SessionHistoryStatus,
   SessionSummary,
 } from "../lib/types";
-import { eventButtonId, formatTimestamp, providerLabel } from "../lib/state";
+import {
+  eventButtonId,
+  formatTimestamp,
+  providerLabel,
+  sessionDisplayTitle,
+  shortSessionId,
+} from "../lib/state";
 import { InspectorIcon, PanelIcon } from "./Icons";
 import { EventCard } from "./EventCard";
 import { LoadingRows, StateView } from "./StateView";
@@ -122,13 +128,20 @@ export function Conversation({
         {session ? (
           <div className="conversation__identity">
             <div className="conversation__title-row">
-              <h2>{session.title}</h2>
+              <h2 title={sessionDisplayTitle(session)}>{sessionDisplayTitle(session)}</h2>
               <span className="provider-badge" data-provider={session.provider}>
                 {providerLabel(session.provider)}
               </span>
             </div>
-            <p title={session.cwd ?? session.session_id}>
+            <p title={`${session.cwd ?? "Unassigned project"}\nSession ${session.session_id}`}>
               {session.project ?? session.cwd ?? "Unassigned project"}
+              <span aria-hidden="true"> · </span>
+              <span
+                aria-label={`Session ${session.session_id}`}
+                className="conversation__session-id"
+              >
+                {shortSessionId(session.session_id)}
+              </span>
               <span aria-hidden="true"> · </span>
               {countLabel}
             </p>

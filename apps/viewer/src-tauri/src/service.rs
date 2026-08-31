@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -21,6 +22,8 @@ use crate::repository::{NativeRepository, ViewerRepository};
 
 const MAX_DETAIL_VALUE_BYTES: usize = 512 * 1024;
 const MAX_MESSAGE_SUMMARY_CHARS: usize = 16 * 1024;
+const MAX_SESSION_PREVIEW_CHARS: usize = 240;
+const MAX_SESSION_TITLE_CHARS: usize = 160;
 const MAX_TECHNICAL_SUMMARY_CHARS: usize = 500;
 const MAX_TOOL_CARD_STRING_CHARS: usize = 500;
 const MAX_TOOL_NAME_CHARS: usize = 120;
@@ -30,7 +33,14 @@ const TOOL_OUTPUT_TRUNCATION_MARKER: &str = "\n\u{2026} output truncated \u{2026
 #[derive(Clone)]
 pub(crate) struct ViewerService {
   repository: Arc<dyn ViewerRepository>,
+  session_header_cache: Arc<Mutex<HashMap<SessionLocator, CachedSessionHeader>>>,
+  session_header_gates: Arc<Mutex<HashMap<SessionLocator, Arc<Mutex<()>>>>>,
   loaded_session_cache: Arc<Mutex<Option<CachedSession>>>,
+}
+
+struct CachedSessionHeader {
+  source_revision: SourceRevision,
+  header: SessionHeader,
 }
 
 struct CachedSession {
@@ -55,6 +65,8 @@ impl ViewerService {
   pub fn native() -> Self {
     Self {
       repository: Arc::new(NativeRepository),
+      session_header_cache: Arc::new(Mutex::new(HashMap::new())),
+      session_header_gates: Arc::new(Mutex::new(HashMap::new())),
       loaded_session_cache: Arc::new(Mutex::new(None)),
     }
   }
@@ -63,6 +75,8 @@ impl ViewerService {
   fn new(repository: Arc<dyn ViewerRepository>) -> Self {
     Self {
       repository,
+      session_header_cache: Arc::new(Mutex::new(HashMap::new())),
+      session_header_gates: Arc::new(Mutex::new(HashMap::new())),
       loaded_session_cache: Arc::new(Mutex::new(None)),
     }
   }
@@ -78,58 +92,167 @@ impl ViewerService {
       .map(str::trim)
       .filter(|value| !value.is_empty())
       .map(str::to_lowercase);
-    let mut sessions = Vec::new();
+    let mut candidates = Vec::new();
     let mut source_errors = Vec::new();
 
     for provider in providers {
       let headers = match self.repository.list_session_headers(provider) {
         Ok(headers) => headers,
         Err(message) => {
-          source_errors.push(SourceError { provider, message });
+          record_source_error(&mut source_errors, provider, message);
           continue;
         }
       };
 
-      let mut conversion_error = None;
       for header in headers {
         // The global roster intentionally shows roots. Descendants will be
         // loaded within a selected root's conversation tree in a later slice.
         if header.parent_session_id.is_some() {
           continue;
         }
-        match session_summary(provider, header) {
-          Ok(summary) if matches_search(&summary, search.as_deref()) => sessions.push(summary),
-          Ok(_) => {}
-          Err(error) => {
-            conversion_error.get_or_insert(error);
-          }
-        };
-      }
-      if let Some(message) = conversion_error {
-        source_errors.push(SourceError { provider, message });
+        if let Err(message) = validate_session_header(provider, &header) {
+          record_source_error(&mut source_errors, provider, message);
+          continue;
+        }
+        candidates.push((provider, header));
       }
     }
 
-    sessions.sort_by(|left, right| {
-      right
-        .updated_at_ms
-        .cmp(&left.updated_at_ms)
-        .then_with(|| right.timestamp.cmp(&left.timestamp))
-        .then_with(|| left.provider.as_str().cmp(right.provider.as_str()))
-        .then_with(|| left.session_id.cmp(&right.session_id))
-        .then_with(|| left.session_key.cmp(&right.session_key))
-    });
+    if let Some(search) = search.as_deref() {
+      let mut matches = Vec::new();
+      for (provider, header) in candidates {
+        let summary = match session_summary(provider, header.clone()) {
+          Ok(summary) => summary,
+          Err(message) => {
+            record_source_error(&mut source_errors, provider, message);
+            continue;
+          }
+        };
+        if matches_search(&summary, Some(search)) {
+          matches.push((provider, header));
+          continue;
+        }
+        if summary.preview.is_some() {
+          continue;
+        }
+        let hydrated = self.hydrate_session_header(provider, header);
+        let summary = match session_summary(provider, hydrated.clone()) {
+          Ok(summary) => summary,
+          Err(message) => {
+            record_source_error(&mut source_errors, provider, message);
+            continue;
+          }
+        };
+        if matches_search(&summary, Some(search)) {
+          matches.push((provider, hydrated));
+        }
+      }
+      sort_session_headers(&mut matches);
+      let start = offset.min(matches.len());
+      let end = start.saturating_add(limit).min(matches.len());
+      let next_cursor = (end < matches.len()).then(|| encode_list_cursor(end));
+      let mut sessions = Vec::with_capacity(end - start);
+      for (provider, header) in matches[start..end].iter().cloned() {
+        let header =
+          if present_string(header.title.as_deref()).is_none() && present_string(header.preview.as_deref()).is_none() {
+            self.hydrate_session_header(provider, header)
+          } else {
+            header
+          };
+        match session_summary(provider, header) {
+          Ok(summary) => sessions.push(summary),
+          Err(message) => record_source_error(&mut source_errors, provider, message),
+        }
+      }
+      return Ok(ListSessionsResponse {
+        sessions,
+        next_cursor,
+        source_errors,
+      });
+    }
 
-    let start = offset.min(sessions.len());
-    let end = start.saturating_add(limit).min(sessions.len());
-    let next_cursor = (end < sessions.len()).then(|| encode_list_cursor(end));
-    let sessions = sessions[start..end].to_vec();
+    sort_session_headers(&mut candidates);
+    let start = offset.min(candidates.len());
+    let end = start.saturating_add(limit).min(candidates.len());
+    let next_cursor = (end < candidates.len()).then(|| encode_list_cursor(end));
+    let mut sessions = Vec::with_capacity(end - start);
+    for (provider, header) in candidates[start..end].iter().cloned() {
+      let header =
+        if present_string(header.title.as_deref()).is_none() && present_string(header.preview.as_deref()).is_none() {
+          self.hydrate_session_header(provider, header)
+        } else {
+          header
+        };
+      match session_summary(provider, header) {
+        Ok(summary) => sessions.push(summary),
+        Err(message) => record_source_error(&mut source_errors, provider, message),
+      }
+    }
 
     Ok(ListSessionsResponse {
       sessions,
       next_cursor,
       source_errors,
     })
+  }
+
+  fn hydrate_session_header(&self, provider: ViewerProvider, mut header: SessionHeader) -> SessionHeader {
+    let locator = locator_for_header(provider, &header);
+    let Some(initial_revision) = source_revision(&locator) else {
+      return self
+        .repository
+        .hydrate_session_header(provider, header.clone())
+        .unwrap_or(header);
+    };
+    if apply_cached_session_header(&self.session_header_cache, &locator, &initial_revision, &mut header) {
+      return header;
+    }
+
+    let gate = match self.session_header_gates.lock() {
+      Ok(mut gates) => Arc::clone(gates.entry(locator.clone()).or_insert_with(|| Arc::new(Mutex::new(())))),
+      Err(_) => {
+        return self
+          .repository
+          .hydrate_session_header(provider, header.clone())
+          .unwrap_or(header);
+      }
+    };
+    let Ok(_gate) = gate.lock() else {
+      return self
+        .repository
+        .hydrate_session_header(provider, header.clone())
+        .unwrap_or(header);
+    };
+    let Some(revision_before) = source_revision(&locator) else {
+      return self
+        .repository
+        .hydrate_session_header(provider, header.clone())
+        .unwrap_or(header);
+    };
+    if apply_cached_session_header(&self.session_header_cache, &locator, &revision_before, &mut header) {
+      return header;
+    }
+
+    // Search requests overlap while the user is typing. A per-session gate
+    // prevents duplicate scans without letting an old slow transcript block
+    // unrelated providers or the currently visible result.
+    let hydrated = match self.repository.hydrate_session_header(provider, header.clone()) {
+      Ok(hydrated) => hydrated,
+      Err(_) => return header,
+    };
+    if let Some(revision_after) = source_revision(&locator)
+      && revision_before == revision_after
+      && let Ok(mut cache) = self.session_header_cache.lock()
+    {
+      cache.insert(
+        locator,
+        CachedSessionHeader {
+          source_revision: revision_after,
+          header: hydrated.clone(),
+        },
+      );
+    }
+    hydrated
   }
 
   pub fn load_event_page(&self, request: EventPageRequest) -> Result<EventPage, String> {
@@ -235,6 +358,27 @@ impl ViewerService {
   }
 }
 
+fn apply_cached_session_header(
+  cache: &Mutex<HashMap<SessionLocator, CachedSessionHeader>>,
+  locator: &SessionLocator,
+  revision: &SourceRevision,
+  header: &mut SessionHeader,
+) -> bool {
+  let Ok(cache) = cache.lock() else {
+    return false;
+  };
+  let Some(cached) = cache.get(locator).filter(|cached| cached.source_revision == *revision) else {
+    return false;
+  };
+  if present_string(header.title.as_deref()).is_none() {
+    header.title.clone_from(&cached.header.title);
+  }
+  if present_string(header.preview.as_deref()).is_none() {
+    header.preview.clone_from(&cached.header.preview);
+  }
+  true
+}
+
 fn source_revision(locator: &SessionLocator) -> Option<SourceRevision> {
   let mut paths = vec![locator.source_path.clone()];
   if locator.provider == ViewerProvider::OpenCode {
@@ -270,25 +414,48 @@ fn selected_providers(requested: &[ViewerProvider]) -> Vec<ViewerProvider> {
     .collect()
 }
 
-fn session_summary(provider: ViewerProvider, header: SessionHeader) -> Result<SessionSummary, String> {
-  let locator = SessionLocator {
+fn record_source_error(errors: &mut Vec<SourceError>, provider: ViewerProvider, message: String) {
+  if errors.iter().all(|error| error.provider != provider) {
+    errors.push(SourceError { provider, message });
+  }
+}
+
+fn validate_session_header(provider: ViewerProvider, header: &SessionHeader) -> Result<(), String> {
+  encode_session_key(&locator_for_header(provider, header)).map(|_| ())
+}
+
+fn sort_session_headers(candidates: &mut [(ViewerProvider, SessionHeader)]) {
+  candidates.sort_by(|(left_provider, left), (right_provider, right)| {
+    right
+      .updated_at_ms
+      .cmp(&left.updated_at_ms)
+      .then_with(|| right.timestamp.cmp(&left.timestamp))
+      .then_with(|| left_provider.as_str().cmp(right_provider.as_str()))
+      .then_with(|| left.id.cmp(&right.id))
+      .then_with(|| left.path.cmp(&right.path))
+  });
+}
+
+fn locator_for_header(provider: ViewerProvider, header: &SessionHeader) -> SessionLocator {
+  SessionLocator {
     version: 1,
     provider,
     session_id: header.id.clone(),
     source_path: header.path.clone(),
-  };
+  }
+}
+
+fn session_summary(provider: ViewerProvider, header: SessionHeader) -> Result<SessionSummary, String> {
+  let locator = locator_for_header(provider, &header);
   let project = header.cwd.as_deref().and_then(path_name).map(str::to_string);
-  let title = header
-    .agent_nickname
-    .as_deref()
-    .or(header.agent_path.as_deref())
-    .map(str::to_string)
-    .unwrap_or_else(|| header.id.clone());
+  let title = normalize_session_text(header.title, MAX_SESSION_TITLE_CHARS);
+  let preview = normalize_session_text(header.preview, MAX_SESSION_PREVIEW_CHARS);
   Ok(SessionSummary {
     session_key: encode_session_key(&locator)?,
     session_id: header.id,
     provider,
     title,
+    preview,
     project,
     cwd: header.cwd,
     updated_at_ms: header
@@ -318,7 +485,8 @@ fn matches_search(session: &SessionSummary, search: Option<&str>) -> bool {
   };
   [
     Some(session.session_id.as_str()),
-    Some(session.title.as_str()),
+    session.title.as_deref(),
+    session.preview.as_deref(),
     session.project.as_deref(),
     session.cwd.as_deref(),
     session.agent_path.as_deref(),
@@ -326,6 +494,86 @@ fn matches_search(session: &SessionSummary, search: Option<&str>) -> bool {
   .into_iter()
   .flatten()
   .any(|value| value.to_lowercase().contains(search))
+}
+
+fn normalize_session_text(value: Option<String>, max_chars: usize) -> Option<String> {
+  let value = value?;
+  let mut normalized = String::with_capacity(value.len().min(max_chars.saturating_mul(4)));
+  let mut characters = value.chars().peekable();
+  let mut normalized_chars = 0;
+  let mut needs_space = false;
+  while let Some(character) = characters.next() {
+    match character {
+      '\u{001b}' => {
+        match characters.next() {
+          Some('[') => consume_control_sequence(&mut characters),
+          Some(']') => consume_operating_system_command(&mut characters),
+          Some(_) | None => {}
+        }
+        continue;
+      }
+      '\u{009b}' => {
+        consume_control_sequence(&mut characters);
+        continue;
+      }
+      _ => {}
+    }
+    if character.is_whitespace() {
+      needs_space = !normalized.is_empty();
+    } else if !is_unsafe_session_character(character) {
+      if needs_space {
+        if !push_bounded_character(&mut normalized, &mut normalized_chars, ' ', max_chars) {
+          break;
+        }
+      }
+      needs_space = false;
+      if !push_bounded_character(&mut normalized, &mut normalized_chars, character, max_chars) {
+        break;
+      }
+    }
+  }
+  if normalized.is_empty() { None } else { Some(normalized) }
+}
+
+fn push_bounded_character(output: &mut String, count: &mut usize, character: char, max_chars: usize) -> bool {
+  if *count < max_chars {
+    output.push(character);
+    *count += 1;
+    true
+  } else {
+    if max_chars > 0 {
+      output.pop();
+      output.push('\u{2026}');
+    }
+    false
+  }
+}
+
+fn is_unsafe_session_character(character: char) -> bool {
+  character.is_control()
+    || matches!(
+      character,
+      '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}'
+    )
+}
+
+fn consume_control_sequence(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+  for character in characters.by_ref() {
+    if ('@'..='~').contains(&character) {
+      break;
+    }
+  }
+}
+
+fn consume_operating_system_command(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+  while let Some(character) = characters.next() {
+    if character == '\u{0007}' {
+      break;
+    }
+    if character == '\u{001b}' && characters.next_if_eq(&'\\').is_some() {
+      break;
+    }
+  }
 }
 
 fn event_page_bounds(
@@ -1166,8 +1414,8 @@ fn truncate_with_flag(value: String, max_chars: usize) -> (String, bool) {
 mod tests {
   use std::collections::HashMap;
   use std::path::PathBuf;
-  use std::sync::Mutex;
   use std::sync::atomic::{AtomicUsize, Ordering};
+  use std::sync::{Barrier, Mutex};
 
   use serde_json::json;
   use tokn_session_core::{
@@ -1186,6 +1434,14 @@ mod tests {
   impl ViewerRepository for FakeRepository {
     fn list_session_headers(&self, provider: ViewerProvider) -> Result<Vec<SessionHeader>, String> {
       self.listings.get(&provider).cloned().unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    fn hydrate_session_header(
+      &self,
+      _provider: ViewerProvider,
+      header: SessionHeader,
+    ) -> Result<SessionHeader, String> {
+      Ok(header)
     }
 
     fn load_session(&self, _locator: &SessionLocator) -> Result<LoadedSession, String> {
@@ -1207,9 +1463,107 @@ mod tests {
       Ok(Vec::new())
     }
 
+    fn hydrate_session_header(
+      &self,
+      _provider: ViewerProvider,
+      header: SessionHeader,
+    ) -> Result<SessionHeader, String> {
+      Ok(header)
+    }
+
     fn load_session(&self, _locator: &SessionLocator) -> Result<LoadedSession, String> {
       self.loads.fetch_add(1, Ordering::SeqCst);
       Ok(visible_session(1))
+    }
+  }
+
+  struct HydratingRepository {
+    headers: Vec<SessionHeader>,
+    hydrations: Arc<AtomicUsize>,
+  }
+
+  struct FlakyHydratingRepository {
+    header: SessionHeader,
+    attempts: Arc<AtomicUsize>,
+  }
+
+  struct SlowHydratingRepository {
+    header: SessionHeader,
+    attempts: Arc<AtomicUsize>,
+  }
+
+  impl ViewerRepository for SlowHydratingRepository {
+    fn list_session_headers(&self, provider: ViewerProvider) -> Result<Vec<SessionHeader>, String> {
+      Ok(if provider == ViewerProvider::Dsh {
+        vec![self.header.clone()]
+      } else {
+        Vec::new()
+      })
+    }
+
+    fn hydrate_session_header(
+      &self,
+      _provider: ViewerProvider,
+      mut header: SessionHeader,
+    ) -> Result<SessionHeader, String> {
+      self.attempts.fetch_add(1, Ordering::SeqCst);
+      std::thread::sleep(std::time::Duration::from_millis(40));
+      header.preview = Some("Shared prompt".to_string());
+      Ok(header)
+    }
+
+    fn load_session(&self, _locator: &SessionLocator) -> Result<LoadedSession, String> {
+      Err("not used by this fixture".to_string())
+    }
+  }
+
+  impl ViewerRepository for FlakyHydratingRepository {
+    fn list_session_headers(&self, provider: ViewerProvider) -> Result<Vec<SessionHeader>, String> {
+      Ok(if provider == ViewerProvider::Pi {
+        vec![self.header.clone()]
+      } else {
+        Vec::new()
+      })
+    }
+
+    fn hydrate_session_header(
+      &self,
+      _provider: ViewerProvider,
+      mut header: SessionHeader,
+    ) -> Result<SessionHeader, String> {
+      if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+        return Err("transient read failure".to_string());
+      }
+      header.preview = Some("Recovered prompt".to_string());
+      Ok(header)
+    }
+
+    fn load_session(&self, _locator: &SessionLocator) -> Result<LoadedSession, String> {
+      Err("not used by this fixture".to_string())
+    }
+  }
+
+  impl ViewerRepository for HydratingRepository {
+    fn list_session_headers(&self, provider: ViewerProvider) -> Result<Vec<SessionHeader>, String> {
+      Ok(if provider == ViewerProvider::Codex {
+        self.headers.clone()
+      } else {
+        Vec::new()
+      })
+    }
+
+    fn hydrate_session_header(
+      &self,
+      _provider: ViewerProvider,
+      mut header: SessionHeader,
+    ) -> Result<SessionHeader, String> {
+      self.hydrations.fetch_add(1, Ordering::SeqCst);
+      header.preview = Some(format!("Prompt for {}", header.id));
+      Ok(header)
+    }
+
+    fn load_session(&self, _locator: &SessionLocator) -> Result<LoadedSession, String> {
+      Err("not used by this fixture".to_string())
     }
   }
 
@@ -1274,6 +1628,217 @@ mod tests {
       .unwrap();
     assert_eq!(second.sessions[0].session_id, "pi-root");
     assert!(second.next_cursor.is_none());
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn listing_isolates_a_non_utf8_source_path_to_its_provider_warning() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut invalid = session_header("invalid", None, "/projects/Alpha", "2000");
+    invalid.path = PathBuf::from(OsString::from_vec(b"/fixtures/invalid-\xff.jsonl".to_vec()));
+    let valid = session_header("valid", None, "/projects/Alpha", "1000");
+    let service = ViewerService::new(Arc::new(FakeRepository {
+      listings: HashMap::from([(ViewerProvider::Codex, Ok(vec![invalid, valid]))]),
+      loaded: Mutex::new(None),
+    }));
+
+    let response = service
+      .list_sessions(ListSessionsRequest {
+        query: SessionQuery::default(),
+        cursor: None,
+        offset: None,
+        limit: None,
+      })
+      .unwrap();
+
+    assert_eq!(response.sessions.len(), 1);
+    assert_eq!(response.sessions[0].session_id, "valid");
+    assert_eq!(response.source_errors.len(), 1);
+    assert_eq!(response.source_errors[0].provider, ViewerProvider::Codex);
+  }
+
+  #[test]
+  fn session_metadata_is_sanitized_bounded_and_separate_from_agent_identity() {
+    let mut header = session_header("session-id", None, "/projects/Alpha", "1000");
+    header.agent_nickname = Some("worker-name".to_string());
+    header.title = Some(" \u{001b}[31mBuild\u{202e}\n\tthe viewer\u{001b}[0m ".to_string());
+    header.preview = Some(format!("Prompt {}", "x".repeat(MAX_SESSION_PREVIEW_CHARS + 20)));
+
+    let summary = session_summary(ViewerProvider::Pi, header).unwrap();
+
+    assert_eq!(summary.title.as_deref(), Some("Build the viewer"));
+    assert_eq!(
+      summary.preview.as_ref().unwrap().chars().count(),
+      MAX_SESSION_PREVIEW_CHARS
+    );
+    assert!(summary.preview.as_ref().unwrap().ends_with('\u{2026}'));
+    assert_ne!(summary.title.as_deref(), Some("worker-name"));
+  }
+
+  #[test]
+  fn search_matches_native_titles_and_first_message_previews() {
+    let mut title_header = session_header("title", None, "/projects/Alpha", "2000");
+    title_header.title = Some("Release checklist".to_string());
+    let mut preview_header = session_header("preview", None, "/projects/Alpha", "1000");
+    preview_header.preview = Some("Investigate socket ownership".to_string());
+    let service = ViewerService::new(Arc::new(FakeRepository {
+      listings: HashMap::from([(ViewerProvider::Codex, Ok(vec![title_header, preview_header]))]),
+      loaded: Mutex::new(None),
+    }));
+
+    let response = service
+      .list_sessions(ListSessionsRequest {
+        query: SessionQuery {
+          providers: vec![ViewerProvider::Codex],
+          search: Some("socket ownership".to_string()),
+        },
+        cursor: None,
+        offset: None,
+        limit: None,
+      })
+      .unwrap();
+
+    assert_eq!(response.sessions.len(), 1);
+    assert_eq!(response.sessions[0].session_id, "preview");
+  }
+
+  #[test]
+  fn default_listing_hydrates_only_the_visible_page_and_caches_by_source_revision() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut headers = vec![
+      session_header("newest", None, "/projects/Alpha", "3000"),
+      session_header("middle", None, "/projects/Alpha", "2000"),
+      session_header("oldest", None, "/projects/Alpha", "1000"),
+    ];
+    for header in &mut headers {
+      header.path = directory.path().join(format!("{}.jsonl", header.id));
+      std::fs::write(&header.path, "fixture\n").unwrap();
+    }
+    let hydrations = Arc::new(AtomicUsize::new(0));
+    let service = ViewerService::new(Arc::new(HydratingRepository {
+      headers,
+      hydrations: Arc::clone(&hydrations),
+    }));
+    let request = ListSessionsRequest {
+      query: SessionQuery {
+        providers: vec![ViewerProvider::Codex],
+        search: None,
+      },
+      cursor: None,
+      offset: None,
+      limit: Some(1),
+    };
+
+    let first = service.list_sessions(request.clone()).unwrap();
+    let second = service.list_sessions(request).unwrap();
+
+    assert_eq!(first.sessions[0].session_id, "newest");
+    assert_eq!(first.sessions[0].preview.as_deref(), Some("Prompt for newest"));
+    assert_eq!(second.sessions[0].preview, first.sessions[0].preview);
+    assert_eq!(hydrations.load(Ordering::SeqCst), 1);
+  }
+
+  #[test]
+  fn cheap_field_search_hydrates_only_the_visible_matching_page() {
+    let headers = vec![
+      session_header("newest", None, "/projects/Alpha", "3000"),
+      session_header("middle", None, "/projects/Alpha", "2000"),
+      session_header("oldest", None, "/projects/Alpha", "1000"),
+    ];
+    let hydrations = Arc::new(AtomicUsize::new(0));
+    let service = ViewerService::new(Arc::new(HydratingRepository {
+      headers,
+      hydrations: Arc::clone(&hydrations),
+    }));
+
+    let response = service
+      .list_sessions(ListSessionsRequest {
+        query: SessionQuery {
+          providers: vec![ViewerProvider::Codex],
+          search: Some("alpha".to_string()),
+        },
+        cursor: None,
+        offset: None,
+        limit: Some(1),
+      })
+      .unwrap();
+
+    assert_eq!(response.sessions[0].session_id, "newest");
+    assert_eq!(response.sessions[0].preview.as_deref(), Some("Prompt for newest"));
+    assert_eq!(hydrations.load(Ordering::SeqCst), 1);
+    assert!(response.next_cursor.is_some());
+  }
+
+  #[test]
+  fn transient_hydration_failures_are_not_cached() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut header = session_header("flaky", None, "/projects/Alpha", "1000");
+    header.path = directory.path().join("flaky.jsonl");
+    std::fs::write(&header.path, "fixture\n").unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let service = ViewerService::new(Arc::new(FlakyHydratingRepository {
+      header,
+      attempts: Arc::clone(&attempts),
+    }));
+    let request = ListSessionsRequest {
+      query: SessionQuery {
+        providers: vec![ViewerProvider::Pi],
+        search: None,
+      },
+      cursor: None,
+      offset: None,
+      limit: Some(1),
+    };
+
+    let first = service.list_sessions(request.clone()).unwrap();
+    let second = service.list_sessions(request).unwrap();
+
+    assert_eq!(first.sessions[0].preview, None);
+    assert_eq!(second.sessions[0].preview.as_deref(), Some("Recovered prompt"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+  }
+
+  #[test]
+  fn overlapping_requests_share_one_in_flight_session_hydration() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut header = session_header("shared", None, "/projects/Alpha", "1000");
+    header.path = directory.path().join("shared.jsonl");
+    std::fs::write(&header.path, "fixture\n").unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let service = ViewerService::new(Arc::new(SlowHydratingRepository {
+      header,
+      attempts: Arc::clone(&attempts),
+    }));
+    let request = ListSessionsRequest {
+      query: SessionQuery {
+        providers: vec![ViewerProvider::Dsh],
+        search: None,
+      },
+      cursor: None,
+      offset: None,
+      limit: Some(1),
+    };
+    let start = Arc::new(Barrier::new(3));
+    let handles: Vec<_> = (0..2)
+      .map(|_| {
+        let service = service.clone();
+        let request = request.clone();
+        let start = Arc::clone(&start);
+        std::thread::spawn(move || {
+          start.wait();
+          service.list_sessions(request).unwrap()
+        })
+      })
+      .collect();
+    start.wait();
+
+    for handle in handles {
+      let response = handle.join().unwrap();
+      assert_eq!(response.sessions[0].preview.as_deref(), Some("Shared prompt"));
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
   }
 
   #[test]
@@ -2155,6 +2720,8 @@ mod tests {
   fn session_ref(id: &str, parent: Option<&str>, cwd: &str, timestamp: &str) -> SessionRef {
     SessionRef {
       id: id.to_string(),
+      title: None,
+      preview: None,
       parent_session_id: parent.map(str::to_string),
       agent_path: None,
       agent_nickname: None,
@@ -2170,6 +2737,8 @@ mod tests {
     let updated_at_ms = parse_updated_at_ms(Some(timestamp));
     SessionHeader {
       id: id.to_string(),
+      title: None,
+      preview: None,
       parent_session_id: parent.map(str::to_string),
       agent_path: None,
       agent_nickname: None,
@@ -2191,6 +2760,8 @@ mod tests {
   ) -> SessionHeader {
     SessionHeader {
       id: id.to_string(),
+      title: None,
+      preview: None,
       parent_session_id: None,
       agent_path: None,
       agent_nickname: None,

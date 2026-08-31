@@ -3,9 +3,9 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use crate::event::PiSessionLine;
+use crate::event::{PiContentBlock, PiMessage, PiSessionItem, PiSessionLine, PiUserContent};
 use crate::normalize::PiNormalizer;
-use tokn_session_core::{LoadedSession, SessionHistoryStatus, SessionRef};
+use tokn_session_core::{LoadedSession, SessionHeader, SessionHistoryStatus, SessionRef};
 
 pub struct PiSessionSource {
   session_dir: Option<PathBuf>,
@@ -22,6 +22,18 @@ impl PiSessionSource {
 
   pub fn list_session_relations(&self) -> Result<Vec<SessionRef>, String> {
     self.list_session_refs(inspect_session_header)
+  }
+
+  /// Populate presentation metadata stored outside Pi's first session row.
+  ///
+  /// Relation discovery deliberately remains a header-only operation. Callers
+  /// can hydrate only the rows they intend to display, avoiding a full scan of
+  /// every Pi transcript on each list refresh.
+  pub fn hydrate_session_header(&self, mut header: SessionHeader) -> Result<SessionHeader, String> {
+    let summary = inspect_session_summary(&header.path)?;
+    header.title = summary.title;
+    header.preview = summary.preview;
+    Ok(header)
   }
 
   fn list_session_refs(&self, inspect: fn(&Path) -> Result<SessionRef, String>) -> Result<Vec<SessionRef>, String> {
@@ -193,24 +205,75 @@ fn collect_jsonl_files(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<(), Strin
 
 fn inspect_session(path: &Path) -> Result<SessionRef, String> {
   let mut reference = inspect_session_header(path)?;
+  let summary = inspect_session_summary(path)?;
+  reference.message_count = summary.message_count;
+  reference.title = summary.title;
+  reference.preview = summary.preview;
+  Ok(reference)
+}
+
+#[derive(Default)]
+struct PiSessionSummary {
+  title: Option<String>,
+  preview: Option<String>,
+  message_count: usize,
+}
+
+fn inspect_session_summary(path: &Path) -> Result<PiSessionSummary, String> {
   let file = File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
   let reader = BufReader::new(file);
-  let mut message_count = 0;
+  let mut summary = PiSessionSummary::default();
 
-  for line in reader.lines() {
+  for (index, line) in reader.lines().enumerate() {
     let line = line.map_err(|err| format!("failed to read {}: {err}", path.display()))?;
     if line.trim().is_empty() {
       continue;
     }
-    let value: serde_json::Value =
-      serde_json::from_str(&line).map_err(|err| format!("invalid pi jsonl at {}: {err}", path.display()))?;
-    if value.get("type").and_then(|value| value.as_str()) == Some("message") {
-      message_count += 1;
+    let line: PiSessionLine = serde_json::from_str(&line)
+      .map_err(|err| format!("invalid pi jsonl at {}:{}: {err}", path.display(), index + 1))?;
+    match line.into_item() {
+      PiSessionItem::SessionInfo(info) => {
+        // Pi treats the latest session_info as authoritative. An absent or
+        // blank name is an explicit clear, rather than a request to retain an
+        // older name.
+        summary.title = info.name.and_then(non_blank);
+      }
+      PiSessionItem::Message(message) => {
+        summary.message_count += 1;
+        if summary.preview.is_none() {
+          summary.preview = message.message.and_then(pi_user_preview);
+        }
+      }
+      _ => {}
     }
   }
 
-  reference.message_count = message_count;
-  Ok(reference)
+  Ok(summary)
+}
+
+fn pi_user_preview(message: PiMessage) -> Option<String> {
+  let PiMessage::User(message) = message else {
+    return None;
+  };
+  match message.content {
+    PiUserContent::Text(text) => non_blank(text),
+    PiUserContent::Blocks(blocks) => non_blank(
+      blocks
+        .into_iter()
+        .filter_map(|block| match block {
+          PiContentBlock::Text(text) => text.text,
+          _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n"),
+    ),
+    PiUserContent::Missing | PiUserContent::Unknown(_) => None,
+  }
+}
+
+fn non_blank(value: String) -> Option<String> {
+  let value = value.trim();
+  (!value.is_empty()).then(|| value.to_string())
 }
 
 fn inspect_session_header(path: &Path) -> Result<SessionRef, String> {
@@ -222,6 +285,8 @@ fn inspect_session_header(path: &Path) -> Result<SessionRef, String> {
     agent_path: None,
     agent_nickname: None,
     agent_role: None,
+    title: None,
+    preview: None,
     path: path.to_path_buf(),
     cwd: None,
     timestamp: None,
@@ -312,6 +377,63 @@ mod tests {
 
     assert_eq!(reference.parent_session_id.as_deref(), Some("pi-tree-root"));
     assert_eq!(reference.message_count, 0);
+    assert_eq!(reference.title, None);
+    assert_eq!(reference.preview, None);
+  }
+
+  #[test]
+  fn summary_uses_latest_name_and_first_meaningful_user_text() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("session.jsonl");
+    let records = [
+      serde_json::json!({"type":"session","id":"summary"}),
+      serde_json::json!({"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"not the preview"}]}}),
+      serde_json::json!({"type":"message","message":{"role":"user","content":"   "}}),
+      serde_json::json!({"type":"session_info","name":"Earlier title"}),
+      serde_json::json!({"type":"message","message":{"role":"user","content":[
+        {"type":"image","mimeType":"image/png","data":"opaque"},
+        {"type":"text","text":"  first line  "},
+        {"type":"text","text":"second line"}
+      ]}}),
+      serde_json::json!({"type":"session_info","name":"  Latest title  "}),
+      serde_json::json!({"type":"message","message":{"role":"user","content":"later prompt"}}),
+    ];
+    std::fs::write(
+      &path,
+      records
+        .into_iter()
+        .map(|record| record.to_string())
+        .collect::<Vec<_>>()
+        .join("\n"),
+    )
+    .unwrap();
+
+    let summary = inspect_session_summary(&path).unwrap();
+
+    assert_eq!(summary.title.as_deref(), Some("Latest title"));
+    assert_eq!(summary.preview.as_deref(), Some("first line  \nsecond line"));
+    assert_eq!(summary.message_count, 4);
+  }
+
+  #[test]
+  fn latest_blank_session_info_explicitly_clears_name() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("session.jsonl");
+    std::fs::write(
+      &path,
+      [
+        serde_json::json!({"type":"session","id":"summary"}),
+        serde_json::json!({"type":"session_info","name":"Named"}),
+        serde_json::json!({"type":"session_info","name":" \n "}),
+      ]
+      .into_iter()
+      .map(|record| record.to_string())
+      .collect::<Vec<_>>()
+      .join("\n"),
+    )
+    .unwrap();
+
+    assert_eq!(inspect_session_summary(&path).unwrap().title, None);
   }
 
   #[test]

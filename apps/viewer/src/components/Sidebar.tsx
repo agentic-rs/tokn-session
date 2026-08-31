@@ -3,6 +3,8 @@ import {
   formatRelativeTime,
   groupSessions,
   providerLabel,
+  sessionDisplayTitle,
+  shortSessionId,
 } from "../lib/state";
 import { SearchIcon, WarningIcon } from "./Icons";
 import { LoadingRows } from "./StateView";
@@ -148,19 +150,23 @@ export function Sidebar({
             <div className="session-group__items">
               {group.sessions.map((session) => (
                 <button
+                  aria-label={`${sessionDisplayTitle(session)}, ${providerLabel(session.provider)} session ${session.session_id}`}
                   aria-current={session.session_key === selected_session_key ? "page" : undefined}
                   className="session-row"
                   data-selected={session.session_key === selected_session_key}
                   key={session.session_key}
                   onClick={() => on_session_select(session.session_key)}
+                  title={`${sessionDisplayTitle(session)}\n${session.session_id}`}
                   type="button"
                 >
                   <span className="provider-avatar" data-provider={session.provider}>
                     {providerLabel(session.provider).slice(0, 1)}
                   </span>
                   <span className="session-row__body">
-                    <span className="session-row__title">{session.title}</span>
+                    <span className="session-row__title">{sessionDisplayTitle(session)}</span>
                     <span className="session-row__meta">
+                      <span className="session-row__id">{shortSessionId(session.session_id)}</span>
+                      <span aria-hidden="true">·</span>
                       <span>{formatRelativeTime(session.timestamp, session.updated_at_ms)}</span>
                       {session.message_count !== null ? (
                         <>

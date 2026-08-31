@@ -1205,6 +1205,8 @@ mod tests {
         agent_path: None,
         agent_nickname: None,
         agent_role: None,
+        title: None,
+        preview: None,
         path: PathBuf::from("session.jsonl"),
         cwd: None,
         timestamp: None,

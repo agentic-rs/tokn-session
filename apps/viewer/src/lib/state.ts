@@ -2,6 +2,7 @@ import type { EventDetail, EventSummary, JsonValue, SessionSummary, ViewerProvid
 
 export const SESSION_PAGE_SIZE = 60;
 export const EVENT_PAGE_SIZE = 80;
+export const UNTITLED_SESSION = "Untitled session";
 
 export interface ReadableContentSection {
   label: string | null;
@@ -62,6 +63,18 @@ export function readableEventContent(
 
 export function eventButtonId(eventKey: string): string {
   return `event-button-${eventKey.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+}
+
+export function sessionDisplayTitle(session: SessionSummary): string {
+  return session.title?.trim() || session.preview?.trim() || UNTITLED_SESSION;
+}
+
+export function shortSessionId(sessionId: string): string {
+  const compact = sessionId.trim();
+  if (compact.length <= 12) {
+    return compact;
+  }
+  return `${compact.slice(0, 8)}…`;
 }
 
 export function errorMessage(error: unknown): string {

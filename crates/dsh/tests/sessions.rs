@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use serde_json::json;
-use tokn_session_core::{AgentEvent, MessageDelivery, Phase, SessionHistoryStatus};
+use tokn_session_core::{AgentEvent, MessageDelivery, Phase, SessionHeader, SessionHistoryStatus};
 use tokn_session_dsh::DshSessionSource;
 
 const FIXTURE: &str = include_str!("../fixtures/basic/session.jsonl");
@@ -19,8 +19,12 @@ fn discovers_and_normalizes_historical_session_without_duplicate_streams() {
   assert_eq!(references[0].id, "dsh-fixture");
   assert_eq!(references[0].message_count, 4);
   assert_eq!(references[0].cwd.as_deref(), Some("/project/demo"));
+  assert_eq!(references[0].title.as_deref(), Some("Reading a guide"));
+  assert_eq!(references[0].preview.as_deref(), Some("Read the guide."));
   let loaded = source.load_session("dsh-fixt").unwrap();
   assert_eq!(loaded.history_status, SessionHistoryStatus::Complete);
+  assert_eq!(loaded.reference.title.as_deref(), Some("Reading a guide"));
+  assert_eq!(loaded.reference.preview.as_deref(), Some("Read the guide."));
   let messages: Vec<_> = loaded
     .events
     .iter()
@@ -91,6 +95,25 @@ fn reads_concatenated_zstd_frames_and_never_modifies_input() {
   compressed.extend(zstd::stream::encode_all(&FIXTURE.as_bytes()[split..], 1).unwrap());
   fs::write(&path, &compressed).unwrap();
   let source = DshSessionSource::new(Some(dir.path().into()));
+  let relation = source.list_session_relations().unwrap().pop().unwrap();
+  let hydrated = source
+    .hydrate_session_header(SessionHeader {
+      id: relation.id,
+      parent_session_id: relation.parent_session_id,
+      agent_path: relation.agent_path,
+      agent_nickname: relation.agent_nickname,
+      agent_role: relation.agent_role,
+      title: relation.title,
+      preview: relation.preview,
+      path: relation.path,
+      cwd: relation.cwd,
+      timestamp: relation.timestamp,
+      updated_at: None,
+      updated_at_ms: None,
+    })
+    .unwrap();
+  assert_eq!(hydrated.title.as_deref(), Some("Reading a guide"));
+  assert_eq!(hydrated.preview.as_deref(), Some("Read the guide."));
   let compressed_session = source.load_session("dsh-fixture").unwrap();
   let plain_session = DshSessionSource::new(Some(fixture_dir()))
     .load_session("dsh-fixture")
@@ -165,6 +188,7 @@ fn distinguishes_subagent_seed_from_fork_and_resume_history() {
       header["origin"] = json!(origin);
     }
     let body = [
+      json!({"type":"session/title","seq":0,"time":0,"data":{"title":"Inherited title","messageSeqs":[1],"source":{"kind":"fallback"}}}),
       json!({"type":"user/message","seq":1,"time":1,"data":{"id":"inherited","role":"user","source":{"kind":"user"},"content":[{"type":"text","text":"parent history"}]}}),
       json!({"type":"user/message","seq":2,"time":2,"data":{"id":"own","role":"user","source":{"kind":"user"},"content":[{"type":"text","text":"own history"}]}}),
       json!({"type":"session/end-seed","seq":3,"time":3,"data":{}}),
@@ -180,6 +204,8 @@ fn distinguishes_subagent_seed_from_fork_and_resume_history() {
   assert_eq!(child.reference.parent_session_id.as_deref(), Some("root"));
   assert_eq!(child.history_status, SessionHistoryStatus::FilteredSubagent);
   assert_eq!(child.reference.message_count, 1);
+  assert_eq!(child.reference.title.as_deref(), Some("Inherited title"));
+  assert_eq!(child.reference.preview.as_deref(), Some("own history"));
   assert!(
     child
       .events
@@ -189,7 +215,43 @@ fn distinguishes_subagent_seed_from_fork_and_resume_history() {
   let fork = source.load_session("fork").unwrap();
   assert_eq!(fork.reference.parent_session_id, None);
   assert_eq!(fork.reference.message_count, 2);
-  assert_eq!(source.list_session_relations().unwrap()[0].message_count, 0);
+  let relation = &source.list_session_relations().unwrap()[0];
+  assert_eq!(relation.message_count, 0);
+  assert_eq!(relation.title, None);
+  assert_eq!(relation.preview, None);
+}
+
+#[test]
+fn latest_valid_title_wins_and_non_human_messages_do_not_become_preview() {
+  let dir = tempfile::tempdir().unwrap();
+  let path = dir.path().join("session.jsonl");
+  let records = [
+    json!({"type":"session","version":0,"id":"titles","createdAt":0,"delegationDepth":0}),
+    json!({"type":"session/title","seq":0,"time":0,"data":{"title":"Earlier","messageSeqs":[],"source":{"kind":"user"}}}),
+    json!({"type":"user/message","seq":1,"time":1,"data":{"id":"tool","role":"user","source":{"kind":"tool"},"content":[{"type":"text","text":"tool output"}]}}),
+    json!({"type":"user/message","seq":2,"time":2,"data":{"id":"empty","role":"user","source":{"kind":"user"},"content":[{"type":"text","text":"  "}]}}),
+    json!({"type":"user/message","seq":3,"time":3,"data":{"id":"human","role":"user","source":{"kind":"user"},"content":[{"type":"image","attachment":{}},{"type":"text","text":"first"},{"type":"text","text":"prompt"}]}}),
+    json!({"type":"session/title","seq":4,"time":4,"data":{"title":"Latest","messageSeqs":[3],"source":{"kind":"fallback"}}}),
+    // A malformed later record is not allowed to erase the latest valid fold.
+    json!({"type":"session/title","seq":5,"time":5,"data":{"title":"Malformed"}}),
+  ];
+  fs::write(
+    &path,
+    records
+      .into_iter()
+      .map(|record| record.to_string())
+      .collect::<Vec<_>>()
+      .join("\n"),
+  )
+  .unwrap();
+
+  let reference = DshSessionSource::new(Some(dir.path().into()))
+    .list_sessions()
+    .unwrap()
+    .remove(0);
+
+  assert_eq!(reference.title.as_deref(), Some("Latest"));
+  assert_eq!(reference.preview.as_deref(), Some("first\nprompt"));
 }
 
 #[test]

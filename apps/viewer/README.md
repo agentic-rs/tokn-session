@@ -29,11 +29,15 @@ pnpm tauri build
 
 The sidebar discovers root sessions from every provider at startup. Use the
 provider pills to include or exclude sources, type in the search box to match a
-session id or working directory, and select a row to load its newest normalized
-events. Earlier history is loaded on demand. Technical event headers expand in
-place, while their **Inspect** action opens the full inspector. Messages and
-reasoning have a readable **Content** view, while **Normalized** and **Native**
-expose the debugging representations.
+title, first user prompt, session id, project, or working directory, and select
+a row to load its newest normalized events. Rows prefer the provider's native
+title, fall back to a preview of the first meaningful user prompt, and otherwise
+show **Untitled session**. The shortened id beside the title remains a separate
+identity field; the full id is available to assistive technology and on hover.
+Earlier history is loaded on demand. Technical event headers expand in place,
+while their **Inspect** action opens the full inspector. Messages and reasoning
+have a readable **Content** view, while **Normalized** and **Native** expose the
+debugging representations.
 
 Known shell, file, search, web, and task tools use compact semantic headers.
 Expanding a tool fetches its output lazily, including the matching result when a
@@ -68,8 +72,16 @@ histories normalize to `AgentEvent` before source-neutral, snake-case DTOs
 cross the IPC boundary. Source errors remain isolated so one unavailable
 provider does not hide sessions from the others.
 
-Session discovery reads provider headers or catalog rows only; it deliberately
-does not compute message or event counts. The selected session's normalized
+Session discovery starts with provider headers or catalog rows and deliberately
+does not compute message or event counts. Indexed native titles are returned in
+that cheap pass. Visible untitled rows are then hydrated lazily with a
+provider-specific history scan, while a prompt-text search may hydrate
+additional candidates to determine whether they match. Hydrated headers are
+cached by source revision, and overlapping requests share each session's
+in-flight scan. Codex can also
+read title metadata from its optional private `state_5.sqlite` in read-only
+mode; rows are correlated by both thread id and rollout path, and incompatible
+or unavailable private state fails softly. The selected session's normalized
 event count arrives with its first event page. Session and event responses are
 listed in bounded pages; conversational Markdown previews are capped before IPC,
 tool-card fields are also capped, and full event detail is loaded only when
@@ -77,10 +89,10 @@ requested. Inline tool output keeps at most 64 KiB using a head-and-tail preview
 the full normalized and native inspector representations retain their separate
 512 KiB limits. The backend keeps at most one normalized session snapshot and
 reuses it across page and inspector requests while the source revision is
-unchanged;
-OpenCode revision checks include its SQLite WAL and SHM sidecars. The current
-provider readers may still load an entire selected session before producing an
-event page, so paging does not yet bound parser memory for very large histories.
+unchanged; OpenCode revision checks include its SQLite WAL and SHM sidecars. The
+current provider readers may still load an entire selected session before
+producing an event page, so paging does not yet bound parser memory for very
+large histories.
 Each normalized and provider-native inspector representation is capped at 512
 KiB before IPC. Oversized values become structured JSON truncation placeholders;
 an uncapped export path is future work.
