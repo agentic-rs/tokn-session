@@ -233,11 +233,10 @@ fn watch_targets(root: &ProviderRoot) -> Vec<(PathBuf, RecursiveMode)> {
     targets.push((parent.to_path_buf(), RecursiveMode::NonRecursive));
   }
 
-  for path in [
-    database_path.clone(),
-    sqlite_sidecar_path(&database_path, "-wal"),
-    sqlite_sidecar_path(&database_path, "-shm"),
-  ] {
+  // SQLite readers may update the SHM index themselves. Watching it feeds the
+  // resulting notification back into another read; the database and WAL are
+  // the durable change signals we need.
+  for path in [database_path.clone(), sqlite_sidecar_path(&database_path, "-wal")] {
     if path.exists() {
       targets.push((path, RecursiveMode::NonRecursive));
     }
@@ -291,6 +290,8 @@ mod tests {
     let fixture = TempDir::new().unwrap();
     let database = fixture.path().join("opencode.db");
     std::fs::write(&database, b"not a database").unwrap();
+    std::fs::write(fixture.path().join("opencode.db-wal"), b"wal").unwrap();
+    std::fs::write(fixture.path().join("opencode.db-shm"), b"shm").unwrap();
     std::fs::write(fixture.path().join("opencode.log"), b"log").unwrap();
 
     let root = ProviderRoot::new(Provider::OpenCode, fixture.path().to_path_buf());
@@ -298,6 +299,16 @@ mod tests {
     assert!(targets.iter().all(|(_, mode)| *mode == RecursiveMode::NonRecursive));
     assert!(targets.iter().any(|(path, _)| path == fixture.path()));
     assert!(targets.iter().any(|(path, _)| path == &database));
+    assert!(
+      targets
+        .iter()
+        .any(|(path, _)| path == &fixture.path().join("opencode.db-wal"))
+    );
+    assert!(
+      !targets
+        .iter()
+        .any(|(path, _)| path == &fixture.path().join("opencode.db-shm"))
+    );
     assert!(!targets.iter().any(|(path, _)| path.ends_with("opencode.log")));
   }
 

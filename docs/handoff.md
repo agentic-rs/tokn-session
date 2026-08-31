@@ -51,9 +51,11 @@ scan is a 30-second fallback for missed notifications and roots created after
 startup. Watcher notifications retain and coalesce their affected paths, so
 normal updates inspect only changed files instead of rescanning every session.
 OpenCode is watched non-recursively at its data directory plus the database and
-SQLite WAL/SHM files; unrelated logs, snapshots, and auth files do not trigger
-database work. macOS uses the kqueue backend because FSEvents can omit these
-session-file writes.
+SQLite WAL file; its transient SHM index is deliberately excluded because
+readers can update it and feed their own watcher notifications back into the
+relay. Unrelated logs, snapshots, and auth files do not trigger database work.
+macOS uses the kqueue backend because FSEvents can omit these session-file
+writes.
 Newly discovered or replaced files emit all normalized events beginning at the
 third-most-recent message by default. `--replay=<count>` changes that window,
 while `--replay-all` emits every complete record. These replay options only
