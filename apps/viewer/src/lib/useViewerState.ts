@@ -367,9 +367,7 @@ export function useViewerState() {
   }, [applySessionSelection]);
 
   const selectEvent = useCallback((eventKey: string) => {
-    if (document.activeElement instanceof HTMLElement) {
-      inspectorTriggerRef.current = document.activeElement;
-    }
+    inspectorTriggerRef.current = document.getElementById(eventButtonId(eventKey));
     applyEventSelection(eventKey, true);
   }, [applyEventSelection]);
 

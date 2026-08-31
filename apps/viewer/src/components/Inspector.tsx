@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEve
 import type { EventDetail, EventSummary } from "../lib/types";
 import { formatTimestamp, providerLabel, readableEventContent } from "../lib/state";
 import { CloseIcon, WarningIcon } from "./Icons";
+import { MarkdownContent } from "./MarkdownContent";
 
 interface InspectorProps {
   is_open: boolean;
@@ -245,7 +246,10 @@ export function Inspector({
                   {readableContent.sections.map((section, index) => (
                     <section key={`${section.label ?? "content"}-${index}`}>
                       {section.label ? <h3>{section.label}</h3> : null}
-                      <div className="readable-content__text">{section.text}</div>
+                      <MarkdownContent
+                        class_name="readable-content__text"
+                        content={section.text}
+                      />
                     </section>
                   ))}
                 </div>

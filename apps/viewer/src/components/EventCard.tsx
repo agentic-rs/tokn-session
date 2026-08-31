@@ -8,6 +8,7 @@ import {
   ToolIcon,
   WarningIcon,
 } from "./Icons";
+import { MarkdownContent } from "./MarkdownContent";
 
 interface EventCardProps {
   event: EventSummary;
@@ -18,6 +19,10 @@ interface EventCardProps {
 
 function isMessage(event: EventSummary): boolean {
   return event.type === "message";
+}
+
+function usesMarkdown(event: EventSummary): boolean {
+  return !event.is_hidden && (event.role === "user" || event.role === "assistant");
 }
 
 function eventIcon(event: EventSummary) {
@@ -57,24 +62,31 @@ export function EventCard({ event, button_id, is_selected, on_select }: EventCar
     const role = event.role ?? "unknown";
     return (
       <article className="message-event" data-role={role} data-selected={is_selected}>
-        <button
-          aria-label={`Inspect ${role} message`}
-          className="message-event__button"
-          id={button_id}
-          onClick={() => on_select(event.event_key)}
-          type="button"
-        >
+        <div className="message-event__surface">
           <span className="message-event__role">{role}</span>
-          <span className="message-event__text">
-            {event.is_hidden ? "Hidden extension message" : event.summary || event.title}
-          </span>
-          {event.summary_truncated && !event.is_hidden ? (
-            <span className="event-full-content-hint">View full message</span>
-          ) : null}
+          {usesMarkdown(event) ? (
+            <MarkdownContent
+              class_name="message-event__text"
+              content={event.summary || event.title}
+            />
+          ) : (
+            <div className="message-event__text message-event__text--plain">
+              {event.is_hidden ? "Hidden extension message" : event.summary || event.title}
+            </div>
+          )}
+          <button
+            aria-label={`Inspect ${role} message`}
+            className="message-event__inspect"
+            id={button_id}
+            onClick={() => on_select(event.event_key)}
+            type="button"
+          >
+            {event.summary_truncated && !event.is_hidden ? "View full message" : "Inspect"}
+          </button>
           <time className="message-event__time" dateTime={event.timestamp ?? undefined} title={timestampLabel}>
             {event.phase && event.phase !== "finished" ? event.phase : ""}
           </time>
-        </button>
+        </div>
       </article>
     );
   }
@@ -112,7 +124,11 @@ export function EventCard({ event, button_id, is_selected, on_select }: EventCar
       </button>
       {isExpanded ? (
         <div className="technical-event__body">
-          <p>{event.is_hidden ? "Hidden extension event" : event.summary || "No summary available."}</p>
+          {event.type === "reasoning" && !event.is_hidden ? (
+            <MarkdownContent content={event.summary || "No summary available."} />
+          ) : (
+            <p>{event.is_hidden ? "Hidden extension event" : event.summary || "No summary available."}</p>
+          )}
           <span className="event-kind-label">{event.type.replace(/_/g, " ")}</span>
         </div>
       ) : null}

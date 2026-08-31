@@ -33,6 +33,9 @@ session id or working directory, and select a row to load its newest normalized
 events. Earlier history is loaded on demand. Select any message or technical
 event to open the inspector; messages and reasoning have a readable **Content**
 view, while **Normalized** and **Native** expose the debugging representations.
+User and assistant messages, expanded reasoning, and readable inspector content
+render GitHub-flavored Markdown. Raw HTML is disabled, remote images are never
+loaded, and links remain inert so provider content cannot navigate the WebView.
 
 Provider storage is resolved as follows:
 
@@ -61,8 +64,9 @@ provider does not hide sessions from the others.
 Session discovery reads provider headers or catalog rows only; it deliberately
 does not compute message or event counts. The selected session's normalized
 event count arrives with its first event page. Session and event responses are
-paged to bound IPC payloads, and full event detail is loaded only when
-requested. The backend keeps at most one normalized session snapshot and reuses
+listed in bounded pages; conversational Markdown previews are capped before IPC,
+and full event detail is loaded only when requested. The backend keeps at most
+one normalized session snapshot and reuses
 it across page and inspector requests while the source revision is unchanged;
 OpenCode revision checks include its SQLite WAL and SHM sidecars. The current
 provider readers may still load an entire selected session before producing an

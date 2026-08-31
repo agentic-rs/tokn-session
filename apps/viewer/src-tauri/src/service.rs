@@ -17,6 +17,8 @@ use crate::model::{
 use crate::repository::{NativeRepository, ViewerRepository};
 
 const MAX_DETAIL_VALUE_BYTES: usize = 512 * 1024;
+const MAX_MESSAGE_SUMMARY_CHARS: usize = 16 * 1024;
+const MAX_TECHNICAL_SUMMARY_CHARS: usize = 500;
 
 #[derive(Clone)]
 pub(crate) struct ViewerService {
@@ -340,12 +342,31 @@ fn event_summary(index: usize, event: &AgentEvent) -> EventSummary {
   };
   let summary = if hidden {
     render_event_summary(event)
-  } else if let AgentEvent::Message(message) = event {
-    message.text.clone()
   } else {
-    render_event_summary(event)
+    match event {
+      AgentEvent::Message(message) => message.text.clone(),
+      AgentEvent::Reasoning(reasoning) => reasoning
+        .summary
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+          reasoning
+            .text
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+        })
+        .unwrap_or_else(|| render_event_summary(event)),
+      _ => render_event_summary(event),
+    }
   };
-  let (summary, summary_truncated) = truncate_with_flag(summary, 500);
+  let summary_max_chars = if !hidden && matches!(event, AgentEvent::Message(_)) {
+    MAX_MESSAGE_SUMMARY_CHARS
+  } else {
+    MAX_TECHNICAL_SUMMARY_CHARS
+  };
+  let (summary, summary_truncated) = truncate_with_flag(summary, summary_max_chars);
   EventSummary {
     event_key: encode_event_key(index),
     event_type: normalized_event_type(event).to_string(),
@@ -543,8 +564,8 @@ mod tests {
 
   use serde_json::json;
   use tokn_session_core::{
-    MessageDelivery, MessageEvent, MessageProvenance, Phase, SessionHistoryStatus, SessionRef, ToolCallEvent, ToolKind,
-    UnknownEvent,
+    ErrorEvent, MessageDelivery, MessageEvent, MessageProvenance, Phase, ReasoningEvent, SessionHistoryStatus,
+    SessionRef, ToolCallEvent, ToolKind, UnknownEvent,
   };
 
   use super::*;
@@ -773,23 +794,50 @@ mod tests {
   }
 
   #[test]
-  fn truncated_message_summaries_keep_full_bounded_inspector_content() {
-    let full_text = "0123456789".repeat(80);
-    let message = || {
-      AgentEvent::Message(MessageEvent {
+  fn message_summaries_preserve_markdown_within_the_timeline_cap() {
+    let markdown = "# Result\n\n```rust\nfn main() {}\n```\n";
+    let page = service_with_session(loaded_session(vec![message_event(markdown)]))
+      .load_event_page(EventPageRequest {
+        session_key: key_for("fixture"),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+
+    assert_eq!(page.events[0].summary, markdown);
+    assert!(!page.events[0].summary_truncated);
+  }
+
+  #[test]
+  fn reasoning_summaries_preserve_multiline_markdown() {
+    let markdown = "## Approach\n\n- inspect the source\n- verify the result\n";
+    let summary = event_summary(
+      0,
+      &AgentEvent::Reasoning(ReasoningEvent {
         provenance: None,
         provider: Provider::Codex,
         session_id: Some("fixture".to_string()),
-        message_id: Some("long-message".to_string()),
+        message_id: Some("reasoning".to_string()),
         parent_id: None,
-        role: Role::Assistant,
-        delivery: MessageDelivery::Final,
         phase: Phase::Finished,
-        text: full_text.clone(),
+        text: Some("Longer private reasoning".to_string()),
+        summary: Some(markdown.to_string()),
+        encrypted_content: None,
+        signature: None,
         timestamp: None,
-      })
-    };
-    let page = service_with_session(loaded_session(vec![message()]))
+      }),
+    );
+
+    assert_eq!(summary.summary, markdown);
+    assert!(!summary.summary_truncated);
+  }
+
+  #[test]
+  fn truncated_message_summaries_keep_full_bounded_inspector_content() {
+    let full_text = "m".repeat(MAX_MESSAGE_SUMMARY_CHARS + 1);
+    let page = service_with_session(loaded_session(vec![message_event(&full_text)]))
       .load_event_page(EventPageRequest {
         session_key: key_for("fixture"),
         cursor: None,
@@ -800,16 +848,31 @@ mod tests {
       .unwrap();
 
     assert!(page.events[0].summary_truncated);
-    assert_eq!(page.events[0].summary.chars().count(), 500);
+    assert_eq!(page.events[0].summary.chars().count(), MAX_MESSAGE_SUMMARY_CHARS);
     assert!(page.events[0].summary.ends_with('…'));
 
-    let detail = service_with_session(loaded_session(vec![message()]))
+    let detail = service_with_session(loaded_session(vec![message_event(&full_text)]))
       .load_event_detail(LoadEventDetailRequest {
         session_key: key_for("fixture"),
         event_key: encode_event_key(0),
       })
       .unwrap();
     assert_eq!(detail.event["text"], full_text);
+  }
+
+  #[test]
+  fn technical_summaries_keep_the_compact_timeline_cap() {
+    let event = AgentEvent::Error(ErrorEvent {
+      provider: Provider::Codex,
+      session_id: Some("fixture".to_string()),
+      message: "e".repeat(MAX_TECHNICAL_SUMMARY_CHARS + 1),
+      timestamp: None,
+    });
+    let summary = event_summary(0, &event);
+
+    assert!(summary.summary_truncated);
+    assert_eq!(summary.summary.chars().count(), MAX_TECHNICAL_SUMMARY_CHARS);
+    assert!(summary.summary.ends_with('…'));
   }
 
   #[test]
@@ -1003,6 +1066,21 @@ mod tests {
         })
         .collect(),
     )
+  }
+
+  fn message_event(text: &str) -> AgentEvent {
+    AgentEvent::Message(MessageEvent {
+      provenance: None,
+      provider: Provider::Codex,
+      session_id: Some("fixture".to_string()),
+      message_id: Some("message".to_string()),
+      parent_id: None,
+      role: Role::Assistant,
+      delivery: MessageDelivery::Final,
+      phase: Phase::Finished,
+      text: text.to_string(),
+      timestamp: None,
+    })
   }
 
   fn hidden_message_session() -> LoadedSession {
