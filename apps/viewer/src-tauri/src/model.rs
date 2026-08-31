@@ -182,6 +182,23 @@ pub struct EventSummary {
   pub tool: Option<ToolCardSummary>,
   pub usage: Option<UsageCardSummary>,
   pub reasoning: Option<ReasoningCardSummary>,
+  /// Safe historical activity metadata. A target is present only when the
+  /// activity's provider-native target ID resolves to a canonical direct child
+  /// of the session being viewed.
+  pub agent_activity: Option<AgentActivityCardSummary>,
+}
+
+/// Bounded presentation metadata for one historical agent-activity record.
+///
+/// `target_agent_path` is descriptive only. Navigation is exposed exclusively
+/// through a verified direct-child [`SessionSummary`] in `target`.
+#[derive(Clone, Debug, Serialize)]
+pub struct AgentActivityCardSummary {
+  pub kind: String,
+  pub event_id: Option<String>,
+  pub target_session_id: Option<String>,
+  pub target_agent_path: Option<String>,
+  pub target: Option<SessionSummary>,
 }
 
 /// Source-neutral token accounting for a usage event.

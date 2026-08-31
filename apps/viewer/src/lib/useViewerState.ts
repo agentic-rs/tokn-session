@@ -305,9 +305,10 @@ export function useViewerState() {
             return;
           }
           updateSessionChildren(parentSessionKey, (existing) => ({
-            sessions: cursor === null
-              ? response.sessions
-              : mergeSessions(existing?.sessions ?? [], response.sessions),
+            // An activity card can optimistically materialize one exact child
+            // before this lazy page arrives. Merge both initial and later
+            // pages so that navigation never makes that child disappear.
+            sessions: mergeSessions(existing?.sessions ?? [], response.sessions),
             next_cursor: response.next_cursor,
             is_loading: false,
             is_loading_more: false,
@@ -356,6 +357,26 @@ export function useViewerState() {
       requestSessionChildPage(parentSessionKey, cursor, false);
     }
   }, [requestSessionChildPage]);
+
+  const openSubagent = useCallback((parentSessionKey: string, target: SessionSummary) => {
+    // The target came from an activity event in this exact parent timeline.
+    // Ignore a stale card after the user has already selected another session.
+    if (selectedSessionKeyRef.current !== parentSessionKey) {
+      return;
+    }
+    updateSessionChildren(parentSessionKey, (existing) => ({
+      sessions: mergeSessions(existing?.sessions ?? [], [target]),
+      next_cursor: existing?.next_cursor ?? null,
+      is_loading: existing?.is_loading ?? false,
+      is_loading_more: existing?.is_loading_more ?? false,
+      error: existing?.error ?? null,
+    }));
+    // Fetch the normal sidebar page in the background. It retains the
+    // injected target and restores any siblings omitted from the card.
+    requestSessionChildPage(parentSessionKey, null, true);
+    applySessionSelection(target.session_key);
+    setMobileSidebarOpen(false);
+  }, [applySessionSelection, requestSessionChildPage, updateSessionChildren]);
 
   useEffect(() => {
     const requestId = ++sessionsRequest.current;
@@ -769,6 +790,7 @@ export function useViewerState() {
     loadSessionChildren,
     retrySessionChildren,
     loadMoreSessionChildren,
+    openSubagent,
     selectedSession,
     selectedSessionKey,
     selectSession,

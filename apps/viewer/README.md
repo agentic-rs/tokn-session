@@ -40,6 +40,11 @@ first meaningful user prompt, then an agent label for known subagents, and
 otherwise show **Untitled session**. The shortened id beside the title remains a
 separate identity field; the full id is available to assistive technology and
 on hover.
+Historical agent-activity records become delegation cards when their native
+target id resolves to a canonical direct child of the selected session within
+the same provider. **Open** selects that child and makes it available in the
+sidebar; unavailable, ambiguous, or non-child targets remain inspectable but
+are never guessed. These cards describe recorded activity, not live state.
 Earlier history is loaded on demand. Technical event headers expand in place,
 while their **Inspect** action opens the full inspector. Messages and reasoning
 have a readable **Content** view, while **Normalized** and **Native** expose the

@@ -1,6 +1,17 @@
 import { useState } from "react";
-import type { EventDetail, EventSummary, ToolCardSummary } from "../lib/types";
-import { formatTimestamp } from "../lib/state";
+import type {
+  AgentActivityCardSummary,
+  EventDetail,
+  EventSummary,
+  SessionSummary,
+  ToolCardSummary,
+} from "../lib/types";
+import {
+  formatTimestamp,
+  sessionDisplayTitle,
+  shortSessionId,
+  subagentDetail,
+} from "../lib/state";
 import {
   ChevronIcon,
   ReasoningIcon,
@@ -24,6 +35,7 @@ interface EventCardProps {
   detail_loading: boolean;
   on_select: (event_key: string) => void;
   on_toggle: (event_key: string) => void;
+  on_open_subagent?: (target: SessionSummary) => void;
   on_retry_detail: () => void;
 }
 
@@ -143,6 +155,31 @@ function toolHeading(event: EventSummary): TechnicalCardHeading {
   }
 }
 
+function agentActivityHeading(event: EventSummary): TechnicalCardHeading {
+  const activity = event.agent_activity;
+  const target = activity?.target ?? null;
+  if (target) {
+    const detail = subagentDetail(target);
+    return {
+      action: "Subagent",
+      primary: sessionDisplayTitle(target),
+      secondary: detail ?? `Session ${shortSessionId(target.session_id)}`,
+      monospace: false,
+    };
+  }
+
+  const targetLabel = activity?.target_agent_path?.trim()
+    || activity?.target_session_id?.trim()
+    || event.title
+    || "Agent activity";
+  return {
+    action: "Subagent",
+    primary: targetLabel,
+    secondary: null,
+    monospace: false,
+  };
+}
+
 function changeSummary(tool: ToolCardSummary): string | null {
   const changes = [
     tool.added === null ? null : `+${tool.added}`,
@@ -210,6 +247,9 @@ function cardHeading(event: EventSummary): TechnicalCardHeading | null {
   if (event.type === "tool_call") {
     return toolHeading(event);
   }
+  if (event.type === "agent_activity" && event.agent_activity) {
+    return agentActivityHeading(event);
+  }
   if (event.type === "usage" && event.usage) {
     return usageHeading(event.usage);
   }
@@ -224,6 +264,14 @@ function usesControlledExpansion(event: EventSummary): boolean {
 }
 
 function eventStatus(event: EventSummary): { label: string; tone: string } | null {
+  if (event.type === "agent_activity") {
+    const kind = event.agent_activity?.kind.trim();
+    if (!kind) {
+      return null;
+    }
+    const tone = /^(failed|interrupted|blocked)$/i.test(kind) ? "error" : "neutral";
+    return { label: humanize(kind), tone };
+  }
   if (event.type !== "tool_call") {
     if (!event.phase || (event.type === "reasoning" && event.phase === "finished")) {
       return null;
@@ -257,6 +305,40 @@ function eventStatus(event: EventSummary): { label: string; tone: string } | nul
     return { label: event.phase === "started" ? "running" : event.phase, tone: "neutral" };
   }
   return null;
+}
+
+function AgentActivityBody({
+  activity,
+  event,
+}: {
+  activity: AgentActivityCardSummary | null | undefined;
+  event: EventSummary;
+}) {
+  const target = activity?.target ?? null;
+  if (!activity) {
+    return <p>{event.summary || "No activity summary available."}</p>;
+  }
+  if (target) {
+    return (
+      <div className="delegation-card">
+        <p>
+          Recorded {humanize(activity.kind).toLowerCase()} activity for this subagent.
+        </p>
+        <span className="delegation-card__session" title={`Session ${target.session_id}`}>
+          Session {shortSessionId(target.session_id)}
+        </span>
+      </div>
+    );
+  }
+  if (activity.target_session_id || activity.target_agent_path) {
+    return (
+      <p>
+        Child session is not available in this viewer.
+        {activity.target_session_id ? ` Recorded target: ${activity.target_session_id}.` : ""}
+      </p>
+    );
+  }
+  return <p>{event.summary || "No child session was recorded for this activity."}</p>;
 }
 
 function ToolOutput({
@@ -344,6 +426,7 @@ export function EventCard({
   detail_loading,
   on_select,
   on_toggle,
+  on_open_subagent,
   on_retry_detail,
 }: EventCardProps) {
   const [isLocallyExpanded, setIsLocallyExpanded] = useState(
@@ -390,6 +473,7 @@ export function EventCard({
   const regionId = `${button_id}-details`;
   const labelId = `${button_id}-label`;
   const cardIsExpanded = usesControlledExpansion(event) ? is_expanded : isLocallyExpanded;
+  const subagentTarget = event.type === "agent_activity" ? event.agent_activity?.target ?? null : null;
   return (
     <article
       className="technical-event"
@@ -440,15 +524,27 @@ export function EventCard({
           </time>
           <ChevronIcon className={cardIsExpanded ? "chevron chevron--open" : "chevron"} />
         </button>
-        <button
-          aria-label={`Inspect ${title}`}
-          className="technical-event__inspect"
-          id={button_id}
-          onClick={() => on_select(event.event_key)}
-          type="button"
-        >
-          {event.summary_truncated && !event.is_hidden ? "Full detail" : "Inspect"}
-        </button>
+        <div className="technical-event__actions">
+          {subagentTarget ? (
+            <button
+              aria-label={`Open subagent ${sessionDisplayTitle(subagentTarget)}`}
+              className="technical-event__open-subagent"
+              onClick={() => on_open_subagent?.(subagentTarget)}
+              type="button"
+            >
+              Open
+            </button>
+          ) : null}
+          <button
+            aria-label={`Inspect ${title}`}
+            className="technical-event__inspect"
+            id={button_id}
+            onClick={() => on_select(event.event_key)}
+            type="button"
+          >
+            {event.summary_truncated && !event.is_hidden ? "Full detail" : "Inspect"}
+          </button>
+        </div>
       </div>
       {cardIsExpanded ? (
         <div
@@ -475,6 +571,8 @@ export function EventCard({
               is_loading={detail_loading}
               on_retry={on_retry_detail}
             />
+          ) : event.type === "agent_activity" ? (
+            <AgentActivityBody activity={event.agent_activity} event={event} />
           ) : (
             <p>{event.is_hidden ? "Hidden extension event" : event.summary || "No summary available."}</p>
           )}

@@ -7,17 +7,18 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokn_session_client::SessionHeader;
 use tokn_session_core::{
-  AgentEvent, LifecycleOutcome, LoadedSession, Phase, Provider, Role, TerminalAction, ToolCallEvent, ToolKind,
-  ToolOperation, ToolOperationStatus, ToolSummary, UsageKind, assemble_tool_operations,
+  AgentActivity, AgentEvent, LifecycleOutcome, LoadedSession, Phase, Provider, Role, TerminalAction, ToolCallEvent,
+  ToolKind, ToolOperation, ToolOperationStatus, ToolSummary, UsageKind, assemble_tool_operations,
 };
 use tokn_session_render::render_event_summary;
 
 use crate::model::{
-  EventDetail, EventPage, EventPageRequest, EventSummary, ListSessionChildrenRequest, ListSessionChildrenResponse,
-  ListSessionsRequest, ListSessionsResponse, LoadEventDetailRequest, PageDirection, ReasoningCardSummary,
-  SessionLocator, SessionSummary, SourceError, ToolCardSummary, ToolOutputPreview, ToolOutputSection, UsageCardSummary,
-  ViewerProvider, bounded_limit, decode_event_cursor, decode_event_key, decode_list_cursor, decode_session_key,
-  encode_event_cursor, encode_event_key, encode_list_cursor, encode_session_key, parse_updated_at_ms, requested_offset,
+  AgentActivityCardSummary, EventDetail, EventPage, EventPageRequest, EventSummary, ListSessionChildrenRequest,
+  ListSessionChildrenResponse, ListSessionsRequest, ListSessionsResponse, LoadEventDetailRequest, PageDirection,
+  ReasoningCardSummary, SessionLocator, SessionSummary, SourceError, ToolCardSummary, ToolOutputPreview,
+  ToolOutputSection, UsageCardSummary, ViewerProvider, bounded_limit, decode_event_cursor, decode_event_key,
+  decode_list_cursor, decode_session_key, encode_event_cursor, encode_event_key, encode_list_cursor,
+  encode_session_key, parse_updated_at_ms, requested_offset,
 };
 use crate::repository::{NativeRepository, ViewerRepository};
 
@@ -370,12 +371,25 @@ impl ViewerService {
       PageDirection::Backward => total_events,
     });
     let (start, end) = event_page_bounds(total_events, boundary, request.direction, limit)?;
+    let has_targeted_agent_activity = timeline[start..end].iter().any(|entry| match entry {
+      TimelineEntry::Event { source_event_index } => matches!(
+        loaded.events.get(*source_event_index),
+        Some(AgentEvent::AgentActivity(activity)) if present_string(activity.target_session_id.as_deref()).is_some()
+      ),
+      TimelineEntry::ToolOperation { .. } => false,
+    });
+    let delegation_targets = has_targeted_agent_activity
+      .then(|| self.delegation_targets_for_parent(&locator))
+      .unwrap_or_default();
     let events = timeline[start..end]
       .iter()
       .map(|entry| match entry {
-        TimelineEntry::Event { source_event_index } => {
-          event_summary(&loaded.events, *source_event_index, &loaded.events[*source_event_index])
-        }
+        TimelineEntry::Event { source_event_index } => event_summary_with_delegation_targets(
+          &loaded.events,
+          *source_event_index,
+          &loaded.events[*source_event_index],
+          &delegation_targets,
+        ),
         TimelineEntry::ToolOperation {
           source_event_index,
           operation,
@@ -450,6 +464,37 @@ impl ViewerService {
       _ => None,
     };
     Ok(loaded)
+  }
+
+  /// Returns direct, canonical descendants that are safe to open from a
+  /// parent activity card. Header discovery is deliberately fail-closed: an
+  /// unavailable provider catalog or a parent source that is no longer the
+  /// canonical header produces no links, while leaving the parent timeline
+  /// readable.
+  fn delegation_targets_for_parent(&self, parent_locator: &SessionLocator) -> HashMap<String, SessionSummary> {
+    let Ok(headers) = self.repository.list_session_headers(parent_locator.provider) else {
+      return HashMap::new();
+    };
+    let mut ignored_errors = Vec::new();
+    let relations = session_relation_index(parent_locator.provider, headers, &mut ignored_errors);
+    let Some(parent_index) = relations
+      .headers
+      .iter()
+      .position(|header| locator_for_header(parent_locator.provider, header) == *parent_locator)
+    else {
+      return HashMap::new();
+    };
+
+    relations
+      .headers
+      .into_iter()
+      .enumerate()
+      .filter_map(|(index, header)| (relations.parent_indices[index] == Some(parent_index)).then_some((index, header)))
+      .filter_map(|(index, header)| {
+        session_summary_with_child_count(parent_locator.provider, header, relations.child_counts[index], true).ok()
+      })
+      .map(|summary| (summary.session_id.clone(), summary))
+      .collect()
   }
 }
 
@@ -946,7 +991,17 @@ fn timeline_entry_for_source(events: &[AgentEvent], source_event_index: usize) -
   })
 }
 
-fn event_summary(_events: &[AgentEvent], index: usize, event: &AgentEvent) -> EventSummary {
+#[cfg(test)]
+fn event_summary(events: &[AgentEvent], index: usize, event: &AgentEvent) -> EventSummary {
+  event_summary_with_delegation_targets(events, index, event, &HashMap::new())
+}
+
+fn event_summary_with_delegation_targets(
+  _events: &[AgentEvent],
+  index: usize,
+  event: &AgentEvent,
+  delegation_targets: &HashMap<String, SessionSummary>,
+) -> EventSummary {
   let hidden = event.is_hidden();
   let title = if hidden {
     "Hidden provider content".to_string()
@@ -979,6 +1034,12 @@ fn event_summary(_events: &[AgentEvent], index: usize, event: &AgentEvent) -> Ev
   let (summary, summary_truncated) = truncate_with_flag(summary, summary_max_chars);
   let tool = (!hidden).then(|| tool_event(event).map(tool_card_summary)).flatten();
   let usage = (!hidden).then(|| usage_card_summary(event)).flatten();
+  let agent_activity = (!hidden)
+    .then(|| match event {
+      AgentEvent::AgentActivity(activity) => Some(agent_activity_card_summary(activity, delegation_targets)),
+      _ => None,
+    })
+    .flatten();
   EventSummary {
     event_key: encode_event_key(index),
     event_type: normalized_event_type(event).to_string(),
@@ -994,6 +1055,7 @@ fn event_summary(_events: &[AgentEvent], index: usize, event: &AgentEvent) -> Ev
     tool,
     usage,
     reasoning,
+    agent_activity,
   }
 }
 
@@ -1035,6 +1097,35 @@ fn tool_operation_event_summary(source_event_index: usize, operation: &ToolOpera
     tool: Some(tool),
     usage: None,
     reasoning: None,
+    agent_activity: None,
+  }
+}
+
+fn agent_activity_card_summary(
+  activity: &AgentActivity,
+  delegation_targets: &HashMap<String, SessionSummary>,
+) -> AgentActivityCardSummary {
+  AgentActivityCardSummary {
+    kind: normalize_one_line_text(&activity.kind, MAX_AGENT_IDENTITY_CHARS).unwrap_or_else(|| "activity".to_string()),
+    event_id: activity
+      .event_id
+      .as_deref()
+      .and_then(|value| normalize_one_line_text(value, MAX_AGENT_IDENTITY_CHARS)),
+    target_session_id: activity
+      .target_session_id
+      .as_deref()
+      .and_then(|value| normalize_one_line_text(value, MAX_AGENT_IDENTITY_CHARS)),
+    target_agent_path: activity
+      .target_agent_path
+      .as_deref()
+      .and_then(|value| normalize_one_line_text(value, MAX_AGENT_IDENTITY_CHARS)),
+    // Lookup intentionally uses the raw ID. A sanitized display string must
+    // never become a new session identity.
+    target: activity
+      .target_session_id
+      .as_deref()
+      .and_then(|target_session_id| delegation_targets.get(target_session_id))
+      .cloned(),
   }
 }
 
@@ -1844,8 +1935,9 @@ mod tests {
 
   use serde_json::json;
   use tokn_session_core::{
-    ErrorEvent, MessageDelivery, MessageEvent, MessageProvenance, Phase, ReasoningEvent, SessionHistoryStatus,
-    SessionRef, ToolCallEvent, ToolKind, ToolRecordKind, ToolTransport, UnknownEvent, UsageEvent, UsageKind,
+    AgentActivity, ErrorEvent, MessageDelivery, MessageEvent, MessageProvenance, Phase, ReasoningEvent,
+    SessionHistoryStatus, SessionRef, ToolCallEvent, ToolKind, ToolRecordKind, ToolTransport, UnknownEvent, UsageEvent,
+    UsageKind,
   };
 
   use super::*;
@@ -2455,6 +2547,157 @@ mod tests {
       1
     );
     assert_eq!(page.total_events, 5);
+  }
+
+  #[test]
+  fn event_page_resolves_agent_activity_to_its_canonical_direct_child() {
+    let parent = session_header("parent", None, "/projects/Alpha", "2026-08-31T00:00:00Z");
+    let mut child = session_header("child", Some("parent"), "/projects/Alpha", "2026-08-31T00:02:00Z");
+    child.title = Some("Current child".to_string());
+    child.agent_nickname = Some("Hubble".to_string());
+    child.agent_role = Some("researcher".to_string());
+
+    let mut stale_child = session_header("child", Some("parent"), "/projects/Alpha", "2026-08-31T00:01:00Z");
+    stale_child.path = PathBuf::from("/fixtures/child-stale.jsonl");
+    stale_child.title = Some("Stale child".to_string());
+
+    let service = ViewerService::new(Arc::new(FakeRepository {
+      listings: HashMap::from([(ViewerProvider::Codex, Ok(vec![parent, stale_child, child]))]),
+      loaded: Mutex::new(Some(loaded_session_for(
+        "parent",
+        vec![agent_activity("child", Some("/root/researcher"))],
+      ))),
+    }));
+
+    let page = service
+      .load_event_page(EventPageRequest {
+        session_key: key_for_header("parent"),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+
+    let activity = page.events[0]
+      .agent_activity
+      .as_ref()
+      .expect("agent activity card should be projected");
+    assert_eq!(activity.kind, "started");
+    assert_eq!(activity.target_session_id.as_deref(), Some("child"));
+    assert_eq!(activity.target_agent_path.as_deref(), Some("/root/researcher"));
+    let target = activity.target.as_ref().expect("direct child should be safe to open");
+    assert_eq!(target.session_id, "child");
+    assert_eq!(target.title.as_deref(), Some("Current child"));
+    assert_eq!(target.agent_nickname.as_deref(), Some("Hubble"));
+    assert_eq!(target.agent_role.as_deref(), Some("researcher"));
+    assert!(target.is_subagent);
+    assert_eq!(
+      decode_session_key(&target.session_key).unwrap().source_path,
+      PathBuf::from("/fixtures/child.jsonl")
+    );
+  }
+
+  #[test]
+  fn event_page_keeps_non_child_agent_activity_target_unlinked() {
+    let parent = session_header("parent", None, "/projects/Alpha", "2026-08-31T00:00:00Z");
+    let unrelated = session_header(
+      "target",
+      Some("other-parent"),
+      "/projects/Alpha",
+      "2026-08-31T00:01:00Z",
+    );
+    let service = ViewerService::new(Arc::new(FakeRepository {
+      listings: HashMap::from([(ViewerProvider::Codex, Ok(vec![parent, unrelated]))]),
+      loaded: Mutex::new(Some(loaded_session_for(
+        "parent",
+        vec![agent_activity("target", Some("/root/not-a-child"))],
+      ))),
+    }));
+
+    let page = service
+      .load_event_page(EventPageRequest {
+        session_key: key_for_header("parent"),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+
+    let activity = page.events[0]
+      .agent_activity
+      .as_ref()
+      .expect("agent activity card should remain visible");
+    assert_eq!(activity.target_session_id.as_deref(), Some("target"));
+    assert_eq!(activity.target_agent_path.as_deref(), Some("/root/not-a-child"));
+    assert!(activity.target.is_none());
+  }
+
+  #[test]
+  fn event_page_keeps_agent_activity_unlinked_for_a_noncanonical_parent_source() {
+    let mut stale_parent = session_header("parent", None, "/projects/Alpha", "2026-08-31T00:00:00Z");
+    stale_parent.path = PathBuf::from("/fixtures/parent-stale.jsonl");
+    let current_parent = session_header("parent", None, "/projects/Alpha", "2026-08-31T00:01:00Z");
+    let child = session_header("child", Some("parent"), "/projects/Alpha", "2026-08-31T00:02:00Z");
+    let service = ViewerService::new(Arc::new(FakeRepository {
+      listings: HashMap::from([(ViewerProvider::Codex, Ok(vec![stale_parent, current_parent, child]))]),
+      loaded: Mutex::new(Some(loaded_session_for(
+        "parent",
+        vec![agent_activity("child", Some("/root/researcher"))],
+      ))),
+    }));
+
+    let stale_parent_key = encode_session_key(&SessionLocator {
+      version: 1,
+      provider: ViewerProvider::Codex,
+      session_id: "parent".to_string(),
+      source_path: PathBuf::from("/fixtures/parent-stale.jsonl"),
+    })
+    .unwrap();
+    let page = service
+      .load_event_page(EventPageRequest {
+        session_key: stale_parent_key,
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+
+    let activity = page.events[0]
+      .agent_activity
+      .as_ref()
+      .expect("agent activity card should remain visible");
+    assert!(activity.target.is_none());
+  }
+
+  #[test]
+  fn event_page_keeps_agent_activity_unlinked_when_header_lookup_fails() {
+    let service = ViewerService::new(Arc::new(FakeRepository {
+      listings: HashMap::from([(ViewerProvider::Codex, Err("session catalog unavailable".to_string()))]),
+      loaded: Mutex::new(Some(loaded_session_for(
+        "parent",
+        vec![agent_activity("child", Some("/root/researcher"))],
+      ))),
+    }));
+
+    let page = service
+      .load_event_page(EventPageRequest {
+        session_key: key_for_header("parent"),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+
+    let activity = page.events[0]
+      .agent_activity
+      .as_ref()
+      .expect("agent activity card should remain visible");
+    assert_eq!(activity.target_session_id.as_deref(), Some("child"));
+    assert!(activity.target.is_none());
   }
 
   #[test]
@@ -3707,11 +3950,31 @@ mod tests {
   }
 
   fn loaded_session(events: Vec<AgentEvent>) -> LoadedSession {
+    loaded_session_for("fixture", events)
+  }
+
+  fn loaded_session_for(id: &str, events: Vec<AgentEvent>) -> LoadedSession {
     LoadedSession {
-      reference: session_ref("fixture", None, "/projects/fixture", "2026-06-01T00:00:00Z"),
+      reference: session_ref(id, None, "/projects/fixture", "2026-06-01T00:00:00Z"),
       events,
       history_status: SessionHistoryStatus::Complete,
     }
+  }
+
+  fn agent_activity(target_session_id: &str, target_agent_path: Option<&str>) -> AgentEvent {
+    AgentEvent::AgentActivity(AgentActivity {
+      provider: Provider::Codex,
+      session_id: Some("parent".to_string()),
+      event_id: Some("activity-1".to_string()),
+      actor_session_id: None,
+      actor_agent_path: None,
+      target_session_id: Some(target_session_id.to_string()),
+      target_agent_path: target_agent_path.map(str::to_string),
+      kind: "started".to_string(),
+      occurred_at_ms: Some(1_788_112_800_000),
+      native: None,
+      timestamp: Some("2026-08-31T00:03:00Z".to_string()),
+    })
   }
 
   fn key_for(session_id: &str) -> String {
@@ -3720,6 +3983,16 @@ mod tests {
       provider: ViewerProvider::Codex,
       session_id: session_id.to_string(),
       source_path: PathBuf::from("/fixtures/session.jsonl"),
+    })
+    .unwrap()
+  }
+
+  fn key_for_header(session_id: &str) -> String {
+    encode_session_key(&SessionLocator {
+      version: 1,
+      provider: ViewerProvider::Codex,
+      session_id: session_id.to_string(),
+      source_path: PathBuf::from(format!("/fixtures/{session_id}.jsonl")),
     })
     .unwrap()
   }

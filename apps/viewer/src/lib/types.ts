@@ -179,6 +179,21 @@ export interface SessionChildrenState {
   error: string | null;
 }
 
+/**
+ * Compact, historical delegation metadata for an `agent_activity` event.
+ *
+ * `target` is present only when the backend can prove that the activity
+ * points at a known direct child in the same provider. It is deliberately not
+ * a live subagent-state assertion.
+ */
+export interface AgentActivityCardSummary {
+  kind: string;
+  event_id: string | null;
+  target_session_id: string | null;
+  target_agent_path: string | null;
+  target: SessionSummary | null;
+}
+
 export interface EventSummary {
   event_key: string;
   type: EventType | string;
@@ -191,6 +206,8 @@ export interface EventSummary {
   summary_truncated: boolean;
   is_hidden: boolean;
   is_error: boolean | null;
+  /** Optional while the viewer remains compatible with older backends. */
+  agent_activity?: AgentActivityCardSummary | null;
   tool: ToolCardSummary | null;
   usage: UsageCardSummary | null;
   reasoning: ReasoningCardSummary | null;

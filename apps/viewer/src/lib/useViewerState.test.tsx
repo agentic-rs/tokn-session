@@ -473,4 +473,45 @@ describe("useViewerState subagent discovery", () => {
     act(() => result.current.selectSession(child.session_key));
     await waitFor(() => expect(result.current.selectedSession?.session_key).toBe(child.session_key));
   });
+
+  it("opens a delegation child before its lazy sidebar page arrives", async () => {
+    const root = session("codex:delegating-root");
+    root.child_count = 1;
+    const child = session("codex:delegated-child");
+    child.parent_session_id = root.session_id;
+    child.is_subagent = true;
+    child.agent_nickname = "Hubble";
+    const childPage = deferred<{ sessions: SessionSummary[]; next_cursor: string | null }>();
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [root],
+      next_cursor: null,
+      source_errors: [],
+    });
+    vi.mocked(loadEventPage).mockResolvedValue(toolEventPage());
+    vi.mocked(listSessionChildren).mockImplementation(() => childPage.promise);
+
+    const { result } = renderHook(() => useViewerState());
+    await waitFor(() => expect(result.current.selectedSession?.session_key).toBe(root.session_key));
+
+    act(() => result.current.openSubagent(root.session_key, child));
+
+    await waitFor(() => {
+      expect(result.current.selectedSession?.session_key).toBe(child.session_key);
+      expect(result.current.sessionChildren.get(root.session_key)?.sessions).toEqual([child]);
+    });
+    expect(listSessionChildren).toHaveBeenCalledWith({
+      parent_session_key: root.session_key,
+      cursor: undefined,
+      limit: 60,
+    });
+
+    await act(async () => {
+      childPage.resolve({ sessions: [], next_cursor: null });
+      await childPage.promise;
+    });
+
+    await waitFor(() => {
+      expect(result.current.sessionChildren.get(root.session_key)?.sessions).toEqual([child]);
+    });
+  });
 });

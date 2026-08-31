@@ -57,6 +57,7 @@ export function ViewerPage() {
         is_loading_older={viewer.olderLoading}
         on_event_select={viewer.selectEvent}
         on_event_toggle={viewer.toggleEventExpanded}
+        on_open_subagent={viewer.openSubagent}
         on_inspector_toggle={viewer.toggleInspector}
         on_load_newer={viewer.loadNewerEvents}
         on_load_older={viewer.loadOlderEvents}

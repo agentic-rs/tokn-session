@@ -39,6 +39,7 @@ interface ConversationProps {
   on_inspector_toggle: () => void;
   on_event_select: (event_key: string) => void;
   on_event_toggle: (event_key: string) => void;
+  on_open_subagent: (parent_session_key: string, target: SessionSummary) => void;
   on_load_older: () => void;
   on_load_newer: () => void;
   on_retry: () => void;
@@ -67,6 +68,7 @@ export function Conversation({
   on_inspector_toggle,
   on_event_select,
   on_event_toggle,
+  on_open_subagent,
   on_load_older,
   on_load_newer,
   on_retry,
@@ -252,6 +254,11 @@ export function Conversation({
                 key={`${session.session_key}:${event.event_key}`}
                 on_select={on_event_select}
                 on_toggle={on_event_toggle}
+                on_open_subagent={(target) => {
+                  if (session) {
+                    on_open_subagent(session.session_key, target);
+                  }
+                }}
                 on_retry_detail={on_retry_expanded_detail}
               />
             ))}

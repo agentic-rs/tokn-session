@@ -352,11 +352,13 @@ Each expandable session uses a separate bounded, metadata-only direct-child
 query. Parent-child edges are resolved within one provider after duplicate IDs
 are canonicalized by newest provider timestamp (then path); orphaned and cyclic
 records remain visible as roots instead of disappearing. `agent_path`, nickname,
-and role cross the viewer boundary as sanitized bounded labels. Selecting a
-child loads only that child's independent timeline: parent timelines do not yet
-include synthetic delegation summaries, child searches are not yet included in
-root search, and
-historical headers do not claim live subagent status.
+and role cross the viewer boundary as sanitized bounded labels. A parent
+timeline shows a historical delegation card only when an `agent_activity` target
+id resolves to its canonical, same-provider direct child; unknown, ambiguous,
+cross-provider, or non-child targets remain visible but are not navigable.
+Opening that card materializes the verified child in the sidebar and selects its
+independent timeline. Child searches are not yet included in root search, and
+historical headers or activity cards do not claim live subagent status.
 
 Codex normalization follows the first session header's `history_mode`. Legacy
 rollouts keep their response-item and legacy-event projection, while paginated

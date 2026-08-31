@@ -4,6 +4,7 @@ import type {
   EventDetail,
   EventSummary,
   ReasoningCardSummary,
+  SessionSummary,
   ToolCardSummary,
   UsageCardSummary,
 } from "../lib/types";
@@ -52,6 +53,30 @@ function reasoning(overrides: Partial<ReasoningCardSummary> = {}): ReasoningCard
     has_text: false,
     has_encrypted_content: false,
     is_redacted: false,
+    ...overrides,
+  };
+}
+
+function subagent(overrides: Partial<SessionSummary> = {}): SessionSummary {
+  return {
+    session_key: "session.v1.child",
+    session_id: "child-session-123456",
+    parent_session_id: "parent-session",
+    is_subagent: true,
+    provider: "codex",
+    title: null,
+    preview: null,
+    project: "tokn-agent",
+    cwd: "/work/tokn-agent",
+    updated_at_ms: 1_788_000_000_000,
+    timestamp: "2026-08-31T00:00:00Z",
+    agent_path: "/root/reviewer",
+    agent_nickname: "Hubble",
+    agent_role: "reviewer",
+    child_count: 0,
+    message_count: null,
+    event_count: null,
+    history_status: null,
     ...overrides,
   };
 }
@@ -215,6 +240,66 @@ describe("EventCard tool headings", () => {
 
     expect(screen.getByText("failed")).toHaveAttribute("data-tone", "error");
     expect(screen.queryByText("exit 0")).not.toBeInTheDocument();
+  });
+});
+
+describe("EventCard subagent activity", () => {
+  it("presents a known child and opens it without selecting or expanding the event", () => {
+    const onOpenSubagent = vi.fn();
+    const onSelect = vi.fn();
+    const onToggle = vi.fn();
+    const child = subagent();
+    renderCard(event({
+      type: "agent_activity",
+      role: null,
+      title: "Agent activity",
+      summary: "agent activity completed /root/reviewer",
+      agent_activity: {
+        kind: "completed",
+        event_id: "activity-1",
+        target_session_id: child.session_id,
+        target_agent_path: child.agent_path,
+        target: child,
+      },
+    }), {
+      on_open_subagent: onOpenSubagent,
+      on_select: onSelect,
+      on_toggle: onToggle,
+    });
+
+    expect(screen.getByRole("button", { name: "Subagent: Hubble" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.getByText("reviewer · /root/reviewer")).toBeInTheDocument();
+    expect(screen.getByText("Completed")).toHaveAttribute("data-tone", "neutral");
+
+    fireEvent.click(screen.getByRole("button", { name: "Open subagent Hubble" }));
+
+    expect(onOpenSubagent).toHaveBeenCalledWith(child);
+    expect(onSelect).not.toHaveBeenCalled();
+    expect(onToggle).not.toHaveBeenCalled();
+  });
+
+  it("keeps an unresolved target inspectable without offering a fabricated navigation action", () => {
+    renderCard(event({
+      type: "agent_activity",
+      role: null,
+      title: "Agent activity",
+      summary: "agent activity started /root/missing",
+      agent_activity: {
+        kind: "started",
+        event_id: "activity-2",
+        target_session_id: "missing-child",
+        target_agent_path: "/root/missing",
+        target: null,
+      },
+    }));
+
+    expect(screen.queryByRole("button", { name: /open subagent/i })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Subagent: /root/missing" }));
+    expect(screen.getByText(/Child session is not available in this viewer/)).toBeInTheDocument();
+    expect(screen.getByText(/Recorded target: missing-child/)).toBeInTheDocument();
   });
 });
 
