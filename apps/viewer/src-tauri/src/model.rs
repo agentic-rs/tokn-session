@@ -16,6 +16,7 @@ const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 pub enum ViewerProvider {
   Codex,
   Pi,
+  #[serde(rename = "opencode")]
   OpenCode,
   Dsh,
 }
@@ -338,6 +339,22 @@ mod tests {
     );
     assert_eq!(parse_updated_at_ms(Some("not-a-time")), None);
     assert_eq!(parse_updated_at_ms(Some("9007199254740992")), None);
+  }
+
+  #[test]
+  fn provider_wire_names_match_the_frontend_contract() {
+    for (provider, wire_name) in [
+      (ViewerProvider::Codex, "codex"),
+      (ViewerProvider::Pi, "pi"),
+      (ViewerProvider::OpenCode, "opencode"),
+      (ViewerProvider::Dsh, "dsh"),
+    ] {
+      assert_eq!(serde_json::to_value(provider).unwrap(), wire_name);
+      assert_eq!(
+        serde_json::from_value::<ViewerProvider>(wire_name.into()).unwrap(),
+        provider
+      );
+    }
   }
 
   #[test]

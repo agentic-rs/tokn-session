@@ -15,6 +15,15 @@ fn normalizer() -> CodexNormalizer {
   normalizer
 }
 
+fn paginated_normalizer() -> CodexNormalizer {
+  let mut normalizer = CodexNormalizer::new();
+  line(
+    &mut normalizer,
+    json!({"type":"session_meta","payload":{"id":"codex-1","history_mode":"paginated"}}),
+  );
+  normalizer
+}
+
 fn token_count(total: u64) -> Value {
   let counters = json!({"input_tokens":total-5,"output_tokens":5,"cached_input_tokens":10,
     "cache_write_input_tokens":2,"reasoning_output_tokens":2,"total_tokens":total});
@@ -124,6 +133,10 @@ fn context_records_are_metadata_not_final_messages() {
       "{record}"
     );
   }
+  let record = json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"codex-1","turn_id":"turn-1",
+    "item":{"type":"ContextCompaction","id":"compact-1"},"completed_at_ms":1}});
+  assert!(matches!(&line(&mut paginated_normalizer(), record.clone())[..],
+    [AgentEvent::Metadata(event)] if event.native == record));
 }
 
 #[test]
@@ -140,6 +153,12 @@ fn malformed_context_and_future_events_stay_unknown() {
       "{record}"
     );
   }
+  let record = json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"codex-1","turn_id":"turn-1",
+    "item":{"type":"ContextCompaction"},"completed_at_ms":1}});
+  assert!(matches!(
+    &line(&mut paginated_normalizer(), record)[..],
+    [AgentEvent::Unknown(_)]
+  ));
 }
 
 #[test]
@@ -183,4 +202,15 @@ fn rollback_and_compaction_reset_snapshot_deduplication() {
       [AgentEvent::Usage(_)]
     ));
   }
+  let mut normalizer = paginated_normalizer();
+  line(&mut normalizer, token_count(35));
+  line(
+    &mut normalizer,
+    json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"codex-1","turn_id":"turn-1",
+      "item":{"type":"ContextCompaction","id":"compact-1"},"completed_at_ms":1}}),
+  );
+  assert!(matches!(
+    &line(&mut normalizer, token_count(35))[..],
+    [AgentEvent::Usage(_)]
+  ));
 }

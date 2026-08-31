@@ -11,7 +11,12 @@ pub(crate) struct RecordsNormalizer {
 }
 
 impl RecordsNormalizer {
-  pub(crate) fn normalize(&mut self, line: &RolloutLine, session_id: Option<String>) -> Option<Vec<AgentEvent>> {
+  pub(crate) fn normalize(
+    &mut self,
+    line: &RolloutLine,
+    session_id: Option<String>,
+    canonical_items: bool,
+  ) -> Option<Vec<AgentEvent>> {
     let context = RecordContext {
       session_id,
       timestamp: line.timestamp().map(str::to_owned),
@@ -47,6 +52,15 @@ impl RecordsNormalizer {
           payload["num_turns"]
             .as_u64()
             .map(|_| (MetadataKind::Context, "thread rolled back"))
+        }
+        Some("item_completed") if canonical_items && payload["item"]["type"] == "ContextCompaction" => {
+          self.last_info = None;
+          ["thread_id", "turn_id"]
+            .iter()
+            .all(|field| payload[field].as_str().is_some_and(|value| !value.is_empty()))
+            .then(|| payload["item"]["id"].as_str().filter(|id| !id.is_empty()))
+            .flatten()
+            .map(|_| (MetadataKind::Context, "context compacted"))
         }
         _ => return None,
       },

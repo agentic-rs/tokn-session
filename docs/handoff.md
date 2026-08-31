@@ -290,6 +290,14 @@ provider-native inspector representation is capped at 512 KiB before IPC;
 oversized values are replaced by structured JSON truncation metadata. A full,
 uncapped export path is not implemented yet.
 
+Codex normalization follows the first session header's `history_mode`. Legacy
+rollouts keep their response-item and legacy-event projection, while paginated
+rollouts use canonical `item_started`/`item_completed` records and suppress
+duplicate raw response records. Raw reasoning remains authoritative so its
+encrypted content is retained. Every current Codex turn-item and extension kind
+has an explicit disposition; malformed and future shapes remain visible as
+subtype-specific unknown events.
+
 ## Provider Sources
 
 - Pi session roots resolve in this order: `--session-dir`,

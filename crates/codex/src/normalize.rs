@@ -1,3 +1,5 @@
+mod item_lifecycle;
+
 use serde_json::{Value, json};
 use tokn_codex_protocol::{
   AgentMessageItem, ContentItem, EventMessage, InterAgentCommunicationItem, MessageItem, ReasoningItem, ResponseItem,
@@ -11,11 +13,20 @@ use tokn_session_core::{
 };
 
 use crate::event::CodexLine;
+use item_lifecycle::{normalize_item_lifecycle, normalize_legacy_item_completed};
 
 pub struct CodexNormalizer {
   session_id: Option<String>,
+  history_mode: CodexRolloutHistoryMode,
   history_boundary: Option<CodexHistoryBoundary>,
   records: crate::records::RecordsNormalizer,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum CodexRolloutHistoryMode {
+  #[default]
+  Legacy,
+  Paginated,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +88,7 @@ impl CodexNormalizer {
   pub fn new() -> Self {
     Self {
       session_id: None,
+      history_mode: CodexRolloutHistoryMode::Legacy,
       history_boundary: None,
       records: Default::default(),
     }
@@ -85,6 +97,7 @@ impl CodexNormalizer {
   pub fn new_historical() -> Self {
     Self {
       session_id: None,
+      history_mode: CodexRolloutHistoryMode::Legacy,
       history_boundary: Some(CodexHistoryBoundary::new()),
       records: Default::default(),
     }
@@ -100,7 +113,11 @@ impl CodexNormalizer {
       return Vec::new();
     }
 
-    if let Some(events) = self.records.normalize(&line, self.session_id.clone()) {
+    if let Some(events) = self.records.normalize(
+      &line,
+      self.session_id.clone(),
+      matches!(self.history_mode, CodexRolloutHistoryMode::Paginated),
+    ) {
       return events;
     }
     self.normalize_item(line.into_item(), timestamp)
@@ -117,7 +134,19 @@ impl CodexNormalizer {
   fn normalize_item(&mut self, item: RolloutItem, timestamp: Option<String>) -> Vec<AgentEvent> {
     match item {
       RolloutItem::SessionMeta(item) => self.normalize_session_meta(item, timestamp),
-      RolloutItem::ResponseItem(item) => normalize_response_item(self.session_id.clone(), item, timestamp),
+      RolloutItem::ResponseItem(item) => {
+        if matches!(self.history_mode, CodexRolloutHistoryMode::Paginated) {
+          match item {
+            ResponseItem::Reasoning(item) => normalize_reasoning(self.session_id.clone(), item, timestamp),
+            ResponseItem::Unknown(item) => {
+              vec![unknown_response_event(self.session_id.clone(), item, timestamp)]
+            }
+            _ => Vec::new(),
+          }
+        } else {
+          normalize_response_item(self.session_id.clone(), item, timestamp)
+        }
+      }
       RolloutItem::InterAgentCommunication(item) => {
         normalize_inter_agent_communication(self.session_id.clone(), item, timestamp)
       }
@@ -125,7 +154,12 @@ impl CodexNormalizer {
       | RolloutItem::TurnContext(_)
       | RolloutItem::WorldState(_)
       | RolloutItem::Compacted(_) => unreachable!("context records handled before consuming native envelope"),
-      RolloutItem::EventMessage(item) => normalize_event_message(self.session_id.clone(), item, timestamp),
+      RolloutItem::EventMessage(item) => normalize_event_message(
+        self.session_id.clone(),
+        item,
+        matches!(self.history_mode, CodexRolloutHistoryMode::Paginated),
+        timestamp,
+      ),
       RolloutItem::Unknown(item) => vec![unknown_rollout_event(self.session_id.clone(), item, timestamp)],
     }
   }
@@ -144,6 +178,11 @@ impl CodexNormalizer {
       )];
     };
 
+    self.history_mode = if item.history_mode.as_deref() == Some("paginated") {
+      CodexRolloutHistoryMode::Paginated
+    } else {
+      CodexRolloutHistoryMode::Legacy
+    };
     self.session_id = Some(session_id.clone());
     let timestamp = item.timestamp.clone().or(line_timestamp);
     let mut events = vec![AgentEvent::SessionStarted(SessionStarted {
@@ -437,6 +476,7 @@ fn normalize_inter_agent_communication(
 fn normalize_event_message(
   session_id: Option<String>,
   item: EventMessage,
+  canonical_items: bool,
   timestamp: Option<String>,
 ) -> Vec<AgentEvent> {
   let payload = item.native;
@@ -469,6 +509,13 @@ fn normalize_event_message(
     Some("reasoning_content_delta") => {
       normalize_reasoning_event(session_id, &payload, "delta", Phase::Delta, timestamp)
     }
+    Some("item_started") if canonical_items => {
+      normalize_item_lifecycle(session_id, &payload, Phase::Started, timestamp)
+    }
+    Some("item_completed") if canonical_items => {
+      normalize_item_lifecycle(session_id, &payload, Phase::Finished, timestamp)
+    }
+    Some("item_completed") => normalize_legacy_item_completed(session_id, &payload, timestamp),
     Some("exec_command_begin") => normalize_exec_begin(session_id, &payload, timestamp),
     Some("exec_command_output_delta") => normalize_exec_delta(session_id, payload, timestamp),
     Some("exec_command_end") => normalize_exec_end(session_id, &payload, timestamp),
@@ -1023,6 +1070,13 @@ fn mcp_result_is_error(result: &Value) -> bool {
     .or_else(|| result.get("ok"))
     .unwrap_or(result)
     .get("is_error")
+    .or_else(|| {
+      result
+        .get("Ok")
+        .or_else(|| result.get("ok"))
+        .unwrap_or(result)
+        .get("isError")
+    })
     .and_then(Value::as_bool)
     .unwrap_or(false)
 }
@@ -1062,6 +1116,10 @@ mod tests {
       })
       .collect();
     (events, normalizer.history_status())
+  }
+
+  fn normalize_value(normalizer: &mut CodexNormalizer, value: Value) -> Vec<AgentEvent> {
+    normalizer.normalize(serde_json::from_value(value).expect("record should decode"))
   }
 
   #[test]
@@ -1125,6 +1183,242 @@ mod tests {
   }
 
   #[test]
+  fn normalizes_canonical_item_lifecycle_without_duplicate_conversation_events() {
+    let events = normalize_fixture(include_str!("../fixtures/item_lifecycle_session.jsonl"));
+
+    assert_eq!(events.len(), 17);
+    assert!(matches!(&events[0], AgentEvent::SessionStarted(event) if event.session_id == "canonical-session"));
+    assert!(matches!(&events[1], AgentEvent::Message(event)
+      if matches!(event.role, Role::User)
+        && event.message_id.as_deref() == Some("user-1")
+        && event.text == "hello world"));
+    assert!(matches!(&events[2], AgentEvent::Message(event)
+      if matches!(event.role, Role::Assistant)
+        && matches!(event.delivery, MessageDelivery::Commentary)
+        && event.text == "working"));
+    assert!(matches!(&events[3], AgentEvent::Reasoning(event)
+      if event.summary.as_deref() == Some("checking")
+        && event.encrypted_content.as_deref() == Some("encrypted-reasoning")));
+    assert!(matches!(&events[4], AgentEvent::Metadata(event)
+      if event.native_type == "event_msg.item_completed.Plan"
+        && event.summary == "plan completed"));
+    assert!(matches!(&events[5], AgentEvent::ToolCall(event)
+      if matches!(event.phase, Phase::Started)
+        && event.tool_call_id.as_deref() == Some("exec-1")
+        && event.input.as_ref().is_some_and(Value::is_array)));
+    assert!(matches!(&events[6], AgentEvent::ToolCall(event)
+      if matches!(event.phase, Phase::Finished)
+        && event.tool_call_id.as_deref() == Some("exec-1")
+        && event.is_error == Some(false)));
+    assert!(matches!(&events[7], AgentEvent::ToolCall(event)
+      if matches!(event.tool_kind, ToolKind::FileEdit)
+        && event.tool_call_id.as_deref() == Some("patch-1")
+        && event.is_error == Some(true)));
+    assert!(matches!(&events[8], AgentEvent::ToolCall(event)
+      if matches!(event.phase, Phase::Started)
+        && event.tool_call_id.as_deref() == Some("mcp-1")));
+    assert!(matches!(&events[9], AgentEvent::ToolCall(event)
+      if event.tool_call_id.as_deref() == Some("mcp-1")
+        && event.tool_name.as_deref() == Some("codex_app.read_thread_terminal")
+        && event.is_error == Some(true)));
+    assert!(matches!(&events[10], AgentEvent::ToolCall(event)
+      if matches!(event.tool_kind, ToolKind::Task)
+        && event.tool_name.as_deref() == Some("wait")));
+    assert!(matches!(&events[11], AgentEvent::AgentActivity(event)
+      if event.event_id.as_deref() == Some("subagent-1")
+        && event.target_session_id.as_deref() == Some("child-1")
+        && event.occurred_at_ms == Some(1014)));
+    assert!(matches!(&events[12], AgentEvent::ToolCall(event)
+      if matches!(event.tool_kind, ToolKind::Search)
+        && event.tool_call_id.as_deref() == Some("search-1")));
+    assert!(matches!(&events[13], AgentEvent::Metadata(event) if event.summary == "context compacted"));
+    assert!(matches!(&events[14], AgentEvent::Unknown(event)
+      if event.native_type.as_deref() == Some("event_msg.item_completed.FutureItem")));
+    assert!(matches!(&events[15], AgentEvent::ToolCall(event)
+      if event.tool_call_id.as_deref() == Some("dynamic-1")));
+    assert!(matches!(&events[16], AgentEvent::Unknown(event)
+      if event.native_type.as_deref() == Some("event_msg.item_completed.SubAgentActivity")));
+  }
+
+  #[test]
+  fn paginated_history_uses_one_canonical_projection_per_item() {
+    let mut normalizer = CodexNormalizer::new();
+    normalize_value(
+      &mut normalizer,
+      json!({"type":"session_meta","payload":{"id":"session-1","history_mode":"paginated"}}),
+    );
+    assert!(
+      normalize_value(
+        &mut normalizer,
+        json!({"type":"session_meta","payload":{"id":"copied-parent","history_mode":"legacy"}}),
+      )
+      .is_empty()
+    );
+    assert!(
+      normalize_value(
+        &mut normalizer,
+        json!({"type":"response_item","payload":{"type":"message","id":"message-1","role":"assistant",
+          "content":[{"type":"output_text","text":"canonical answer"}],"phase":"final_answer"}}),
+      )
+      .is_empty()
+    );
+    let mut events = normalize_value(
+      &mut normalizer,
+      json!({"type":"response_item","payload":{"type":"reasoning","id":"reasoning-1",
+        "summary":[{"type":"summary_text","text":"canonical thought"}],
+        "encrypted_content":"encrypted-reasoning"}}),
+    );
+    assert!(matches!(&events[..], [AgentEvent::Reasoning(event)]
+      if event.encrypted_content.as_deref() == Some("encrypted-reasoning")));
+    for raw in [
+      json!({"type":"response_item","payload":{"type":"custom_tool_call","id":"raw-call","name":"exec",
+        "call_id":"call-1","input":{"cmd":"cargo test"}}}),
+      json!({"type":"response_item","payload":{"type":"custom_tool_call_output","id":"raw-output",
+        "call_id":"call-1","name":"exec","output":"ok"}}),
+    ] {
+      assert!(normalize_value(&mut normalizer, raw).is_empty());
+    }
+
+    let canonical = [
+      json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"session-1","turn_id":"turn-1",
+        "item":{"type":"AgentMessage","id":"message-1","content":[{"type":"Text","text":"canonical answer"}],
+          "phase":"final_answer"},"completed_at_ms":1}}),
+      json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"session-1","turn_id":"turn-1",
+        "item":{"type":"Reasoning","id":"reasoning-1","summary_text":["canonical thought"],"raw_content":[]},
+        "completed_at_ms":2}}),
+      json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"session-1","turn_id":"turn-1",
+        "item":{"type":"CommandExecution","id":"exec-1","command":["cargo","test"],"cwd":"file:///tmp/project",
+          "parsed_cmd":[],"source":"agent","status":"completed","stdout":"ok","stderr":"","exit_code":0},
+        "completed_at_ms":3}}),
+    ];
+    events.extend(
+      canonical
+        .into_iter()
+        .flat_map(|record| normalize_value(&mut normalizer, record)),
+    );
+
+    assert_eq!(events.len(), 3);
+    assert_eq!(
+      events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::Message(_)))
+        .count(),
+      1
+    );
+    assert_eq!(
+      events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::Reasoning(_)))
+        .count(),
+      1
+    );
+    assert_eq!(
+      events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::ToolCall(_)))
+        .count(),
+      1
+    );
+  }
+
+  #[test]
+  fn every_current_canonical_item_variant_has_an_explicit_disposition() {
+    let mut normalizer = CodexNormalizer::new();
+    normalize_value(
+      &mut normalizer,
+      json!({"type":"session_meta","payload":{"id":"session-1","history_mode":"paginated"}}),
+    );
+    let items = [
+      json!({"type":"UserMessage","id":"user","content":[{"type":"text","text":"hello"}]}),
+      json!({"type":"HookPrompt","id":"hook","fragments":[{"text":"hook text","hookRunId":"run-1"}]}),
+      json!({"type":"AgentMessage","id":"agent","content":[{"type":"Text","text":"answer"}],"phase":"final_answer"}),
+      json!({"type":"Plan","id":"plan","text":"inspect then fix"}),
+      json!({"type":"Reasoning","id":"reasoning","summary_text":["summary"],"raw_content":["detail"]}),
+      json!({"type":"CommandExecution","id":"command","command":["true"],"cwd":"file:///tmp","parsed_cmd":[],
+        "source":"agent","status":"completed","stdout":"","stderr":"","exit_code":0}),
+      json!({"type":"DynamicToolCall","id":"dynamic","namespace":"tools","tool":"lookup","arguments":{},
+        "status":"completed","content_items":[],"success":true}),
+      json!({"type":"CollabAgentToolCall","id":"collab","tool":"wait","status":"completed",
+        "sender_thread_id":"session-1","receiver_thread_ids":[],"receiver_agents":[],"agents_states":{}}),
+      json!({"type":"SubAgentActivity","id":"activity","kind":"completed","agent_thread_id":"child-1",
+        "agent_path":"/root/child"}),
+      json!({"type":"WebSearch","id":"hosted-search","query":"query","action":{"type":"search","query":"query"},
+        "results":[]}),
+      json!({"type":"ImageView","id":"image-view","path":"file:///tmp/image.png"}),
+      json!({"type":"Extension","kind":"image_gen.generation","id":"extension-image","status":"completed",
+        "revisedPrompt":"blue square","result":"image-data","savedPath":"/tmp/image.png"}),
+      json!({"type":"Extension","kind":"clock.sleep","id":"extension-sleep","durationMs":10}),
+      json!({"type":"Extension","kind":"web.search","id":"extension-search","query":"query","action":null,
+        "results":[]}),
+      json!({"type":"ImageGeneration","id":"hosted-image","status":"completed","revised_prompt":"blue square",
+        "result":"image-data","saved_path":"/tmp/image.png"}),
+      json!({"type":"EnteredReviewMode","id":"review-enter","target":{"type":"uncommittedChanges"},
+        "user_facing_hint":"review changes"}),
+      json!({"type":"ExitedReviewMode","id":"review-exit","review_output":null}),
+      json!({"type":"FileChange","id":"file-change","changes":{},"status":"completed","stdout":"","stderr":""}),
+      json!({"type":"McpToolCall","id":"mcp","server":"server","tool":"tool","arguments":{},"status":"completed",
+        "result":{"content":[],"isError":true}}),
+      json!({"type":"ContextCompaction","id":"compaction"}),
+    ];
+
+    for item in items {
+      let label = if item["type"] == "Extension" {
+        format!("Extension.{}", item["kind"].as_str().unwrap())
+      } else {
+        item["type"].as_str().unwrap().to_string()
+      };
+      let events = normalize_value(
+        &mut normalizer,
+        json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"session-1","turn_id":"turn-1",
+          "item":item,"completed_at_ms":100}}),
+      );
+      if label == "Reasoning" {
+        assert!(events.is_empty(), "{label} should be a validated suppressed duplicate");
+        continue;
+      }
+      assert!(!events.is_empty(), "{label} should have a visible disposition");
+      assert!(
+        events.iter().all(|event| !matches!(event, AgentEvent::Unknown(_))),
+        "{label} should not be unknown"
+      );
+      if label == "McpToolCall" {
+        assert!(matches!(&events[..], [AgentEvent::ToolCall(event)] if event.is_error == Some(true)));
+      }
+    }
+  }
+
+  #[test]
+  fn legacy_history_keeps_raw_projection_and_only_handles_unpaired_canonical_items() {
+    let events = normalize_fixture(
+      r#"{"type":"session_meta","payload":{"id":"session-1","history_mode":"legacy"}}
+{"type":"response_item","payload":{"type":"message","id":"raw-message","role":"assistant","content":[{"type":"output_text","text":"raw answer"}],"phase":"final_answer"}}
+{"type":"event_msg","payload":{"type":"item_completed","thread_id":"session-1","turn_id":"turn-1","item":{"type":"AgentMessage","id":"canonical-message","content":[{"type":"Text","text":"canonical answer"}],"phase":"final_answer"},"completed_at_ms":1}}
+{"type":"event_msg","payload":{"type":"item_completed","thread_id":"session-1","turn_id":"turn-1","item":{"type":"Plan","id":"plan","text":"plan body"},"completed_at_ms":2}}
+{"type":"event_msg","payload":{"type":"item_completed","thread_id":"session-1","turn_id":"turn-1","item":{"type":"Extension","kind":"clock.sleep","id":"sleep","durationMs":10},"completed_at_ms":3}}"#,
+    );
+
+    assert!(matches!(&events[1], AgentEvent::Message(event) if event.text == "raw answer"));
+    assert!(matches!(&events[2], AgentEvent::Unknown(event)
+      if event.native_type.as_deref() == Some("event_msg.item_completed")));
+    assert!(matches!(&events[3], AgentEvent::Metadata(event) if event.summary == "plan completed"));
+    assert!(matches!(&events[4], AgentEvent::ToolCall(event) if event.tool_name.as_deref() == Some("sleep")));
+  }
+
+  #[test]
+  fn future_and_malformed_extensions_keep_specific_unknown_identity() {
+    let events = normalize_fixture(
+      r#"{"type":"session_meta","payload":{"id":"session-1","history_mode":"paginated"}}
+{"type":"event_msg","payload":{"type":"item_completed","thread_id":"session-1","turn_id":"turn-1","item":{"type":"Extension","kind":"future.kind","id":"future"},"completed_at_ms":1}}
+{"type":"event_msg","payload":{"type":"item_completed","thread_id":"session-1","turn_id":"turn-1","item":{"type":"Extension","kind":"web.search","id":"broken","query":"query","action":[]},"completed_at_ms":2}}"#,
+    );
+
+    assert!(matches!(&events[1], AgentEvent::Unknown(event)
+      if event.native_type.as_deref() == Some("event_msg.item_completed.Extension.future.kind")));
+    assert!(matches!(&events[2], AgentEvent::Unknown(event)
+      if event.native_type.as_deref() == Some("event_msg.item_completed.Extension.web.search")));
+  }
+
+  #[test]
   fn keeps_unknown_response_identity_and_payload() {
     let events = normalize_fixture(
       r#"{"type":"session_meta","payload":{"id":"session-1"}}
@@ -1139,6 +1433,29 @@ mod tests {
       event.native.as_ref().and_then(|value| value.get("answer")),
       Some(&json!(42))
     );
+  }
+
+  #[test]
+  fn paginated_history_preserves_unknown_response_items() {
+    let events = normalize_fixture(
+      r#"{"type":"session_meta","payload":{"id":"session-1","history_mode":"paginated"}}
+{"type":"response_item","payload":{"type":"future_response","answer":42}}"#,
+    );
+
+    assert!(matches!(&events[1], AgentEvent::Unknown(event)
+      if event.native_type.as_deref() == Some("response_item.future_response")
+        && event.native.as_ref().is_some_and(|native| native["answer"] == 42)));
+  }
+
+  #[test]
+  fn malformed_canonical_reasoning_stays_unknown() {
+    let events = normalize_fixture(
+      r#"{"type":"session_meta","payload":{"id":"session-1","history_mode":"paginated"}}
+{"type":"event_msg","payload":{"type":"item_completed","thread_id":"session-1","turn_id":"turn-1","item":{"type":"Reasoning","id":"reasoning-1","summary_text":[42]},"completed_at_ms":1}}"#,
+    );
+
+    assert!(matches!(&events[1], AgentEvent::Unknown(event)
+      if event.native_type.as_deref() == Some("event_msg.item_completed.Reasoning")));
   }
 
   #[test]
