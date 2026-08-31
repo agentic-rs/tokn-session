@@ -29,7 +29,9 @@ export type EventPhase = "started" | "delta" | "updated" | "finished";
 export type MessageRole = "user" | "assistant" | "system" | "tool" | "unknown";
 
 export type ToolKind =
+  | "code_execution"
   | "shell"
+  | "terminal"
   | "file_read"
   | "file_write"
   | "file_edit"
@@ -38,12 +40,22 @@ export type ToolKind =
   | "task"
   | "unknown";
 
+export type ToolOperationStatus = "pending" | "running" | "completed" | "failed";
+
 export interface ToolCardSummary {
   kind: ToolKind | string;
   tool_name: string | null;
   tool_call_id: string | null;
+  /** Derived operation state; absent only when connected to an older backend. */
+  status?: ToolOperationStatus | string;
+  provider_tool_name?: string | null;
+  language?: string | null;
   command: string | null;
   cwd: string | null;
+  terminal_session_id?: string | null;
+  terminal_action?: "send" | "wait" | string | null;
+  chars_len?: number | null;
+  wait_ms?: number | null;
   path: string | null;
   query: string | null;
   url: string | null;

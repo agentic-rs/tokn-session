@@ -274,15 +274,26 @@ Visible user and assistant messages, expanded reasoning, and readable inspector
 content render GitHub-flavored Markdown. Raw HTML is disabled, images become
 inert placeholders, and links cannot navigate the WebView.
 
-Known shell, file, search, web, and task events have source-neutral tool cards
-with compact command, path, query, status, and change facts. Expanding a tool
-loads a bounded plain-text or JSON output preview without opening the inspector;
-the inspector remains available as a separate action. The detail projection can
-follow a non-empty provider tool-call id to a later result, because Codex, Pi,
-and DSH may persist invocation and output as separate normalized events. It does
-not combine those lifecycle records into one timeline event or correlate records
-that lack an id. Inline output retains at most 64 KiB with both its head and tail
-visible and never renders provider output as Markdown or HTML.
+Known code-execution, terminal, shell, file, search, web, and task events have
+source-neutral tool cards with compact command, path, query, status, and change
+facts. Providers still contribute an append-only fact stream, but the shared
+core `ToolOperationAssembler` turns safely correlated invocation, progress, and
+result records into one logical historical operation. The viewer consequently
+shows one card, with a derived `pending`/`running`/`completed`/`failed` state;
+its normalized Inspector view contains the semantic input and final output,
+while the Native tab shows any provider-native envelopes the adapter retained
+from contributing records. Completed cards sit at their terminal source record
+so intervening assistant activity remains chronological. Missing or overlapping
+call IDs deliberately remain separate rather than being guessed.
+
+Expanding a tool loads a bounded plain-text or JSON output preview without
+opening the inspector; the inspector remains available as a separate action.
+Semantic results with a readable `text` field display that text directly rather
+than surrounding response metadata. Inline output retains at most 64 KiB with
+both its head and tail visible and never renders provider output as Markdown or
+HTML. Codex Code Mode wrappers are decoded only for the generated single-call
+`write_stdin` and `exec_command` shapes; arbitrary JavaScript remains a raw
+Code Execution operation.
 
 Usage events have dedicated token cards. The card labels model-call,
 operation-total, and replaceable session-snapshot scopes so users do not sum
@@ -472,12 +483,18 @@ assistant text is final because those persisted message records do not expose a
 separate commentary channel. Current Codex `final_answer` and legacy `final`
 phases both normalize to `final`; user and other messages use `unspecified`.
 
-Tool calls now carry semantic display metadata:
+Tool calls carry explicit operation roles and semantic display metadata:
 
-- `tool_kind`: `shell`, `file_read`, `file_write`, `file_edit`, `search`, `web`, `task`, or `unknown`
+- `record_kind`: `invocation`, `progress`, `result`, or provider-state `snapshot`
+- `tool_name`, plus optional `provider_tool_name` and `transport` when a provider wrapper differs from the semantic operation
+- `tool_kind`: `code_execution`, `terminal`, `shell`, `file_read`, `file_write`, `file_edit`, `search`, `web`, `task`, or `unknown`
 - `summary`: compact facts for known tool families, such as shell command/exit code or file edit path and rough line counts
+- `native`: the original provider record when an adapter has projected cleaner semantic fields
 
-Raw `input` and `output` remain in the IR for debugging and provider-native detail.
+Raw `input` and `output` remain in the IR for debugging and provider-native
+detail. Historical pretty rendering and the desktop viewer use the shared
+operation projection; JSONL and live event consumers retain the atomic source
+records so results can update naturally as they arrive.
 
 Reasoning is intentionally flat:
 

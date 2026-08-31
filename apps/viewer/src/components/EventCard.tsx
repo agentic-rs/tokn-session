@@ -58,6 +58,15 @@ function toolHeading(event: EventSummary): TechnicalCardHeading {
 
   const fallback = toolFallbackName(event, tool);
   switch (tool.kind) {
+    case "code_execution":
+      return {
+        action: "Code",
+        primary: tool.language?.trim()
+          ? `${humanize(tool.language)} code`
+          : fallback,
+        secondary: tool.provider_tool_name?.trim() || null,
+        monospace: false,
+      };
     case "shell":
       return {
         action: "Shell",
@@ -65,6 +74,23 @@ function toolHeading(event: EventSummary): TechnicalCardHeading {
         secondary: tool.cwd,
         monospace: tool.command !== null,
       };
+    case "terminal": {
+      const session = tool.terminal_session_id?.trim();
+      const action = tool.terminal_action;
+      const primary = action === "wait"
+        ? `Wait for ${session ? `terminal ${session}` : "terminal"}`
+        : action === "send"
+          ? `Send ${tool.chars_len ?? 0} characters${session ? ` to terminal ${session}` : ""}`
+          : fallback;
+      return {
+        action: "Terminal",
+        primary,
+        secondary: tool.wait_ms === null || tool.wait_ms === undefined
+          ? null
+          : `Up to ${formatDuration(tool.wait_ms)}`,
+        monospace: false,
+      };
+    }
     case "file_read":
       return {
         action: "Read",
@@ -135,6 +161,16 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1_000_000).toFixed(bytes < 10_000_000 ? 1 : 0)} MB`;
 }
 
+function formatDuration(milliseconds: number): string {
+  if (milliseconds < 1_000) {
+    return `${milliseconds} ms`;
+  }
+  if (milliseconds % 1_000 === 0) {
+    return `${milliseconds / 1_000} s`;
+  }
+  return `${(milliseconds / 1_000).toFixed(1)} s`;
+}
+
 function eventIcon(event: EventSummary) {
   if (event.type === "reasoning") {
     return <ReasoningIcon />;
@@ -202,6 +238,18 @@ function eventStatus(event: EventSummary): { label: string; tone: string } | nul
   if (event.is_error) {
     return { label: "failed", tone: "error" };
   }
+  switch (event.tool?.status) {
+    case "failed":
+      return { label: "failed", tone: "error" };
+    case "pending":
+      return { label: "pending", tone: "neutral" };
+    case "running":
+      return { label: "running", tone: "neutral" };
+    case "completed":
+      return null;
+    default:
+      break;
+  }
   if (event.tool?.exit_code !== null && event.tool?.exit_code !== undefined) {
     return { label: `exit ${event.tool.exit_code}`, tone: "success" };
   }
@@ -251,7 +299,8 @@ function ToolOutput({
 
   const output = detail?.tool_output ?? null;
   if (!output || output.sections.length === 0) {
-    const isPending = event.phase !== null && event.phase !== "finished";
+    const isPending = event.tool?.status === "pending" || event.tool?.status === "running"
+      || (event.tool?.status === undefined && event.phase !== null && event.phase !== "finished");
     return (
       <p className="tool-output__empty" role="status">
         {isPending ? "Output is not available yet." : "No output was captured for this tool call."}
@@ -280,9 +329,6 @@ function ToolOutput({
           {output.original_size_bytes > 0 ? ` from ${formatBytes(output.original_size_bytes)}` : ""}.
           Inspect the event for the complete bounded detail.
         </p>
-      ) : null}
-      {output.source_event_key !== event.event_key ? (
-        <p className="tool-output__source">Output matched from the related result event.</p>
       ) : null}
     </div>
   );

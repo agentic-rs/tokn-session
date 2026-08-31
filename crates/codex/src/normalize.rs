@@ -1,4 +1,7 @@
+mod code_mode;
 mod item_lifecycle;
+
+use std::collections::{HashMap, VecDeque};
 
 use serde_json::{Value, json};
 use tokn_codex_protocol::{
@@ -8,18 +11,33 @@ use tokn_codex_protocol::{
 use tokn_session_core::{
   AgentActivity, AgentEvent, ErrorEvent, GoalUpdated, MessageDelivery, MessageEvent, Phase, Provider, ProviderChanged,
   ReasoningEvent, Role, SessionHistoryStatus, SessionSettingsApplied, SessionStarted, ToolCallEvent, ToolKind,
-  ToolSummary, UnknownEvent, patch_summary, tool_kind_for_name, tool_kind_for_optional_name, tool_summary_for_input,
-  tool_summary_for_io,
+  ToolRecordKind, ToolSummary, ToolTransport, UnknownEvent, patch_summary, tool_kind_for_name,
+  tool_kind_for_optional_name, tool_summary_for_input, tool_summary_for_io,
 };
 
 use crate::event::CodexLine;
+use code_mode::{DecodedCodeModeCall, decode_call, decode_output};
 use item_lifecycle::{normalize_item_lifecycle, normalize_legacy_item_completed};
+
+const MAX_PENDING_CODE_MODE_CALLS: usize = 256;
 
 pub struct CodexNormalizer {
   session_id: Option<String>,
   history_mode: CodexRolloutHistoryMode,
   history_boundary: Option<CodexHistoryBoundary>,
   records: crate::records::RecordsNormalizer,
+  pending_code_mode_calls: HashMap<String, VecDeque<PendingCodeModeCall>>,
+  pending_code_mode_order: VecDeque<(String, u64)>,
+  pending_code_mode_call_count: usize,
+  next_pending_code_mode_token: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PendingCodeModeCall {
+  token: u64,
+  call: Option<DecodedCodeModeCall>,
+  provider_tool_name: String,
+  turn_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -91,6 +109,10 @@ impl CodexNormalizer {
       history_mode: CodexRolloutHistoryMode::Legacy,
       history_boundary: None,
       records: Default::default(),
+      pending_code_mode_calls: Default::default(),
+      pending_code_mode_order: Default::default(),
+      pending_code_mode_call_count: 0,
+      next_pending_code_mode_token: 0,
     }
   }
 
@@ -100,6 +122,10 @@ impl CodexNormalizer {
       history_mode: CodexRolloutHistoryMode::Legacy,
       history_boundary: Some(CodexHistoryBoundary::new()),
       records: Default::default(),
+      pending_code_mode_calls: Default::default(),
+      pending_code_mode_order: Default::default(),
+      pending_code_mode_call_count: 0,
+      next_pending_code_mode_token: 0,
     }
   }
 
@@ -144,7 +170,7 @@ impl CodexNormalizer {
             _ => Vec::new(),
           }
         } else {
-          normalize_response_item(self.session_id.clone(), item, timestamp)
+          self.normalize_response_item(item, timestamp)
         }
       }
       RolloutItem::InterAgentCommunication(item) => {
@@ -207,6 +233,238 @@ impl CodexNormalizer {
 
     events
   }
+
+  fn normalize_response_item(&mut self, item: ResponseItem, timestamp: Option<String>) -> Vec<AgentEvent> {
+    match item {
+      ResponseItem::CustomToolCall(item) => self.normalize_custom_tool_call(item, timestamp),
+      ResponseItem::CustomToolCallOutput(item) => self.normalize_custom_tool_call_output(item, timestamp),
+      item => normalize_response_item(self.session_id.clone(), item, timestamp),
+    }
+  }
+
+  fn normalize_custom_tool_call(
+    &mut self,
+    item: tokn_codex_protocol::CustomToolCallItem,
+    timestamp: Option<String>,
+  ) -> Vec<AgentEvent> {
+    let native = json_value(&item);
+    let name = item
+      .name
+      .clone()
+      .or_else(|| item.namespace.clone())
+      .unwrap_or_else(|| "custom_tool".to_string());
+    let raw_input = item.input.clone();
+    let input = parse_json_string_or_value(item.input);
+    let turn_id = response_turn_id(item.internal_chat_message_metadata_passthrough.as_ref());
+    let code_mode = name == "exec"
+      && raw_input.as_str().is_some_and(|source| {
+        let source = source.trim_start();
+        source.contains("tools.")
+          || source.starts_with("const ")
+          || source.starts_with("let ")
+          || source.starts_with("await ")
+      });
+    let decoded = code_mode.then(|| decode_call(&raw_input)).flatten();
+
+    if code_mode {
+      self.remember_code_mode_call(
+        item.call_id.clone(),
+        PendingCodeModeCall {
+          token: 0,
+          call: decoded.clone(),
+          provider_tool_name: name.clone(),
+          turn_id: turn_id.clone(),
+        },
+      );
+    }
+
+    let (tool_name, tool_kind, summary, semantic_input) = if let Some(decoded) = decoded {
+      let tool_name = decoded.tool.name().to_string();
+      let tool_kind = tool_kind_for_name(&tool_name);
+      let summary = tool_summary_for_input(&tool_name, &decoded.input);
+      (tool_name, tool_kind, summary, decoded.input)
+    } else if code_mode {
+      (
+        name.clone(),
+        ToolKind::CodeExecution,
+        Some(ToolSummary::CodeExecution {
+          language: Some("javascript".to_string()),
+        }),
+        input,
+      )
+    } else {
+      let tool_kind = tool_kind_for_name(&name);
+      let summary = tool_summary_for_input(&name, &input);
+      (name.clone(), tool_kind, summary, input)
+    };
+    let provider_tool_name = code_mode.then(|| name.clone());
+
+    vec![AgentEvent::ToolCall(ToolCallEvent {
+      provider: Provider::Codex,
+      session_id: self.session_id.clone(),
+      turn_id,
+      message_id: item.id,
+      parent_id: None,
+      record_kind: ToolRecordKind::Invocation,
+      tool_call_id: item.call_id,
+      provider_tool_name,
+      tool_name: Some(tool_name),
+      tool_kind,
+      transport: code_mode.then_some(ToolTransport::CodeExecution),
+      summary,
+      phase: Phase::Started,
+      input: Some(semantic_input),
+      output: None,
+      is_error: None,
+      native: Some(native),
+      timestamp,
+    })]
+  }
+
+  fn normalize_custom_tool_call_output(
+    &mut self,
+    item: tokn_codex_protocol::CustomToolCallOutputItem,
+    timestamp: Option<String>,
+  ) -> Vec<AgentEvent> {
+    let native = json_value(&item);
+    let turn_id = response_turn_id(item.internal_chat_message_metadata_passthrough.as_ref());
+    let pending = self.take_code_mode_call(item.call_id.as_deref(), turn_id.as_deref());
+    let had_pending_code_mode_call = pending.is_some();
+    let fallback_provider_tool_name = pending.as_ref().map(|call| call.provider_tool_name.clone());
+    let fallback_turn_id = pending.as_ref().and_then(|call| call.turn_id.clone());
+
+    if let Some(pending) = pending {
+      if let Some(call) = pending.call {
+        if let Some(output) = decode_output(call.tool, &item.output) {
+          let tool_name = call.tool.name().to_string();
+          let is_error = output.get("exit_code").and_then(Value::as_i64).map(|code| code != 0);
+          return vec![AgentEvent::ToolCall(ToolCallEvent {
+            provider: Provider::Codex,
+            session_id: self.session_id.clone(),
+            turn_id: turn_id.or(pending.turn_id),
+            message_id: item.id,
+            parent_id: None,
+            record_kind: ToolRecordKind::Result,
+            tool_call_id: item.call_id,
+            provider_tool_name: Some(pending.provider_tool_name),
+            tool_name: Some(tool_name.clone()),
+            tool_kind: tool_kind_for_name(&tool_name),
+            transport: Some(ToolTransport::CodeExecution),
+            summary: tool_summary_for_io(Some(&tool_name), Some(&call.input), Some(&output)),
+            phase: Phase::Finished,
+            input: Some(call.input),
+            output: Some(output),
+            is_error,
+            native: Some(native),
+            timestamp,
+          })];
+        }
+      }
+    }
+
+    let name = item
+      .name
+      .or(fallback_provider_tool_name)
+      .unwrap_or_else(|| "custom_tool".to_string());
+    let code_mode = had_pending_code_mode_call;
+    let (tool_kind, summary, transport) = if code_mode {
+      (
+        ToolKind::CodeExecution,
+        Some(ToolSummary::CodeExecution {
+          language: Some("javascript".to_string()),
+        }),
+        Some(ToolTransport::CodeExecution),
+      )
+    } else {
+      (tool_kind_for_name(&name), None, None)
+    };
+
+    vec![AgentEvent::ToolCall(ToolCallEvent {
+      provider: Provider::Codex,
+      session_id: self.session_id.clone(),
+      turn_id: turn_id.or(fallback_turn_id),
+      message_id: item.id,
+      parent_id: None,
+      record_kind: ToolRecordKind::Result,
+      tool_call_id: item.call_id,
+      provider_tool_name: code_mode.then(|| name.clone()),
+      tool_name: Some(name),
+      tool_kind,
+      transport,
+      summary,
+      phase: Phase::Finished,
+      input: None,
+      output: Some(item.output),
+      is_error: None,
+      native: Some(native),
+      timestamp,
+    })]
+  }
+
+  fn remember_code_mode_call(&mut self, call_id: Option<String>, call: PendingCodeModeCall) {
+    let Some(call_id) = call_id else {
+      return;
+    };
+    let mut call = call;
+    call.token = self.next_pending_code_mode_token;
+    self.next_pending_code_mode_token = self.next_pending_code_mode_token.wrapping_add(1);
+    self.pending_code_mode_order.push_back((call_id.clone(), call.token));
+    self.pending_code_mode_calls.entry(call_id).or_default().push_back(call);
+    self.pending_code_mode_call_count += 1;
+    self.trim_pending_code_mode_calls();
+  }
+
+  fn take_code_mode_call(
+    &mut self,
+    call_id: Option<&str>,
+    result_turn_id: Option<&str>,
+  ) -> Option<PendingCodeModeCall> {
+    let call_id = call_id?;
+    let pending = self.pending_code_mode_calls.get_mut(call_id)?;
+    let index = pending
+      .iter()
+      .position(|call| match (call.turn_id.as_deref(), result_turn_id) {
+        (Some(invocation_turn_id), Some(result_turn_id)) => invocation_turn_id == result_turn_id,
+        _ => true,
+      })?;
+    let call = pending.remove(index);
+    if pending.is_empty() {
+      self.pending_code_mode_calls.remove(call_id);
+    }
+    if let Some(call) = &call {
+      self.pending_code_mode_call_count = self.pending_code_mode_call_count.saturating_sub(1);
+      self
+        .pending_code_mode_order
+        .retain(|(queued_call_id, token)| queued_call_id != call_id || *token != call.token);
+    }
+    call
+  }
+
+  fn trim_pending_code_mode_calls(&mut self) {
+    while self.pending_code_mode_call_count > MAX_PENDING_CODE_MODE_CALLS {
+      let Some((call_id, token)) = self.pending_code_mode_order.pop_front() else {
+        self.pending_code_mode_call_count = 0;
+        self.pending_code_mode_calls.clear();
+        break;
+      };
+      let removed = self.pending_code_mode_calls.get_mut(&call_id).and_then(|calls| {
+        calls
+          .iter()
+          .position(|call| call.token == token)
+          .and_then(|index| calls.remove(index))
+      });
+      if self
+        .pending_code_mode_calls
+        .get(&call_id)
+        .is_some_and(VecDeque::is_empty)
+      {
+        self.pending_code_mode_calls.remove(&call_id);
+      }
+      if removed.is_some() {
+        self.pending_code_mode_call_count = self.pending_code_mode_call_count.saturating_sub(1);
+      }
+    }
+  }
 }
 
 fn requires_thread_spawn_boundary(item: &SessionMetaItem) -> bool {
@@ -238,16 +496,21 @@ fn normalize_response_item(
       vec![AgentEvent::ToolCall(ToolCallEvent {
         provider: Provider::Codex,
         session_id,
+        turn_id: None,
         message_id: item.id,
         parent_id: None,
+        record_kind: ToolRecordKind::Invocation,
         tool_call_id: item.call_id,
+        provider_tool_name: None,
         tool_name: Some(name.clone()),
         tool_kind: tool_kind_for_name(&name),
+        transport: None,
         summary: tool_summary_for_input(&name, &input),
         phase: Phase::Finished,
         input: Some(input),
         output: None,
         is_error: None,
+        native: None,
         timestamp,
       })]
     }
@@ -260,70 +523,54 @@ fn normalize_response_item(
       timestamp,
     )],
     ResponseItem::LocalShellCall(item) => {
+      let (record_kind, phase, is_error) = standalone_tool_call_lifecycle(item.status.as_deref());
       let input = item.action.unwrap_or(Value::Null);
       vec![AgentEvent::ToolCall(ToolCallEvent {
         provider: Provider::Codex,
         session_id,
+        turn_id: None,
         message_id: item.id,
         parent_id: None,
+        record_kind,
         tool_call_id: item.call_id,
+        provider_tool_name: None,
         tool_name: Some("local_shell".to_string()),
         tool_kind: ToolKind::Shell,
+        transport: None,
         summary: tool_summary_for_input("local_shell", &input),
-        phase: Phase::Finished,
+        phase,
         input: Some(input),
-        // Response-item status describes invocation lifecycle. A separate
-        // output record, when present, carries the user-visible result.
+        // Local shell calls are standalone response items. They can be
+        // complete without an additional output envelope.
         output: None,
-        is_error: None,
+        is_error,
+        native: None,
         timestamp,
       })]
     }
-    ResponseItem::CustomToolCall(item) => {
-      let name = item
-        .name
-        .or(item.namespace)
-        .unwrap_or_else(|| "custom_tool".to_string());
-      let input = parse_json_string_or_value(item.input);
-      vec![AgentEvent::ToolCall(ToolCallEvent {
-        provider: Provider::Codex,
-        session_id,
-        message_id: item.id,
-        parent_id: None,
-        tool_call_id: item.call_id,
-        tool_name: Some(name.clone()),
-        tool_kind: tool_kind_for_name(&name),
-        summary: tool_summary_for_input(&name, &input),
-        phase: Phase::Finished,
-        input: Some(input),
-        output: None,
-        is_error: None,
-        timestamp,
-      })]
+    ResponseItem::CustomToolCall(_) | ResponseItem::CustomToolCallOutput(_) => {
+      unreachable!("custom Code Mode calls are normalized with correlation state")
     }
-    ResponseItem::CustomToolCallOutput(item) => vec![tool_output_event(
-      session_id,
-      item.id,
-      item.call_id,
-      item.name,
-      item.output,
-      timestamp,
-    )],
     ResponseItem::ToolSearchCall(item) => {
       let input = parse_json_string_or_value(item.arguments);
       vec![AgentEvent::ToolCall(ToolCallEvent {
         provider: Provider::Codex,
         session_id,
+        turn_id: None,
         message_id: item.id,
         parent_id: None,
+        record_kind: ToolRecordKind::Invocation,
         tool_call_id: item.call_id,
+        provider_tool_name: None,
         tool_name: Some("tool_search".to_string()),
         tool_kind: ToolKind::Search,
+        transport: None,
         summary: tool_summary_for_input("tool_search", &input),
         phase: Phase::Finished,
         input: Some(input),
         output: None,
         is_error: None,
+        native: None,
         timestamp,
       })]
     }
@@ -340,36 +587,47 @@ fn normalize_response_item(
       timestamp,
     )],
     ResponseItem::WebSearchCall(item) => {
+      let (record_kind, phase, is_error) = standalone_tool_call_lifecycle(item.status.as_deref());
       let input = item.action.unwrap_or(Value::Null);
       vec![AgentEvent::ToolCall(ToolCallEvent {
         provider: Provider::Codex,
         session_id,
+        turn_id: None,
         message_id: item.id,
         parent_id: None,
+        record_kind,
         tool_call_id: None,
+        provider_tool_name: None,
         tool_name: Some("web_search".to_string()),
         tool_kind: ToolKind::Search,
+        transport: None,
         summary: tool_summary_for_input("web_search", &input),
-        phase: Phase::Finished,
+        phase,
         input: Some(input),
         output: None,
-        is_error: None,
+        is_error,
+        native: None,
         timestamp,
       })]
     }
     ResponseItem::ImageGenerationCall(item) => vec![AgentEvent::ToolCall(ToolCallEvent {
       provider: Provider::Codex,
       session_id,
+      turn_id: None,
       message_id: item.id,
       parent_id: None,
+      record_kind: ToolRecordKind::Snapshot,
       tool_call_id: None,
+      provider_tool_name: None,
       tool_name: Some("image_generation".to_string()),
       tool_kind: ToolKind::Unknown,
+      transport: None,
       summary: None,
       phase: Phase::Finished,
       input: item.revised_prompt.map(Value::String),
       output: item.result.map(Value::String),
       is_error: None,
+      native: None,
       timestamp,
     })],
     ResponseItem::AdditionalTools(_)
@@ -593,11 +851,15 @@ fn normalize_exec_begin(session_id: Option<String>, payload: &Value, timestamp: 
   vec![AgentEvent::ToolCall(ToolCallEvent {
     provider: Provider::Codex,
     session_id,
+    turn_id: None,
     message_id: None,
     parent_id: None,
+    record_kind: ToolRecordKind::Invocation,
     tool_call_id: string_field(payload, "call_id"),
+    provider_tool_name: None,
     tool_name: Some("exec_command".to_string()),
     tool_kind: ToolKind::Shell,
+    transport: None,
     summary: Some(ToolSummary::Shell {
       command: command_text(command.as_ref()),
       cwd: path_field(payload, "cwd"),
@@ -607,6 +869,7 @@ fn normalize_exec_begin(session_id: Option<String>, payload: &Value, timestamp: 
     input: command,
     output: None,
     is_error: None,
+    native: None,
     timestamp,
   })]
 }
@@ -615,16 +878,21 @@ fn normalize_exec_delta(session_id: Option<String>, payload: Value, timestamp: O
   vec![AgentEvent::ToolCall(ToolCallEvent {
     provider: Provider::Codex,
     session_id,
+    turn_id: None,
     message_id: None,
     parent_id: None,
+    record_kind: ToolRecordKind::Progress,
     tool_call_id: string_field(&payload, "call_id"),
+    provider_tool_name: None,
     tool_name: Some("exec_command".to_string()),
     tool_kind: ToolKind::Shell,
+    transport: None,
     summary: None,
     phase: Phase::Delta,
     input: None,
     output: Some(payload),
     is_error: None,
+    native: None,
     timestamp,
   })]
 }
@@ -634,11 +902,15 @@ fn normalize_exec_end(session_id: Option<String>, payload: &Value, timestamp: Op
   vec![AgentEvent::ToolCall(ToolCallEvent {
     provider: Provider::Codex,
     session_id,
+    turn_id: None,
     message_id: None,
     parent_id: None,
+    record_kind: ToolRecordKind::Result,
     tool_call_id: string_field(payload, "call_id"),
+    provider_tool_name: None,
     tool_name: Some("exec_command".to_string()),
     tool_kind: ToolKind::Shell,
+    transport: None,
     summary: Some(ToolSummary::Shell {
       command: command_text(command_value(payload).as_ref()),
       cwd: path_field(payload, "cwd"),
@@ -653,6 +925,7 @@ fn normalize_exec_end(session_id: Option<String>, payload: &Value, timestamp: Op
       "formatted_output": payload.get("formatted_output").cloned().unwrap_or(Value::Null),
     })),
     is_error: exit_code.map(|code| code != 0),
+    native: None,
     timestamp,
   })]
 }
@@ -664,16 +937,21 @@ fn normalize_mcp_begin(session_id: Option<String>, payload: &Value, timestamp: O
   vec![AgentEvent::ToolCall(ToolCallEvent {
     provider: Provider::Codex,
     session_id,
+    turn_id: None,
     message_id: None,
     parent_id: None,
+    record_kind: ToolRecordKind::Invocation,
     tool_call_id: string_field(payload, "call_id"),
+    provider_tool_name: None,
     tool_name: name.clone(),
     tool_kind: tool_kind_for_optional_name(name.as_deref()),
+    transport: None,
     summary: tool_summary_for_io(name.as_deref(), input.as_ref(), None),
     phase: Phase::Started,
     input,
     output: None,
     is_error: None,
+    native: None,
     timestamp,
   })]
 }
@@ -684,16 +962,21 @@ fn normalize_mcp_end(session_id: Option<String>, payload: &Value, timestamp: Opt
   vec![AgentEvent::ToolCall(ToolCallEvent {
     provider: Provider::Codex,
     session_id,
+    turn_id: None,
     message_id: None,
     parent_id: None,
+    record_kind: ToolRecordKind::Result,
     tool_call_id: string_field(payload, "call_id"),
+    provider_tool_name: None,
     tool_name: name.clone(),
     tool_kind: tool_kind_for_optional_name(name.as_deref()),
+    transport: None,
     summary: None,
     phase: Phase::Finished,
     input: None,
     output: Some(output.clone()),
     is_error: Some(mcp_result_is_error(&output)),
+    native: None,
     timestamp,
   })]
 }
@@ -720,11 +1003,15 @@ fn normalize_web_search_end(session_id: Option<String>, payload: &Value, timesta
   vec![AgentEvent::ToolCall(ToolCallEvent {
     provider: Provider::Codex,
     session_id,
+    turn_id: None,
     message_id: None,
     parent_id: None,
+    record_kind: ToolRecordKind::Result,
     tool_call_id: string_field(payload, "call_id"),
+    provider_tool_name: None,
     tool_name: Some("web_search".to_string()),
     tool_kind: ToolKind::Search,
+    transport: None,
     summary: Some(ToolSummary::Search { query: query.clone() }),
     phase: Phase::Finished,
     input: payload.get("action").cloned(),
@@ -733,6 +1020,7 @@ fn normalize_web_search_end(session_id: Option<String>, payload: &Value, timesta
       "results": payload.get("results").cloned().unwrap_or(Value::Null),
     })),
     is_error: None,
+    native: None,
     timestamp,
   })]
 }
@@ -756,11 +1044,15 @@ fn normalize_patch_end(session_id: Option<String>, payload: &Value, timestamp: O
   vec![AgentEvent::ToolCall(ToolCallEvent {
     provider: Provider::Codex,
     session_id,
+    turn_id: None,
     message_id: None,
     parent_id: None,
+    record_kind: ToolRecordKind::Result,
     tool_call_id: string_field(payload, "call_id"),
+    provider_tool_name: None,
     tool_name: Some("apply_patch".to_string()),
     tool_kind: ToolKind::FileEdit,
+    transport: None,
     summary: Some(patch_summary(&changes)),
     phase: Phase::Finished,
     input: None,
@@ -769,6 +1061,7 @@ fn normalize_patch_end(session_id: Option<String>, payload: &Value, timestamp: O
       "stderr": payload.get("stderr").cloned().unwrap_or(Value::Null),
     })),
     is_error: payload.get("success").and_then(Value::as_bool).map(|success| !success),
+    native: None,
     timestamp,
   })]
 }
@@ -778,16 +1071,21 @@ fn normalize_view_image(session_id: Option<String>, payload: &Value, timestamp: 
   vec![AgentEvent::ToolCall(ToolCallEvent {
     provider: Provider::Codex,
     session_id,
+    turn_id: None,
     message_id: None,
     parent_id: None,
+    record_kind: ToolRecordKind::Snapshot,
     tool_call_id: string_field(payload, "call_id"),
+    provider_tool_name: None,
     tool_name: Some("view_image".to_string()),
     tool_kind: ToolKind::FileRead,
+    transport: None,
     summary: Some(ToolSummary::FileRead { path: path.clone() }),
     phase: Phase::Finished,
     input: path.map(|path| json!({ "path": path })),
     output: None,
     is_error: None,
+    native: None,
     timestamp,
   })]
 }
@@ -898,16 +1196,21 @@ fn tool_lifecycle_event(
   AgentEvent::ToolCall(ToolCallEvent {
     provider: Provider::Codex,
     session_id,
+    turn_id: None,
     message_id: None,
     parent_id: None,
+    record_kind: tool_record_kind_for_phase(phase),
     tool_call_id: call_id,
+    provider_tool_name: None,
     tool_name: Some(name.to_string()),
     tool_kind: kind,
+    transport: None,
     summary,
     phase,
     input,
     output: None,
     is_error: None,
+    native: None,
     timestamp,
   })
 }
@@ -923,18 +1226,49 @@ fn tool_output_event(
   AgentEvent::ToolCall(ToolCallEvent {
     provider: Provider::Codex,
     session_id,
+    turn_id: None,
     message_id,
     parent_id: None,
+    record_kind: ToolRecordKind::Result,
     tool_call_id: call_id,
+    provider_tool_name: None,
     tool_name: name.clone(),
     tool_kind: tool_kind_for_optional_name(name.as_deref()),
+    transport: None,
     summary: None,
     phase: Phase::Finished,
     input: None,
     output: Some(output),
     is_error: None,
+    native: None,
     timestamp,
   })
+}
+
+pub(super) fn tool_record_kind_for_phase(phase: Phase) -> ToolRecordKind {
+  match phase {
+    Phase::Started => ToolRecordKind::Invocation,
+    Phase::Delta => ToolRecordKind::Progress,
+    Phase::Updated => ToolRecordKind::Snapshot,
+    Phase::Finished => ToolRecordKind::Result,
+  }
+}
+
+/// Response items such as `local_shell_call` and `web_search_call` are
+/// standalone snapshots: Codex does not emit a matching result item for them.
+/// Preserve an explicitly in-progress snapshot as pending, but let a
+/// historical completed/failed item finish its logical operation without
+/// inventing an output record.
+fn standalone_tool_call_lifecycle(status: Option<&str>) -> (ToolRecordKind, Phase, Option<bool>) {
+  let status = status
+    .map(str::trim)
+    .filter(|status| !status.is_empty())
+    .map(str::to_ascii_lowercase);
+  match status.as_deref() {
+    Some("in_progress" | "pending" | "running") => (ToolRecordKind::Invocation, Phase::Started, None),
+    Some("failed" | "error" | "cancelled" | "canceled") => (ToolRecordKind::Snapshot, Phase::Finished, Some(true)),
+    _ => (ToolRecordKind::Snapshot, Phase::Finished, None),
+  }
 }
 
 fn message_event(
@@ -1030,6 +1364,10 @@ fn string_field(value: &Value, field: &str) -> Option<String> {
     .and_then(Value::as_str)
     .filter(|value| !value.is_empty())
     .map(str::to_string)
+}
+
+fn response_turn_id(metadata: Option<&Value>) -> Option<String> {
+  metadata.and_then(|metadata| string_field(metadata, "turn_id"))
 }
 
 fn string_field_any(value: &Value, fields: &[&str]) -> Option<String> {
@@ -1179,10 +1517,288 @@ mod tests {
       assert!(call.input.is_some());
       assert!(call.output.is_none());
     }
+    assert!(matches!(&events[0], AgentEvent::ToolCall(call)
+      if matches!(call.record_kind, ToolRecordKind::Snapshot)
+        && matches!(call.phase, Phase::Finished)));
+    assert!(matches!(&events[5], AgentEvent::ToolCall(call)
+      if matches!(call.record_kind, ToolRecordKind::Snapshot)
+        && matches!(call.phase, Phase::Finished)));
     assert!(matches!(&events[2], AgentEvent::ToolCall(call)
       if call.output.as_ref().and_then(Value::as_str) == Some("custom result")));
     assert!(matches!(&events[4], AgentEvent::ToolCall(call)
       if call.output.as_ref().is_some_and(Value::is_object)));
+
+    let operations = tokn_session_core::assemble_tool_operations(&events);
+    for tool_name in ["local_shell", "web_search"] {
+      assert!(operations.iter().any(|operation| {
+        operation.tool_name.as_deref() == Some(tool_name)
+          && matches!(operation.status, tokn_session_core::ToolOperationStatus::Completed)
+      }));
+    }
+  }
+
+  #[test]
+  fn projects_strict_code_mode_wrappers_into_semantic_tool_operations() {
+    let events = normalize_fixture(include_str!("../fixtures/code_mode_wrappers.jsonl"));
+    assert_eq!(events.len(), 5);
+
+    let AgentEvent::ToolCall(write_invocation) = &events[1] else {
+      panic!("expected write_stdin invocation");
+    };
+    assert_eq!(write_invocation.turn_id.as_deref(), Some("turn-write"));
+    assert!(matches!(write_invocation.record_kind, ToolRecordKind::Invocation));
+    assert!(matches!(write_invocation.phase, Phase::Started));
+    assert_eq!(write_invocation.provider_tool_name.as_deref(), Some("exec"));
+    assert_eq!(write_invocation.tool_name.as_deref(), Some("write_stdin"));
+    assert!(matches!(write_invocation.tool_kind, ToolKind::Terminal));
+    assert!(matches!(write_invocation.transport, Some(ToolTransport::CodeExecution)));
+    assert!(matches!(
+      &write_invocation.summary,
+      Some(ToolSummary::Terminal {
+        session_id: Some(session_id),
+        action: Some(tokn_session_core::TerminalAction::Wait),
+        chars_len: Some(0),
+        wait_ms: Some(30_000),
+      }) if session_id == "90855"
+    ));
+    assert_eq!(
+      write_invocation.input,
+      Some(json!({
+        "session_id": 90855,
+        "chars": "",
+        "yield_time_ms": 30000,
+        "max_output_tokens": 4000,
+      }))
+    );
+    assert!(write_invocation.output.is_none());
+    assert_eq!(
+      write_invocation
+        .native
+        .as_ref()
+        .and_then(|native| native.get("type"))
+        .and_then(Value::as_str),
+      Some("custom_tool_call")
+    );
+    assert_eq!(
+      write_invocation
+        .native
+        .as_ref()
+        .and_then(|native| native.get("input"))
+        .and_then(Value::as_str),
+      Some(
+        "const r = await tools.write_stdin({session_id: 90855, chars: \"\", yield_time_ms: 30000, max_output_tokens: 4000});\ntext(JSON.stringify(r));\n"
+      )
+    );
+
+    let AgentEvent::ToolCall(write_result) = &events[2] else {
+      panic!("expected write_stdin result");
+    };
+    assert_eq!(write_result.turn_id.as_deref(), Some("turn-write"));
+    assert!(matches!(write_result.record_kind, ToolRecordKind::Result));
+    assert!(matches!(write_result.phase, Phase::Finished));
+    assert_eq!(write_result.provider_tool_name.as_deref(), Some("exec"));
+    assert_eq!(write_result.tool_name.as_deref(), Some("write_stdin"));
+    assert!(matches!(write_result.tool_kind, ToolKind::Terminal));
+    assert_eq!(write_result.input, write_invocation.input);
+    assert_eq!(
+      write_result.output,
+      Some(json!({
+        "session_id": 90855,
+        "chunk_id": "842651",
+        "wall_time_seconds": 30.001430708,
+        "original_token_count": 179,
+        "text": "Refreshing checks status",
+      }))
+    );
+    assert!(
+      write_result
+        .native
+        .as_ref()
+        .and_then(|native| native.get("output"))
+        .is_some_and(Value::is_array)
+    );
+    assert_eq!(
+      write_result
+        .native
+        .as_ref()
+        .and_then(|native| native.get("type"))
+        .and_then(Value::as_str),
+      Some("custom_tool_call_output")
+    );
+
+    let AgentEvent::ToolCall(command_invocation) = &events[3] else {
+      panic!("expected exec_command invocation");
+    };
+    assert!(matches!(command_invocation.record_kind, ToolRecordKind::Invocation));
+    assert_eq!(command_invocation.provider_tool_name.as_deref(), Some("exec"));
+    assert_eq!(command_invocation.tool_name.as_deref(), Some("exec_command"));
+    assert!(matches!(command_invocation.tool_kind, ToolKind::Shell));
+    assert_eq!(
+      command_invocation.input,
+      Some(json!({"cmd": "pwd", "yield_time_ms": 1000}))
+    );
+
+    let AgentEvent::ToolCall(command_result) = &events[4] else {
+      panic!("expected exec_command result");
+    };
+    assert!(matches!(command_result.record_kind, ToolRecordKind::Result));
+    assert_eq!(command_result.tool_name.as_deref(), Some("exec_command"));
+    assert!(matches!(
+      &command_result.summary,
+      Some(ToolSummary::Shell {
+        command: Some(command),
+        exit_code: Some(0),
+        ..
+      }) if command == "pwd"
+    ));
+    assert_eq!(
+      command_result.output,
+      Some(json!({
+        "session_id": 34,
+        "exit_code": 0,
+        "wall_time_seconds": 0.01,
+        "text": "/tmp/project\n",
+      }))
+    );
+
+    let operations = tokn_session_core::assemble_tool_operations(&events);
+    assert_eq!(operations.len(), 2);
+    assert!(matches!(
+      operations[0].status,
+      tokn_session_core::ToolOperationStatus::Completed
+    ));
+    assert_eq!(operations[0].tool_name.as_deref(), Some("write_stdin"));
+    assert_eq!(operations[0].output, write_result.output);
+    assert_eq!(operations[0].native.len(), 2);
+    assert_eq!(operations[1].tool_name.as_deref(), Some("exec_command"));
+    assert_eq!(operations[1].output, command_result.output);
+  }
+
+  #[test]
+  fn preserves_non_generated_code_mode_programs_and_results_as_raw_code_execution() {
+    let events = normalize_fixture(
+      r#"{"type":"session_meta","payload":{"id":"code-mode-session"}}
+{"type":"response_item","payload":{"type":"custom_tool_call","id":"dynamic-call","call_id":"dynamic","name":"exec","input":"const r = await tools.write_stdin({session_id: process.pid, chars: \"x\"});\ntext(JSON.stringify(r));\n"}}
+{"type":"response_item","payload":{"type":"custom_tool_call_output","id":"dynamic-result","call_id":"dynamic","output":[{"type":"input_text","text":"Script completed\nWall time 0.0 seconds\nOutput:\n"},{"type":"input_text","text":"{\"session_id\":1,\"output\":\"would be unsafe to infer\"}"}]}}"#,
+    );
+
+    let AgentEvent::ToolCall(invocation) = &events[1] else {
+      panic!("expected code execution invocation");
+    };
+    assert!(matches!(invocation.record_kind, ToolRecordKind::Invocation));
+    assert_eq!(invocation.provider_tool_name.as_deref(), Some("exec"));
+    assert_eq!(invocation.tool_name.as_deref(), Some("exec"));
+    assert!(matches!(invocation.tool_kind, ToolKind::CodeExecution));
+    assert!(matches!(invocation.transport, Some(ToolTransport::CodeExecution)));
+    assert!(invocation.input.as_ref().is_some_and(Value::is_string));
+
+    let AgentEvent::ToolCall(result) = &events[2] else {
+      panic!("expected raw code execution result");
+    };
+    assert!(matches!(result.record_kind, ToolRecordKind::Result));
+    assert_eq!(result.tool_name.as_deref(), Some("exec"));
+    assert!(matches!(result.tool_kind, ToolKind::CodeExecution));
+    assert!(result.output.as_ref().is_some_and(Value::is_array));
+  }
+
+  #[test]
+  fn correlates_reused_code_mode_call_ids_by_turn_before_falling_back_to_order() {
+    let wrapper = |session_id: u64| {
+      format!(
+        "const r = await tools.write_stdin({{session_id: {session_id}, chars: \"x\"}});\ntext(JSON.stringify(r));\n"
+      )
+    };
+    let result = |session_id: u64, text: &str| {
+      json!([
+        {"type": "input_text", "text": "Script completed\nWall time 0.0 seconds\nOutput:\n"},
+        {"type": "input_text", "text": format!("{{\"session_id\":{session_id},\"output\":\"{text}\"}}")},
+      ])
+    };
+    let records = [
+      json!({"type": "session_meta", "payload": {"id": "code-mode-session"}}),
+      json!({"type": "response_item", "payload": {
+        "type": "custom_tool_call", "id": "call-a", "call_id": "reused", "name": "exec",
+        "input": wrapper(1), "internal_chat_message_metadata_passthrough": {"turn_id": "turn-a"},
+      }}),
+      json!({"type": "response_item", "payload": {
+        "type": "custom_tool_call", "id": "call-b", "call_id": "reused", "name": "exec",
+        "input": wrapper(2), "internal_chat_message_metadata_passthrough": {"turn_id": "turn-b"},
+      }}),
+      json!({"type": "response_item", "payload": {
+        "type": "custom_tool_call_output", "id": "result-b", "call_id": "reused", "output": result(2, "second"),
+        "internal_chat_message_metadata_passthrough": {"turn_id": "turn-b"},
+      }}),
+      json!({"type": "response_item", "payload": {
+        "type": "custom_tool_call_output", "id": "result-a", "call_id": "reused", "output": result(1, "first"),
+        "internal_chat_message_metadata_passthrough": {"turn_id": "turn-a"},
+      }}),
+    ];
+    let mut normalizer = CodexNormalizer::new();
+    let events = records
+      .into_iter()
+      .flat_map(|record| normalize_value(&mut normalizer, record))
+      .collect::<Vec<_>>();
+
+    let AgentEvent::ToolCall(second_result) = &events[3] else {
+      panic!("expected second result");
+    };
+    assert_eq!(second_result.turn_id.as_deref(), Some("turn-b"));
+    assert_eq!(
+      second_result.input.as_ref().and_then(|input| input.get("session_id")),
+      Some(&json!(2))
+    );
+    assert_eq!(
+      second_result.output.as_ref().and_then(|output| output.get("text")),
+      Some(&json!("second"))
+    );
+
+    let AgentEvent::ToolCall(first_result) = &events[4] else {
+      panic!("expected first result");
+    };
+    assert_eq!(first_result.turn_id.as_deref(), Some("turn-a"));
+    assert_eq!(
+      first_result.input.as_ref().and_then(|input| input.get("session_id")),
+      Some(&json!(1))
+    );
+    assert_eq!(
+      first_result.output.as_ref().and_then(|output| output.get("text")),
+      Some(&json!("first"))
+    );
+  }
+
+  #[test]
+  fn bounds_unmatched_code_mode_correlations() {
+    let mut normalizer = CodexNormalizer::new();
+    normalize_value(
+      &mut normalizer,
+      json!({"type": "session_meta", "payload": {"id": "code-mode-session"}}),
+    );
+
+    for index in 0..=MAX_PENDING_CODE_MODE_CALLS {
+      normalize_value(
+        &mut normalizer,
+        json!({"type": "response_item", "payload": {
+          "type": "custom_tool_call",
+          "id": format!("item-{index}"),
+          "call_id": format!("call-{index}"),
+          "name": "exec",
+          "input": format!(
+            "const r = await tools.write_stdin({{session_id: {index}, chars: \"\"}});\ntext(JSON.stringify(r));\n"
+          ),
+        }}),
+      );
+    }
+
+    assert_eq!(normalizer.pending_code_mode_call_count, MAX_PENDING_CODE_MODE_CALLS);
+    assert_eq!(normalizer.pending_code_mode_order.len(), MAX_PENDING_CODE_MODE_CALLS);
+    assert_eq!(
+      normalizer
+        .pending_code_mode_calls
+        .values()
+        .map(VecDeque::len)
+        .sum::<usize>(),
+      MAX_PENDING_CODE_MODE_CALLS
+    );
   }
 
   #[test]

@@ -94,6 +94,23 @@ function toolEventPage(): EventPageResponse {
   };
 }
 
+function pendingToolEventPage(): EventPageResponse {
+  const page = toolEventPage();
+  const event = page.events[0]!;
+  return {
+    ...page,
+    events: [{
+      ...event,
+      phase: "started",
+      summary: "shell running cargo test",
+      tool: {
+        ...event.tool!,
+        exit_code: null,
+      },
+    }],
+  };
+}
+
 function toolDetail(text: string): EventDetail {
   return {
     event_key: "event.v1.1",
@@ -302,6 +319,63 @@ describe("useViewerState expanded tool detail", () => {
     act(() => result.current.toggleEventExpanded("event.v1.1"));
     await waitFor(() => {
       expect(result.current.expandedDetail?.tool_output?.sections[0]?.text).toBe("fresh A");
+    });
+    expect(loadEventDetail).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshes expanded and Inspector detail after a same-session event update", async () => {
+    const stale = deferred<EventDetail>();
+    const fresh = deferred<EventDetail>();
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [session("codex:session-1")],
+      next_cursor: null,
+      source_errors: [],
+    });
+    vi.mocked(loadEventPage)
+      .mockResolvedValueOnce(pendingToolEventPage())
+      .mockResolvedValueOnce(toolEventPage());
+    vi.mocked(loadEventDetail)
+      .mockImplementationOnce(() => stale.promise)
+      .mockImplementationOnce(() => fresh.promise);
+    const { result } = renderHook(() => useViewerState());
+
+    await waitFor(() => expect(result.current.events).toHaveLength(1));
+    act(() => result.current.selectEvent("event.v1.1"));
+    act(() => result.current.toggleEventExpanded("event.v1.1"));
+    await waitFor(() => expect(loadEventDetail).toHaveBeenCalledTimes(1));
+
+    act(() => result.current.retryEvents());
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(loadEventDetail).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      fresh.resolve(toolDetail("fresh output"));
+      await fresh.promise;
+    });
+    await waitFor(() => {
+      expect(result.current.detail?.tool_output?.sections[0]?.text).toBe("fresh output");
+      expect(result.current.expandedDetail?.tool_output?.sections[0]?.text).toBe("fresh output");
+    });
+
+    await act(async () => {
+      stale.resolve(toolDetail("stale output"));
+      await stale.promise;
+    });
+    expect(result.current.detail?.tool_output?.sections[0]?.text).toBe("fresh output");
+    expect(result.current.expandedDetail?.tool_output?.sections[0]?.text).toBe("fresh output");
+
+    act(() => result.current.toggleEventExpanded("event.v1.1"));
+    await waitFor(() => expect(result.current.expandedEventKey).toBeNull());
+    act(() => result.current.toggleEventExpanded("event.v1.1"));
+    await waitFor(() => {
+      expect(result.current.expandedDetail?.tool_output?.sections[0]?.text).toBe("fresh output");
+    });
+
+    act(() => result.current.closeInspector());
+    await waitFor(() => expect(result.current.inspectorOpen).toBe(false));
+    act(() => result.current.toggleInspector());
+    await waitFor(() => {
+      expect(result.current.detail?.tool_output?.sections[0]?.text).toBe("fresh output");
     });
     expect(loadEventDetail).toHaveBeenCalledTimes(2);
   });

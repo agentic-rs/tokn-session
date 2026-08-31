@@ -1,10 +1,12 @@
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde_json::Value;
 use tokn_session_core::{
   AgentActivity, AgentEvent, LifecycleEvent, LifecycleOutcome, LifecycleScope, LiveSessionEvent, LoadedSession,
-  LoadedSessionTree, Phase, Role, SessionHistoryStatus, SessionRef, SessionSettingsApplied, ToolCallEvent, ToolKind,
-  ToolSummary, UsageEvent, UsageKind,
+  LoadedSessionTree, Phase, Role, SessionHistoryStatus, SessionRef, SessionSettingsApplied, TerminalAction,
+  ToolCallEvent, ToolKind, ToolOperation, ToolOperationStatus, ToolSummary, UsageEvent, UsageKind,
+  assemble_tool_operations,
 };
 
 pub struct EventDisplay {
@@ -143,8 +145,28 @@ pub fn render_pretty(session: &LoadedSession) -> String {
   }
   output.push('\n');
 
-  for event in &session.events {
-    output.push_str(&render_event_pretty(event));
+  let mut operations_by_timeline_source = HashMap::new();
+  let mut hidden_tool_sources = HashSet::new();
+  for operation in assemble_tool_operations(&session.events) {
+    let Some(source_event_index) = operation.timeline_source_event_index() else {
+      continue;
+    };
+    hidden_tool_sources.extend(
+      operation
+        .source_event_indices
+        .iter()
+        .copied()
+        .filter(|index| *index != source_event_index),
+    );
+    operations_by_timeline_source.insert(source_event_index, operation);
+  }
+
+  for (source_event_index, event) in session.events.iter().enumerate() {
+    if let Some(operation) = operations_by_timeline_source.remove(&source_event_index) {
+      render_tool_operation(&mut output, &operation);
+    } else if !hidden_tool_sources.contains(&source_event_index) {
+      output.push_str(&render_event_pretty(event));
+    }
   }
 
   output
@@ -353,7 +375,7 @@ pub fn render_event_summary(event: &AgentEvent) -> String {
         summary.push(' ');
         summary.push_str(name);
       }
-      append_tool_id(&mut summary, event);
+      append_tool_id(&mut summary, event.tool_call_id.as_deref());
       summary
     }),
     AgentEvent::Error(event) => format!("error {}", first_line(&event.message)),
@@ -559,9 +581,77 @@ fn render_tool(output: &mut String, event: &ToolCallEvent) {
   output.push('\n');
 }
 
+/// Render one historical logical operation. The source event stream remains
+/// append-only for JSONL and live consumers, but pretty output should not
+/// repeat a provider's invocation, progress, and result fragments.
+fn render_tool_operation(output: &mut String, operation: &ToolOperation) {
+  if let Some(line) = render_tool_operation_summary(operation) {
+    output.push_str(&line);
+    output.push('\n');
+    if matches!(operation.status, ToolOperationStatus::Failed)
+      && let Some(detail) = operation.output.as_ref().map(|output| format!("output: {output}"))
+    {
+      write_indented(output, &detail);
+    }
+    output.push('\n');
+    return;
+  }
+
+  output.push_str("tool");
+  if let Some(name) = operation
+    .tool_name
+    .as_deref()
+    .or(operation.provider_tool_name.as_deref())
+  {
+    output.push(' ');
+    output.push_str(name);
+  }
+  if let Some(id) = &operation.tool_call_id {
+    output.push_str(" #");
+    output.push_str(id);
+  }
+  if matches!(operation.status, ToolOperationStatus::Failed) {
+    output.push_str(" error");
+  }
+  output.push('\n');
+  if let Some(input) = &operation.input {
+    write_indented(output, &format!("input: {input}"));
+  }
+  if let Some(output_value) = &operation.output {
+    write_indented(output, &format!("output: {output_value}"));
+  }
+  output.push('\n');
+}
+
 fn render_tool_summary(event: &ToolCallEvent) -> Option<String> {
-  let status = tool_status(event);
-  let mut line = match &event.summary {
+  render_tool_summary_parts(
+    event.summary.as_ref(),
+    event.tool_kind,
+    tool_status(event),
+    event.tool_call_id.as_deref(),
+  )
+}
+
+fn render_tool_operation_summary(operation: &ToolOperation) -> Option<String> {
+  render_tool_summary_parts(
+    operation.summary.as_ref(),
+    operation.tool_kind,
+    tool_operation_status(operation.status),
+    operation.tool_call_id.as_deref(),
+  )
+}
+
+fn render_tool_summary_parts(
+  summary: Option<&ToolSummary>,
+  tool_kind: ToolKind,
+  status: &str,
+  tool_call_id: Option<&str>,
+) -> Option<String> {
+  let mut line = match summary {
+    Some(ToolSummary::CodeExecution { language }) => {
+      let language = language.as_deref().unwrap_or("code");
+      format!("code{status} {language}")
+    }
     Some(ToolSummary::Shell {
       command,
       cwd: _,
@@ -574,6 +664,26 @@ fn render_tool_summary(event: &ToolCallEvent) -> Option<String> {
       if let Some(command) = command {
         line.push(' ');
         line.push_str(command);
+      }
+      line
+    }
+    Some(ToolSummary::Terminal {
+      session_id,
+      action,
+      chars_len,
+      wait_ms,
+    }) => {
+      let mut line = match action {
+        Some(TerminalAction::Wait) => "terminal wait".to_string(),
+        Some(TerminalAction::Send) => format!("terminal send {} chars", chars_len.unwrap_or(0)),
+        None => "terminal".to_string(),
+      };
+      line.push_str(status);
+      if let Some(session_id) = session_id {
+        line.push_str(&format!(" session={session_id}"));
+      }
+      if let Some(wait_ms) = wait_ms {
+        line.push_str(&format!(" wait={wait_ms}ms"));
       }
       line
     }
@@ -595,8 +705,10 @@ fn render_tool_summary(event: &ToolCallEvent) -> Option<String> {
     Some(ToolSummary::Search { query }) => format!("search{status} {}", query.as_deref().unwrap_or("-")),
     Some(ToolSummary::Web { url }) => format!("web{status} {}", url.as_deref().unwrap_or("-")),
     Some(ToolSummary::Task { title }) => format!("task{status} {}", title.as_deref().unwrap_or("-")),
-    None => match event.tool_kind {
+    None => match tool_kind {
+      ToolKind::CodeExecution => Some(format!("code{status}")),
       ToolKind::Shell => Some(format!("shell{status}")),
+      ToolKind::Terminal => Some(format!("terminal{status}")),
       ToolKind::FileRead => Some(format!("read{status}")),
       ToolKind::FileWrite => Some(format!("write{status}")),
       ToolKind::FileEdit => Some(format!("edit{status}")),
@@ -606,12 +718,12 @@ fn render_tool_summary(event: &ToolCallEvent) -> Option<String> {
       ToolKind::Unknown => None,
     }?,
   };
-  append_tool_id(&mut line, event);
+  append_tool_id(&mut line, tool_call_id);
   Some(line)
 }
 
-fn append_tool_id(line: &mut String, event: &ToolCallEvent) {
-  if let Some(id) = &event.tool_call_id {
+fn append_tool_id(line: &mut String, tool_call_id: Option<&str>) {
+  if let Some(id) = tool_call_id {
     line.push_str(" #");
     line.push_str(id);
   }
@@ -636,6 +748,15 @@ fn tool_status(event: &ToolCallEvent) -> &'static str {
     Phase::Updated => " running",
     Phase::Delta => " delta",
     Phase::Finished => "",
+  }
+}
+
+fn tool_operation_status(status: ToolOperationStatus) -> &'static str {
+  match status {
+    ToolOperationStatus::Pending => " pending",
+    ToolOperationStatus::Running => " running",
+    ToolOperationStatus::Completed => "",
+    ToolOperationStatus::Failed => " error",
   }
 }
 
@@ -676,7 +797,7 @@ mod tests {
   use serde_json::json;
   use tokn_session_core::{
     AgentActivity, AgentEvent, GoalUpdated, LoadedSession, MessageDelivery, MessageEvent, Provider, ProviderChanged,
-    ReasoningEvent, SessionRef, SessionSettingsApplied, UnknownEvent,
+    ReasoningEvent, SessionRef, SessionSettingsApplied, ToolRecordKind, ToolTransport, UnknownEvent,
   };
 
   use super::*;
@@ -686,11 +807,15 @@ mod tests {
     let event = AgentEvent::ToolCall(ToolCallEvent {
       provider: Provider::Codex,
       session_id: Some("session".to_string()),
+      turn_id: None,
       message_id: None,
       parent_id: None,
+      record_kind: ToolRecordKind::Snapshot,
       tool_call_id: Some("call".to_string()),
+      provider_tool_name: Some("exec_command".to_string()),
       tool_name: Some("exec_command".to_string()),
       tool_kind: ToolKind::Shell,
+      transport: Some(ToolTransport::Native),
       summary: Some(ToolSummary::Shell {
         command: Some("cargo check".to_string()),
         cwd: None,
@@ -700,6 +825,7 @@ mod tests {
       input: None,
       output: None,
       is_error: None,
+      native: None,
       timestamp: None,
     });
 
@@ -715,11 +841,15 @@ mod tests {
     let session = loaded_session(vec![AgentEvent::ToolCall(ToolCallEvent {
       provider: Provider::Codex,
       session_id: Some("session".to_string()),
+      turn_id: None,
       message_id: None,
       parent_id: None,
+      record_kind: ToolRecordKind::Invocation,
       tool_call_id: Some("call".to_string()),
+      provider_tool_name: Some("exec_command".to_string()),
       tool_name: Some("exec_command".to_string()),
       tool_kind: ToolKind::Shell,
+      transport: Some(ToolTransport::Native),
       summary: Some(ToolSummary::Shell {
         command: Some("cargo test".to_string()),
         cwd: None,
@@ -729,13 +859,89 @@ mod tests {
       input: Some(json!(["cargo", "test"])),
       output: None,
       is_error: None,
+      native: None,
       timestamp: None,
     })]);
 
     let output = render_pretty(&session);
 
-    assert!(output.contains("shell started cargo test #call\n"));
+    assert!(output.contains("shell pending cargo test #call\n"));
     assert!(!output.contains("input:"));
+  }
+
+  #[test]
+  fn render_pretty_assembles_tool_invocation_and_result_once() {
+    let session = loaded_session(vec![
+      AgentEvent::ToolCall(ToolCallEvent {
+        provider: Provider::Codex,
+        session_id: Some("session".to_string()),
+        turn_id: Some("turn".to_string()),
+        message_id: None,
+        parent_id: None,
+        record_kind: ToolRecordKind::Invocation,
+        tool_call_id: Some("call".to_string()),
+        provider_tool_name: Some("exec".to_string()),
+        tool_name: Some("write_stdin".to_string()),
+        tool_kind: ToolKind::Terminal,
+        transport: Some(ToolTransport::CodeExecution),
+        summary: Some(ToolSummary::Terminal {
+          session_id: Some("90855".to_string()),
+          action: Some(TerminalAction::Wait),
+          chars_len: Some(0),
+          wait_ms: Some(30_000),
+        }),
+        phase: Phase::Started,
+        input: Some(json!({ "session_id": 90855, "chars": "" })),
+        output: None,
+        is_error: None,
+        native: None,
+        timestamp: None,
+      }),
+      AgentEvent::Message(MessageEvent {
+        provenance: None,
+        provider: Provider::Codex,
+        session_id: Some("session".to_string()),
+        message_id: None,
+        parent_id: None,
+        role: Role::Assistant,
+        delivery: MessageDelivery::Commentary,
+        phase: Phase::Finished,
+        text: "intervening commentary".to_string(),
+        timestamp: None,
+      }),
+      AgentEvent::ToolCall(ToolCallEvent {
+        provider: Provider::Codex,
+        session_id: Some("session".to_string()),
+        turn_id: Some("turn".to_string()),
+        message_id: None,
+        parent_id: None,
+        record_kind: ToolRecordKind::Result,
+        tool_call_id: Some("call".to_string()),
+        provider_tool_name: Some("exec".to_string()),
+        tool_name: Some("write_stdin".to_string()),
+        tool_kind: ToolKind::Terminal,
+        transport: Some(ToolTransport::CodeExecution),
+        summary: Some(ToolSummary::Terminal {
+          session_id: Some("90855".to_string()),
+          action: Some(TerminalAction::Wait),
+          chars_len: Some(0),
+          wait_ms: Some(30_000),
+        }),
+        phase: Phase::Finished,
+        input: Some(json!({ "session_id": 90855, "chars": "" })),
+        output: Some(json!({ "text": "Refreshing checks status" })),
+        is_error: None,
+        native: None,
+        timestamp: None,
+      }),
+    ]);
+
+    let output = render_pretty(&session);
+
+    assert_eq!(output.matches("terminal wait").count(), 1);
+    assert!(output.contains("terminal wait session=90855 wait=30000ms #call\n"));
+    assert!(!output.contains("pending"));
+    assert!(output.find("intervening commentary").unwrap() < output.find("terminal wait session=90855").unwrap());
   }
 
   #[test]
@@ -876,11 +1082,15 @@ mod tests {
     let event = AgentEvent::ToolCall(ToolCallEvent {
       provider: Provider::Codex,
       session_id: Some("session".to_string()),
+      turn_id: None,
       message_id: None,
       parent_id: None,
+      record_kind: ToolRecordKind::Snapshot,
       tool_call_id: Some("call".to_string()),
+      provider_tool_name: Some("exec_command".to_string()),
       tool_name: Some("exec_command".to_string()),
       tool_kind: ToolKind::Shell,
+      transport: Some(ToolTransport::Native),
       summary: Some(ToolSummary::Shell {
         command: Some("cargo check".to_string()),
         cwd: None,
@@ -890,6 +1100,7 @@ mod tests {
       input: None,
       output: None,
       is_error: None,
+      native: None,
       timestamp: None,
     });
 
@@ -901,11 +1112,15 @@ mod tests {
     let session = loaded_session(vec![AgentEvent::ToolCall(ToolCallEvent {
       provider: Provider::Codex,
       session_id: Some("session".to_string()),
+      turn_id: None,
       message_id: None,
       parent_id: None,
+      record_kind: ToolRecordKind::Snapshot,
       tool_call_id: Some("call".to_string()),
+      provider_tool_name: Some("apply_patch".to_string()),
       tool_name: Some("apply_patch".to_string()),
       tool_kind: ToolKind::FileEdit,
+      transport: Some(ToolTransport::Native),
       summary: Some(ToolSummary::FileEdit {
         path: Some("crates/core/src/agent_event.rs".to_string()),
         added: Some(4),
@@ -915,6 +1130,7 @@ mod tests {
       input: None,
       output: None,
       is_error: None,
+      native: None,
       timestamp: None,
     })]);
 
@@ -928,16 +1144,21 @@ mod tests {
     let session = loaded_session(vec![AgentEvent::ToolCall(ToolCallEvent {
       provider: Provider::Pi,
       session_id: Some("session".to_string()),
+      turn_id: None,
       message_id: None,
       parent_id: None,
+      record_kind: ToolRecordKind::Snapshot,
       tool_call_id: Some("call".to_string()),
+      provider_tool_name: Some("mystery".to_string()),
       tool_name: Some("mystery".to_string()),
       tool_kind: ToolKind::Unknown,
+      transport: Some(ToolTransport::Native),
       summary: None,
       phase: Phase::Finished,
       input: Some(json!({ "value": 1 })),
       output: Some(json!({ "ok": true })),
       is_error: None,
+      native: None,
       timestamp: None,
     })]);
 

@@ -122,6 +122,7 @@ export function useViewerState() {
   const detailCache = useRef(new Map<string, EventDetail>());
   const detailLoads = useRef(new Map<string, Promise<EventDetail>>());
   const detailGeneration = useRef(0);
+  const [detailRevision, setDetailRevision] = useState(0);
   const [expandedEventKey, setExpandedEventKey] = useState<string | null>(null);
   const [expandedDetail, setExpandedDetail] = useState<EventDetail | null>(null);
   const [expandedDetailOwnerKey, setExpandedDetailOwnerKey] = useState<string | null>(null);
@@ -153,6 +154,24 @@ export function useViewerState() {
     });
     detailLoads.current.set(cacheKey, request);
     return request;
+  }, []);
+
+  const invalidateEventDetails = useCallback(() => {
+    detailGeneration.current += 1;
+    detailCache.current.clear();
+    detailLoads.current.clear();
+    detailRequest.current += 1;
+    expandedDetailRequest.current += 1;
+    detailOwnerKeyRef.current = null;
+    setDetailOwnerKey(null);
+    setDetail(null);
+    setDetailLoading(false);
+    setDetailError(null);
+    setExpandedDetailOwnerKey(null);
+    setExpandedDetail(null);
+    setExpandedDetailLoading(false);
+    setExpandedDetailError(null);
+    setDetailRevision((revision) => revision + 1);
   }, []);
 
   const applyEventSelection = useCallback((eventKey: string | null, openInspector: boolean) => {
@@ -421,6 +440,7 @@ export function useViewerState() {
         if (eventsRequest.current !== requestId) {
           return;
         }
+        invalidateEventDetails();
         setEvents(response.events);
         setOlderCursor(response.previous_cursor);
         setNewerCursor(response.next_cursor);
@@ -442,7 +462,7 @@ export function useViewerState() {
           setEventsLoading(false);
         }
       });
-  }, [applyEventSelection, eventsAttempt, selectedSessionKey]);
+  }, [applyEventSelection, eventsAttempt, invalidateEventDetails, selectedSessionKey]);
 
   useEffect(() => {
     const requestId = ++detailRequest.current;
@@ -484,7 +504,14 @@ export function useViewerState() {
           setDetailLoading(false);
         }
       });
-  }, [detailAttempt, inspectorOpen, requestDetail, selectedEventKey, selectedSessionKey]);
+  }, [
+    detailAttempt,
+    detailRevision,
+    inspectorOpen,
+    requestDetail,
+    selectedEventKey,
+    selectedSessionKey,
+  ]);
 
   useEffect(() => {
     const requestId = ++expandedDetailRequest.current;
@@ -524,7 +551,14 @@ export function useViewerState() {
           setExpandedDetailLoading(false);
         }
       });
-  }, [events, expandedDetailAttempt, expandedEventKey, requestDetail, selectedSessionKey]);
+  }, [
+    detailRevision,
+    events,
+    expandedDetailAttempt,
+    expandedEventKey,
+    requestDetail,
+    selectedSessionKey,
+  ]);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -669,6 +703,7 @@ export function useViewerState() {
         if (eventsRequest.current !== requestGeneration) {
           return;
         }
+        invalidateEventDetails();
         setEvents((current) => mergeEvents(current, response.events, "before"));
         setOlderCursor(response.previous_cursor);
         setTotalEvents(response.total_events);
@@ -683,7 +718,7 @@ export function useViewerState() {
           setOlderLoading(false);
         }
       });
-  }, [olderCursor, olderLoading, selectedSessionKey]);
+  }, [invalidateEventDetails, olderCursor, olderLoading, selectedSessionKey]);
 
   const loadNewerEvents = useCallback(() => {
     if (
@@ -707,6 +742,7 @@ export function useViewerState() {
         if (eventsRequest.current !== requestGeneration) {
           return;
         }
+        invalidateEventDetails();
         setEvents((current) => mergeEvents(current, response.events, "after"));
         setNewerCursor(response.next_cursor);
         setTotalEvents(response.total_events);
@@ -721,7 +757,7 @@ export function useViewerState() {
           setNewerLoading(false);
         }
       });
-  }, [newerCursor, newerLoading, selectedSessionKey]);
+  }, [invalidateEventDetails, newerCursor, newerLoading, selectedSessionKey]);
 
   return {
     search,

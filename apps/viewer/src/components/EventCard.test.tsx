@@ -291,7 +291,8 @@ describe("EventCard tool output", () => {
     expect(container.querySelector(".tool-output img")).not.toBeInTheDocument();
     expect(container.querySelector(".tool-output strong")).not.toBeInTheDocument();
     expect(screen.getByText(/truncated from 70 KB/i)).toBeInTheDocument();
-    expect(screen.getByText(/related result event/i)).toBeInTheDocument();
+    expect(screen.getByText(/Inspect the event for the complete bounded detail/i)).toBeInTheDocument();
+    expect(screen.queryByText(/related result event/i)).not.toBeInTheDocument();
   });
 
   it("shows loading, retryable error, pending, and finished empty-output states", () => {
@@ -369,6 +370,156 @@ describe("EventCard tool output", () => {
 
     expect(screen.getByText("Tool output is hidden by the provider.")).toBeInTheDocument();
     expect(screen.queryByText("secret output")).not.toBeInTheDocument();
+  });
+});
+
+describe("EventCard semantic tool operations", () => {
+  it("renders Code Execution and Terminal operation headings", () => {
+    render(
+      <>
+        <EventCard
+          button_id="code-button"
+          detail={null}
+          detail_error={null}
+          detail_loading={false}
+          event={event({
+            event_key: "event.code",
+            type: "tool_call",
+            role: null,
+            title: "exec",
+            tool: tool({
+              kind: "code_execution",
+              tool_name: "exec",
+              provider_tool_name: "exec",
+              language: "javascript",
+              command: null,
+              cwd: null,
+              exit_code: null,
+            }),
+          })}
+          is_expanded={false}
+          is_selected={false}
+          on_retry_detail={vi.fn()}
+          on_select={vi.fn()}
+          on_toggle={vi.fn()}
+        />
+        <EventCard
+          button_id="terminal-button"
+          detail={null}
+          detail_error={null}
+          detail_loading={false}
+          event={event({
+            event_key: "event.terminal",
+            type: "tool_call",
+            role: null,
+            title: "write_stdin",
+            tool: tool({
+              kind: "terminal",
+              tool_name: "write_stdin",
+              command: null,
+              cwd: null,
+              exit_code: null,
+              terminal_action: "wait",
+              terminal_session_id: "90855",
+              wait_ms: 30_000,
+              status: "completed",
+            }),
+          })}
+          is_expanded={false}
+          is_selected={false}
+          on_retry_detail={vi.fn()}
+          on_select={vi.fn()}
+          on_toggle={vi.fn()}
+        />
+      </>,
+    );
+
+    expect(screen.getByRole("button", { name: "Code: Javascript code" })).toBeInTheDocument();
+    expect(screen.getByText("exec")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Terminal: Wait for terminal 90855" }))
+      .toBeInTheDocument();
+    expect(screen.getByText("Up to 30 s")).toBeInTheDocument();
+  });
+
+  it("uses the derived operation status instead of the source record phase", () => {
+    const { rerender } = renderCard(event({
+      type: "tool_call",
+      role: null,
+      title: "write_stdin",
+      phase: "finished",
+      tool: tool({
+        kind: "terminal",
+        tool_name: "write_stdin",
+        command: null,
+        cwd: null,
+        exit_code: null,
+        status: "running",
+        terminal_action: "send",
+        terminal_session_id: "90855",
+        chars_len: 14,
+      }),
+    }), {
+      detail: detail(),
+      is_expanded: true,
+    });
+
+    expect(screen.getByRole("button", {
+      name: "Terminal: Send 14 characters to terminal 90855",
+    })).toBeInTheDocument();
+    expect(screen.getByText("running")).toHaveAttribute("data-tone", "neutral");
+    expect(screen.getByText("Output is not available yet.")).toBeInTheDocument();
+
+    rerender(
+      <EventCard
+        button_id="event-button"
+        detail={detail()}
+        detail_error={null}
+        detail_loading={false}
+        event={event({
+          type: "tool_call",
+          role: null,
+          title: "write_stdin",
+          phase: "started",
+          tool: tool({
+            kind: "terminal",
+            tool_name: "write_stdin",
+            command: null,
+            cwd: null,
+            exit_code: null,
+            status: "completed",
+            terminal_action: "send",
+            terminal_session_id: "90855",
+            chars_len: 14,
+          }),
+        })}
+        is_expanded
+        is_selected={false}
+        on_retry_detail={vi.fn()}
+        on_select={vi.fn()}
+        on_toggle={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByText("running")).not.toBeInTheDocument();
+    expect(screen.getByText("No output was captured for this tool call.")).toBeInTheDocument();
+  });
+
+  it("labels a failed logical operation as failed without relying on an exit code", () => {
+    renderCard(event({
+      type: "tool_call",
+      role: null,
+      title: "exec",
+      tool: tool({
+        kind: "code_execution",
+        tool_name: "exec",
+        command: null,
+        cwd: null,
+        exit_code: null,
+        status: "failed",
+      }),
+    }));
+
+    expect(screen.getByText("failed")).toHaveAttribute("data-tone", "error");
   });
 });
 
