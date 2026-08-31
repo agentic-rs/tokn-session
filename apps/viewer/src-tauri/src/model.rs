@@ -150,6 +150,24 @@ pub struct EventSummary {
   pub summary_truncated: bool,
   pub is_hidden: bool,
   pub is_error: Option<bool>,
+  pub tool: Option<ToolCardSummary>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ToolCardSummary {
+  pub kind: String,
+  pub tool_name: Option<String>,
+  pub tool_call_id: Option<String>,
+  pub command: Option<String>,
+  pub cwd: Option<String>,
+  pub path: Option<String>,
+  pub query: Option<String>,
+  pub url: Option<String>,
+  pub task_title: Option<String>,
+  pub exit_code: Option<i64>,
+  pub bytes: Option<u64>,
+  pub added: Option<u64>,
+  pub removed: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -164,6 +182,22 @@ pub struct EventDetail {
   pub event: Value,
   pub native: Option<Value>,
   pub is_hidden: bool,
+  pub tool_output: Option<ToolOutputPreview>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ToolOutputPreview {
+  pub sections: Vec<ToolOutputSection>,
+  pub truncated: bool,
+  pub original_size_bytes: usize,
+  pub source_event_key: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ToolOutputSection {
+  pub label: Option<String>,
+  pub text: String,
+  pub format: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

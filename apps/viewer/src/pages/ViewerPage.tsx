@@ -39,6 +39,10 @@ export function ViewerPage() {
       <Conversation
         error={viewer.eventsError}
         events={viewer.events}
+        expanded_detail={viewer.expandedDetail}
+        expanded_detail_error={viewer.expandedDetailError}
+        expanded_detail_loading={viewer.expandedDetailLoading}
+        expanded_event_key={viewer.expandedEventKey}
         has_newer={viewer.newerCursor !== null}
         has_older={viewer.olderCursor !== null}
         history_status={viewer.historyStatus}
@@ -48,10 +52,12 @@ export function ViewerPage() {
         is_loading_newer={viewer.newerLoading}
         is_loading_older={viewer.olderLoading}
         on_event_select={viewer.selectEvent}
+        on_event_toggle={viewer.toggleEventExpanded}
         on_inspector_toggle={viewer.toggleInspector}
         on_load_newer={viewer.loadNewerEvents}
         on_load_older={viewer.loadOlderEvents}
         on_retry={viewer.retryEvents}
+        on_retry_expanded_detail={viewer.retryExpandedDetail}
         on_sidebar_open={() => viewer.setMobileSidebarOpen(true)}
         selected_event_key={viewer.selectedEventKey}
         session={viewer.selectedSession}

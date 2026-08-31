@@ -272,7 +272,9 @@ fn normalize_response_item(
         summary: tool_summary_for_input("local_shell", &input),
         phase: Phase::Finished,
         input: Some(input),
-        output: item.status.map(Value::String),
+        // Response-item status describes invocation lifecycle. A separate
+        // output record, when present, carries the user-visible result.
+        output: None,
         is_error: None,
         timestamp,
       })]
@@ -294,7 +296,7 @@ fn normalize_response_item(
         summary: tool_summary_for_input(&name, &input),
         phase: Phase::Finished,
         input: Some(input),
-        output: item.status.map(Value::String),
+        output: None,
         is_error: None,
         timestamp,
       })]
@@ -320,7 +322,7 @@ fn normalize_response_item(
         summary: tool_summary_for_input("tool_search", &input),
         phase: Phase::Finished,
         input: Some(input),
-        output: item.status.map(Value::String),
+        output: None,
         is_error: None,
         timestamp,
       })]
@@ -350,7 +352,7 @@ fn normalize_response_item(
         summary: tool_summary_for_input("web_search", &input),
         phase: Phase::Finished,
         input: Some(input),
-        output: item.status.map(Value::String),
+        output: None,
         is_error: None,
         timestamp,
       })]
@@ -1154,6 +1156,31 @@ mod tests {
     assert!(
       matches!(&events[10], AgentEvent::Unknown(event) if event.native_type.as_deref() == Some("event_msg.new_native_event"))
     );
+  }
+
+  #[test]
+  fn response_item_call_status_is_not_exposed_as_tool_output() {
+    let events = normalize_fixture(
+      r#"{"type":"response_item","payload":{"type":"local_shell_call","id":"local-1","call_id":"local-call","status":"completed","action":{"command":["pwd"]}}}
+{"type":"response_item","payload":{"type":"custom_tool_call","id":"custom-1","call_id":"custom-call","name":"exec","status":"completed","input":{"cmd":"cargo test"}}}
+{"type":"response_item","payload":{"type":"custom_tool_call_output","id":"custom-output","call_id":"custom-call","name":"exec","output":"custom result"}}
+{"type":"response_item","payload":{"type":"tool_search_call","id":"search-1","call_id":"search-call","status":"completed","arguments":{"query":"browser"}}}
+{"type":"response_item","payload":{"type":"tool_search_output","id":"search-output","call_id":"search-call","status":"completed","execution":"local","tools":[]}}
+{"type":"response_item","payload":{"type":"web_search_call","id":"web-1","status":"completed","action":{"query":"rust"}}}"#,
+    );
+
+    assert_eq!(events.len(), 6);
+    for index in [0, 1, 3, 5] {
+      let AgentEvent::ToolCall(call) = &events[index] else {
+        panic!("expected invocation at index {index}");
+      };
+      assert!(call.input.is_some());
+      assert!(call.output.is_none());
+    }
+    assert!(matches!(&events[2], AgentEvent::ToolCall(call)
+      if call.output.as_ref().and_then(Value::as_str) == Some("custom result")));
+    assert!(matches!(&events[4], AgentEvent::ToolCall(call)
+      if call.output.as_ref().is_some_and(Value::is_object)));
   }
 
   #[test]

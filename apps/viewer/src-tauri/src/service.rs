@@ -5,20 +5,27 @@ use std::time::SystemTime;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokn_session_client::SessionHeader;
-use tokn_session_core::{AgentEvent, LifecycleOutcome, LoadedSession, Provider, Role};
+use tokn_session_core::{
+  AgentEvent, LifecycleOutcome, LoadedSession, Phase, Provider, Role, ToolCallEvent, ToolKind, ToolSummary,
+};
 use tokn_session_render::render_event_summary;
 
 use crate::model::{
   EventDetail, EventPage, EventPageRequest, EventSummary, ListSessionsRequest, ListSessionsResponse,
-  LoadEventDetailRequest, PageDirection, SessionLocator, SessionSummary, SourceError, ViewerProvider, bounded_limit,
-  decode_event_cursor, decode_event_key, decode_list_cursor, decode_session_key, encode_event_cursor, encode_event_key,
-  encode_list_cursor, encode_session_key, parse_updated_at_ms, requested_offset,
+  LoadEventDetailRequest, PageDirection, SessionLocator, SessionSummary, SourceError, ToolCardSummary,
+  ToolOutputPreview, ToolOutputSection, ViewerProvider, bounded_limit, decode_event_cursor, decode_event_key,
+  decode_list_cursor, decode_session_key, encode_event_cursor, encode_event_key, encode_list_cursor,
+  encode_session_key, parse_updated_at_ms, requested_offset,
 };
 use crate::repository::{NativeRepository, ViewerRepository};
 
 const MAX_DETAIL_VALUE_BYTES: usize = 512 * 1024;
 const MAX_MESSAGE_SUMMARY_CHARS: usize = 16 * 1024;
 const MAX_TECHNICAL_SUMMARY_CHARS: usize = 500;
+const MAX_TOOL_CARD_STRING_CHARS: usize = 500;
+const MAX_TOOL_NAME_CHARS: usize = 120;
+const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
+const TOOL_OUTPUT_TRUNCATION_MARKER: &str = "\n\u{2026} output truncated \u{2026}\n";
 
 #[derive(Clone)]
 pub(crate) struct ViewerService {
@@ -139,7 +146,7 @@ impl ViewerService {
     let events = loaded.events[start..end]
       .iter()
       .enumerate()
-      .map(|(relative_index, event)| event_summary(start + relative_index, event))
+      .map(|(relative_index, event)| event_summary(&loaded.events, start + relative_index, event))
       .collect();
 
     Ok(EventPage {
@@ -170,6 +177,7 @@ impl ViewerService {
         }),
         native: None,
         is_hidden: true,
+        tool_output: None,
       });
     }
 
@@ -180,11 +188,13 @@ impl ViewerService {
       serde_json::to_value(event).map_err(|error| format!("failed to serialize normalized event: {error}"))?;
     remove_embedded_native(&mut normalized);
     let normalized = bounded_detail_value(normalized, "normalized_event")?;
+    let tool_output = tool_output_preview(&loaded.events, index);
     Ok(EventDetail {
       event_key: request.event_key,
       event: normalized,
       native,
       is_hidden: false,
+      tool_output,
     })
   }
 
@@ -333,7 +343,7 @@ fn event_page_bounds(
   })
 }
 
-fn event_summary(index: usize, event: &AgentEvent) -> EventSummary {
+fn event_summary(events: &[AgentEvent], index: usize, event: &AgentEvent) -> EventSummary {
   let hidden = event.is_hidden();
   let title = if hidden {
     "Hidden provider content".to_string()
@@ -367,6 +377,9 @@ fn event_summary(index: usize, event: &AgentEvent) -> EventSummary {
     MAX_TECHNICAL_SUMMARY_CHARS
   };
   let (summary, summary_truncated) = truncate_with_flag(summary, summary_max_chars);
+  let tool = (!hidden)
+    .then(|| tool_event(event).map(|tool| enriched_tool_card_summary(events, index, tool)))
+    .flatten();
   EventSummary {
     event_key: encode_event_key(index),
     event_type: normalized_event_type(event).to_string(),
@@ -378,7 +391,144 @@ fn event_summary(index: usize, event: &AgentEvent) -> EventSummary {
     summary,
     summary_truncated,
     is_hidden: hidden,
-    is_error: error_for_event(event),
+    is_error: correlated_error(events, index, event),
+    tool,
+  }
+}
+
+fn enriched_tool_card_summary(events: &[AgentEvent], index: usize, event: &ToolCallEvent) -> ToolCardSummary {
+  let mut card = tool_card_summary(event);
+  let (before, after) = related_tool_indices(events, index, event);
+
+  for related_index in before.into_iter().chain(after.iter().copied()) {
+    if let Some(related) = events.get(related_index).and_then(tool_event) {
+      merge_tool_card_summary(&mut card, tool_card_summary(related));
+    }
+  }
+
+  // Terminal facts are authoritative for invocation and delta cards even if
+  // an earlier snapshot happened to include provisional values.
+  for related_index in after {
+    let Some(related) = events.get(related_index).and_then(tool_event) else {
+      continue;
+    };
+    if matches!(related.phase, Phase::Finished) {
+      let terminal = tool_card_summary(related);
+      if terminal.exit_code.is_some() {
+        card.exit_code = terminal.exit_code;
+      }
+      if terminal.bytes.is_some() {
+        card.bytes = terminal.bytes;
+      }
+      if terminal.added.is_some() {
+        card.added = terminal.added;
+      }
+      if terminal.removed.is_some() {
+        card.removed = terminal.removed;
+      }
+      break;
+    }
+  }
+
+  bound_tool_card_summary(card)
+}
+
+fn tool_card_summary(event: &ToolCallEvent) -> ToolCardSummary {
+  let mut card = ToolCardSummary {
+    kind: tool_kind_label(event.tool_kind).to_string(),
+    tool_name: present_string(event.tool_name.as_deref()).map(str::to_string),
+    tool_call_id: present_string(event.tool_call_id.as_deref()).map(str::to_string),
+    command: None,
+    cwd: None,
+    path: None,
+    query: None,
+    url: None,
+    task_title: None,
+    exit_code: None,
+    bytes: None,
+    added: None,
+    removed: None,
+  };
+
+  match event.summary.as_ref() {
+    Some(ToolSummary::Shell {
+      command,
+      cwd,
+      exit_code,
+    }) => {
+      card.command.clone_from(command);
+      card.cwd.clone_from(cwd);
+      card.exit_code = *exit_code;
+    }
+    Some(ToolSummary::FileRead { path }) => card.path.clone_from(path),
+    Some(ToolSummary::FileWrite { path, bytes }) => {
+      card.path.clone_from(path);
+      card.bytes = *bytes;
+    }
+    Some(ToolSummary::FileEdit { path, added, removed }) => {
+      card.path.clone_from(path);
+      card.added = *added;
+      card.removed = *removed;
+    }
+    Some(ToolSummary::Search { query }) => card.query.clone_from(query),
+    Some(ToolSummary::Web { url }) => card.url.clone_from(url),
+    Some(ToolSummary::Task { title }) => card.task_title.clone_from(title),
+    None => {}
+  }
+  card
+}
+
+fn merge_tool_card_summary(target: &mut ToolCardSummary, source: ToolCardSummary) {
+  if target.kind == "unknown" && source.kind != "unknown" {
+    target.kind = source.kind;
+  }
+  fill_missing(&mut target.tool_name, source.tool_name);
+  fill_missing(&mut target.tool_call_id, source.tool_call_id);
+  fill_missing(&mut target.command, source.command);
+  fill_missing(&mut target.cwd, source.cwd);
+  fill_missing(&mut target.path, source.path);
+  fill_missing(&mut target.query, source.query);
+  fill_missing(&mut target.url, source.url);
+  fill_missing(&mut target.task_title, source.task_title);
+  target.exit_code = target.exit_code.or(source.exit_code);
+  target.bytes = target.bytes.or(source.bytes);
+  target.added = target.added.or(source.added);
+  target.removed = target.removed.or(source.removed);
+}
+
+fn fill_missing<T>(target: &mut Option<T>, source: Option<T>) {
+  if target.is_none() {
+    *target = source;
+  }
+}
+
+fn bound_tool_card_summary(mut card: ToolCardSummary) -> ToolCardSummary {
+  card.kind = truncate(card.kind, MAX_TOOL_NAME_CHARS);
+  card.tool_name = truncate_option(card.tool_name, MAX_TOOL_NAME_CHARS);
+  card.tool_call_id = truncate_option(card.tool_call_id, MAX_TOOL_CARD_STRING_CHARS);
+  card.command = truncate_option(card.command, MAX_TOOL_CARD_STRING_CHARS);
+  card.cwd = truncate_option(card.cwd, MAX_TOOL_CARD_STRING_CHARS);
+  card.path = truncate_option(card.path, MAX_TOOL_CARD_STRING_CHARS);
+  card.query = truncate_option(card.query, MAX_TOOL_CARD_STRING_CHARS);
+  card.url = truncate_option(card.url, MAX_TOOL_CARD_STRING_CHARS);
+  card.task_title = truncate_option(card.task_title, MAX_TOOL_CARD_STRING_CHARS);
+  card
+}
+
+fn truncate_option(value: Option<String>, max_chars: usize) -> Option<String> {
+  value.map(|value| truncate(value, max_chars))
+}
+
+fn tool_kind_label(kind: ToolKind) -> &'static str {
+  match kind {
+    ToolKind::Shell => "shell",
+    ToolKind::FileRead => "file_read",
+    ToolKind::FileWrite => "file_write",
+    ToolKind::FileEdit => "file_edit",
+    ToolKind::Search => "search",
+    ToolKind::Web => "web",
+    ToolKind::Task => "task",
+    ToolKind::Unknown => "unknown",
   }
 }
 
@@ -497,6 +647,463 @@ fn error_for_event(event: &AgentEvent) -> Option<bool> {
     AgentEvent::Lifecycle(event) => Some(matches!(event.outcome, Some(LifecycleOutcome::Failed))),
     _ => None,
   }
+}
+
+fn correlated_error(events: &[AgentEvent], index: usize, event: &AgentEvent) -> Option<bool> {
+  let Some(tool) = tool_event(event) else {
+    return error_for_event(event);
+  };
+  let mut is_error = tool.is_error;
+  let (_, after) = related_tool_indices(events, index, tool);
+  for related_index in after {
+    let Some(related) = events.get(related_index).and_then(tool_event) else {
+      continue;
+    };
+    if matches!(related.phase, Phase::Finished) {
+      if related.is_error.is_some() {
+        is_error = related.is_error;
+      }
+      break;
+    }
+  }
+  is_error
+}
+
+fn tool_event(event: &AgentEvent) -> Option<&ToolCallEvent> {
+  match event {
+    AgentEvent::ToolCall(event) => Some(event),
+    _ => None,
+  }
+}
+
+/// Finds only the nearest lifecycle records around an event. Stopping at the
+/// first completed record or a new invocation avoids joining a later reuse of
+/// the same provider call ID.
+fn related_tool_indices(events: &[AgentEvent], index: usize, origin: &ToolCallEvent) -> (Vec<usize>, Vec<usize>) {
+  if present_string(origin.tool_call_id.as_deref()).is_none() {
+    return (Vec::new(), Vec::new());
+  }
+
+  let mut before = Vec::new();
+  if !matches!(origin.phase, Phase::Started) && !is_invocation_record(origin) {
+    for related_index in (0..index).rev() {
+      let Some(candidate) = events.get(related_index).and_then(tool_event) else {
+        continue;
+      };
+      if !same_tool_scope_and_id(origin, candidate) {
+        continue;
+      }
+      if !compatible_tool_names(origin, candidate) {
+        break;
+      }
+      if is_invocation_record(candidate) {
+        before.push(related_index);
+        break;
+      }
+      if matches!(candidate.phase, Phase::Finished) {
+        break;
+      }
+      before.push(related_index);
+      if matches!(candidate.phase, Phase::Started) {
+        break;
+      }
+    }
+  }
+
+  let mut after = Vec::new();
+  if !matches!(origin.phase, Phase::Finished) || is_invocation_record(origin) {
+    for related_index in index.saturating_add(1)..events.len() {
+      let Some(candidate) = events.get(related_index).and_then(tool_event) else {
+        continue;
+      };
+      if !same_tool_scope_and_id(origin, candidate) {
+        continue;
+      }
+      if !compatible_tool_names(origin, candidate)
+        || is_invocation_record(candidate)
+        || matches!(candidate.phase, Phase::Started)
+      {
+        break;
+      }
+      after.push(related_index);
+      if matches!(candidate.phase, Phase::Finished) {
+        break;
+      }
+    }
+  }
+
+  (before, after)
+}
+
+fn is_invocation_record(event: &ToolCallEvent) -> bool {
+  event.input.is_some() && event.output.as_ref().is_none_or(Value::is_null)
+}
+
+fn same_tool_scope_and_id(left: &ToolCallEvent, right: &ToolCallEvent) -> bool {
+  same_provider(left.provider, right.provider)
+    && left.session_id.as_deref() == right.session_id.as_deref()
+    && present_string(left.tool_call_id.as_deref()) == present_string(right.tool_call_id.as_deref())
+}
+
+fn compatible_tool_names(left: &ToolCallEvent, right: &ToolCallEvent) -> bool {
+  match (
+    present_string(left.tool_name.as_deref()),
+    present_string(right.tool_name.as_deref()),
+  ) {
+    (Some(left), Some(right)) => left == right,
+    _ => true,
+  }
+}
+
+fn same_provider(left: Provider, right: Provider) -> bool {
+  matches!(
+    (left, right),
+    (Provider::Codex, Provider::Codex)
+      | (Provider::Pi, Provider::Pi)
+      | (Provider::OpenCode, Provider::OpenCode)
+      | (Provider::Dsh, Provider::Dsh)
+  )
+}
+
+fn present_string(value: Option<&str>) -> Option<&str> {
+  value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn tool_output_preview(events: &[AgentEvent], index: usize) -> Option<ToolOutputPreview> {
+  let origin = events.get(index).and_then(tool_event)?;
+  if let Some(sections) = projected_event_output(origin) {
+    return Some(bound_tool_output(sections, index));
+  }
+
+  let (_, after) = related_tool_indices(events, index, origin);
+  let mut latest = None;
+  let mut latest_finished = None;
+  for related_index in after {
+    let Some(related) = events.get(related_index).and_then(tool_event) else {
+      continue;
+    };
+    let Some(sections) = projected_event_output(related) else {
+      continue;
+    };
+    latest = Some((related_index, sections));
+    if matches!(related.phase, Phase::Finished) {
+      latest_finished = latest.take();
+    }
+  }
+
+  latest_finished
+    .or(latest)
+    .map(|(source_index, sections)| bound_tool_output(sections, source_index))
+}
+
+fn projected_event_output(event: &ToolCallEvent) -> Option<Vec<ToolOutputSection>> {
+  let output = event.output.as_ref().filter(|value| !value.is_null())?;
+  let sections = project_output(output, 0);
+  (!sections.is_empty()).then_some(sections)
+}
+
+fn project_output(value: &Value, depth: usize) -> Vec<ToolOutputSection> {
+  const MAX_OUTPUT_PROJECTION_DEPTH: usize = 16;
+  if depth >= MAX_OUTPUT_PROJECTION_DEPTH {
+    return json_section(None, value).into_iter().collect();
+  }
+
+  match value {
+    Value::Null => Vec::new(),
+    Value::String(text) if text.is_empty() => Vec::new(),
+    Value::String(text) => vec![text_section(None, text.clone())],
+    Value::Array(values) if values.is_empty() => Vec::new(),
+    Value::Array(_) => content_text(value)
+      .map(|text| vec![text_section(None, text)])
+      .unwrap_or_else(|| json_section(None, value).into_iter().collect()),
+    Value::Object(object) if object.is_empty() => Vec::new(),
+    Value::Object(object) => {
+      if let Some(sections) = shell_output_sections(object) {
+        return sections;
+      }
+
+      // OpenCode wraps provider output in an `output` object. Recurse through
+      // that wrapper before considering metadata or the raw fallback.
+      if object.contains_key("output") {
+        let mut sections = object
+          .get("output")
+          .map(|output| project_output(output, depth + 1))
+          .unwrap_or_default();
+        if sections.is_empty()
+          && let Some(raw) = object.get("raw")
+        {
+          sections = project_labeled_value("Raw", raw, depth + 1);
+        }
+        if sections.is_empty()
+          && let Some(error) = object.get("error")
+        {
+          sections = project_labeled_value("Error", error, depth + 1);
+        }
+        if sections.is_empty()
+          && let Some(metadata) = object.get("metadata").filter(|value| !is_effectively_empty(value))
+        {
+          sections = project_labeled_value("Metadata", metadata, depth + 1);
+        }
+        return sections;
+      }
+
+      if let Some(content) = object.get("content") {
+        let mut sections = content_text(content)
+          .map(|text| vec![text_section(None, text)])
+          .unwrap_or_else(|| project_output(content, depth + 1));
+        append_distinct_error(&mut sections, object.get("error"), depth + 1);
+        if !sections.is_empty() {
+          return sections;
+        }
+      }
+
+      if let Some(content_items) = object.get("content_items") {
+        let mut sections = content_text(content_items)
+          .map(|text| vec![text_section(None, text)])
+          .unwrap_or_else(|| project_labeled_value("Content", content_items, depth + 1));
+        append_distinct_error(&mut sections, object.get("error"), depth + 1);
+        if !sections.is_empty() {
+          return sections;
+        }
+      }
+
+      if let Some(result) = object.get("result") {
+        let sections = project_labeled_value("Result", result, depth + 1);
+        if !sections.is_empty() {
+          return sections;
+        }
+      }
+
+      if let Some(results) = object.get("results") {
+        let sections = project_labeled_value("Results", results, depth + 1);
+        if !sections.is_empty() {
+          return sections;
+        }
+      }
+
+      if let Some(error) = object.get("error") {
+        let sections = project_labeled_value("Error", error, depth + 1);
+        if !sections.is_empty() {
+          return sections;
+        }
+      }
+
+      if is_effectively_empty(value) {
+        Vec::new()
+      } else {
+        json_section(None, value).into_iter().collect()
+      }
+    }
+    Value::Bool(_) | Value::Number(_) => json_section(None, value).into_iter().collect(),
+  }
+}
+
+fn shell_output_sections(object: &serde_json::Map<String, Value>) -> Option<Vec<ToolOutputSection>> {
+  const SHELL_FIELDS: [&str; 4] = ["formatted_output", "aggregated_output", "stdout", "stderr"];
+  if !SHELL_FIELDS.iter().any(|field| object.contains_key(*field)) {
+    return None;
+  }
+
+  let main = ["formatted_output", "aggregated_output", "stdout"]
+    .into_iter()
+    .find_map(|field| nonempty_string_field(object, field).map(|text| (field, text)));
+  let stderr = nonempty_string_field(object, "stderr");
+  let mut sections = Vec::new();
+  if let Some((field, text)) = main {
+    let label = if field == "stdout" { "Stdout" } else { "Output" };
+    sections.push(text_section(Some(label), text.to_string()));
+  }
+  if let Some(stderr) = stderr {
+    let is_distinct = sections
+      .iter()
+      .all(|section| section.text != stderr && !section.text.contains(stderr));
+    if is_distinct {
+      sections.push(text_section(Some("Stderr"), stderr.to_string()));
+    }
+  }
+
+  if sections.is_empty()
+    && SHELL_FIELDS
+      .iter()
+      .filter_map(|field| object.get(*field))
+      .any(|value| !is_effectively_empty(value))
+  {
+    return json_section(None, &Value::Object(object.clone()))
+      .map(|section| vec![section])
+      .or_else(|| Some(Vec::new()));
+  }
+  Some(sections)
+}
+
+fn nonempty_string_field<'a>(object: &'a serde_json::Map<String, Value>, field: &str) -> Option<&'a str> {
+  object
+    .get(field)
+    .and_then(Value::as_str)
+    .filter(|text| !text.is_empty())
+}
+
+fn project_labeled_value(label: &str, value: &Value, depth: usize) -> Vec<ToolOutputSection> {
+  let mut sections = project_output(value, depth);
+  if sections.len() == 1 && sections[0].label.is_none() {
+    sections[0].label = Some(label.to_string());
+  }
+  sections
+}
+
+fn append_distinct_error(sections: &mut Vec<ToolOutputSection>, error: Option<&Value>, depth: usize) {
+  let Some(error) = error.filter(|value| !is_effectively_empty(value)) else {
+    return;
+  };
+  for section in project_labeled_value("Error", error, depth) {
+    let is_distinct = sections
+      .iter()
+      .all(|existing| existing.text != section.text && !existing.text.contains(&section.text));
+    if is_distinct {
+      sections.push(section);
+    }
+  }
+}
+
+fn content_text(value: &Value) -> Option<String> {
+  let mut parts = Vec::new();
+  collect_content_text(value, 0, &mut parts);
+  (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+fn collect_content_text(value: &Value, depth: usize, parts: &mut Vec<String>) {
+  const MAX_CONTENT_DEPTH: usize = 16;
+  if depth >= MAX_CONTENT_DEPTH {
+    return;
+  }
+  match value {
+    Value::String(text) if !text.is_empty() => parts.push(text.clone()),
+    Value::Array(values) => {
+      for value in values {
+        collect_content_text(value, depth + 1, parts);
+      }
+    }
+    Value::Object(object) => {
+      if let Some(text) = object
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+      {
+        parts.push(text.to_string());
+      } else if let Some(content) = object.get("content") {
+        collect_content_text(content, depth + 1, parts);
+      }
+    }
+    Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+  }
+}
+
+fn is_effectively_empty(value: &Value) -> bool {
+  match value {
+    Value::Null => true,
+    Value::String(text) => text.is_empty(),
+    Value::Array(values) => values.iter().all(is_effectively_empty),
+    Value::Object(object) => object.values().all(is_effectively_empty),
+    Value::Bool(_) | Value::Number(_) => false,
+  }
+}
+
+fn text_section(label: Option<&str>, text: String) -> ToolOutputSection {
+  ToolOutputSection {
+    label: label.map(str::to_string),
+    text,
+    format: "text".to_string(),
+  }
+}
+
+fn json_section(label: Option<&str>, value: &Value) -> Option<ToolOutputSection> {
+  if is_effectively_empty(value) {
+    return None;
+  }
+  serde_json::to_string_pretty(value).ok().map(|text| ToolOutputSection {
+    label: label.map(str::to_string),
+    text,
+    format: "json".to_string(),
+  })
+}
+
+fn bound_tool_output(mut sections: Vec<ToolOutputSection>, source_index: usize) -> ToolOutputPreview {
+  let original_size_bytes = sections
+    .iter()
+    .fold(0usize, |total, section| total.saturating_add(section.text.len()));
+  let truncated = original_size_bytes > MAX_TOOL_OUTPUT_BYTES;
+  if truncated {
+    let budgets = section_budgets(&sections, MAX_TOOL_OUTPUT_BYTES);
+    for (section, budget) in sections.iter_mut().zip(budgets) {
+      section.text = truncate_utf8_head_tail(&section.text, budget);
+    }
+    sections.retain(|section| !section.text.is_empty());
+  }
+  ToolOutputPreview {
+    sections,
+    truncated,
+    original_size_bytes,
+    source_event_key: encode_event_key(source_index),
+  }
+}
+
+fn section_budgets(sections: &[ToolOutputSection], limit: usize) -> Vec<usize> {
+  let mut budgets = vec![0; sections.len()];
+  let mut pending: Vec<usize> = (0..sections.len()).collect();
+  let mut remaining = limit;
+
+  while !pending.is_empty() {
+    let fair_share = remaining / pending.len();
+    let small: Vec<usize> = pending
+      .iter()
+      .copied()
+      .filter(|index| sections[*index].text.len() <= fair_share)
+      .collect();
+    if small.is_empty() {
+      for (position, index) in pending.iter().copied().enumerate() {
+        let budget = fair_share + usize::from(position < remaining % pending.len());
+        budgets[index] = budget;
+      }
+      break;
+    }
+    for index in &small {
+      let size = sections[*index].text.len();
+      budgets[*index] = size;
+      remaining = remaining.saturating_sub(size);
+    }
+    pending.retain(|index| !small.contains(index));
+  }
+  budgets
+}
+
+fn truncate_utf8_head_tail(text: &str, limit: usize) -> String {
+  if text.len() <= limit {
+    return text.to_string();
+  }
+  if limit <= TOOL_OUTPUT_TRUNCATION_MARKER.len() {
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+      end -= 1;
+    }
+    return text[..end].to_string();
+  }
+
+  let retained = limit - TOOL_OUTPUT_TRUNCATION_MARKER.len();
+  let requested_head = retained.div_ceil(2);
+  let requested_tail = retained / 2;
+  let mut head_end = requested_head;
+  while head_end > 0 && !text.is_char_boundary(head_end) {
+    head_end -= 1;
+  }
+  let mut tail_start = text.len().saturating_sub(requested_tail);
+  while tail_start < text.len() && !text.is_char_boundary(tail_start) {
+    tail_start += 1;
+  }
+  format!(
+    "{}{}{}",
+    &text[..head_end],
+    TOOL_OUTPUT_TRUNCATION_MARKER,
+    &text[tail_start..]
+  )
 }
 
 fn native_detail(event: &AgentEvent) -> Option<Value> {
@@ -794,6 +1401,389 @@ mod tests {
   }
 
   #[test]
+  fn tool_cards_project_every_known_summary_and_keep_an_unknown_fallback() {
+    let events = vec![
+      tool_call(
+        Provider::Codex,
+        "shell",
+        "shell-1",
+        ToolKind::Shell,
+        Some(ToolSummary::Shell {
+          command: Some("cargo test".to_string()),
+          cwd: Some("/work".to_string()),
+          exit_code: Some(0),
+        }),
+        Phase::Finished,
+        None,
+      ),
+      tool_call(
+        Provider::Codex,
+        "read_file",
+        "read-1",
+        ToolKind::FileRead,
+        Some(ToolSummary::FileRead {
+          path: Some("src/lib.rs".to_string()),
+        }),
+        Phase::Finished,
+        None,
+      ),
+      tool_call(
+        Provider::Codex,
+        "write_file",
+        "write-1",
+        ToolKind::FileWrite,
+        Some(ToolSummary::FileWrite {
+          path: Some("out.txt".to_string()),
+          bytes: Some(42),
+        }),
+        Phase::Finished,
+        None,
+      ),
+      tool_call(
+        Provider::Codex,
+        "apply_patch",
+        "edit-1",
+        ToolKind::FileEdit,
+        Some(ToolSummary::FileEdit {
+          path: Some("src/main.rs".to_string()),
+          added: Some(4),
+          removed: Some(2),
+        }),
+        Phase::Finished,
+        None,
+      ),
+      tool_call(
+        Provider::Codex,
+        "search",
+        "search-1",
+        ToolKind::Search,
+        Some(ToolSummary::Search {
+          query: Some("ToolCallEvent".to_string()),
+        }),
+        Phase::Finished,
+        None,
+      ),
+      tool_call(
+        Provider::Codex,
+        "fetch",
+        "web-1",
+        ToolKind::Web,
+        Some(ToolSummary::Web {
+          url: Some("https://example.test".to_string()),
+        }),
+        Phase::Finished,
+        None,
+      ),
+      tool_call(
+        Provider::Codex,
+        "task",
+        "task-1",
+        ToolKind::Task,
+        Some(ToolSummary::Task {
+          title: Some("Run checks".to_string()),
+        }),
+        Phase::Finished,
+        None,
+      ),
+      tool_call(
+        Provider::Codex,
+        "future_tool",
+        "unknown-1",
+        ToolKind::Unknown,
+        None,
+        Phase::Finished,
+        None,
+      ),
+    ];
+
+    let summaries: Vec<EventSummary> = events
+      .iter()
+      .enumerate()
+      .map(|(index, event)| event_summary(&events, index, event))
+      .collect();
+
+    let shell = summaries[0].tool.as_ref().unwrap();
+    assert_eq!(shell.kind, "shell");
+    assert_eq!(shell.command.as_deref(), Some("cargo test"));
+    assert_eq!(shell.cwd.as_deref(), Some("/work"));
+    assert_eq!(shell.exit_code, Some(0));
+    assert_eq!(summaries[1].tool.as_ref().unwrap().path.as_deref(), Some("src/lib.rs"));
+    assert_eq!(summaries[2].tool.as_ref().unwrap().bytes, Some(42));
+    assert_eq!(summaries[3].tool.as_ref().unwrap().added, Some(4));
+    assert_eq!(summaries[3].tool.as_ref().unwrap().removed, Some(2));
+    assert_eq!(
+      summaries[4].tool.as_ref().unwrap().query.as_deref(),
+      Some("ToolCallEvent")
+    );
+    assert_eq!(
+      summaries[5].tool.as_ref().unwrap().url.as_deref(),
+      Some("https://example.test")
+    );
+    assert_eq!(
+      summaries[6].tool.as_ref().unwrap().task_title.as_deref(),
+      Some("Run checks")
+    );
+    let unknown = summaries[7].tool.as_ref().unwrap();
+    assert_eq!(unknown.kind, "unknown");
+    assert_eq!(unknown.tool_name.as_deref(), Some("future_tool"));
+    assert_eq!(unknown.tool_call_id.as_deref(), Some("unknown-1"));
+  }
+
+  #[test]
+  fn tool_card_strings_are_bounded_and_lifecycle_facts_are_correlated() {
+    let long_command = "c".repeat(MAX_TOOL_CARD_STRING_CHARS + 100);
+    let events = vec![
+      tool_call(
+        Provider::Codex,
+        "exec_command",
+        "call-1",
+        ToolKind::Shell,
+        Some(ToolSummary::Shell {
+          command: Some(long_command),
+          cwd: Some("/work".to_string()),
+          exit_code: None,
+        }),
+        Phase::Started,
+        None,
+      ),
+      AgentEvent::Message(MessageEvent {
+        provenance: None,
+        provider: Provider::Codex,
+        session_id: Some("fixture".to_string()),
+        message_id: Some("between".to_string()),
+        parent_id: None,
+        role: Role::Assistant,
+        delivery: MessageDelivery::Commentary,
+        phase: Phase::Finished,
+        text: "working".to_string(),
+        timestamp: None,
+      }),
+      tool_call(
+        Provider::Codex,
+        "exec_command",
+        "call-1",
+        ToolKind::Shell,
+        Some(ToolSummary::Shell {
+          command: None,
+          cwd: None,
+          exit_code: Some(7),
+        }),
+        Phase::Finished,
+        Some(json!({"stdout": "failed"})),
+      ),
+    ];
+
+    let invocation = event_summary(&events, 0, &events[0]);
+    let result = event_summary(&events, 2, &events[2]);
+    let invocation_tool = invocation.tool.as_ref().unwrap();
+    let result_tool = result.tool.as_ref().unwrap();
+
+    assert_eq!(
+      invocation_tool.command.as_ref().unwrap().chars().count(),
+      MAX_TOOL_CARD_STRING_CHARS
+    );
+    assert!(invocation_tool.command.as_ref().unwrap().ends_with('\u{2026}'));
+    assert_eq!(invocation_tool.exit_code, Some(7));
+    assert_eq!(invocation.is_error, Some(true));
+    assert_eq!(result_tool.command, invocation_tool.command);
+    assert_eq!(result_tool.cwd.as_deref(), Some("/work"));
+  }
+
+  #[test]
+  fn tool_detail_prefers_final_correlated_output_and_reports_its_source() {
+    let mut invocation = tool_call(
+      Provider::Codex,
+      "exec_command",
+      "call-1",
+      ToolKind::Shell,
+      None,
+      Phase::Finished,
+      None,
+    );
+    let AgentEvent::ToolCall(invocation_event) = &mut invocation else {
+      unreachable!();
+    };
+    invocation_event.input = Some(json!({"cmd": "cargo test"}));
+    let events = vec![
+      invocation,
+      tool_call(
+        Provider::Codex,
+        "exec_command",
+        "call-1",
+        ToolKind::Shell,
+        None,
+        Phase::Delta,
+        Some(Value::String("partial".to_string())),
+      ),
+      tool_call(
+        Provider::Codex,
+        "exec_command",
+        "call-1",
+        ToolKind::Shell,
+        None,
+        Phase::Finished,
+        Some(json!({"output": {"content": [{"type": "text", "text": "final"}]}})),
+      ),
+    ];
+    let detail = service_with_session(loaded_session(events))
+      .load_event_detail(LoadEventDetailRequest {
+        session_key: key_for("fixture"),
+        event_key: encode_event_key(0),
+      })
+      .unwrap();
+    let output = detail.tool_output.unwrap();
+
+    assert_eq!(output.source_event_key, encode_event_key(2));
+    assert!(!output.truncated);
+    assert_eq!(output.sections.len(), 1);
+    assert_eq!(output.sections[0].text, "final");
+    assert_eq!(output.sections[0].format, "text");
+  }
+
+  #[test]
+  fn output_correlation_never_uses_missing_ids_or_crosses_a_reused_invocation() {
+    let missing_ids = vec![
+      tool_call(
+        Provider::Codex,
+        "exec_command",
+        "",
+        ToolKind::Shell,
+        None,
+        Phase::Started,
+        None,
+      ),
+      tool_call(
+        Provider::Codex,
+        "exec_command",
+        "",
+        ToolKind::Shell,
+        None,
+        Phase::Finished,
+        Some(Value::String("wrong".to_string())),
+      ),
+    ];
+    assert!(tool_output_preview(&missing_ids, 0).is_none());
+
+    let reused_id = vec![
+      with_tool_input(
+        tool_call(
+          Provider::Codex,
+          "exec_command",
+          "reused",
+          ToolKind::Shell,
+          None,
+          Phase::Finished,
+          None,
+        ),
+        json!({"cmd": "first"}),
+      ),
+      with_tool_input(
+        tool_call(
+          Provider::Codex,
+          "exec_command",
+          "reused",
+          ToolKind::Shell,
+          None,
+          Phase::Finished,
+          None,
+        ),
+        json!({"cmd": "second"}),
+      ),
+      tool_call(
+        Provider::Codex,
+        "exec_command",
+        "reused",
+        ToolKind::Shell,
+        None,
+        Phase::Finished,
+        Some(Value::String("belongs to the second invocation".to_string())),
+      ),
+    ];
+    assert!(tool_output_preview(&reused_id, 0).is_none());
+    let second = tool_output_preview(&reused_id, 1).unwrap();
+    assert_eq!(second.source_event_key, encode_event_key(2));
+  }
+
+  #[test]
+  fn output_projection_handles_shell_opencode_dsh_and_json_fallbacks() {
+    let shell = project_output(
+      &json!({
+        "formatted_output": "formatted",
+        "aggregated_output": "aggregated",
+        "stdout": "stdout",
+        "stderr": "stderr"
+      }),
+      0,
+    );
+    assert_eq!(shell.len(), 2);
+    assert_eq!(shell[0].label.as_deref(), Some("Output"));
+    assert_eq!(shell[0].text, "formatted");
+    assert_eq!(shell[1].label.as_deref(), Some("Stderr"));
+    assert_eq!(shell[1].text, "stderr");
+
+    let opencode = project_output(&json!({"output": {"result": "nested"}, "metadata": {"exit": 0}}), 0);
+    assert_eq!(opencode[0].label.as_deref(), Some("Result"));
+    assert_eq!(opencode[0].text, "nested");
+    assert_eq!(opencode[0].format, "text");
+
+    let dsh = project_output(
+      &json!({
+        "content": [{
+          "type": "tool-result",
+          "content": [
+            {"type": "text", "text": "first"},
+            {"type": "text", "text": "second"}
+          ]
+        }],
+        "error": null
+      }),
+      0,
+    );
+    assert_eq!(dsh[0].text, "first\nsecond");
+    assert_eq!(dsh[0].format, "text");
+
+    let dynamic_error = project_output(
+      &json!({
+        "content_items": [{"type": "text", "text": "partial result"}],
+        "success": false,
+        "error": "tool failed"
+      }),
+      0,
+    );
+    assert_eq!(dynamic_error.len(), 2);
+    assert_eq!(dynamic_error[0].text, "partial result");
+    assert_eq!(dynamic_error[1].label.as_deref(), Some("Error"));
+    assert_eq!(dynamic_error[1].text, "tool failed");
+
+    let fallback = project_output(&json!({"future": {"value": 1}}), 0);
+    assert_eq!(fallback.len(), 1);
+    assert_eq!(fallback[0].format, "json");
+    assert!(fallback[0].text.contains("\"future\""));
+  }
+
+  #[test]
+  fn tool_output_preview_is_utf8_safe_and_keeps_both_ends() {
+    let text = format!("HEAD{}TAIL", "\u{1f642}".repeat(MAX_TOOL_OUTPUT_BYTES / 2));
+    let event = tool_call(
+      Provider::Codex,
+      "exec_command",
+      "call-1",
+      ToolKind::Shell,
+      None,
+      Phase::Finished,
+      Some(Value::String(text.clone())),
+    );
+    let output = tool_output_preview(std::slice::from_ref(&event), 0).unwrap();
+
+    assert!(output.truncated);
+    assert_eq!(output.original_size_bytes, text.len());
+    assert!(output.sections[0].text.len() <= MAX_TOOL_OUTPUT_BYTES);
+    assert!(output.sections[0].text.starts_with("HEAD"));
+    assert!(output.sections[0].text.ends_with("TAIL"));
+    assert!(output.sections[0].text.contains("output truncated"));
+  }
+
+  #[test]
   fn message_summaries_preserve_markdown_within_the_timeline_cap() {
     let markdown = "# Result\n\n```rust\nfn main() {}\n```\n";
     let page = service_with_session(loaded_session(vec![message_event(markdown)]))
@@ -813,22 +1803,20 @@ mod tests {
   #[test]
   fn reasoning_summaries_preserve_multiline_markdown() {
     let markdown = "## Approach\n\n- inspect the source\n- verify the result\n";
-    let summary = event_summary(
-      0,
-      &AgentEvent::Reasoning(ReasoningEvent {
-        provenance: None,
-        provider: Provider::Codex,
-        session_id: Some("fixture".to_string()),
-        message_id: Some("reasoning".to_string()),
-        parent_id: None,
-        phase: Phase::Finished,
-        text: Some("Longer private reasoning".to_string()),
-        summary: Some(markdown.to_string()),
-        encrypted_content: None,
-        signature: None,
-        timestamp: None,
-      }),
-    );
+    let event = AgentEvent::Reasoning(ReasoningEvent {
+      provenance: None,
+      provider: Provider::Codex,
+      session_id: Some("fixture".to_string()),
+      message_id: Some("reasoning".to_string()),
+      parent_id: None,
+      phase: Phase::Finished,
+      text: Some("Longer private reasoning".to_string()),
+      summary: Some(markdown.to_string()),
+      encrypted_content: None,
+      signature: None,
+      timestamp: None,
+    });
+    let summary = event_summary(std::slice::from_ref(&event), 0, &event);
 
     assert_eq!(summary.summary, markdown);
     assert!(!summary.summary_truncated);
@@ -868,7 +1856,7 @@ mod tests {
       message: "e".repeat(MAX_TECHNICAL_SUMMARY_CHARS + 1),
       timestamp: None,
     });
-    let summary = event_summary(0, &event);
+    let summary = event_summary(std::slice::from_ref(&event), 0, &event);
 
     assert!(summary.summary_truncated);
     assert_eq!(summary.summary.chars().count(), MAX_TECHNICAL_SUMMARY_CHARS);
@@ -1081,6 +2069,48 @@ mod tests {
       text: text.to_string(),
       timestamp: None,
     })
+  }
+
+  #[allow(clippy::too_many_arguments)]
+  fn tool_call(
+    provider: Provider,
+    tool_name: &str,
+    tool_call_id: &str,
+    tool_kind: ToolKind,
+    summary: Option<ToolSummary>,
+    phase: Phase,
+    output: Option<Value>,
+  ) -> AgentEvent {
+    let is_error = match summary.as_ref() {
+      Some(ToolSummary::Shell {
+        exit_code: Some(exit_code),
+        ..
+      }) => Some(*exit_code != 0),
+      _ => None,
+    };
+    AgentEvent::ToolCall(ToolCallEvent {
+      provider,
+      session_id: Some("fixture".to_string()),
+      message_id: None,
+      parent_id: None,
+      tool_call_id: Some(tool_call_id.to_string()),
+      tool_name: Some(tool_name.to_string()),
+      tool_kind,
+      summary,
+      phase,
+      input: None,
+      output,
+      is_error,
+      timestamp: None,
+    })
+  }
+
+  fn with_tool_input(mut event: AgentEvent, input: Value) -> AgentEvent {
+    let AgentEvent::ToolCall(tool) = &mut event else {
+      panic!("fixture must be a tool event");
+    };
+    tool.input = Some(input);
+    event
   }
 
   fn hidden_message_session() -> LoadedSession {

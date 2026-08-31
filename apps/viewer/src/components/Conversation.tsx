@@ -1,5 +1,10 @@
 import { useLayoutEffect, useRef } from "react";
-import type { EventSummary, SessionHistoryStatus, SessionSummary } from "../lib/types";
+import type {
+  EventDetail,
+  EventSummary,
+  SessionHistoryStatus,
+  SessionSummary,
+} from "../lib/types";
 import { eventButtonId, formatTimestamp, providerLabel } from "../lib/state";
 import { InspectorIcon, PanelIcon } from "./Icons";
 import { EventCard } from "./EventCard";
@@ -9,6 +14,10 @@ interface ConversationProps {
   session: SessionSummary | null;
   events: EventSummary[];
   selected_event_key: string | null;
+  expanded_event_key: string | null;
+  expanded_detail: EventDetail | null;
+  expanded_detail_error: string | null;
+  expanded_detail_loading: boolean;
   initial_page_loaded: boolean;
   is_loading: boolean;
   is_loading_older: boolean;
@@ -22,15 +31,21 @@ interface ConversationProps {
   on_sidebar_open: () => void;
   on_inspector_toggle: () => void;
   on_event_select: (event_key: string) => void;
+  on_event_toggle: (event_key: string) => void;
   on_load_older: () => void;
   on_load_newer: () => void;
   on_retry: () => void;
+  on_retry_expanded_detail: () => void;
 }
 
 export function Conversation({
   session,
   events,
   selected_event_key,
+  expanded_event_key,
+  expanded_detail,
+  expanded_detail_error,
+  expanded_detail_loading,
   initial_page_loaded,
   is_loading,
   is_loading_older,
@@ -44,9 +59,11 @@ export function Conversation({
   on_sidebar_open,
   on_inspector_toggle,
   on_event_select,
+  on_event_toggle,
   on_load_older,
   on_load_newer,
   on_retry,
+  on_retry_expanded_detail,
 }: ConversationProps) {
   const timelineRef = useRef<HTMLDivElement>(null);
   const priorScrollHeight = useRef<number | null>(null);
@@ -202,9 +219,17 @@ export function Conversation({
               <EventCard
                 button_id={eventButtonId(event.event_key)}
                 event={event}
+                detail={event.event_key === expanded_event_key ? expanded_detail : null}
+                detail_error={event.event_key === expanded_event_key ? expanded_detail_error : null}
+                detail_loading={
+                  event.event_key === expanded_event_key && expanded_detail_loading
+                }
+                is_expanded={event.event_key === expanded_event_key}
                 is_selected={event.event_key === selected_event_key}
                 key={`${session.session_key}:${event.event_key}`}
                 on_select={on_event_select}
+                on_toggle={on_event_toggle}
+                on_retry_detail={on_retry_expanded_detail}
               />
             ))}
 

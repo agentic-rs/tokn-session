@@ -99,6 +99,40 @@ export function useViewerState() {
   const [detailAttempt, setDetailAttempt] = useState(0);
   const detailRequest = useRef(0);
   const detailCache = useRef(new Map<string, EventDetail>());
+  const detailLoads = useRef(new Map<string, Promise<EventDetail>>());
+  const detailGeneration = useRef(0);
+  const [expandedEventKey, setExpandedEventKey] = useState<string | null>(null);
+  const [expandedDetail, setExpandedDetail] = useState<EventDetail | null>(null);
+  const [expandedDetailOwnerKey, setExpandedDetailOwnerKey] = useState<string | null>(null);
+  const [expandedDetailLoading, setExpandedDetailLoading] = useState(false);
+  const [expandedDetailError, setExpandedDetailError] = useState<string | null>(null);
+  const [expandedDetailAttempt, setExpandedDetailAttempt] = useState(0);
+  const expandedDetailRequest = useRef(0);
+
+  const requestDetail = useCallback((sessionKey: string, eventKey: string) => {
+    const cacheKey = `${sessionKey}:${eventKey}`;
+    const pending = detailLoads.current.get(cacheKey);
+    if (pending) {
+      return pending;
+    }
+    const generation = detailGeneration.current;
+    let request: Promise<EventDetail>;
+    request = loadEventDetail({
+      session_key: sessionKey,
+      event_key: eventKey,
+    }).then((response) => {
+      if (detailGeneration.current === generation) {
+        writeCachedDetail(detailCache.current, cacheKey, response);
+      }
+      return response;
+    }).finally(() => {
+      if (detailLoads.current.get(cacheKey) === request) {
+        detailLoads.current.delete(cacheKey);
+      }
+    });
+    detailLoads.current.set(cacheKey, request);
+    return request;
+  }, []);
 
   const applyEventSelection = useCallback((eventKey: string | null, openInspector: boolean) => {
     if (selectedEventKeyRef.current !== eventKey) {
@@ -127,7 +161,10 @@ export function useViewerState() {
     inspectorTriggerRef.current = null;
     eventsRequest.current += 1;
     eventsOwnerKeyRef.current = null;
+    detailGeneration.current += 1;
     detailCache.current.clear();
+    detailLoads.current.clear();
+    expandedDetailRequest.current += 1;
     setSelectedSessionKey(sessionKey);
     setEventsOwnerKey(null);
     setInitialPageSessionKey(null);
@@ -140,6 +177,11 @@ export function useViewerState() {
     setTotalEvents(null);
     setHistoryStatus(null);
     setEventsError(null);
+    setExpandedEventKey(null);
+    setExpandedDetailOwnerKey(null);
+    setExpandedDetail(null);
+    setExpandedDetailLoading(false);
+    setExpandedDetailError(null);
     applyEventSelection(null, false);
   }, [applyEventSelection]);
 
@@ -290,15 +332,11 @@ export function useViewerState() {
     }
 
     setDetailLoading(true);
-    void loadEventDetail({
-      session_key: selectedSessionKey,
-      event_key: selectedEventKey,
-    })
+    void requestDetail(selectedSessionKey, selectedEventKey)
       .then((response) => {
         if (detailRequest.current !== requestId) {
           return;
         }
-        writeCachedDetail(detailCache.current, cacheKey, response);
         setDetail(response);
       })
       .catch((error: unknown) => {
@@ -311,7 +349,52 @@ export function useViewerState() {
           setDetailLoading(false);
         }
       });
-  }, [detailAttempt, inspectorOpen, selectedEventKey, selectedSessionKey]);
+  }, [detailAttempt, inspectorOpen, requestDetail, selectedEventKey, selectedSessionKey]);
+
+  useEffect(() => {
+    const requestId = ++expandedDetailRequest.current;
+    setExpandedDetail(null);
+    setExpandedDetailError(null);
+
+    const expandedEvent = events.find((event) => event.event_key === expandedEventKey);
+    if (
+      !selectedSessionKey
+      || !expandedEventKey
+      || expandedEvent?.type !== "tool_call"
+      || expandedEvent.is_hidden
+    ) {
+      setExpandedDetailOwnerKey(null);
+      setExpandedDetailLoading(false);
+      return;
+    }
+
+    const cacheKey = `${selectedSessionKey}:${expandedEventKey}`;
+    setExpandedDetailOwnerKey(cacheKey);
+    const cached = readCachedDetail(detailCache.current, cacheKey);
+    if (cached) {
+      setExpandedDetail(cached);
+      setExpandedDetailLoading(false);
+      return;
+    }
+
+    setExpandedDetailLoading(true);
+    void requestDetail(selectedSessionKey, expandedEventKey)
+      .then((response) => {
+        if (expandedDetailRequest.current === requestId) {
+          setExpandedDetail(response);
+        }
+      })
+      .catch((error: unknown) => {
+        if (expandedDetailRequest.current === requestId) {
+          setExpandedDetailError(errorMessage(error));
+        }
+      })
+      .finally(() => {
+        if (expandedDetailRequest.current === requestId) {
+          setExpandedDetailLoading(false);
+        }
+      });
+  }, [events, expandedDetailAttempt, expandedEventKey, requestDetail, selectedSessionKey]);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -342,6 +425,17 @@ export function useViewerState() {
     ? `${selectedSessionKey}:${selectedEventKey}`
     : null;
   const detailIsOwned = detailTargetKey !== null && detailOwnerKey === detailTargetKey;
+  const expandedVisibleEvent = expandedEventKey === null
+    ? null
+    : visibleEvents.find((event) => event.event_key === expandedEventKey) ?? null;
+  const expandedEventIsVisible = expandedVisibleEvent !== null;
+  const expandedDetailTargetKey = selectedSessionKey
+    && expandedVisibleEvent?.type === "tool_call"
+    && !expandedVisibleEvent.is_hidden
+    ? `${selectedSessionKey}:${expandedEventKey}`
+    : null;
+  const expandedDetailIsOwned = expandedDetailTargetKey !== null
+    && expandedDetailOwnerKey === expandedDetailTargetKey;
 
   const toggleProvider = useCallback((provider: ViewerProvider) => {
     sessionsRequest.current += 1;
@@ -370,6 +464,10 @@ export function useViewerState() {
     inspectorTriggerRef.current = document.getElementById(eventButtonId(eventKey));
     applyEventSelection(eventKey, true);
   }, [applyEventSelection]);
+
+  const toggleEventExpanded = useCallback((eventKey: string) => {
+    setExpandedEventKey((current) => current === eventKey ? null : eventKey);
+  }, []);
 
   const toggleInspector = useCallback(() => {
     if (inspectorOpen) {
@@ -518,6 +616,13 @@ export function useViewerState() {
     selectedEvent,
     selectedEventKey: eventsAreOwned ? selectedEventKey : null,
     selectEvent,
+    expandedEventKey: expandedEventIsVisible ? expandedEventKey : null,
+    toggleEventExpanded,
+    expandedDetail: expandedDetailIsOwned ? expandedDetail : null,
+    expandedDetailLoading: expandedDetailTargetKey !== null
+      && (!expandedDetailIsOwned || expandedDetailLoading),
+    expandedDetailError: expandedDetailIsOwned ? expandedDetailError : null,
+    retryExpandedDetail: () => setExpandedDetailAttempt((attempt) => attempt + 1),
     eventsLoading: selectedSessionKey !== null && (!eventsAreOwned || eventsLoading),
     olderLoading: eventsAreOwned && olderLoading,
     newerLoading: eventsAreOwned && newerLoading,

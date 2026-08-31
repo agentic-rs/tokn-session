@@ -30,12 +30,19 @@ pnpm tauri build
 The sidebar discovers root sessions from every provider at startup. Use the
 provider pills to include or exclude sources, type in the search box to match a
 session id or working directory, and select a row to load its newest normalized
-events. Earlier history is loaded on demand. Select any message or technical
-event to open the inspector; messages and reasoning have a readable **Content**
-view, while **Normalized** and **Native** expose the debugging representations.
-User and assistant messages, expanded reasoning, and readable inspector content
-render GitHub-flavored Markdown. Raw HTML is disabled, remote images are never
-loaded, and links remain inert so provider content cannot navigate the WebView.
+events. Earlier history is loaded on demand. Technical event headers expand in
+place, while their **Inspect** action opens the full inspector. Messages and
+reasoning have a readable **Content** view, while **Normalized** and **Native**
+expose the debugging representations.
+
+Known shell, file, search, web, and task tools use compact semantic headers.
+Expanding a tool fetches its output lazily, including the matching result when a
+provider records invocation and result separately under the same call id. The
+inline preview is bounded, selectable plain text or JSON; it never renders as
+Markdown or HTML. User and assistant messages, expanded reasoning, and readable
+inspector content do render GitHub-flavored Markdown. Raw HTML is disabled,
+remote images are never loaded, and links remain inert so provider content
+cannot navigate the WebView.
 
 Provider storage is resolved as follows:
 
@@ -65,9 +72,12 @@ Session discovery reads provider headers or catalog rows only; it deliberately
 does not compute message or event counts. The selected session's normalized
 event count arrives with its first event page. Session and event responses are
 listed in bounded pages; conversational Markdown previews are capped before IPC,
-and full event detail is loaded only when requested. The backend keeps at most
-one normalized session snapshot and reuses
-it across page and inspector requests while the source revision is unchanged;
+tool-card fields are also capped, and full event detail is loaded only when
+requested. Inline tool output keeps at most 64 KiB using a head-and-tail preview;
+the full normalized and native inspector representations retain their separate
+512 KiB limits. The backend keeps at most one normalized session snapshot and
+reuses it across page and inspector requests while the source revision is
+unchanged;
 OpenCode revision checks include its SQLite WAL and SHM sidecars. The current
 provider readers may still load an entire selected session before producing an
 event page, so paging does not yet bound parser memory for very large histories.

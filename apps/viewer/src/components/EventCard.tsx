@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { EventSummary } from "../lib/types";
+import type { EventDetail, EventSummary, ToolCardSummary } from "../lib/types";
 import { formatTimestamp } from "../lib/state";
 import {
   ChevronIcon,
@@ -14,7 +14,20 @@ interface EventCardProps {
   event: EventSummary;
   button_id: string;
   is_selected: boolean;
+  is_expanded: boolean;
+  detail: EventDetail | null;
+  detail_error: string | null;
+  detail_loading: boolean;
   on_select: (event_key: string) => void;
+  on_toggle: (event_key: string) => void;
+  on_retry_detail: () => void;
+}
+
+interface ToolHeading {
+  action: string | null;
+  primary: string;
+  secondary: string | null;
+  monospace: boolean;
 }
 
 function isMessage(event: EventSummary): boolean {
@@ -23,6 +36,106 @@ function isMessage(event: EventSummary): boolean {
 
 function usesMarkdown(event: EventSummary): boolean {
   return !event.is_hidden && (event.role === "user" || event.role === "assistant");
+}
+
+function humanize(value: string): string {
+  return value
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function toolFallbackName(event: EventSummary, tool: ToolCardSummary): string {
+  return humanize(tool.tool_name?.trim() || event.title || "Tool call");
+}
+
+function toolHeading(event: EventSummary): ToolHeading {
+  const tool = event.tool;
+  if (!tool) {
+    return {
+      action: null,
+      primary: event.title || "Tool call",
+      secondary: null,
+      monospace: false,
+    };
+  }
+
+  const fallback = toolFallbackName(event, tool);
+  switch (tool.kind) {
+    case "shell":
+      return {
+        action: "Shell",
+        primary: tool.command?.trim() || fallback,
+        secondary: tool.cwd,
+        monospace: tool.command !== null,
+      };
+    case "file_read":
+      return {
+        action: "Read",
+        primary: tool.path?.trim() || fallback,
+        secondary: null,
+        monospace: tool.path !== null,
+      };
+    case "file_write":
+      return {
+        action: "Write",
+        primary: tool.path?.trim() || fallback,
+        secondary: tool.bytes === null ? null : formatBytes(tool.bytes),
+        monospace: tool.path !== null,
+      };
+    case "file_edit":
+      return {
+        action: "Edit",
+        primary: tool.path?.trim() || fallback,
+        secondary: changeSummary(tool),
+        monospace: tool.path !== null,
+      };
+    case "search":
+      return {
+        action: "Search",
+        primary: tool.query?.trim() || fallback,
+        secondary: null,
+        monospace: false,
+      };
+    case "web":
+      return {
+        action: "Web",
+        primary: tool.url?.trim() || fallback,
+        secondary: null,
+        monospace: tool.url !== null,
+      };
+    case "task":
+      return {
+        action: "Task",
+        primary: tool.task_title?.trim() || fallback,
+        secondary: null,
+        monospace: false,
+      };
+    default:
+      return {
+        action: "Tool",
+        primary: fallback,
+        secondary: null,
+        monospace: false,
+      };
+  }
+}
+
+function changeSummary(tool: ToolCardSummary): string | null {
+  const changes = [
+    tool.added === null ? null : `+${tool.added}`,
+    tool.removed === null ? null : `−${tool.removed}`,
+  ].filter((change): change is string => change !== null);
+  return changes.length > 0 ? changes.join(" ") : null;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1_000) {
+    return `${bytes} B`;
+  }
+  if (bytes < 1_000_000) {
+    return `${(bytes / 1_000).toFixed(bytes < 10_000 ? 1 : 0)} KB`;
+  }
+  return `${(bytes / 1_000_000).toFixed(bytes < 10_000_000 ? 1 : 0)} MB`;
 }
 
 function eventIcon(event: EventSummary) {
@@ -42,7 +155,7 @@ function eventTone(event: EventSummary): string {
   if (event.type === "unknown") {
     return "unknown";
   }
-  if (event.type === "error" || event.is_error) {
+  if (event.type === "error" || event.is_error || (event.tool?.exit_code ?? 0) !== 0) {
     return "error";
   }
   if (event.type === "reasoning") {
@@ -54,8 +167,119 @@ function eventTone(event: EventSummary): string {
   return "technical";
 }
 
-export function EventCard({ event, button_id, is_selected, on_select }: EventCardProps) {
-  const [isExpanded, setIsExpanded] = useState(event.type === "unknown" || event.type === "error");
+function eventStatus(event: EventSummary): { label: string; tone: string } | null {
+  if (event.type !== "tool_call") {
+    return event.phase ? { label: event.phase, tone: "neutral" } : null;
+  }
+  if (event.tool?.exit_code !== null
+    && event.tool?.exit_code !== undefined
+    && event.tool.exit_code !== 0) {
+    return { label: `exit ${event.tool.exit_code}`, tone: "error" };
+  }
+  if (event.is_error) {
+    return { label: "failed", tone: "error" };
+  }
+  if (event.tool?.exit_code !== null && event.tool?.exit_code !== undefined) {
+    return { label: `exit ${event.tool.exit_code}`, tone: "success" };
+  }
+  if (event.phase && event.phase !== "finished") {
+    return { label: event.phase === "started" ? "running" : event.phase, tone: "neutral" };
+  }
+  return null;
+}
+
+function ToolOutput({
+  detail,
+  error,
+  event,
+  is_loading,
+  on_retry,
+}: {
+  detail: EventDetail | null;
+  error: string | null;
+  event: EventSummary;
+  is_loading: boolean;
+  on_retry: () => void;
+}) {
+  if (event.is_hidden || detail?.is_hidden) {
+    return <p className="tool-output__empty">Tool output is hidden by the provider.</p>;
+  }
+  if (is_loading) {
+    return (
+      <div className="tool-output__state" role="status">
+        <span className="inline-spinner" aria-hidden="true" />
+        Loading tool output…
+      </div>
+    );
+  }
+  if (error) {
+    return (
+      <div className="tool-output__error" role="alert">
+        <span>
+          <strong>Output unavailable</strong>
+          <small>{error}</small>
+        </span>
+        <button className="text-button" onClick={on_retry} type="button">
+          Try again
+        </button>
+      </div>
+    );
+  }
+
+  const output = detail?.tool_output ?? null;
+  if (!output || output.sections.length === 0) {
+    const isPending = event.phase !== null && event.phase !== "finished";
+    return (
+      <p className="tool-output__empty" role="status">
+        {isPending ? "Output is not available yet." : "No output was captured for this tool call."}
+      </p>
+    );
+  }
+
+  const toolLabel = toolHeading(event).primary;
+  return (
+    <div className="tool-output">
+      {output.sections.map((section, index) => (
+        <section className="tool-output__section" key={`${section.label ?? "output"}-${index}`}>
+          {section.label ? <h4>{section.label}</h4> : null}
+          <pre
+            aria-label={`${toolLabel} ${section.label ? `${section.label} output` : "output"}`}
+            data-format={section.format}
+            tabIndex={0}
+          >
+            {section.text}
+          </pre>
+        </section>
+      ))}
+      {output.truncated ? (
+        <p className="tool-output__notice" role="status">
+          Output preview is truncated
+          {output.original_size_bytes > 0 ? ` from ${formatBytes(output.original_size_bytes)}` : ""}.
+          Inspect the event for the complete bounded detail.
+        </p>
+      ) : null}
+      {output.source_event_key !== event.event_key ? (
+        <p className="tool-output__source">Output matched from the related result event.</p>
+      ) : null}
+    </div>
+  );
+}
+
+export function EventCard({
+  event,
+  button_id,
+  is_selected,
+  is_expanded,
+  detail,
+  detail_error,
+  detail_loading,
+  on_select,
+  on_toggle,
+  on_retry_detail,
+}: EventCardProps) {
+  const [isLocallyExpanded, setIsLocallyExpanded] = useState(
+    event.type === "unknown" || event.type === "error",
+  );
   const timestampLabel = formatTimestamp(event.timestamp);
 
   if (isMessage(event)) {
@@ -91,40 +315,88 @@ export function EventCard({ event, button_id, is_selected, on_select }: EventCar
     );
   }
 
+  const heading = event.type === "tool_call" ? toolHeading(event) : null;
+  const title = heading?.primary ?? event.title;
+  const status = eventStatus(event);
+  const regionId = `${button_id}-details`;
+  const labelId = `${button_id}-label`;
+  const cardIsExpanded = event.type === "tool_call" ? is_expanded : isLocallyExpanded;
   return (
     <article
       className="technical-event"
       data-selected={is_selected}
       data-tone={eventTone(event)}
     >
-      <button
-        aria-expanded={isExpanded}
-        className="technical-event__header"
-        id={button_id}
-        onClick={() => {
-          on_select(event.event_key);
-          setIsExpanded((expanded) => !expanded);
-        }}
-        type="button"
-      >
-        <span className="technical-event__icon">{eventIcon(event)}</span>
-        <span className="technical-event__title">{event.title}</span>
-        <span className="technical-event__meta">
-          {event.summary_truncated && !event.is_hidden ? (
-            <span className="event-full-content-hint">
-              {event.type === "reasoning" ? "View full reasoning" : "View full event"}
+      <div className="technical-event__header">
+        <button
+          aria-controls={regionId}
+          aria-expanded={cardIsExpanded}
+          aria-label={heading?.action ? `${heading.action}: ${title}` : title}
+          className="technical-event__toggle"
+          onClick={() => {
+            if (event.type === "tool_call") {
+              on_toggle(event.event_key);
+            } else {
+              setIsLocallyExpanded((expanded) => !expanded);
+            }
+          }}
+          type="button"
+        >
+          <span className="technical-event__icon">{eventIcon(event)}</span>
+          <span className="technical-event__heading">
+            <span className="technical-event__title-row">
+              {heading?.action ? <span className="tool-action">{heading.action}</span> : null}
+              <span
+                className="technical-event__title"
+                data-monospace={heading?.monospace || undefined}
+                id={labelId}
+                title={title}
+              >
+                {title}
+              </span>
             </span>
-          ) : null}
-          {event.phase ? <span className="event-phase">{event.phase}</span> : null}
-        </span>
-        <time dateTime={event.timestamp ?? undefined} title={timestampLabel}>
-          {event.timestamp ? timestampLabel : ""}
-        </time>
-        <ChevronIcon className={isExpanded ? "chevron chevron--open" : "chevron"} />
-      </button>
-      {isExpanded ? (
-        <div className="technical-event__body">
-          {event.type === "reasoning" && !event.is_hidden ? (
+            {heading?.secondary ? (
+              <span className="technical-event__secondary" title={heading.secondary}>
+                {heading.secondary}
+              </span>
+            ) : null}
+          </span>
+          <span className="technical-event__meta">
+            {status ? (
+              <span className="event-phase" data-tone={status.tone}>{status.label}</span>
+            ) : null}
+          </span>
+          <time dateTime={event.timestamp ?? undefined} title={timestampLabel}>
+            {event.timestamp ? timestampLabel : ""}
+          </time>
+          <ChevronIcon className={cardIsExpanded ? "chevron chevron--open" : "chevron"} />
+        </button>
+        <button
+          aria-label={`Inspect ${title}`}
+          className="technical-event__inspect"
+          id={button_id}
+          onClick={() => on_select(event.event_key)}
+          type="button"
+        >
+          {event.summary_truncated && !event.is_hidden ? "Full detail" : "Inspect"}
+        </button>
+      </div>
+      {cardIsExpanded ? (
+        <div
+          aria-labelledby={labelId}
+          className="technical-event__body"
+          id={regionId}
+          role="region"
+        >
+          {event.type === "tool_call" ? (
+            <ToolOutput
+              detail={detail}
+              error={detail_error}
+              event={event}
+              is_loading={detail_loading}
+              on_retry={on_retry_detail}
+            />
+          ) : event.type === "reasoning" && !event.is_hidden ? (
             <MarkdownContent content={event.summary || "No summary available."} />
           ) : (
             <p>{event.is_hidden ? "Hidden extension event" : event.summary || "No summary available."}</p>

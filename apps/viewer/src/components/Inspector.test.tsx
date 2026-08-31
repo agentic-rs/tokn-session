@@ -17,6 +17,7 @@ const EVENT: EventSummary = {
   summary_truncated: true,
   is_hidden: false,
   is_error: false,
+  tool: null,
 };
 
 const DETAIL: EventDetail = {
@@ -29,6 +30,7 @@ const DETAIL: EventDetail = {
   },
   native: null,
   is_hidden: false,
+  tool_output: null,
 };
 
 describe("Inspector Markdown routing", () => {
@@ -58,6 +60,7 @@ describe("Inspector Markdown routing", () => {
           event: { type: "message", provider: "pi", redacted: true },
           native: null,
           is_hidden: true,
+          tool_output: null,
         }}
         error={null}
         event={{ ...EVENT, provider: "pi", is_hidden: true }}
