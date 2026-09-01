@@ -3412,6 +3412,7 @@ fn viewer_provider(provider: Provider) -> ViewerProvider {
     Provider::Pi => ViewerProvider::Pi,
     Provider::OpenCode => ViewerProvider::OpenCode,
     Provider::ZCode => ViewerProvider::ZCode,
+    Provider::WorkBuddy => ViewerProvider::WorkBuddy,
     Provider::Dsh => ViewerProvider::Dsh,
   }
 }

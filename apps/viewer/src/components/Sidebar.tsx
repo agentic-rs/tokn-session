@@ -52,7 +52,7 @@ interface SessionBranchProps {
   on_children_load_more: (parent_session_key: string) => void;
 }
 
-const PROVIDER_FILTERS: ViewerProvider[] = ["codex", "pi", "opencode", "zcode", "dsh"];
+const PROVIDER_FILTERS: ViewerProvider[] = ["codex", "pi", "opencode", "zcode", "workbuddy", "dsh"];
 
 function subagentCountLabel(count: number): string {
   return `${count} subagent${count === 1 ? "" : "s"}`;

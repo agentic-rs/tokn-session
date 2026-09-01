@@ -1,0 +1,13 @@
+[package]
+name = "tokn-session-workbuddy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde_json.workspace = true
+tokn-session-core.workspace = true
+tokn-workbuddy-protocol.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

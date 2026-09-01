@@ -63,7 +63,7 @@ pub(crate) fn append_session(request: AppendSessionRequest) -> Result<(), String
 }
 
 fn run_print_session(request: PrintSessionRequest) -> Result<(), String> {
-  if matches!(request.source, Source::Dsh | Source::ZCode) {
+  if matches!(request.source, Source::Dsh | Source::WorkBuddy | Source::ZCode) {
     return Err(format!(
       "{} currently supports historical list/show/browse only; create/append are not implemented",
       request.source.as_str()
@@ -104,6 +104,7 @@ fn print_args(source: Source, action: &PrintAction) -> Result<Vec<String>, Strin
     Source::Pi => pi_print_args(action),
     Source::Codex => codex_print_args(action),
     Source::OpenCode => opencode_print_args(action),
+    Source::WorkBuddy => return Err("workbuddy create/append are not implemented".into()),
     Source::ZCode => return Err("zcode create/append are not implemented".into()),
   })
 }
@@ -389,5 +390,18 @@ mod tests {
     .expect_err("zcode is historical-only");
 
     assert_eq!(error, "zcode create/append are not implemented");
+  }
+
+  #[test]
+  fn workbuddy_print_mode_is_explicitly_unsupported() {
+    let error = print_args(
+      Source::WorkBuddy,
+      &PrintAction::Create {
+        prompt: "create a todo app".to_string(),
+      },
+    )
+    .expect_err("workbuddy is historical-only");
+
+    assert_eq!(error, "workbuddy create/append are not implemented");
   }
 }

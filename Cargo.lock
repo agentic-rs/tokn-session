@@ -4107,6 +4107,7 @@ dependencies = [
  "tokn-session-dsh",
  "tokn-session-opencode",
  "tokn-session-pi",
+ "tokn-session-workbuddy",
  "tokn-session-zcode",
 ]
 
@@ -4220,6 +4221,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokn-session-workbuddy"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "tokn-session-core",
+ "tokn-workbuddy-protocol",
+]
+
+[[package]]
 name = "tokn-session-zcode"
 version = "0.1.0"
 dependencies = [
@@ -4228,6 +4240,14 @@ dependencies = [
  "tempfile",
  "tokn-session-core",
  "tokn-session-opencode",
+]
+
+[[package]]
+name = "tokn-workbuddy-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

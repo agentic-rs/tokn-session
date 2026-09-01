@@ -61,6 +61,14 @@ function renderSidebar(
 }
 
 describe("Sidebar session identity", () => {
+  it("offers WorkBuddy as a provider filter", () => {
+    renderSidebar([]);
+
+    const filter = screen.getByRole("button", { name: "WorkBuddy" });
+    expect(filter).toHaveAttribute("data-provider", "workbuddy");
+    expect(filter).toHaveAttribute("aria-pressed", "false");
+  });
+
   it("shows an explicit cold-index state instead of treating it as an empty catalog", () => {
     renderSidebar([], ["codex"]);
 

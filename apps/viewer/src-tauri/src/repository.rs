@@ -22,7 +22,7 @@ impl ViewerRepository for NativeRepository {
         Some(locator.source_path.clone()),
         &locator.session_id,
       ),
-      ViewerProvider::Codex | ViewerProvider::Pi | ViewerProvider::Dsh => {
+      ViewerProvider::Codex | ViewerProvider::Pi | ViewerProvider::WorkBuddy | ViewerProvider::Dsh => {
         let path = locator
           .source_path
           .to_str()

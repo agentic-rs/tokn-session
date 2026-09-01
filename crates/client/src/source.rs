@@ -5,6 +5,7 @@ pub enum Source {
   Codex,
   OpenCode,
   ZCode,
+  WorkBuddy,
 }
 
 impl Source {
@@ -15,6 +16,7 @@ impl Source {
       Self::Codex => "codex",
       Self::OpenCode => "opencode",
       Self::ZCode => "zcode",
+      Self::WorkBuddy => "workbuddy",
     }
   }
 }

@@ -20,11 +20,20 @@ pub enum ViewerProvider {
   OpenCode,
   #[serde(rename = "zcode")]
   ZCode,
+  #[serde(rename = "workbuddy")]
+  WorkBuddy,
   Dsh,
 }
 
 impl ViewerProvider {
-  pub const ALL: [Self; 5] = [Self::Codex, Self::Pi, Self::OpenCode, Self::ZCode, Self::Dsh];
+  pub const ALL: [Self; 6] = [
+    Self::Codex,
+    Self::Pi,
+    Self::OpenCode,
+    Self::ZCode,
+    Self::WorkBuddy,
+    Self::Dsh,
+  ];
 
   pub fn as_str(self) -> &'static str {
     match self {
@@ -32,6 +41,7 @@ impl ViewerProvider {
       Self::Pi => "pi",
       Self::OpenCode => "opencode",
       Self::ZCode => "zcode",
+      Self::WorkBuddy => "workbuddy",
       Self::Dsh => "dsh",
     }
   }
@@ -42,6 +52,7 @@ impl ViewerProvider {
       Self::Pi => Source::Pi,
       Self::OpenCode => Source::OpenCode,
       Self::ZCode => Source::ZCode,
+      Self::WorkBuddy => Source::WorkBuddy,
       Self::Dsh => Source::Dsh,
     }
   }
@@ -584,6 +595,7 @@ mod tests {
       (ViewerProvider::Pi, "pi"),
       (ViewerProvider::OpenCode, "opencode"),
       (ViewerProvider::ZCode, "zcode"),
+      (ViewerProvider::WorkBuddy, "workbuddy"),
       (ViewerProvider::Dsh, "dsh"),
     ] {
       assert_eq!(serde_json::to_value(provider).unwrap(), wire_name);

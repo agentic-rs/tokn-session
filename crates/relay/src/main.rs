@@ -281,6 +281,7 @@ fn provider_name(provider: Provider) -> &'static str {
     Provider::Codex => "codex",
     Provider::OpenCode => "opencode",
     Provider::ZCode => "zcode",
+    Provider::WorkBuddy => "workbuddy",
     Provider::Dsh => "dsh",
   }
 }

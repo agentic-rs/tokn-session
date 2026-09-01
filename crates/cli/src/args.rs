@@ -312,6 +312,7 @@ fn parse_source(value: &str) -> Result<Source, String> {
     "codex" => Ok(Source::Codex),
     "opencode" => Ok(Source::OpenCode),
     "zcode" => Ok(Source::ZCode),
+    "workbuddy" => Ok(Source::WorkBuddy),
     "dsh" => Ok(Source::Dsh),
     _ => Err(format!("unknown source `{value}`")),
   }
@@ -351,10 +352,10 @@ fn reject_show_scope(command: &str, scope: Option<ShowScope>) -> Result<(), Stri
 
 fn help() -> String {
   "usage:
-  tokn-session list [--source pi|codex|opencode|zcode|dsh] [--session-dir <dir>]
-  tokn-session list [--source pi|codex|opencode|zcode|dsh] [--limit <n>]
-  tokn-session show [--source pi|codex|opencode|zcode|dsh] [--format pretty|jsonl] [--scope self|tree] [--session-dir <dir>] <session-id-or-path>
-  tokn-session browse [--source pi|codex|opencode|zcode|dsh] [--session-dir <dir>] [session-id-or-path]
+  tokn-session list [--source pi|codex|opencode|zcode|workbuddy|dsh] [--session-dir <dir>]
+  tokn-session list [--source pi|codex|opencode|zcode|workbuddy|dsh] [--limit <n>]
+  tokn-session show [--source pi|codex|opencode|zcode|workbuddy|dsh] [--format pretty|jsonl] [--scope self|tree] [--session-dir <dir>] <session-id-or-path>
+  tokn-session browse [--source pi|codex|opencode|zcode|workbuddy|dsh] [--session-dir <dir>] [session-id-or-path]
   tokn-session create [--source pi|codex|opencode] [--executor <command>] [--cwd <dir>] <prompt>
   tokn-session append [--source pi|codex|opencode] [--executor <command>] [--cwd <dir>] (--continue|--session <id>) <prompt>"
     .to_string()
@@ -451,6 +452,44 @@ mod tests {
         source: Source::ZCode,
         ..
       }
+    ));
+  }
+
+  #[test]
+  fn list_accepts_workbuddy_as_a_historical_source() {
+    let cli = parse(vec![
+      "list".to_string(),
+      "--source".to_string(),
+      "workbuddy".to_string(),
+    ])
+    .expect("workbuddy list should parse");
+
+    assert!(matches!(
+      cli.command,
+      Command::List {
+        source: Source::WorkBuddy,
+        ..
+      }
+    ));
+  }
+
+  #[test]
+  fn browse_accepts_workbuddy_as_a_historical_source() {
+    let cli = parse(vec![
+      "browse".to_string(),
+      "--source".to_string(),
+      "workbuddy".to_string(),
+      "wb-chat-basic".to_string(),
+    ])
+    .expect("workbuddy browse should parse");
+
+    assert!(matches!(
+      cli.command,
+      Command::Browse {
+        source: Source::WorkBuddy,
+        session: Some(session),
+        ..
+      } if session == "wb-chat-basic"
     ));
   }
 }

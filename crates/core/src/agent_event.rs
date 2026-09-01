@@ -312,6 +312,8 @@ pub enum Provider {
   OpenCode,
   #[serde(rename = "zcode")]
   ZCode,
+  #[serde(rename = "workbuddy")]
+  WorkBuddy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]

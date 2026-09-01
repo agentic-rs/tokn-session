@@ -29,7 +29,7 @@ The core abstraction is `AgentEvent`: provider-native historical sessions and li
 
 - The CLI binary is `tokn-session`.
 - Commands are top-level. Do not reintroduce a `sessions` namespace.
-- Historical sources today are `pi`, `codex`, `opencode`, `zcode`, and `dsh`.
+- Historical sources today are `pi`, `codex`, `opencode`, `zcode`, `workbuddy`, and `dsh`.
 - Current implemented commands are `list` and `show`.
 - Future likely commands are `create` and `attach`.
 - Provider-native events are normalized for display first; exact round-trip preservation is not a current goal.
@@ -41,6 +41,7 @@ The core abstraction is `AgentEvent`: provider-native historical sessions and li
 - `crates/codex-protocol`: tolerant, lossless wire types for persisted Codex rollout JSONL.
 - `crates/pi-protocol`: tolerant, lossless wire types for persisted Pi session JSONL.
 - `crates/opencode-protocol`: tolerant, lossless wire types for OpenCode V1 payloads and run JSONL.
+- `crates/workbuddy-protocol`: tolerant, lossless wire types for persisted WorkBuddy session JSONL.
 - `crates/dsh-protocol`: tolerant, lossless wire types for persisted DeepSeek Harness session logs.
 - `crates/dsh`: read-only DSH JSONL/Zstandard session discovery and normalization.
 - `crates/client`: source dispatch and public client API.
@@ -50,6 +51,7 @@ The core abstraction is `AgentEvent`: provider-native historical sessions and li
 - `crates/opencode`: OpenCode SQLite session source and normalization.
 - `crates/zcode`: ZCode SQLite session source using the compatible tolerant
   OpenCode V1 wire decoder with ZCode-specific provider semantics.
+- `crates/workbuddy`: read-only WorkBuddy SQLite catalog and JSONL session source.
 - `vendor/`: source-of-truth checkouts for upstream projects. Do not edit vendored code unless explicitly asked.
 
 ## Before Non-Trivial Work

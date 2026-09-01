@@ -5,7 +5,7 @@ Read `AGENTS.md` first for the project goal, stable architecture, and working ru
 ## Current Status
 
 `tokn-session` can list and show existing sessions from Pi, Codex, OpenCode,
-ZCode, and DSH.
+ZCode, WorkBuddy, and DSH.
 
 Implemented CLI:
 
@@ -15,6 +15,7 @@ tokn-session show --source opencode <session-id> --format pretty
 tokn-session show --source codex <session-id> --scope tree
 tokn-session show --source pi <session-id> --format jsonl
 tokn-session list --source zcode --limit 5
+tokn-session list --source workbuddy --limit 5
 tokn-session browse --source codex <session-id>
 tokn-session create --source opencode --executor "tokn-gateway proxy opencode --npx --" "create a todo app"
 tokn-session append --source opencode --executor "tokn-gateway proxy opencode --npx --" --session <session-id> "next turn"
@@ -267,12 +268,12 @@ the project.
 ## Desktop Session Viewer
 
 `apps/viewer` is a read-only Tauri 2/React desktop viewer for historical Pi,
-Codex, OpenCode, ZCode, and DSH sessions. It aggregates root sessions into one
-searchable, provider-filterable sidebar, lazily expands known subagents into a
-tree, renders the selected session's normalized events as a conversation, and
-keeps reasoning, tools, metadata, errors, and unknown events inspectable
-without adding a message composer. A failure in one provider is reported
-without preventing the other providers from loading.
+Codex, OpenCode, ZCode, WorkBuddy, and DSH sessions. It aggregates root sessions
+into one searchable, provider-filterable sidebar, lazily expands known
+subagents into a tree, renders the selected session's normalized events as a
+conversation, and keeps reasoning, tools, metadata, errors, and unknown events
+inspectable without adding a message composer. A failure in one provider is
+reported without preventing the other providers from loading.
 
 The conversation keeps user prompts and final assistant replies visible. A
 contiguous stretch of intermediate assistant progress and non-message activity
@@ -479,6 +480,17 @@ subtype-specific unknown events.
   checkpoint, and input-resolution entries normalize into provider or metadata
   events. Metadata entries retain their native envelopes, while future runtime
   entry kinds remain visible as unknown events.
+- WorkBuddy reads the read-only `workbuddy.db` catalog and per-session JSONL
+  histories below `projects`. `--session-dir` overrides discovery;
+  `$WORKBUDDY_CONFIG_DIR`, `$CODEBUDDY_CONFIG_DIR`, and then
+  `~/.workbuddy-ai` provide the default root.
+  Catalog metadata is merged with discovered JSONL so headless or otherwise
+  uncataloged histories remain listable. Session paths point to the JSONL body,
+  and explicit JSONL paths work for `show`. The observed schema has message
+  ancestry but no session-level parent relationship, so tree scope treats each
+  WorkBuddy history as a leaf. Loading never writes catalog rows or JSONL
+  histories; a catalog without a live WAL is opened immutable, while a
+  non-empty WAL is read through SQLite's read-only WAL-aware mode.
 
 `SessionRef` and `SessionHeader` carry optional `title` and `preview` fields in
 addition to relationship and agent identity. Successful background body loads
@@ -494,6 +506,8 @@ bounded rollout scan as fallbacks. Its state location follows `config.toml`
 session title column, filters strict generated `New session` and `Child session`
 placeholders, and lazily queries the first user text or subtask when needed.
 ZCode uses the same title behavior.
+WorkBuddy prefers its catalog title, then the latest valid `ai-title` record,
+and derives previews from the first user text when body hydration is requested.
 
 Codex Desktop can copy a root thread's state-db title, preview, and first user
 message into each subagent row. The Codex adapter intentionally ignores those
@@ -556,6 +570,14 @@ additional envelope fields, so `tokn-session-zcode` deliberately shares that
 wire decoder while assigning the distinct `zcode` provider identity. The
 ZCode application itself is closed source; compatibility is based on its
 read-only local schema and retained native records rather than an upstream API.
+
+Persisted WorkBuddy JSONL wire types live in `tokn-workbuddy-protocol`.
+Messages, reasoning, function calls/results, file-history snapshots, and AI
+titles have tolerant typed views while every record retains its exact native
+JSON. Future tags, malformed known shapes, nested unknown content, and duplicate
+record IDs remain losslessly inspectable. `tokn-session-workbuddy` merges the
+SQLite catalog with JSONL discovery and normalizes messages, model changes,
+reasoning, tools, usage, metadata, provider errors, and unknown records.
 
 Current event families include:
 
@@ -747,6 +769,8 @@ OpenCode has the first live-output normalizer: `OpenCodeLiveNormalizer` parses `
 - No `attach` command yet.
 - ZCode support is historical-only. Relay watching, create/append, and live
   input are not implemented.
+- WorkBuddy support is historical-only. Relay watching, create/append, and
+  live input are not implemented.
 - Codex and Pi have normalization fixtures. OpenCode now has wire-format
   fixtures plus adapter/source regression tests; full SQLite-backed CLI golden
   tests are still missing.
@@ -772,6 +796,8 @@ dependencies because the viewer backend is a workspace member.
 cargo run -p tokn-session-cli -- list --source codex --limit 1
 cargo run -p tokn-session-cli -- list --source opencode --limit 1
 cargo run -p tokn-session-cli -- list --source zcode --limit 1
+cargo run -p tokn-session-cli -- list --source workbuddy --session-dir crates/workbuddy/fixtures --limit 1
+cargo run -p tokn-session-cli -- show --source workbuddy --session-dir crates/workbuddy/fixtures wb-shell-command
 cargo run -p tokn-session-cli -- show --source opencode <session-id> --format pretty
 cargo run -p tokn-session-relay -- stdout
 cargo run -p tokn-session-relay -- zeromq

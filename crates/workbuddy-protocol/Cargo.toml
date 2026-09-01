@@ -1,0 +1,11 @@
+[package]
+name = "tokn-workbuddy-protocol"
+version.workspace = true
+edition.workspace = true
+description = "Tolerant, lossless wire types for persisted WorkBuddy session JSONL."
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
