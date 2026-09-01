@@ -26,6 +26,7 @@ interface SidebarProps {
   is_loading: boolean;
   error: string | null;
   source_errors: SourceError[];
+  pending_providers: ViewerProvider[];
   has_more: boolean;
   is_loading_more: boolean;
   on_search_change: (value: string) => void;
@@ -55,6 +56,14 @@ const PROVIDER_FILTERS: ViewerProvider[] = ["codex", "pi", "opencode", "zcode", 
 
 function subagentCountLabel(count: number): string {
   return `${count} subagent${count === 1 ? "" : "s"}`;
+}
+
+function pendingProviderLabel(providers: ViewerProvider[]): string {
+  const labels = providers.map((provider) => providerLabel(provider));
+  if (labels.length < 3) {
+    return labels.join(" and ");
+  }
+  return `${labels.slice(0, -1).join(", ")}, and ${labels[labels.length - 1]!}`;
 }
 
 function SessionBranch({
@@ -215,6 +224,7 @@ export function Sidebar({
   is_loading,
   error,
   source_errors,
+  pending_providers,
   has_more,
   is_loading_more,
   on_search_change,
@@ -228,6 +238,8 @@ export function Sidebar({
 }: SidebarProps) {
   const groups = groupSessions(sessions);
   const noProviders = enabled_providers.size === 0;
+  const isIndexingCatalog = pending_providers.length > 0;
+  const indexingLabel = pendingProviderLabel(pending_providers);
   const [expandedSessionKeys, setExpandedSessionKeys] = useState<Set<string>>(() => new Set());
 
   useEffect(() => {
@@ -340,16 +352,41 @@ export function Sidebar({
           </div>
         ) : null}
 
+        {!is_loading && error && sessions.length > 0 ? (
+          <div className="sidebar-refresh-error" role="alert">
+            <strong>Session catalog could not refresh</strong>
+            <span>{error}</span>
+            <button className="text-button" onClick={on_retry} type="button">
+              Try again
+            </button>
+          </div>
+        ) : null}
+
         {!is_loading && !error && sessions.length === 0 ? (
           <div className="sidebar-state">
-            <strong>{noProviders ? "No providers selected" : "No sessions found"}</strong>
+            <strong>
+              {noProviders
+                ? "No providers selected"
+                : isIndexingCatalog
+                  ? "Building session catalog"
+                  : "No sessions found"}
+            </strong>
             <span>
               {noProviders
                 ? "Enable a provider to browse its sessions."
-                : search.trim()
-                  ? "Try a different search."
-                  : "Known sessions will appear here."}
+                : isIndexingCatalog
+                  ? `Indexing ${indexingLabel}. Known sessions will appear here shortly.`
+                  : search.trim()
+                    ? "Try a different search."
+                    : "Known sessions will appear here."}
             </span>
+          </div>
+        ) : null}
+
+        {!is_loading && !error && sessions.length > 0 && isIndexingCatalog ? (
+          <div className="sidebar-indexing" role="status">
+            <span className="inline-spinner" />
+            <span>{`Indexing ${indexingLabel}…`}</span>
           </div>
         ) : null}
 

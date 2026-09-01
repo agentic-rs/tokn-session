@@ -11,8 +11,8 @@ use tokn_session_core::{
   ToolCallEvent, ToolKind, ToolOperation, ToolOperationStatus, ToolSummary, UsageKind, assemble_tool_operations,
 };
 use tokn_session_index::{
-  IndexedSession, SessionIndex, SessionKey as IndexedSessionKey, SessionMetadata, SourceCursorPrecondition, SourceKey,
-  SourceReplacement, SourceState,
+  IndexedSession, SessionBaselineCompletionRequest, SessionIndex, SessionIndexError, SessionKey as IndexedSessionKey,
+  SessionMetadata, SessionPresentation, SourceCursorPrecondition, SourceKey, SourceReplacement, SourceState,
 };
 use tokn_session_render::render_event_summary;
 
@@ -61,15 +61,12 @@ pub(crate) struct ViewerService {
   /// succeeds, even if a direct body retry happens to work in the meantime.
   catalog_errors: Arc<Mutex<HashMap<ViewerProvider, String>>>,
   index_errors: Arc<Mutex<HashMap<ViewerProvider, String>>>,
+  /// SQLite `data_version` most recently observed through this service's own
+  /// index connection. It lets one app process notice a clean commit made by
+  /// another process even when this process's next catalog scan is a no-op.
+  observed_index_data_version: Arc<Mutex<Option<i64>>>,
   failed_body_jobs: Arc<Mutex<HashMap<(SourceKey, String), FailedBodyJob>>>,
-  session_header_cache: Arc<Mutex<HashMap<SessionLocator, CachedSessionHeader>>>,
-  session_header_gates: Arc<Mutex<HashMap<SessionLocator, Arc<Mutex<()>>>>>,
   loaded_session_cache: Arc<Mutex<Option<CachedSession>>>,
-}
-
-struct CachedSessionHeader {
-  source_revision: SourceRevision,
-  header: SessionHeader,
 }
 
 struct CachedSession {
@@ -105,9 +102,19 @@ struct SessionAttention {
   has_unread_descendant: bool,
 }
 
+#[derive(Default)]
 struct SessionHeaderInventory {
   headers: Vec<SessionHeader>,
   direct_attention: HashMap<SessionLocator, bool>,
+}
+
+/// One SQLite-only sidebar snapshot. A provider becomes visible only after
+/// its catalog sentinel commits, so the UI never observes a partial first
+/// catalog or falls back to provider storage while it is pending.
+struct IndexedSessionInventories {
+  by_provider: HashMap<ViewerProvider, SessionHeaderInventory>,
+  pending_providers: Vec<ViewerProvider>,
+  source_errors: Vec<SourceError>,
 }
 
 /// Stable source/session membership observed during one header catalog pass.
@@ -163,12 +170,23 @@ struct PendingBodyJob {
 #[derive(Clone)]
 struct FailedBodyJob {
   raw_cursor: String,
+  source_generation: i64,
   message: String,
 }
 
 struct BodyBackfillRefresh {
   refresh: IndexRefresh,
   errors: HashMap<ViewerProvider, String>,
+}
+
+/// Result of a complete provider-header pass before any session body is read.
+/// The scheduler emits this immediately so a newly committed catalog becomes
+/// visible even when later body work is slow or malformed.
+struct CatalogRefresh {
+  refresh: IndexRefresh,
+  errors: HashMap<ViewerProvider, String>,
+  #[cfg_attr(not(test), allow(dead_code))]
+  unavailable: HashSet<ViewerProvider>,
 }
 
 enum BodyJobRefresh {
@@ -238,15 +256,19 @@ impl ViewerService {
   }
 
   fn with_repository(repository: Arc<dyn ViewerRepository>, session_index: Arc<SessionIndex>) -> Self {
+    // Capture the shared-index revision before the first IPC list request.
+    // If another viewer commits after that list but before our first catalog
+    // pass, the pass will detect the revision change and ask this UI to read
+    // the durable catalog again.
+    let observed_index_data_version = session_index.data_version().ok();
     Self {
       repository,
       session_index,
       index_refresh_gate: Arc::new(Mutex::new(())),
       catalog_errors: Arc::new(Mutex::new(HashMap::new())),
       index_errors: Arc::new(Mutex::new(HashMap::new())),
+      observed_index_data_version: Arc::new(Mutex::new(observed_index_data_version)),
       failed_body_jobs: Arc::new(Mutex::new(HashMap::new())),
-      session_header_cache: Arc::new(Mutex::new(HashMap::new())),
-      session_header_gates: Arc::new(Mutex::new(HashMap::new())),
       loaded_session_cache: Arc::new(Mutex::new(None)),
     }
   }
@@ -263,19 +285,16 @@ impl ViewerService {
       .filter(|value| !value.is_empty())
       .map(str::to_lowercase);
     let mut candidates = Vec::new();
-    let mut source_errors = Vec::new();
+    let mut inventories = self.indexed_session_inventories(&providers)?;
+    let mut source_errors = std::mem::take(&mut inventories.source_errors);
 
     for provider in providers {
-      let inventory = match self.session_header_inventory(provider) {
-        Ok(inventory) => inventory,
-        Err(message) => {
-          record_source_error(&mut source_errors, provider, message);
-          continue;
-        }
-      };
       if let Some(message) = self.index_error_for(provider) {
         record_source_error(&mut source_errors, provider, message);
       }
+      let Some(inventory) = inventories.by_provider.remove(&provider) else {
+        continue;
+      };
 
       let relations = session_relation_index(provider, inventory.headers, &mut source_errors);
       let attention = session_relation_attention(provider, &relations, &inventory.direct_attention);
@@ -314,30 +333,6 @@ impl ViewerService {
         };
         if matches_search(&summary, Some(search)) {
           matches.push(candidate);
-          continue;
-        }
-        if summary.preview.is_some() {
-          continue;
-        }
-        let hydrated = self.hydrate_session_header(candidate.provider, candidate.header.clone());
-        let summary = match session_summary_with_child_count(
-          candidate.provider,
-          hydrated.clone(),
-          candidate.child_count,
-          candidate.is_subagent,
-          candidate.attention,
-        ) {
-          Ok(summary) => summary,
-          Err(message) => {
-            record_source_error(&mut source_errors, candidate.provider, message);
-            continue;
-          }
-        };
-        if matches_search(&summary, Some(search)) {
-          matches.push(SessionListCandidate {
-            header: hydrated,
-            ..candidate
-          });
         }
       }
       sort_session_candidates(&mut matches);
@@ -346,16 +341,9 @@ impl ViewerService {
       let next_cursor = (end < matches.len()).then(|| encode_list_cursor(end));
       let mut sessions = Vec::with_capacity(end - start);
       for candidate in matches[start..end].iter().cloned() {
-        let header = if present_string(candidate.header.title.as_deref()).is_none()
-          && present_string(candidate.header.preview.as_deref()).is_none()
-        {
-          self.hydrate_session_header(candidate.provider, candidate.header)
-        } else {
-          candidate.header
-        };
         match session_summary_with_child_count(
           candidate.provider,
-          header,
+          candidate.header,
           candidate.child_count,
           candidate.is_subagent,
           candidate.attention,
@@ -367,6 +355,7 @@ impl ViewerService {
       return Ok(ListSessionsResponse {
         sessions,
         next_cursor,
+        pending_providers: inventories.pending_providers,
         source_errors,
       });
     }
@@ -377,16 +366,9 @@ impl ViewerService {
     let next_cursor = (end < candidates.len()).then(|| encode_list_cursor(end));
     let mut sessions = Vec::with_capacity(end - start);
     for candidate in candidates[start..end].iter().cloned() {
-      let header = if present_string(candidate.header.title.as_deref()).is_none()
-        && present_string(candidate.header.preview.as_deref()).is_none()
-      {
-        self.hydrate_session_header(candidate.provider, candidate.header)
-      } else {
-        candidate.header
-      };
       match session_summary_with_child_count(
         candidate.provider,
-        header,
+        candidate.header,
         candidate.child_count,
         candidate.is_subagent,
         candidate.attention,
@@ -399,6 +381,7 @@ impl ViewerService {
     Ok(ListSessionsResponse {
       sessions,
       next_cursor,
+      pending_providers: inventories.pending_providers,
       source_errors,
     })
   }
@@ -414,7 +397,9 @@ impl ViewerService {
     let limit = bounded_limit(request.limit)?;
     let offset = requested_offset(request.cursor.as_deref(), request.offset, decode_list_cursor)?.unwrap_or(0);
     let parent_locator = decode_session_key(&request.parent_session_key)?;
-    let inventory = self.session_header_inventory(parent_locator.provider)?;
+    let inventory = self
+      .indexed_session_inventory(parent_locator.provider)?
+      .ok_or_else(|| "session catalog is still being indexed".to_string())?;
     let mut ignored_errors = Vec::new();
     let relations = session_relation_index(parent_locator.provider, inventory.headers, &mut ignored_errors);
     let attention = session_relation_attention(parent_locator.provider, &relations, &inventory.direct_attention);
@@ -460,50 +445,98 @@ impl ViewerService {
     Ok(ListSessionChildrenResponse { sessions, next_cursor })
   }
 
-  /// Reads headers from the durable index once this provider's complete header
-  /// catalog is committed. Until then, keep the current native header path so
-  /// opening the app never waits for a whole-history body scan.
-  fn session_header_inventory(&self, provider: ViewerProvider) -> Result<SessionHeaderInventory, String> {
-    let catalog_key = index_catalog_source_key(provider);
-    let index_ready = self
+  /// Returns one provider's complete committed catalog from the durable index.
+  /// A missing sentinel is an ordinary cold-start state, not permission to
+  /// synchronously inspect provider storage on an IPC request.
+  fn indexed_session_inventory(&self, provider: ViewerProvider) -> Result<Option<SessionHeaderInventory>, String> {
+    let catalog = self
       .session_index
-      .source_state(&catalog_key)
-      .map(|state| state.is_some())
-      .unwrap_or(false);
-    if !index_ready {
-      return self.native_session_header_inventory(provider);
+      .source_state(&index_catalog_source_key(provider))
+      .map_err(|error| format!("failed to read the local {provider:?} session catalog: {error}"))?;
+    if catalog.is_none() {
+      return Ok(None);
     }
 
-    let indexed = match self.session_index.list_present_sessions() {
-      Ok(indexed) => indexed,
-      // The source catalog remains the safe read-only fallback if a local
-      // cache is unavailable or corrupt. A background pass can repair the
-      // index without making the historical viewer unusable.
-      Err(_) => return self.native_session_header_inventory(provider),
-    };
-    let mut headers = Vec::new();
-    let mut direct_attention = HashMap::new();
-    for session in indexed
-      .into_iter()
-      .filter(|session| session.key.provider == provider.as_str())
-    {
-      let header = match indexed_session_header(&session) {
-        Ok(header) => header,
-        Err(_) => return self.native_session_header_inventory(provider),
+    let indexed = self
+      .session_index
+      .list_present_sessions_for_provider(provider.as_str())
+      .map_err(|error| format!("failed to read the local {provider:?} session index: {error}"))?;
+    let mut inventory = SessionHeaderInventory::default();
+    for session in indexed {
+      // An invalid row is not a reason to fall back to provider storage. The
+      // root listing can report it as a source warning; an on-demand child or
+      // delegation query simply excludes the unusable row.
+      let Ok(header) = indexed_session_header(&session) else {
+        continue;
       };
-      direct_attention.insert(locator_for_header(provider, &header), session.has_unread());
-      headers.push(header);
+      inventory
+        .direct_attention
+        .insert(locator_for_header(provider, &header), session.has_unread());
+      inventory.headers.push(header);
     }
-    Ok(SessionHeaderInventory {
-      headers,
-      direct_attention,
-    })
+    Ok(Some(inventory))
   }
 
-  fn native_session_header_inventory(&self, provider: ViewerProvider) -> Result<SessionHeaderInventory, String> {
-    Ok(SessionHeaderInventory {
-      headers: self.repository.list_session_headers(provider)?,
-      direct_attention: HashMap::new(),
+  /// Reads all sidebar-visible metadata from the durable index in one snapshot.
+  /// The background reconciler is the only code path allowed to call provider
+  /// header APIs, so the first viewer screen remains fast and deterministic
+  /// even while a provider catalog is still pending.
+  fn indexed_session_inventories(&self, providers: &[ViewerProvider]) -> Result<IndexedSessionInventories, String> {
+    let mut committed_providers = HashSet::new();
+    let mut pending_providers = Vec::new();
+    for &provider in providers {
+      let catalog = self
+        .session_index
+        .source_state(&index_catalog_source_key(provider))
+        .map_err(|error| format!("failed to read the local {provider:?} session catalog: {error}"))?;
+      if catalog.is_some() {
+        committed_providers.insert(provider);
+      } else {
+        pending_providers.push(provider);
+      }
+    }
+
+    let indexed = self
+      .session_index
+      .list_present_sessions()
+      .map_err(|error| format!("failed to read the local session index: {error}"))?;
+    let mut by_provider = committed_providers
+      .iter()
+      .copied()
+      .map(|provider| (provider, SessionHeaderInventory::default()))
+      .collect::<HashMap<_, _>>();
+    let mut source_errors = Vec::new();
+
+    for session in indexed {
+      let Some(provider) = providers
+        .iter()
+        .copied()
+        .find(|provider| session.key.provider == provider.as_str())
+      else {
+        continue;
+      };
+      let Some(inventory) = by_provider.get_mut(&provider) else {
+        // Rows can remain from a previous catalog while this provider is
+        // rebuilding. Hide them until its new complete sentinel commits.
+        continue;
+      };
+      let header = match indexed_session_header(&session) {
+        Ok(header) => header,
+        Err(message) => {
+          record_source_error(&mut source_errors, provider, message);
+          continue;
+        }
+      };
+      inventory
+        .direct_attention
+        .insert(locator_for_header(provider, &header), session.has_unread());
+      inventory.headers.push(header);
+    }
+
+    Ok(IndexedSessionInventories {
+      by_provider,
+      pending_providers,
+      source_errors,
     })
   }
 
@@ -526,34 +559,17 @@ impl ViewerService {
       .map(|session| session.attention_revision.to_string())
   }
 
-  /// Reconciles the compact session index. This is intentionally a synchronous
-  /// method because Tauri runs it on a dedicated blocking task; all provider
-  /// and SQLite I/O stays out of IPC handlers and the UI thread.
+  /// Test helper that reconciles a complete provider-header pass and one
+  /// bounded body batch in one call.
+  #[cfg(test)]
   pub(crate) fn refresh_session_index(&self) -> Result<IndexRefresh, String> {
     let _refresh_gate = self
       .index_refresh_gate
       .lock()
       .map_err(|_| "session index refresh gate is poisoned".to_string())?;
-    let mut refresh = IndexRefresh::default();
-    let mut catalog_errors = HashMap::new();
-    let mut catalog_failures = HashSet::new();
-    for provider in ViewerProvider::ALL {
-      match self.refresh_provider_catalog(provider) {
-        Ok(provider_refresh) => {
-          refresh.changed |= provider_refresh.changed;
-          refresh.retry_catalog_soon |= provider_refresh.retry_catalog_soon;
-          refresh
-            .attention_session_keys
-            .extend(provider_refresh.attention_session_keys);
-        }
-        Err(message) => {
-          catalog_failures.insert(provider);
-          catalog_errors.insert(provider, message);
-        }
-      }
-    }
-
-    let body_refresh = self.refresh_pending_body_jobs(&catalog_failures)?;
+    let catalog_refresh = self.refresh_session_catalogs();
+    let body_refresh = self.refresh_pending_body_jobs(&catalog_refresh.unavailable)?;
+    let mut refresh = catalog_refresh.refresh;
     refresh.changed |= body_refresh.refresh.changed;
     refresh
       .attention_session_keys
@@ -561,8 +577,33 @@ impl ViewerService {
     refresh.has_pending_body_jobs = body_refresh.refresh.has_pending_body_jobs;
     refresh.attention_session_keys.sort();
     refresh.attention_session_keys.dedup();
-    self.replace_catalog_errors(catalog_errors.clone());
-    Ok(self.finish_index_refresh(refresh, combined_index_errors(catalog_errors, body_refresh.errors)))
+    self.finalize_index_refresh(
+      refresh,
+      combined_index_errors(catalog_refresh.errors, body_refresh.errors),
+    )
+  }
+
+  /// Commits only provider catalogs and returns before any session body is
+  /// loaded. The Tauri scheduler uses this path on its normal cadence so a
+  /// cold index can notify the sidebar as soon as each complete catalog
+  /// sentinel is durable; body reconciliation follows in later one-second
+  /// passes.
+  pub(crate) fn refresh_session_catalog(&self) -> Result<IndexRefresh, String> {
+    let _refresh_gate = self
+      .index_refresh_gate
+      .lock()
+      .map_err(|_| "session index refresh gate is poisoned".to_string())?;
+    let catalog_refresh = self.refresh_session_catalogs();
+    let remaining_jobs = self.pending_body_jobs(&HashSet::new())?;
+    let mut refresh = catalog_refresh.refresh;
+    refresh.has_pending_body_jobs = !remaining_jobs.is_empty();
+    self.finalize_index_refresh(
+      refresh,
+      combined_index_errors(
+        catalog_refresh.errors,
+        self.body_errors_for_pending_jobs(&remaining_jobs),
+      ),
+    )
   }
 
   /// Advances only the bounded body queue from an already committed catalog.
@@ -582,7 +623,37 @@ impl ViewerService {
     let mut refresh = body_refresh.refresh;
     refresh.attention_session_keys.sort();
     refresh.attention_session_keys.dedup();
-    Ok(self.finish_index_refresh(refresh, combined_index_errors(catalog_errors, body_refresh.errors)))
+    self.finalize_index_refresh(refresh, combined_index_errors(catalog_errors, body_refresh.errors))
+  }
+
+  /// Performs a complete header pass while the caller holds
+  /// `index_refresh_gate`. Catalog failures are isolated per provider so a
+  /// successful provider can publish its stable sentinel immediately.
+  fn refresh_session_catalogs(&self) -> CatalogRefresh {
+    let mut refresh = IndexRefresh::default();
+    let mut errors = HashMap::new();
+    let mut unavailable = HashSet::new();
+    for provider in ViewerProvider::ALL {
+      match self.refresh_provider_catalog(provider) {
+        Ok(provider_refresh) => {
+          refresh.changed |= provider_refresh.changed;
+          refresh.retry_catalog_soon |= provider_refresh.retry_catalog_soon;
+          refresh
+            .attention_session_keys
+            .extend(provider_refresh.attention_session_keys);
+        }
+        Err(message) => {
+          unavailable.insert(provider);
+          errors.insert(provider, message);
+        }
+      }
+    }
+    self.replace_catalog_errors(errors.clone());
+    CatalogRefresh {
+      refresh,
+      errors,
+      unavailable,
+    }
   }
 
   /// The catalog commits first, so even a large historical provider becomes
@@ -598,7 +669,15 @@ impl ViewerService {
     for index in 0..batch_len {
       let job = pending_jobs[index].clone();
       match self.refresh_pending_body_job(&job) {
-        Ok(BodyJobRefresh::Stale) => self.clear_failed_body_job(&job),
+        Ok(BodyJobRefresh::Stale) => {
+          self.clear_failed_body_job(&job);
+          // A stale body job commonly means another viewer process committed
+          // the same source while this process was loading it. Request a
+          // sidebar reread so this window observes that durable winner's
+          // title, preview, or attention revision. Source-file churn can also
+          // reach this path; an extra SQLite-only reread is harmless.
+          refresh.changed = true;
+        }
         Ok(BodyJobRefresh::Updated {
           provider_refresh,
           next_source,
@@ -640,6 +719,36 @@ impl ViewerService {
       *current_errors = errors;
     }
     refresh
+  }
+
+  fn finalize_index_refresh(
+    &self,
+    refresh: IndexRefresh,
+    errors: HashMap<ViewerProvider, String>,
+  ) -> Result<IndexRefresh, String> {
+    let mut refresh = self.finish_index_refresh(refresh, errors);
+    refresh.changed |= self.observe_external_index_change()?;
+    Ok(refresh)
+  }
+
+  fn observe_external_index_change(&self) -> Result<bool, String> {
+    let current = self
+      .session_index
+      .data_version()
+      .map_err(|error| format!("failed to observe shared session index changes: {error}"))?;
+    let mut observed = self
+      .observed_index_data_version
+      .lock()
+      .map_err(|_| "viewer index data-version state is poisoned".to_owned())?;
+    // A constructor-time observation can fail transiently. In that case, use
+    // the first successful pass as a conservative reread signal rather than
+    // risking a stale sidebar after another process committed meanwhile.
+    let changed = match *observed {
+      Some(previous) => previous != current,
+      None => true,
+    };
+    *observed = Some(current);
+    Ok(changed)
   }
 
   /// Builds one provider's complete header catalog without reading any message
@@ -762,6 +871,12 @@ impl ViewerService {
             // The later body completion compares against this retained marker
             // and therefore does not create a duplicate revision for the move.
             metadata.notify_on_baseline = false;
+            // The archive header is often blank. Retain the old body's
+            // fallback separately from catalog presentation until this new
+            // source can be loaded, so a transient archive error does not
+            // make a known session look untitled.
+            metadata.body_title = relocated.body_title.clone();
+            metadata.body_preview = relocated.body_preview.clone();
             if relocated.has_unread() {
               metadata.attention_marker = known_attention_marker(relocated);
               metadata.has_new_attention = true;
@@ -794,7 +909,7 @@ impl ViewerService {
         source: SourceState::new(source.key.clone(), INDEX_MISSING_SOURCE_CURSOR, indexed_at_ms),
         sessions: Vec::new(),
         attention_mode: Default::default(),
-        source_cursor_precondition: SourceCursorPrecondition::existing(source.cursor.clone()),
+        source_cursor_precondition: SourceCursorPrecondition::existing(source),
       });
     }
 
@@ -869,10 +984,23 @@ impl ViewerService {
         ..Default::default()
       });
     }
-    self
-      .session_index
-      .replace_sources(&replacements)
-      .map_err(|error| format!("failed to update the {provider:?} session index: {error}"))?;
+    match self.session_index.replace_sources(&replacements) {
+      Ok(_) => {}
+      // Another viewer process won the race after this process completed its
+      // stable header scan. Its committed catalog remains valid; retry the
+      // full catalog soon rather than surfacing a spurious source warning.
+      Err(SessionIndexError::SourceCursorConflict { .. }) => {
+        return Ok(ProviderIndexRefresh {
+          // The other process committed a new shared SQLite snapshot. Tell
+          // this process's sidebar to reread it even though this writer did
+          // not apply a local replacement.
+          changed: true,
+          retry_catalog_soon: true,
+          ..Default::default()
+        });
+      }
+      Err(error) => return Err(format!("failed to update the {provider:?} session index: {error}")),
+    }
     Ok(ProviderIndexRefresh {
       changed: true,
       attention_session_keys: Vec::new(),
@@ -930,7 +1058,7 @@ impl ViewerService {
           let locator = locator_for_header(provider, &header);
           let deprioritized = failed_jobs
             .get(&(source.key.clone(), locator.session_id.clone()))
-            .is_some_and(|failure| failure.raw_cursor == raw_cursor);
+            .is_some_and(|failure| failure.raw_cursor == raw_cursor && failure.source_generation == source.generation);
           jobs.push(PendingBodyJob {
             provider,
             source: source.clone(),
@@ -960,6 +1088,7 @@ impl ViewerService {
         (job.source.key.clone(), job.locator.session_id.clone()),
         FailedBodyJob {
           raw_cursor: job.raw_cursor.clone(),
+          source_generation: job.source.generation,
           message,
         },
       );
@@ -969,10 +1098,9 @@ impl ViewerService {
   fn clear_failed_body_job(&self, job: &PendingBodyJob) {
     if let Ok(mut failed_jobs) = self.failed_body_jobs.lock() {
       let key = (job.source.key.clone(), job.locator.session_id.clone());
-      if failed_jobs
-        .get(&key)
-        .is_some_and(|failure| failure.raw_cursor == job.raw_cursor)
-      {
+      if failed_jobs.get(&key).is_some_and(|failure| {
+        failure.raw_cursor == job.raw_cursor && failure.source_generation == job.source.generation
+      }) {
         failed_jobs.remove(&key);
       }
     }
@@ -987,7 +1115,7 @@ impl ViewerService {
       let key = (job.source.key.clone(), job.locator.session_id.clone());
       if let Some(failure) = failed_jobs
         .get(&key)
-        .filter(|failure| failure.raw_cursor == job.raw_cursor)
+        .filter(|failure| failure.raw_cursor == job.raw_cursor && failure.source_generation == job.source.generation)
       {
         errors.entry(job.provider).or_insert_with(|| failure.message.clone());
       }
@@ -1004,10 +1132,7 @@ impl ViewerService {
       return;
     };
     for job in jobs {
-      if job.source.key == previous_source.key
-        && job.source.cursor == previous_source.cursor
-        && job.raw_cursor == next_raw_cursor
-      {
+      if job.source.key == previous_source.key && job.source == *previous_source && job.raw_cursor == next_raw_cursor {
         job.source = next_source.clone();
       }
     }
@@ -1021,7 +1146,7 @@ impl ViewerService {
       .session_index
       .source_state(&job.source.key)
       .map_err(|error| format!("failed to read indexed body job source: {error}"))?;
-    if current_source.as_ref().map(|source| source.cursor.as_str()) != Some(job.source.cursor.as_str()) {
+    if current_source.as_ref() != Some(&job.source) {
       return Ok(BodyJobRefresh::Stale);
     }
     if source_cursor(job.provider, &job.locator.source_path)? != job.raw_cursor {
@@ -1060,14 +1185,16 @@ impl ViewerService {
     if loaded.reference.id != job.locator.session_id {
       return Err("session index source no longer matches its header".to_string());
     }
+    let presentation = session_presentation_from_loaded(&loaded);
     let attention_marker = visible_attention_marker(&loaded.events);
     if source_cursor(job.provider, &job.locator.source_path)? != job.raw_cursor {
       return Ok(BodyJobRefresh::Stale);
     }
 
-    // Completion writes only attention fields. Use the committed catalog row
-    // for relocation identity, so this bounded body job never needs to walk
-    // the whole provider header catalog again or overwrite newer metadata.
+    // Completion writes attention plus bounded presentation captured from the
+    // same body snapshot. Use the committed catalog row for relocation
+    // identity, so this bounded job never needs to walk the whole provider
+    // header catalog again or overwrite newer relationship metadata.
     let metadata = session_metadata_from_header(
       &job.source.key,
       indexed_session_header(existing)?,
@@ -1086,7 +1213,8 @@ impl ViewerService {
       &existing_by_session_id,
     );
     let has_new_attention = body_has_new_attention(existing, relocated, attention_marker.as_deref());
-    let mut completion = tokn_session_index::SessionBaselineCompletionRequest::new(key, attention_marker);
+    let mut completion = SessionBaselineCompletionRequest::new(key, attention_marker);
+    completion.presentation = Some(presentation);
     completion.has_new_attention = has_new_attention;
     let next_source = SourceState::new(
       job.source.key.clone(),
@@ -1100,6 +1228,10 @@ impl ViewerService {
     if completion == tokn_session_index::SessionBaselineCompletion::Stale {
       return Ok(BodyJobRefresh::Stale);
     }
+    let next_source = completion
+      .committed_source()
+      .cloned()
+      .expect("an applied session baseline completion must return its source state");
     let attention_session_keys = completion
       .attention_changed()
       .then(|| encode_session_key(&job.locator))
@@ -1114,65 +1246,6 @@ impl ViewerService {
       },
       next_source,
     })
-  }
-
-  fn hydrate_session_header(&self, provider: ViewerProvider, mut header: SessionHeader) -> SessionHeader {
-    let locator = locator_for_header(provider, &header);
-    let Some(initial_revision) = source_revision(&locator) else {
-      return self
-        .repository
-        .hydrate_session_header(provider, header.clone())
-        .unwrap_or(header);
-    };
-    if apply_cached_session_header(&self.session_header_cache, &locator, &initial_revision, &mut header) {
-      return header;
-    }
-
-    let gate = match self.session_header_gates.lock() {
-      Ok(mut gates) => Arc::clone(gates.entry(locator.clone()).or_insert_with(|| Arc::new(Mutex::new(())))),
-      Err(_) => {
-        return self
-          .repository
-          .hydrate_session_header(provider, header.clone())
-          .unwrap_or(header);
-      }
-    };
-    let Ok(_gate) = gate.lock() else {
-      return self
-        .repository
-        .hydrate_session_header(provider, header.clone())
-        .unwrap_or(header);
-    };
-    let Some(revision_before) = source_revision(&locator) else {
-      return self
-        .repository
-        .hydrate_session_header(provider, header.clone())
-        .unwrap_or(header);
-    };
-    if apply_cached_session_header(&self.session_header_cache, &locator, &revision_before, &mut header) {
-      return header;
-    }
-
-    // Search requests overlap while the user is typing. A per-session gate
-    // prevents duplicate scans without letting an old slow transcript block
-    // unrelated providers or the currently visible result.
-    let hydrated = match self.repository.hydrate_session_header(provider, header.clone()) {
-      Ok(hydrated) => hydrated,
-      Err(_) => return header,
-    };
-    if let Some(revision_after) = source_revision(&locator)
-      && revision_before == revision_after
-      && let Ok(mut cache) = self.session_header_cache.lock()
-    {
-      cache.insert(
-        locator,
-        CachedSessionHeader {
-          source_revision: revision_after,
-          header: hydrated.clone(),
-        },
-      );
-    }
-    hydrated
   }
 
   pub fn load_event_page(&self, request: EventPageRequest) -> Result<EventPage, String> {
@@ -1347,7 +1420,7 @@ impl ViewerService {
   /// canonical header produces no links, while leaving the parent timeline
   /// readable.
   fn delegation_targets_for_parent(&self, parent_locator: &SessionLocator) -> HashMap<String, SessionSummary> {
-    let Ok(inventory) = self.session_header_inventory(parent_locator.provider) else {
+    let Ok(Some(inventory)) = self.indexed_session_inventory(parent_locator.provider) else {
       return HashMap::new();
     };
     let mut ignored_errors = Vec::new();
@@ -1597,34 +1670,13 @@ fn tool_operation_output_preview(operation: &ToolOperation) -> Option<ToolOutput
   (!sections.is_empty()).then(|| bound_tool_output(sections, source_event_index))
 }
 
-fn apply_cached_session_header(
-  cache: &Mutex<HashMap<SessionLocator, CachedSessionHeader>>,
-  locator: &SessionLocator,
-  revision: &SourceRevision,
-  header: &mut SessionHeader,
-) -> bool {
-  let Ok(cache) = cache.lock() else {
-    return false;
-  };
-  let Some(cached) = cache.get(locator).filter(|cached| cached.source_revision == *revision) else {
-    return false;
-  };
-  if present_string(header.title.as_deref()).is_none() {
-    header.title.clone_from(&cached.header.title);
-  }
-  if present_string(header.preview.as_deref()).is_none() {
-    header.preview.clone_from(&cached.header.preview);
-  }
-  true
-}
-
 fn index_catalog_source_key(provider: ViewerProvider) -> SourceKey {
   SourceKey::new(provider.as_str(), INDEX_CATALOG_SOURCE_KEY)
 }
 
 fn source_cursor_precondition(previous: Option<&SourceState>) -> SourceCursorPrecondition {
   previous
-    .map(|source| SourceCursorPrecondition::existing(source.cursor.clone()))
+    .map(SourceCursorPrecondition::existing)
     .unwrap_or_else(SourceCursorPrecondition::missing)
 }
 
@@ -1783,9 +1835,23 @@ fn session_metadata_from_header(
   Ok(metadata)
 }
 
+/// The body pass is the one bounded provider read that can enrich a catalog
+/// row whose provider headers do not expose presentation text. Keep this
+/// separate from attention derivation so the index never receives full event
+/// contents or provider-native payloads.
+fn session_presentation_from_loaded(loaded: &LoadedSession) -> SessionPresentation {
+  SessionPresentation {
+    title: normalize_session_text(loaded.reference.title.clone(), MAX_SESSION_TITLE_CHARS),
+    preview: normalize_session_text(loaded.reference.preview.clone(), MAX_SESSION_PREVIEW_CHARS),
+  }
+}
+
 /// Builds a compact catalog row while preserving the prior body-derived
-/// notification state. A changed source becomes pending again, but a brand-new
-/// row only requests notification after a completed provider catalog exists.
+/// notification state. Presentation remains catalog-owned here; the index
+/// separately retains any completed body fallback so a blank header does not
+/// erase it or turn it into a stale catalog title. A changed source becomes
+/// pending again, but a brand-new row only requests notification after a
+/// completed provider catalog exists.
 fn catalog_session_metadata(
   source_key: &SourceKey,
   header: SessionHeader,
@@ -1853,8 +1919,8 @@ fn indexed_source_matches_catalog(
 fn indexed_session_matches_metadata(indexed: &IndexedSession, metadata: &SessionMetadata) -> bool {
   indexed.key == metadata.key
     && indexed.source_path == metadata.source_path
-    && indexed.title == metadata.title
-    && indexed.preview == metadata.preview
+    && indexed.catalog_title == metadata.title
+    && indexed.catalog_preview == metadata.preview
     && indexed.cwd == metadata.cwd
     && indexed.timestamp == metadata.timestamp
     && indexed.updated_at == metadata.updated_at
@@ -3806,8 +3872,8 @@ fn truncate_with_flag(value: String, max_chars: usize) -> (String, bool) {
 mod tests {
   use std::collections::HashMap;
   use std::path::PathBuf;
+  use std::sync::Mutex;
   use std::sync::atomic::{AtomicUsize, Ordering};
-  use std::sync::{Barrier, Mutex};
 
   use serde_json::json;
   use tokn_session_core::{
@@ -3828,14 +3894,6 @@ mod tests {
   impl ViewerRepository for FakeRepository {
     fn list_session_headers(&self, provider: ViewerProvider) -> Result<Vec<SessionHeader>, String> {
       self.listings.get(&provider).cloned().unwrap_or_else(|| Ok(Vec::new()))
-    }
-
-    fn hydrate_session_header(
-      &self,
-      _provider: ViewerProvider,
-      header: SessionHeader,
-    ) -> Result<SessionHeader, String> {
-      Ok(header)
     }
 
     fn load_session(&self, _locator: &SessionLocator) -> Result<LoadedSession, String> {
@@ -3930,14 +3988,6 @@ mod tests {
       )
     }
 
-    fn hydrate_session_header(
-      &self,
-      _provider: ViewerProvider,
-      header: SessionHeader,
-    ) -> Result<SessionHeader, String> {
-      Ok(header)
-    }
-
     fn load_session(&self, locator: &SessionLocator) -> Result<LoadedSession, String> {
       self.load_calls.fetch_add(1, Ordering::SeqCst);
       self
@@ -3996,14 +4046,6 @@ mod tests {
         .ok_or_else(|| "catalog sequence requires at least one Codex listing".to_string())
     }
 
-    fn hydrate_session_header(
-      &self,
-      _provider: ViewerProvider,
-      header: SessionHeader,
-    ) -> Result<SessionHeader, String> {
-      Ok(header)
-    }
-
     fn load_session(&self, locator: &SessionLocator) -> Result<LoadedSession, String> {
       let header = self
         .codex_catalogs
@@ -4019,6 +4061,70 @@ mod tests {
         }
         .load(),
       )
+    }
+  }
+
+  struct BlockingCatalogRepository {
+    header: SessionHeader,
+    codex_header_calls: AtomicUsize,
+    confirmation_reached: std::sync::mpsc::Sender<()>,
+    resume_confirmation: Mutex<std::sync::mpsc::Receiver<()>>,
+  }
+
+  impl ViewerRepository for BlockingCatalogRepository {
+    fn list_session_headers(&self, provider: ViewerProvider) -> Result<Vec<SessionHeader>, String> {
+      if provider != ViewerProvider::Codex {
+        return Ok(Vec::new());
+      }
+      let call = self.codex_header_calls.fetch_add(1, Ordering::SeqCst);
+      if call == 1 {
+        self
+          .confirmation_reached
+          .send(())
+          .map_err(|_| "catalog test no longer has a waiting coordinator".to_owned())?;
+        self
+          .resume_confirmation
+          .lock()
+          .expect("catalog test resume lock should not be poisoned")
+          .recv()
+          .map_err(|_| "catalog test coordinator stopped before confirmation".to_owned())?;
+      }
+      Ok(vec![self.header.clone()])
+    }
+
+    fn load_session(&self, _locator: &SessionLocator) -> Result<LoadedSession, String> {
+      Err("catalog-only test must not load a session body".to_owned())
+    }
+  }
+
+  struct BlockingBodyRepository {
+    header: SessionHeader,
+    loaded: IndexedLoadSpec,
+    load_started: std::sync::mpsc::Sender<()>,
+    resume_load: Mutex<std::sync::mpsc::Receiver<()>>,
+  }
+
+  impl ViewerRepository for BlockingBodyRepository {
+    fn list_session_headers(&self, provider: ViewerProvider) -> Result<Vec<SessionHeader>, String> {
+      if provider == ViewerProvider::Codex {
+        Ok(vec![self.header.clone()])
+      } else {
+        Ok(Vec::new())
+      }
+    }
+
+    fn load_session(&self, _locator: &SessionLocator) -> Result<LoadedSession, String> {
+      self
+        .load_started
+        .send(())
+        .map_err(|_| "body test no longer has a waiting coordinator".to_owned())?;
+      self
+        .resume_load
+        .lock()
+        .expect("body test resume lock should not be poisoned")
+        .recv()
+        .map_err(|_| "body test coordinator stopped before resuming the load".to_owned())?;
+      Ok(self.loaded.load())
     }
   }
 
@@ -4063,6 +4169,10 @@ mod tests {
       source_path: "/tmp/fixture.jsonl".to_string(),
       title: None,
       preview: None,
+      catalog_title: None,
+      catalog_preview: None,
+      body_title: None,
+      body_preview: None,
       cwd: None,
       timestamp: None,
       updated_at: None,
@@ -4225,6 +4335,230 @@ mod tests {
       .expect("stable session should be cataloged");
     assert_eq!(stored.title.as_deref(), before.title.as_deref());
     assert!(stored.attention_baselined);
+  }
+
+  #[test]
+  fn concurrent_same_cursor_catalog_update_retries_quietly_without_overwriting_the_winner() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("active.jsonl");
+    std::fs::write(&path, "unchanged source bytes").expect("fixture source should be written");
+    let initial_header = indexed_header(path.clone(), "concurrent-catalog", None);
+    let mut stale_header = initial_header.clone();
+    stale_header.title = Some("stale catalog title".to_owned());
+    stale_header.parent_session_id = Some("stale-parent".to_owned());
+    let mut winning_header = initial_header.clone();
+    winning_header.title = Some("winning catalog title".to_owned());
+    winning_header.parent_session_id = Some("winning-parent".to_owned());
+
+    let index = Arc::new(SessionIndex::open_in_memory().expect("test index should open"));
+    let initial_service = ViewerService::new_with_index(
+      indexing_repository(vec![IndexedLoadSpec {
+        header: initial_header.clone(),
+        messages: Vec::new(),
+      }]),
+      Arc::clone(&index),
+    );
+    initial_service
+      .refresh_provider_catalog(ViewerProvider::Codex)
+      .expect("initial catalog should commit");
+
+    let (confirmation_reached, confirmation_waiter) = std::sync::mpsc::channel();
+    let (resume_sender, resume_confirmation) = std::sync::mpsc::channel();
+    let stale_service = ViewerService::new_with_index(
+      Arc::new(BlockingCatalogRepository {
+        header: stale_header,
+        codex_header_calls: AtomicUsize::new(0),
+        confirmation_reached,
+        resume_confirmation: Mutex::new(resume_confirmation),
+      }),
+      Arc::clone(&index),
+    );
+    let stale_refresh_service = stale_service.clone();
+    let stale_refresh = std::thread::spawn(move || stale_refresh_service.refresh_session_catalog());
+    confirmation_waiter
+      .recv_timeout(std::time::Duration::from_secs(1))
+      .expect("stale catalog should pause before its confirmation read");
+
+    let winning_service = ViewerService::new_with_index(
+      indexing_repository(vec![IndexedLoadSpec {
+        header: winning_header,
+        messages: Vec::new(),
+      }]),
+      Arc::clone(&index),
+    );
+    assert!(
+      winning_service
+        .refresh_session_catalog()
+        .expect("winning catalog should refresh")
+        .changed
+    );
+    resume_sender
+      .send(())
+      .expect("stale catalog confirmation should resume");
+    let stale_refresh = stale_refresh
+      .join()
+      .expect("stale catalog thread should not panic")
+      .expect("same-cursor conflict should be a quiet retry");
+    assert!(
+      stale_refresh.changed,
+      "the loser must ask its sidebar to reread the winner's shared index snapshot"
+    );
+    assert!(stale_refresh.retry_catalog_soon);
+    assert!(
+      stale_service.index_error_for(ViewerProvider::Codex).is_none(),
+      "an optimistic collision is not a provider read error"
+    );
+
+    let locator = locator_for_header(ViewerProvider::Codex, &initial_header);
+    let stored = index
+      .session(&index_session_key(&locator).expect("index key should encode"))
+      .expect("index query should work")
+      .expect("winning row should remain indexed");
+    assert_eq!(stored.catalog_title.as_deref(), Some("winning catalog title"));
+    assert_eq!(stored.parent_session_id.as_deref(), Some("winning-parent"));
+  }
+
+  #[test]
+  fn concurrent_body_completion_requests_a_sidebar_reread_for_the_other_process() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("concurrent-body.jsonl");
+    std::fs::write(&path, "stable source bytes").expect("fixture source should be written");
+    let mut header = indexed_header(path, "concurrent-body", None);
+    header.title = None;
+    let locator = locator_for_header(ViewerProvider::Codex, &header);
+    let mut loaded_header = header.clone();
+    loaded_header.title = Some("winner body title".to_owned());
+    let body_spec = IndexedLoadSpec {
+      header: loaded_header,
+      messages: vec![indexed_message(Role::User, MessageDelivery::Unspecified)],
+    };
+    let index = Arc::new(SessionIndex::open_in_memory().expect("test index should open"));
+    let catalog_service = ViewerService::new_with_index(
+      indexing_repository(vec![IndexedLoadSpec {
+        header: header.clone(),
+        messages: vec![indexed_message(Role::User, MessageDelivery::Unspecified)],
+      }]),
+      Arc::clone(&index),
+    );
+    catalog_service
+      .refresh_provider_catalog(ViewerProvider::Codex)
+      .expect("catalog should stage the body job");
+
+    let (load_started, load_waiter) = std::sync::mpsc::channel();
+    let (resume_sender, resume_load) = std::sync::mpsc::channel();
+    let stale_service = ViewerService::new_with_index(
+      Arc::new(BlockingBodyRepository {
+        header: header.clone(),
+        loaded: body_spec.clone(),
+        load_started,
+        resume_load: Mutex::new(resume_load),
+      }),
+      Arc::clone(&index),
+    );
+    let stale_body_service = stale_service.clone();
+    let stale_body_refresh = std::thread::spawn(move || stale_body_service.refresh_pending_session_index());
+    load_waiter
+      .recv_timeout(std::time::Duration::from_secs(1))
+      .expect("first process should pause during its body load");
+
+    let winner_service = ViewerService::new_with_index(indexing_repository(vec![body_spec]), Arc::clone(&index));
+    assert!(
+      winner_service
+        .refresh_pending_session_index()
+        .expect("winning body completion should commit")
+        .changed
+    );
+    resume_sender.send(()).expect("stale body load should resume");
+    let stale_refresh = stale_body_refresh
+      .join()
+      .expect("stale body thread should not panic")
+      .expect("stale body completion should stay quiet");
+    assert!(
+      stale_refresh.changed,
+      "the stale process must refresh its sidebar from the winner's shared index commit"
+    );
+
+    let stored = index
+      .session(&index_session_key(&locator).expect("index key should encode"))
+      .expect("index query should work")
+      .expect("winner session should remain indexed");
+    assert_eq!(stored.title.as_deref(), Some("winner body title"));
+  }
+
+  #[test]
+  fn external_commit_after_the_initial_sidebar_read_requests_a_reread_on_the_first_catalog_pass() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let source_path = directory.path().join("external-commit.jsonl");
+    std::fs::write(&source_path, "stable source bytes").expect("fixture source should be written");
+    let index_path = directory.path().join("session-index.sqlite");
+    let observing_index = Arc::new(SessionIndex::open(&index_path).expect("observing index should open"));
+    let writing_index = Arc::new(SessionIndex::open(&index_path).expect("writing index should open"));
+    let initial_header = indexed_header(source_path.clone(), "external-commit", None);
+    let mut winning_header = initial_header.clone();
+    winning_header.title = Some("written by the other viewer".to_owned());
+
+    let initial_writer = ViewerService::new_with_index(
+      indexing_repository(vec![IndexedLoadSpec {
+        header: initial_header.clone(),
+        messages: Vec::new(),
+      }]),
+      Arc::clone(&writing_index),
+    );
+    assert!(
+      initial_writer
+        .refresh_session_catalog()
+        .expect("initial catalog should commit before the observing viewer opens")
+        .changed
+    );
+
+    let observing_repository = indexing_repository(vec![IndexedLoadSpec {
+      header: initial_header.clone(),
+      messages: Vec::new(),
+    }]);
+    let observing_service = ViewerService::new_with_index(observing_repository.clone(), observing_index);
+    let initial_sidebar = observing_service
+      .list_sessions(ListSessionsRequest {
+        query: SessionQuery {
+          providers: vec![ViewerProvider::Codex],
+          search: None,
+        },
+        cursor: None,
+        offset: None,
+        limit: None,
+      })
+      .expect("first sidebar request should read the durable initial catalog");
+    assert_eq!(initial_sidebar.sessions.len(), 1);
+    assert_eq!(
+      initial_sidebar.sessions[0].title.as_deref(),
+      Some("Indexed external-commit")
+    );
+
+    let writing_service = ViewerService::new_with_index(
+      indexing_repository(vec![IndexedLoadSpec {
+        header: winning_header.clone(),
+        messages: Vec::new(),
+      }]),
+      writing_index,
+    );
+    assert!(
+      writing_service
+        .refresh_session_catalog()
+        .expect("other viewer should commit its catalog")
+        .changed
+    );
+    observing_repository
+      .listings
+      .lock()
+      .expect("fixture listings lock should not be poisoned")
+      .insert(ViewerProvider::Codex, vec![winning_header]);
+
+    let observed = observing_service
+      .refresh_session_catalog()
+      .expect("matching local catalog should refresh");
+    assert!(
+      observed.changed,
+      "SQLite data_version must wake this process even when its first local scan writes nothing"
+    );
   }
 
   #[test]
@@ -4736,6 +5070,83 @@ mod tests {
   }
 
   #[test]
+  fn session_index_preserves_body_presentation_when_a_session_moves_and_archive_body_fails() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let active_path = directory.path().join("active.jsonl");
+    std::fs::write(&active_path, "active session").expect("fixture source should be written");
+    let mut active_header = indexed_header(active_path.clone(), "moved-presentation", None);
+    active_header.title = None;
+    active_header.preview = None;
+    let active_locator = locator_for_header(ViewerProvider::Codex, &active_header);
+    let repository = indexing_repository(vec![IndexedLoadSpec {
+      header: active_header.clone(),
+      messages: vec![indexed_message(Role::User, MessageDelivery::Unspecified)],
+    }]);
+    let mut loaded_active_header = active_header.clone();
+    loaded_active_header.title = Some("Body-derived title".to_owned());
+    loaded_active_header.preview = Some("Body-derived preview".to_owned());
+    repository
+      .loads
+      .lock()
+      .expect("fixture loads lock should not be poisoned")
+      .insert(
+        active_locator.clone(),
+        Ok(IndexedLoadSpec {
+          header: loaded_active_header,
+          messages: vec![indexed_message(Role::User, MessageDelivery::Unspecified)],
+        }),
+      );
+    let index = Arc::new(SessionIndex::open_in_memory().expect("test index should open"));
+    let service = ViewerService::new_with_index(repository.clone(), Arc::clone(&index));
+    service
+      .refresh_session_index()
+      .expect("active body should establish its presentation fallback");
+    let active = index
+      .session(&index_session_key(&active_locator).expect("index key should encode"))
+      .expect("index query should work")
+      .expect("active row should exist");
+    assert_eq!(active.title.as_deref(), Some("Body-derived title"));
+    assert_eq!(active.catalog_title, None);
+    assert_eq!(active.body_title.as_deref(), Some("Body-derived title"));
+
+    let archived_path = directory.path().join("archived.jsonl");
+    std::fs::rename(&active_path, &archived_path).expect("fixture source should move");
+    let mut archived_header = active_header;
+    archived_header.path = archived_path;
+    let archived_locator = locator_for_header(ViewerProvider::Codex, &archived_header);
+    repository
+      .listings
+      .lock()
+      .expect("fixture listings lock should not be poisoned")
+      .insert(ViewerProvider::Codex, vec![archived_header]);
+    let mut loads = repository
+      .loads
+      .lock()
+      .expect("fixture loads lock should not be poisoned");
+    loads.remove(&active_locator);
+    loads.insert(
+      archived_locator.clone(),
+      Err("fixture archive body is temporarily unavailable".to_owned()),
+    );
+    drop(loads);
+
+    service
+      .refresh_session_index()
+      .expect("catalog should retain moved presentation despite an archive body failure");
+    let archived = index
+      .session(&index_session_key(&archived_locator).expect("index key should encode"))
+      .expect("index query should work")
+      .expect("archived row should remain indexed");
+    assert!(!archived.attention_baselined);
+    assert_eq!(archived.catalog_title, None);
+    assert_eq!(archived.catalog_preview, None);
+    assert_eq!(archived.body_title.as_deref(), Some("Body-derived title"));
+    assert_eq!(archived.body_preview.as_deref(), Some("Body-derived preview"));
+    assert_eq!(archived.title.as_deref(), Some("Body-derived title"));
+    assert_eq!(archived.preview.as_deref(), Some("Body-derived preview"));
+  }
+
+  #[test]
   fn session_index_updates_header_metadata_without_replaying_an_unchanged_body() {
     let directory = tempfile::tempdir().expect("temporary directory should exist");
     let path = directory.path().join("renamed.jsonl");
@@ -4810,13 +5221,15 @@ mod tests {
       limit: None,
     };
 
-    // Before the first body scan completes, list IPC remains on its existing
-    // header-only path instead of waiting for indexing work.
+    // Before the first catalog commits, list IPC reports a cold index instead
+    // of reading provider headers or bodies on the UI request path.
     let initial = service
       .list_sessions(request.clone())
-      .expect("native listing should work");
-    assert!(!initial.sessions[0].has_unread);
-    assert_eq!(repository.header_calls.load(Ordering::SeqCst), 1);
+      .expect("cold index listing should work");
+    assert!(initial.sessions.is_empty());
+    assert_eq!(initial.pending_providers, vec![ViewerProvider::Codex]);
+    assert_eq!(repository.header_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(repository.load_calls.load(Ordering::SeqCst), 0);
 
     let baseline_refresh = service.refresh_session_index().expect("baseline should refresh");
     assert!(baseline_refresh.changed);
@@ -4887,6 +5300,49 @@ mod tests {
       .expect("indexed session should query")
       .expect("indexed session should exist");
     assert_eq!(indexed.attention_marker.as_deref(), Some("visible-message-count.v1.3"));
+  }
+
+  #[test]
+  fn catalog_refresh_publishes_index_rows_before_body_backfill() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("catalog-first.jsonl");
+    std::fs::write(&path, "fixture body").expect("fixture source should be written");
+    let header = indexed_header(path, "catalog-first", None);
+    let repository = indexing_repository(vec![IndexedLoadSpec {
+      header: header.clone(),
+      messages: vec![indexed_message(Role::User, MessageDelivery::Unspecified)],
+    }]);
+    let service = ViewerService::new_with_index(
+      repository.clone(),
+      Arc::new(SessionIndex::open_in_memory().expect("test index should open")),
+    );
+
+    let catalog = service
+      .refresh_session_catalog()
+      .expect("catalog-only refresh should succeed");
+    assert!(catalog.changed);
+    assert!(catalog.has_pending_body_jobs);
+    assert_eq!(repository.load_calls.load(Ordering::SeqCst), 0);
+
+    let listed = service
+      .list_sessions(ListSessionsRequest {
+        query: SessionQuery {
+          providers: vec![ViewerProvider::Codex],
+          search: None,
+        },
+        cursor: None,
+        offset: None,
+        limit: None,
+      })
+      .expect("cataloged rows should be listable before body work");
+    assert!(listed.pending_providers.is_empty());
+    assert_eq!(listed.sessions.len(), 1);
+    assert_eq!(listed.sessions[0].session_id, header.id);
+
+    service
+      .refresh_pending_session_index()
+      .expect("body backfill should succeed");
+    assert_eq!(repository.load_calls.load(Ordering::SeqCst), 1);
   }
 
   #[test]
@@ -5002,6 +5458,60 @@ mod tests {
       .refresh_pending_session_index()
       .expect("body-only retry should refresh");
     assert!(service.index_error_for(ViewerProvider::Codex).is_none());
+  }
+
+  #[test]
+  fn same_cursor_catalog_metadata_change_reenables_a_failed_body_job() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("same-cursor-retry.jsonl");
+    std::fs::write(&path, "unchanged source bytes").expect("fixture source should be written");
+    let header = indexed_header(path.clone(), "same-cursor-retry", None);
+    let locator = locator_for_header(ViewerProvider::Codex, &header);
+    let repository = indexing_repository(vec![IndexedLoadSpec {
+      header: header.clone(),
+      messages: vec![indexed_message(Role::User, MessageDelivery::Unspecified)],
+    }]);
+    repository
+      .loads
+      .lock()
+      .expect("fixture loads lock should not be poisoned")
+      .insert(locator.clone(), Err("fixture body read failed".to_owned()));
+    let index = Arc::new(SessionIndex::open_in_memory().expect("test index should open"));
+    let service = ViewerService::new_with_index(repository.clone(), Arc::clone(&index));
+
+    service
+      .refresh_provider_catalog(ViewerProvider::Codex)
+      .expect("initial catalog should commit");
+    service
+      .refresh_pending_session_index()
+      .expect("failed body should remain retryable");
+    let source_key = index_source_key_for_path(ViewerProvider::Codex, &path).expect("source key should encode");
+    let failed_generation = index
+      .source_state(&source_key)
+      .expect("source query should work")
+      .expect("pending source should exist")
+      .generation;
+
+    let mut renamed_header = header;
+    renamed_header.title = Some("new lightweight title".to_owned());
+    repository
+      .listings
+      .lock()
+      .expect("fixture listings lock should not be poisoned")
+      .insert(ViewerProvider::Codex, vec![renamed_header]);
+    service
+      .refresh_provider_catalog(ViewerProvider::Codex)
+      .expect("same-cursor catalog metadata update should commit");
+
+    let jobs = service
+      .pending_body_jobs(&HashSet::new())
+      .expect("pending jobs should query");
+    assert_eq!(jobs.len(), 1);
+    assert!(jobs[0].source.generation > failed_generation);
+    assert!(
+      !jobs[0].deprioritized,
+      "a failure from an earlier same-cursor generation must not delay the refreshed body job"
+    );
   }
 
   #[test]
@@ -5141,136 +5651,71 @@ mod tests {
       Ok(Vec::new())
     }
 
-    fn hydrate_session_header(
-      &self,
-      _provider: ViewerProvider,
-      header: SessionHeader,
-    ) -> Result<SessionHeader, String> {
-      Ok(header)
-    }
-
     fn load_session(&self, _locator: &SessionLocator) -> Result<LoadedSession, String> {
       self.loads.fetch_add(1, Ordering::SeqCst);
       Ok(visible_session(1))
     }
   }
 
-  struct HydratingRepository {
-    headers: Vec<SessionHeader>,
-    hydrations: Arc<AtomicUsize>,
-  }
-
-  struct FlakyHydratingRepository {
-    header: SessionHeader,
-    attempts: Arc<AtomicUsize>,
-  }
-
-  struct SlowHydratingRepository {
-    header: SessionHeader,
-    attempts: Arc<AtomicUsize>,
-  }
-
-  impl ViewerRepository for SlowHydratingRepository {
-    fn list_session_headers(&self, provider: ViewerProvider) -> Result<Vec<SessionHeader>, String> {
-      Ok(if provider == ViewerProvider::Dsh {
-        vec![self.header.clone()]
-      } else {
-        Vec::new()
-      })
-    }
-
-    fn hydrate_session_header(
-      &self,
-      _provider: ViewerProvider,
-      mut header: SessionHeader,
-    ) -> Result<SessionHeader, String> {
-      self.attempts.fetch_add(1, Ordering::SeqCst);
-      std::thread::sleep(std::time::Duration::from_millis(40));
-      header.preview = Some("Shared prompt".to_string());
-      Ok(header)
-    }
-
-    fn load_session(&self, _locator: &SessionLocator) -> Result<LoadedSession, String> {
-      Err("not used by this fixture".to_string())
-    }
-  }
-
-  impl ViewerRepository for FlakyHydratingRepository {
-    fn list_session_headers(&self, provider: ViewerProvider) -> Result<Vec<SessionHeader>, String> {
-      Ok(if provider == ViewerProvider::Pi {
-        vec![self.header.clone()]
-      } else {
-        Vec::new()
-      })
-    }
-
-    fn hydrate_session_header(
-      &self,
-      _provider: ViewerProvider,
-      mut header: SessionHeader,
-    ) -> Result<SessionHeader, String> {
-      if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-        return Err("transient read failure".to_string());
+  /// Seeds only the durable metadata surface for tests that exercise sidebar
+  /// behavior. It deliberately does not call the repository: that mirrors a
+  /// fully indexed app startup and makes unexpected provider reads observable.
+  fn service_with_indexed_headers(
+    repository: Arc<dyn ViewerRepository>,
+    provider_headers: Vec<(ViewerProvider, Vec<SessionHeader>)>,
+  ) -> ViewerService {
+    let session_index = Arc::new(SessionIndex::open_in_memory().expect("test session index should open"));
+    for (provider, headers) in provider_headers {
+      let mut sessions_by_source = HashMap::<SourceKey, Vec<SessionMetadata>>::new();
+      for header in headers {
+        let source_key =
+          index_source_key_for_path(provider, &header.path).expect("fixture header path should be valid UTF-8");
+        let metadata =
+          session_metadata_from_header(&source_key, header, None, false).expect("fixture header should be indexable");
+        sessions_by_source.entry(source_key).or_default().push(metadata);
       }
-      header.preview = Some("Recovered prompt".to_string());
-      Ok(header)
+      let mut replacements = sessions_by_source
+        .into_iter()
+        .map(|(source_key, sessions)| {
+          SourceReplacement::new(SourceState::new(source_key, "fixture-source", 0), sessions)
+        })
+        .collect::<Vec<_>>();
+      replacements.push(SourceReplacement::new(
+        SourceState::new(index_catalog_source_key(provider), "fixture-catalog", 0),
+        Vec::new(),
+      ));
+      session_index
+        .replace_sources(&replacements)
+        .expect("fixture catalog should seed");
     }
-
-    fn load_session(&self, _locator: &SessionLocator) -> Result<LoadedSession, String> {
-      Err("not used by this fixture".to_string())
-    }
-  }
-
-  impl ViewerRepository for HydratingRepository {
-    fn list_session_headers(&self, provider: ViewerProvider) -> Result<Vec<SessionHeader>, String> {
-      Ok(if provider == ViewerProvider::Codex {
-        self.headers.clone()
-      } else {
-        Vec::new()
-      })
-    }
-
-    fn hydrate_session_header(
-      &self,
-      _provider: ViewerProvider,
-      mut header: SessionHeader,
-    ) -> Result<SessionHeader, String> {
-      self.hydrations.fetch_add(1, Ordering::SeqCst);
-      header.preview = Some(format!("Prompt for {}", header.id));
-      Ok(header)
-    }
-
-    fn load_session(&self, _locator: &SessionLocator) -> Result<LoadedSession, String> {
-      Err("not used by this fixture".to_string())
-    }
+    ViewerService::new_with_index(repository, session_index)
   }
 
   #[test]
   fn listing_filters_roots_searches_paginates_and_isolates_provider_errors() {
-    let listings = HashMap::from([
-      (
-        ViewerProvider::Codex,
-        Ok(vec![
-          session_header("root-new", None, "/projects/Alpha", "2026-06-05T00:00:00Z"),
-          session_header(
-            "child-hidden",
-            Some("root-new"),
-            "/projects/Alpha",
-            "2026-06-06T00:00:00Z",
-          ),
-          session_header("root-old", None, "/projects/Beta", "2026-06-01T00:00:00Z"),
-        ]),
+    let codex_headers = vec![
+      session_header("root-new", None, "/projects/Alpha", "2026-06-05T00:00:00Z"),
+      session_header(
+        "child-hidden",
+        Some("root-new"),
+        "/projects/Alpha",
+        "2026-06-06T00:00:00Z",
       ),
-      (
-        ViewerProvider::Pi,
-        Ok(vec![session_header("pi-root", None, "/projects/Alpha", "1000")]),
-      ),
-      (ViewerProvider::Dsh, Err("fixture provider unavailable".to_string())),
-    ]);
-    let service = ViewerService::new(Arc::new(FakeRepository {
-      listings,
-      loaded: Mutex::new(None),
-    }));
+      session_header("root-old", None, "/projects/Beta", "2026-06-01T00:00:00Z"),
+    ];
+    let pi_headers = vec![session_header("pi-root", None, "/projects/Alpha", "1000")];
+    let service = service_with_indexed_headers(
+      Arc::new(FakeRepository {
+        listings: HashMap::new(),
+        loaded: Mutex::new(None),
+      }),
+      vec![(ViewerProvider::Codex, codex_headers), (ViewerProvider::Pi, pi_headers)],
+    );
+    service
+      .index_errors
+      .lock()
+      .expect("fixture index errors lock should not be poisoned")
+      .insert(ViewerProvider::Dsh, "fixture provider unavailable".to_string());
 
     let first = service
       .list_sessions(ListSessionsRequest {
@@ -5328,22 +5773,23 @@ mod tests {
 
     let mut pi_same_id = session_header("child", Some("root"), "/projects/Pi", "4000");
     pi_same_id.path = PathBuf::from("/fixtures/pi-child.jsonl");
-    let service = ViewerService::new(Arc::new(FakeRepository {
-      listings: HashMap::from([
-        (
-          ViewerProvider::Codex,
-          Ok(vec![
-            session_header("root", None, "/projects/Alpha", "1000"),
-            older_duplicate,
-            newest_child,
-            session_header("grandchild", Some("child"), "/projects/Alpha", "2500"),
-            session_header("sibling", Some("root"), "/projects/Alpha", "1500"),
-          ]),
-        ),
-        (ViewerProvider::Pi, Ok(vec![pi_same_id])),
-      ]),
-      loaded: Mutex::new(None),
-    }));
+    let codex_headers = vec![
+      session_header("root", None, "/projects/Alpha", "1000"),
+      older_duplicate,
+      newest_child,
+      session_header("grandchild", Some("child"), "/projects/Alpha", "2500"),
+      session_header("sibling", Some("root"), "/projects/Alpha", "1500"),
+    ];
+    let service = service_with_indexed_headers(
+      Arc::new(FakeRepository {
+        listings: HashMap::new(),
+        loaded: Mutex::new(None),
+      }),
+      vec![
+        (ViewerProvider::Codex, codex_headers),
+        (ViewerProvider::Pi, vec![pi_same_id]),
+      ],
+    );
 
     let roots = service
       .list_sessions(ListSessionsRequest {
@@ -5408,17 +5854,20 @@ mod tests {
 
   #[test]
   fn relation_index_promotes_orphans_and_breaks_cycles_without_losing_sessions() {
-    let service = ViewerService::new(Arc::new(FakeRepository {
-      listings: HashMap::from([(
+    let service = service_with_indexed_headers(
+      Arc::new(FakeRepository {
+        listings: HashMap::new(),
+        loaded: Mutex::new(None),
+      }),
+      vec![(
         ViewerProvider::Codex,
-        Ok(vec![
+        vec![
           session_header("orphan", Some("missing"), "/projects/Alpha", "4000"),
           session_header("cycle-a", Some("cycle-b"), "/projects/Alpha", "3000"),
           session_header("cycle-b", Some("cycle-a"), "/projects/Alpha", "2000"),
-        ]),
-      )]),
-      loaded: Mutex::new(None),
-    }));
+        ],
+      )],
+    );
 
     let roots = service
       .list_sessions(ListSessionsRequest {
@@ -5464,19 +5913,33 @@ mod tests {
     assert!(descendant_children.sessions.is_empty());
   }
 
-  #[cfg(unix)]
   #[test]
-  fn listing_isolates_a_non_utf8_source_path_to_its_provider_warning() {
-    use std::ffi::OsString;
-    use std::os::unix::ffi::OsStringExt;
-
-    let mut invalid = session_header("invalid", None, "/projects/Alpha", "2000");
-    invalid.path = PathBuf::from(OsString::from_vec(b"/fixtures/invalid-\xff.jsonl".to_vec()));
-    let valid = session_header("valid", None, "/projects/Alpha", "1000");
-    let service = ViewerService::new(Arc::new(FakeRepository {
-      listings: HashMap::from([(ViewerProvider::Codex, Ok(vec![invalid, valid]))]),
-      loaded: Mutex::new(None),
-    }));
+  fn listing_isolates_a_malformed_index_row_to_its_provider_warning() {
+    let session_index = Arc::new(SessionIndex::open_in_memory().unwrap());
+    let source_key = SourceKey::new(ViewerProvider::Codex.as_str(), "fixture-source");
+    let invalid_key = IndexedSessionKey::new(ViewerProvider::Codex.as_str(), source_key.source_key.clone(), "invalid");
+    let valid_key = IndexedSessionKey::new(ViewerProvider::Codex.as_str(), source_key.source_key.clone(), "valid");
+    let invalid = SessionMetadata::new(invalid_key, "");
+    let valid = SessionMetadata::new(valid_key, "/fixtures/valid.jsonl");
+    session_index
+      .replace_sources(&[
+        SourceReplacement::new(SourceState::new(source_key, "fixture-source", 0), vec![invalid, valid]),
+        SourceReplacement::new(
+          SourceState::new(index_catalog_source_key(ViewerProvider::Codex), "fixture-catalog", 0),
+          Vec::new(),
+        ),
+      ])
+      .unwrap();
+    let service = ViewerService::new_with_index(
+      Arc::new(FakeRepository {
+        listings: HashMap::from([(
+          ViewerProvider::Codex,
+          Err("sidebar must not read this fixture".to_string()),
+        )]),
+        loaded: Mutex::new(None),
+      }),
+      session_index,
+    );
 
     let response = service
       .list_sessions(ListSessionsRequest {
@@ -5523,10 +5986,13 @@ mod tests {
     title_header.title = Some("Release checklist".to_string());
     let mut preview_header = session_header("preview", None, "/projects/Alpha", "1000");
     preview_header.preview = Some("Investigate socket ownership".to_string());
-    let service = ViewerService::new(Arc::new(FakeRepository {
-      listings: HashMap::from([(ViewerProvider::Codex, Ok(vec![title_header, preview_header]))]),
-      loaded: Mutex::new(None),
-    }));
+    let service = service_with_indexed_headers(
+      Arc::new(FakeRepository {
+        listings: HashMap::new(),
+        loaded: Mutex::new(None),
+      }),
+      vec![(ViewerProvider::Codex, vec![title_header, preview_header])],
+    );
 
     let response = service
       .list_sessions(ListSessionsRequest {
@@ -5545,22 +6011,144 @@ mod tests {
   }
 
   #[test]
-  fn default_listing_hydrates_only_the_visible_page_and_caches_by_source_revision() {
+  fn cold_sidebar_listing_reports_pending_catalogs_without_provider_reads() {
     let directory = tempfile::tempdir().unwrap();
-    let mut headers = vec![
-      session_header("newest", None, "/projects/Alpha", "3000"),
-      session_header("middle", None, "/projects/Alpha", "2000"),
-      session_header("oldest", None, "/projects/Alpha", "1000"),
-    ];
-    for header in &mut headers {
-      header.path = directory.path().join(format!("{}.jsonl", header.id));
-      std::fs::write(&header.path, "fixture\n").unwrap();
-    }
-    let hydrations = Arc::new(AtomicUsize::new(0));
-    let service = ViewerService::new(Arc::new(HydratingRepository {
-      headers,
-      hydrations: Arc::clone(&hydrations),
-    }));
+    let path = directory.path().join("cold.jsonl");
+    std::fs::write(&path, "fixture\n").unwrap();
+    let repository = indexing_repository(vec![IndexedLoadSpec {
+      header: indexed_header(path, "cold", None),
+      messages: vec![indexed_message(Role::User, MessageDelivery::Unspecified)],
+    }]);
+    let viewer_repository: Arc<dyn ViewerRepository> = repository.clone();
+    let service = ViewerService::new(viewer_repository);
+
+    let response = service
+      .list_sessions(ListSessionsRequest {
+        query: SessionQuery {
+          providers: vec![ViewerProvider::Codex],
+          search: None,
+        },
+        cursor: None,
+        offset: None,
+        limit: None,
+      })
+      .unwrap();
+
+    assert!(response.sessions.is_empty());
+    assert_eq!(response.pending_providers, vec![ViewerProvider::Codex]);
+    assert!(response.source_errors.is_empty());
+    assert_eq!(repository.header_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(repository.load_calls.load(Ordering::SeqCst), 0);
+  }
+
+  #[test]
+  fn indexed_sidebar_queries_use_no_provider_reads_until_explicit_timeline_load() {
+    let mut parent = session_header("parent", None, "/projects/Alpha", "2000");
+    parent.title = Some("Indexed parent".to_string());
+    let mut child = session_header("child", Some("parent"), "/projects/Alpha", "1000");
+    child.preview = Some("Indexed child preview".to_string());
+    let repository = indexing_repository(vec![
+      IndexedLoadSpec {
+        header: parent.clone(),
+        messages: vec![indexed_message(Role::User, MessageDelivery::Unspecified)],
+      },
+      IndexedLoadSpec {
+        header: child.clone(),
+        messages: vec![indexed_message(Role::User, MessageDelivery::Unspecified)],
+      },
+    ]);
+    let viewer_repository: Arc<dyn ViewerRepository> = repository.clone();
+    let service = service_with_indexed_headers(viewer_repository, vec![(ViewerProvider::Codex, vec![parent, child])]);
+
+    let roots = service
+      .list_sessions(ListSessionsRequest {
+        query: SessionQuery {
+          providers: vec![ViewerProvider::Codex],
+          search: None,
+        },
+        cursor: None,
+        offset: None,
+        limit: None,
+      })
+      .unwrap();
+    assert_eq!(roots.sessions.len(), 1);
+    let parent_session_key = roots.sessions[0].session_key.clone();
+
+    let search = service
+      .list_sessions(ListSessionsRequest {
+        query: SessionQuery {
+          providers: vec![ViewerProvider::Codex],
+          search: Some("indexed child preview".to_string()),
+        },
+        cursor: None,
+        offset: None,
+        limit: None,
+      })
+      .unwrap();
+    assert!(
+      search.sessions.is_empty(),
+      "root search intentionally excludes child rows"
+    );
+
+    let children = service
+      .list_session_children(ListSessionChildrenRequest {
+        parent_session_key: parent_session_key.clone(),
+        cursor: None,
+        offset: None,
+        limit: None,
+      })
+      .unwrap();
+    assert_eq!(children.sessions.len(), 1);
+    let parent_locator = decode_session_key(&parent_session_key).unwrap();
+    assert!(
+      service
+        .delegation_targets_for_parent(&parent_locator)
+        .contains_key("child")
+    );
+    assert_eq!(repository.header_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(repository.load_calls.load(Ordering::SeqCst), 0);
+
+    let page = service
+      .load_event_page(EventPageRequest {
+        session_key: parent_session_key,
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+    assert_eq!(page.total_events, 1);
+    assert_eq!(repository.header_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(repository.load_calls.load(Ordering::SeqCst), 1);
+  }
+
+  #[test]
+  fn body_backfill_persists_loaded_presentation_and_catalog_keeps_it_while_pending() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("body-presentation.jsonl");
+    std::fs::write(&path, "first body\n").unwrap();
+    let mut header = indexed_header(path.clone(), "body-presentation", None);
+    header.title = None;
+    header.preview = None;
+    let locator = locator_for_header(ViewerProvider::Codex, &header);
+    let repository = indexing_repository(vec![IndexedLoadSpec {
+      header: header.clone(),
+      messages: vec![indexed_message(Role::User, MessageDelivery::Unspecified)],
+    }]);
+    let mut first_loaded_header = header.clone();
+    first_loaded_header.title = Some("Derived first title".to_string());
+    first_loaded_header.preview = Some("Derived first preview".to_string());
+    repository.loads.lock().unwrap().insert(
+      locator.clone(),
+      Ok(IndexedLoadSpec {
+        header: first_loaded_header,
+        messages: vec![indexed_message(Role::User, MessageDelivery::Unspecified)],
+      }),
+    );
+    let viewer_repository: Arc<dyn ViewerRepository> = repository.clone();
+    let service = ViewerService::new(viewer_repository);
+    service.refresh_session_index().unwrap();
+
     let request = ListSessionsRequest {
       query: SessionQuery {
         providers: vec![ViewerProvider::Codex],
@@ -5568,117 +6156,70 @@ mod tests {
       },
       cursor: None,
       offset: None,
-      limit: Some(1),
+      limit: None,
     };
-
     let first = service.list_sessions(request.clone()).unwrap();
-    let second = service.list_sessions(request).unwrap();
+    assert_eq!(first.sessions[0].title.as_deref(), Some("Derived first title"));
+    assert_eq!(first.sessions[0].preview.as_deref(), Some("Derived first preview"));
 
-    assert_eq!(first.sessions[0].session_id, "newest");
-    assert_eq!(first.sessions[0].preview.as_deref(), Some("Prompt for newest"));
-    assert_eq!(second.sessions[0].preview, first.sessions[0].preview);
-    assert_eq!(hydrations.load(Ordering::SeqCst), 1);
-  }
+    // The first catalog after the final body completion upgrades the staged
+    // source cursor from pending to completed. Once that one-time transition
+    // settles, a blank header still matches its raw catalog values; the
+    // effective fallback must not force a replacement every ten seconds.
+    assert!(service.refresh_provider_catalog(ViewerProvider::Codex).unwrap().changed);
+    let no_op_catalog = service.refresh_provider_catalog(ViewerProvider::Codex).unwrap();
+    assert!(!no_op_catalog.changed);
 
-  #[test]
-  fn cheap_field_search_hydrates_only_the_visible_matching_page() {
-    let headers = vec![
-      session_header("newest", None, "/projects/Alpha", "3000"),
-      session_header("middle", None, "/projects/Alpha", "2000"),
-      session_header("oldest", None, "/projects/Alpha", "1000"),
-    ];
-    let hydrations = Arc::new(AtomicUsize::new(0));
-    let service = ViewerService::new(Arc::new(HydratingRepository {
-      headers,
-      hydrations: Arc::clone(&hydrations),
-    }));
+    std::fs::write(&path, "second body with a changed revision\n").unwrap();
+    let mut refreshed_loaded_header = header.clone();
+    refreshed_loaded_header.title = Some("Derived refreshed title".to_string());
+    refreshed_loaded_header.preview = Some("Derived refreshed preview".to_string());
+    repository.loads.lock().unwrap().insert(
+      locator.clone(),
+      Ok(IndexedLoadSpec {
+        header: refreshed_loaded_header,
+        messages: vec![indexed_message(Role::User, MessageDelivery::Unspecified)],
+      }),
+    );
+    service.refresh_provider_catalog(ViewerProvider::Codex).unwrap();
 
-    let response = service
-      .list_sessions(ListSessionsRequest {
-        query: SessionQuery {
-          providers: vec![ViewerProvider::Codex],
-          search: Some("alpha".to_string()),
-        },
-        cursor: None,
-        offset: None,
-        limit: Some(1),
-      })
-      .unwrap();
+    let pending = service.list_sessions(request.clone()).unwrap();
+    assert_eq!(pending.sessions[0].title.as_deref(), Some("Derived first title"));
+    assert_eq!(pending.sessions[0].preview.as_deref(), Some("Derived first preview"));
 
-    assert_eq!(response.sessions[0].session_id, "newest");
-    assert_eq!(response.sessions[0].preview.as_deref(), Some("Prompt for newest"));
-    assert_eq!(hydrations.load(Ordering::SeqCst), 1);
-    assert!(response.next_cursor.is_some());
-  }
+    service.refresh_pending_session_index().unwrap();
+    let refreshed = service.list_sessions(request.clone()).unwrap();
+    assert_eq!(refreshed.sessions[0].title.as_deref(), Some("Derived refreshed title"));
+    assert_eq!(
+      refreshed.sessions[0].preview.as_deref(),
+      Some("Derived refreshed preview")
+    );
 
-  #[test]
-  fn transient_hydration_failures_are_not_cached() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut header = session_header("flaky", None, "/projects/Alpha", "1000");
-    header.path = directory.path().join("flaky.jsonl");
-    std::fs::write(&header.path, "fixture\n").unwrap();
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let service = ViewerService::new(Arc::new(FlakyHydratingRepository {
-      header,
-      attempts: Arc::clone(&attempts),
-    }));
-    let request = ListSessionsRequest {
-      query: SessionQuery {
-        providers: vec![ViewerProvider::Pi],
-        search: None,
-      },
-      cursor: None,
-      offset: None,
-      limit: Some(1),
-    };
+    // A successful body load with no presentation fields is authoritative for
+    // the current source revision: it deliberately clears the prior backfill.
+    std::fs::write(&path, "third body with cleared presentation\n").unwrap();
+    repository.loads.lock().unwrap().insert(
+      locator,
+      Ok(IndexedLoadSpec {
+        header,
+        messages: vec![indexed_message(Role::User, MessageDelivery::Unspecified)],
+      }),
+    );
+    service.refresh_provider_catalog(ViewerProvider::Codex).unwrap();
+    let still_pending = service.list_sessions(request.clone()).unwrap();
+    assert_eq!(
+      still_pending.sessions[0].title.as_deref(),
+      Some("Derived refreshed title")
+    );
+    assert_eq!(
+      still_pending.sessions[0].preview.as_deref(),
+      Some("Derived refreshed preview")
+    );
 
-    let first = service.list_sessions(request.clone()).unwrap();
-    let second = service.list_sessions(request).unwrap();
-
-    assert_eq!(first.sessions[0].preview, None);
-    assert_eq!(second.sessions[0].preview.as_deref(), Some("Recovered prompt"));
-    assert_eq!(attempts.load(Ordering::SeqCst), 2);
-  }
-
-  #[test]
-  fn overlapping_requests_share_one_in_flight_session_hydration() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut header = session_header("shared", None, "/projects/Alpha", "1000");
-    header.path = directory.path().join("shared.jsonl");
-    std::fs::write(&header.path, "fixture\n").unwrap();
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let service = ViewerService::new(Arc::new(SlowHydratingRepository {
-      header,
-      attempts: Arc::clone(&attempts),
-    }));
-    let request = ListSessionsRequest {
-      query: SessionQuery {
-        providers: vec![ViewerProvider::Dsh],
-        search: None,
-      },
-      cursor: None,
-      offset: None,
-      limit: Some(1),
-    };
-    let start = Arc::new(Barrier::new(3));
-    let handles: Vec<_> = (0..2)
-      .map(|_| {
-        let service = service.clone();
-        let request = request.clone();
-        let start = Arc::clone(&start);
-        std::thread::spawn(move || {
-          start.wait();
-          service.list_sessions(request).unwrap()
-        })
-      })
-      .collect();
-    start.wait();
-
-    for handle in handles {
-      let response = handle.join().unwrap();
-      assert_eq!(response.sessions[0].preview.as_deref(), Some("Shared prompt"));
-    }
-    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    service.refresh_pending_session_index().unwrap();
+    let cleared = service.list_sessions(request).unwrap();
+    assert_eq!(cleared.sessions[0].title, None);
+    assert_eq!(cleared.sessions[0].preview, None);
   }
 
   #[test]
@@ -6538,13 +7079,16 @@ mod tests {
     stale_child.path = PathBuf::from("/fixtures/child-stale.jsonl");
     stale_child.title = Some("Stale child".to_string());
 
-    let service = ViewerService::new(Arc::new(FakeRepository {
-      listings: HashMap::from([(ViewerProvider::Codex, Ok(vec![parent, stale_child, child]))]),
-      loaded: Mutex::new(Some(loaded_session_for(
-        "parent",
-        vec![agent_activity("child", Some("/root/researcher"))],
-      ))),
-    }));
+    let service = service_with_indexed_headers(
+      Arc::new(FakeRepository {
+        listings: HashMap::new(),
+        loaded: Mutex::new(Some(loaded_session_for(
+          "parent",
+          vec![agent_activity("child", Some("/root/researcher"))],
+        ))),
+      }),
+      vec![(ViewerProvider::Codex, vec![parent, stale_child, child])],
+    );
 
     let page = service
       .load_trajectory_event_page(LoadTrajectoryEventPageRequest {
@@ -6683,32 +7227,34 @@ mod tests {
 
   #[test]
   fn listing_orders_providers_by_explicit_update_time_not_creation_time() {
-    let listings = HashMap::from([
-      (
-        ViewerProvider::Codex,
-        Ok(vec![session_header_with_updated(
-          "created-first",
-          "/projects/one",
-          "2026-08-31T10:00:00Z",
-          "100",
-          100,
-        )]),
-      ),
-      (
-        ViewerProvider::Pi,
-        Ok(vec![session_header_with_updated(
-          "updated-first",
-          "/projects/two",
-          "2026-08-30T10:00:00Z",
-          "200",
-          200,
-        )]),
-      ),
-    ]);
-    let service = ViewerService::new(Arc::new(FakeRepository {
-      listings,
-      loaded: Mutex::new(None),
-    }));
+    let service = service_with_indexed_headers(
+      Arc::new(FakeRepository {
+        listings: HashMap::new(),
+        loaded: Mutex::new(None),
+      }),
+      vec![
+        (
+          ViewerProvider::Codex,
+          vec![session_header_with_updated(
+            "created-first",
+            "/projects/one",
+            "2026-08-31T10:00:00Z",
+            "100",
+            100,
+          )],
+        ),
+        (
+          ViewerProvider::Pi,
+          vec![session_header_with_updated(
+            "updated-first",
+            "/projects/two",
+            "2026-08-30T10:00:00Z",
+            "200",
+            200,
+          )],
+        ),
+      ],
+    );
 
     let response = service
       .list_sessions(ListSessionsRequest {

@@ -429,6 +429,27 @@ button:disabled {
   overflow-y: auto;
 }
 
+.sidebar-indexing {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 10px 9px 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.sidebar-refresh-error {
+  display: grid;
+  gap: 5px;
+  margin: 10px 9px 4px;
+  color: var(--warning);
+  font-size: 11px;
+}
+
+.sidebar-refresh-error span {
+  color: var(--text-muted);
+}
+
 .session-group {
   margin-top: 12px;
 }

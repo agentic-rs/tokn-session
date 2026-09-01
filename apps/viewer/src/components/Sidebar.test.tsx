@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { SessionSummary } from "../lib/types";
+import type { SessionSummary, ViewerProvider } from "../lib/types";
 import { Sidebar } from "./Sidebar";
 
 afterEach(cleanup);
@@ -30,11 +30,15 @@ function session(overrides: Partial<SessionSummary> = {}): SessionSummary {
   };
 }
 
-function renderSidebar(sessions: SessionSummary[]) {
+function renderSidebar(
+  sessions: SessionSummary[],
+  pendingProviders: ViewerProvider[] = [],
+  error: string | null = null,
+) {
   return render(
     <Sidebar
       enabled_providers={new Set(["codex"])}
-      error={null}
+      error={error}
       has_more={false}
       is_loading={false}
       is_loading_more={false}
@@ -51,6 +55,7 @@ function renderSidebar(sessions: SessionSummary[]) {
       selected_session_key={null}
       sessions={sessions}
       source_errors={[]}
+      pending_providers={pendingProviders}
     />,
   );
 }
@@ -62,6 +67,23 @@ describe("Sidebar session identity", () => {
     const filter = screen.getByRole("button", { name: "WorkBuddy" });
     expect(filter).toHaveAttribute("data-provider", "workbuddy");
     expect(filter).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("shows an explicit cold-index state instead of treating it as an empty catalog", () => {
+    renderSidebar([], ["codex"]);
+
+    expect(screen.getByText("Building session catalog")).toBeInTheDocument();
+    expect(screen.getByText("Indexing Codex. Known sessions will appear here shortly."))
+      .toBeInTheDocument();
+    expect(screen.queryByText("No sessions found")).not.toBeInTheDocument();
+  });
+
+  it("keeps indexed rows visible when a catalog refresh fails", () => {
+    renderSidebar([session({ title: "Indexed session" })], [], "local index is temporarily unavailable");
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Session catalog could not refresh");
+    expect(screen.getByRole("alert")).toHaveTextContent("local index is temporarily unavailable");
+    expect(screen.getByText("Indexed session")).toBeInTheDocument();
   });
 
   it("renders title fallbacks while keeping the full session id discoverable", () => {
@@ -142,6 +164,7 @@ describe("Sidebar session identity", () => {
         selected_session_key={null}
         sessions={[parent]}
         source_errors={[]}
+        pending_providers={[]}
       />,
     );
 
@@ -197,6 +220,7 @@ describe("Sidebar session identity", () => {
         selected_session_key={null}
         sessions={[parent]}
         source_errors={[]}
+        pending_providers={[]}
       />,
     );
 
@@ -280,6 +304,7 @@ describe("Sidebar unread activity", () => {
         selected_session_key={null}
         sessions={[parent]}
         source_errors={[]}
+        pending_providers={[]}
       />,
     );
 

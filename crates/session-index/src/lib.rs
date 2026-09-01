@@ -19,10 +19,10 @@ use std::{
   fmt,
   path::Path,
   sync::{Mutex, MutexGuard},
-  time::{Duration, SystemTime, UNIX_EPOCH},
+  time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior, params};
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const APPLICATION_ID: i32 = 0x544f_4b4e; // "TOKN"
@@ -123,6 +123,72 @@ FROM sessions AS session
 INNER JOIN sources AS source ON source.id = session.source_id;
 "#;
 
+// Provider header scans and body inspections observe different representations
+// of one session. Keep their presentation values separate so a delayed body
+// completion cannot overwrite a newer catalog title, while a catalog with no
+// title can still use the body-derived fallback. Existing rows predate this
+// distinction, so retain their displayed title/preview as the initial fallback
+// during migration instead of making upgraded sidebars suddenly untitled.
+const MIGRATION_004: &str = r#"
+ALTER TABLE sessions
+  ADD COLUMN body_title TEXT;
+
+ALTER TABLE sessions
+  ADD COLUMN body_preview TEXT;
+
+UPDATE sessions
+SET body_title = title,
+    body_preview = preview
+WHERE body_title IS NULL
+  AND body_preview IS NULL;
+
+DROP VIEW indexed_sessions;
+
+CREATE VIEW indexed_sessions AS
+SELECT
+  source.provider AS provider,
+  source.source_key AS source_key,
+  session.id AS id,
+  session.source_id AS source_id,
+  session.session_id AS session_id,
+  session.source_path AS source_path,
+  COALESCE(session.title, session.body_title) AS title,
+  COALESCE(session.preview, session.body_preview) AS preview,
+  session.title AS catalog_title,
+  session.preview AS catalog_preview,
+  session.body_title AS body_title,
+  session.body_preview AS body_preview,
+  session.cwd AS cwd,
+  session.timestamp AS timestamp,
+  session.updated_at AS updated_at,
+  session.updated_at_ms AS updated_at_ms,
+  session.parent_session_id AS parent_session_id,
+  session.agent_path AS agent_path,
+  session.agent_nickname AS agent_nickname,
+  session.agent_role AS agent_role,
+  session.attention_marker AS attention_marker,
+  session.attention_baselined AS attention_baselined,
+  session.notify_on_baseline AS notify_on_baseline,
+  session.attention_revision AS attention_revision,
+  session.seen_attention_revision AS seen_attention_revision,
+  session.seen_at_ms AS seen_at_ms,
+  session.present AS present,
+  session.first_indexed_at_ms AS first_indexed_at_ms,
+  session.indexed_at_ms AS indexed_at_ms
+FROM sessions AS session
+INNER JOIN sources AS source ON source.id = session.source_id;
+"#;
+
+// A source's provider cursor can legitimately stay the same while a catalog
+// writer discovers newer lightweight metadata. Keep an index-owned mutation
+// generation alongside it so optimistic replacements can distinguish that
+// case from an untouched source.
+const MIGRATION_005: &str = r#"
+ALTER TABLE sources
+  ADD COLUMN generation INTEGER NOT NULL DEFAULT 0
+    CHECK(generation >= 0);
+"#;
+
 struct Migration {
   version: i64,
   sql: &'static str,
@@ -140,6 +206,14 @@ const MIGRATIONS: &[Migration] = &[
   Migration {
     version: 3,
     sql: MIGRATION_003,
+  },
+  Migration {
+    version: 4,
+    sql: MIGRATION_004,
+  },
+  Migration {
+    version: 5,
+    sql: MIGRATION_005,
   },
 ];
 
@@ -169,7 +243,7 @@ pub enum SessionIndexError {
   SourceCursorConflict {
     source: SourceKey,
     expected: SourceCursorPrecondition,
-    actual: Option<String>,
+    actual: Option<SourceCheckpoint>,
   },
 }
 
@@ -275,6 +349,13 @@ pub struct SourceState {
   pub key: SourceKey,
   pub cursor: String,
   pub scanned_at_ms: i64,
+  /// Monotonically increases for every committed replacement or baseline
+  /// completion, even when the provider-owned cursor is unchanged.
+  ///
+  /// A freshly constructed state describes a proposed next value and starts at
+  /// zero. States read from [`SessionIndex`] carry the durable generation that
+  /// optimistic callers must use as their precondition.
+  pub generation: i64,
 }
 
 impl SourceState {
@@ -283,6 +364,27 @@ impl SourceState {
       key,
       cursor: cursor.into(),
       scanned_at_ms,
+      generation: 0,
+    }
+  }
+}
+
+/// Durable identity of a source state observed before a replacement.
+///
+/// The provider-owned cursor alone is not sufficient: lightweight catalog
+/// metadata can change without advancing it. `generation` is maintained by
+/// the index and makes those same-cursor writes conflict safely.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceCheckpoint {
+  pub cursor: String,
+  pub generation: i64,
+}
+
+impl From<&SourceState> for SourceCheckpoint {
+  fn from(source: &SourceState) -> Self {
+    Self {
+      cursor: source.cursor.clone(),
+      generation: source.generation,
     }
   }
 }
@@ -290,26 +392,26 @@ impl SourceState {
 /// A condition that must match the source state immediately before a
 /// replacement commits.
 ///
-/// Use [`SourceCursorPrecondition::Exact`] with `Some(cursor)` after reading a
-/// source's prior [`SourceState`] to prevent a stale scan from overwriting a
-/// newer snapshot committed by another process. `Exact(None)` requires the
-/// source not to have been indexed yet. [`SourceCursorPrecondition::Any`] is
-/// the compatibility default for callers that do not need optimistic
-/// concurrency control.
+/// Use [`SourceCursorPrecondition::Exact`] with the checkpoint from a prior
+/// [`SourceState`] to prevent a stale scan from overwriting a newer snapshot
+/// committed by another process. `Exact(None)` requires the source not to
+/// have been indexed yet. [`SourceCursorPrecondition::Any`] is the
+/// compatibility default for callers that do not need optimistic concurrency
+/// control.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum SourceCursorPrecondition {
   /// Do not compare the current source state before replacing it.
   #[default]
   Any,
-  /// Require the current cursor to exactly match this value. `None` requires
-  /// that the source does not exist in the index.
-  Exact(Option<String>),
+  /// Require the current cursor and index generation to exactly match this
+  /// checkpoint. `None` requires that the source does not exist in the index.
+  Exact(Option<SourceCheckpoint>),
 }
 
 impl SourceCursorPrecondition {
-  /// Requires an already indexed source to have this exact cursor.
-  pub fn existing(cursor: impl Into<String>) -> Self {
-    Self::Exact(Some(cursor.into()))
+  /// Requires an already indexed source to still match this observed state.
+  pub fn existing(source: &SourceState) -> Self {
+    Self::Exact(Some(SourceCheckpoint::from(source)))
   }
 
   /// Requires the source not to have been indexed yet.
@@ -317,23 +419,25 @@ impl SourceCursorPrecondition {
     Self::Exact(None)
   }
 
-  fn is_satisfied_by(&self, actual_cursor: Option<&str>) -> bool {
+  fn is_satisfied_by(&self, actual: Option<&SourceCheckpoint>) -> bool {
     match self {
       Self::Any => true,
-      Self::Exact(expected_cursor) => expected_cursor.as_deref() == actual_cursor,
+      Self::Exact(expected) => expected.as_ref() == actual,
     }
   }
 }
 
 /// Session metadata persisted by the index.
 ///
-/// The title and preview are copied exactly as supplied by the caller. The
-/// store does not sanitize, derive, or inspect either field. `attention_marker`
-/// must be an opaque token (for example, a message ID or fingerprint), never a
-/// message body. `attention_baselined` records whether the caller has inspected
-/// the body enough to establish that marker; a missing marker is meaningful only
-/// when it is true. `notify_on_baseline` lets a caller defer the unread decision
-/// until that first body inspection. `has_new_attention` is the separate,
+/// The title and preview are catalog-owned values copied exactly as supplied by
+/// the caller. The store does not sanitize, derive, or inspect either field.
+/// A body completion can persist a separate fallback; read APIs prefer these
+/// catalog values whenever they exist. `attention_marker` must be an opaque
+/// token (for example, a message ID or fingerprint), never a message body.
+/// `attention_baselined` records whether the caller has inspected the body
+/// enough to establish that marker; a missing marker is meaningful only when it
+/// is true. `notify_on_baseline` lets a caller defer the unread decision until
+/// that first body inspection. `has_new_attention` is the separate,
 /// caller-controlled signal that one or more new visible user messages or final
 /// assistant messages have been observed. Metadata changes, marker rewrites,
 /// and history reductions must leave it false.
@@ -345,6 +449,12 @@ pub struct SessionMetadata {
   pub source_path: String,
   pub title: Option<String>,
   pub preview: Option<String>,
+  /// A completed body-derived presentation carried across a source relocation.
+  /// Ordinary catalog replacements leave these empty, preserving the fallback
+  /// already stored for an existing row. New rows may use them when a provider
+  /// moves a session to a new source before its body can be read again.
+  pub body_title: Option<String>,
+  pub body_preview: Option<String>,
   pub cwd: Option<String>,
   /// Provider-native creation time, retained as supplied.
   pub timestamp: Option<String>,
@@ -374,6 +484,8 @@ impl SessionMetadata {
       source_path: source_path.into(),
       title: None,
       preview: None,
+      body_title: None,
+      body_preview: None,
       cwd: None,
       timestamp: None,
       updated_at: None,
@@ -450,12 +562,25 @@ impl SourceReplacement {
 }
 
 /// Metadata read back from the index, including derived notification state.
+///
+/// `title` and `preview` are effective display values: a non-empty catalog
+/// value wins, otherwise the completed body-derived fallback is returned.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexedSession {
   pub key: SessionKey,
   pub source_path: String,
+  /// Effective display title: catalog value when present, otherwise body fallback.
   pub title: Option<String>,
+  /// Effective display preview: catalog value when present, otherwise body fallback.
   pub preview: Option<String>,
+  /// Raw title supplied by the latest provider catalog pass.
+  pub catalog_title: Option<String>,
+  /// Raw preview supplied by the latest provider catalog pass.
+  pub catalog_preview: Option<String>,
+  /// Raw fallback title captured from a completed session body.
+  pub body_title: Option<String>,
+  /// Raw fallback preview captured from a completed session body.
+  pub body_preview: Option<String>,
   pub cwd: Option<String>,
   pub timestamp: Option<String>,
   pub updated_at: Option<String>,
@@ -497,40 +622,72 @@ pub struct ReplaceSummary {
 /// [`Self::Stale`] is expected when a later catalog replacement changed the
 /// source cursor, removed the session, or another worker already completed the
 /// pending baseline.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionBaselineCompletion {
   Applied {
     /// Whether this completion advanced the unread attention revision.
     attention_changed: bool,
+    /// Durable source state after this completion. Callers that queue sibling
+    /// work or construct a later exact precondition must use this state rather
+    /// than the proposed `next_source` they passed into the completion.
+    source: SourceState,
   },
   Stale,
 }
 
 impl SessionBaselineCompletion {
-  pub const fn was_applied(self) -> bool {
+  pub const fn was_applied(&self) -> bool {
     matches!(self, Self::Applied { .. })
   }
 
-  pub const fn attention_changed(self) -> bool {
+  pub const fn attention_changed(&self) -> bool {
     matches!(
       self,
       Self::Applied {
-        attention_changed: true
+        attention_changed: true,
+        ..
       }
     )
   }
+
+  /// Returns the durable source state produced by an applied completion.
+  pub const fn committed_source(&self) -> Option<&SourceState> {
+    match self {
+      Self::Applied { source, .. } => Some(source),
+      Self::Stale => None,
+    }
+  }
 }
 
-/// Body-derived attention data used to complete one cataloged session baseline.
+/// Bounded presentation metadata derived from a successfully loaded session
+/// body.
 ///
-/// This intentionally excludes catalog-owned presentation and relationship
-/// metadata. A delayed body load must not overwrite a title, source path, or
-/// parent relationship that a same-cursor catalog pass has already refreshed.
+/// This is separate from the catalog record because some providers cannot
+/// expose a useful title or first-message preview without reading the session.
+/// A completion only applies while its staged source cursor still matches, so
+/// this data cannot overwrite a newer catalog revision. `None` fields are
+/// intentional and clear a previously body-derived value.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SessionPresentation {
+  pub title: Option<String>,
+  pub preview: Option<String>,
+}
+
+/// Body-derived data used to complete one cataloged session baseline.
+///
+/// Completion intentionally does not change source-owned identity or
+/// relationship metadata such as the source path, parent, timestamps, or agent
+/// fields. It may atomically backfill the bounded presentation fields when a
+/// provider needs a body read to derive them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionBaselineCompletionRequest {
   pub key: SessionKey,
   /// Opaque body-derived marker, such as the newest eligible message ID.
   pub attention_marker: Option<String>,
+  /// Optional title/preview captured from the same successfully loaded body.
+  /// `None` preserves the catalog values for callers that only establish
+  /// attention state.
+  pub presentation: Option<SessionPresentation>,
   /// Whether the completed baseline should advance the unread revision.
   pub has_new_attention: bool,
 }
@@ -540,6 +697,7 @@ impl SessionBaselineCompletionRequest {
     Self {
       key,
       attention_marker,
+      presentation: None,
       has_new_attention: false,
     }
   }
@@ -572,8 +730,9 @@ impl SessionIndex {
   }
 
   fn from_connection(mut connection: Connection) -> Result<Self> {
-    ensure_ownership(&mut connection)?;
     configure_connection(&mut connection)?;
+    ensure_ownership(&mut connection)?;
+    configure_owned_connection(&mut connection)?;
     migrate(&mut connection)?;
     Ok(Self {
       connection: Mutex::new(connection),
@@ -585,13 +744,14 @@ impl SessionIndex {
     let connection = self.connection()?;
     connection
       .query_row(
-        "SELECT cursor, scanned_at_ms FROM sources WHERE provider = ?1 AND source_key = ?2",
+        "SELECT cursor, scanned_at_ms, generation FROM sources WHERE provider = ?1 AND source_key = ?2",
         params![key.provider, key.source_key],
         |row| {
           Ok(SourceState {
             key: key.clone(),
             cursor: row.get(0)?,
             scanned_at_ms: row.get(1)?,
+            generation: row.get(2)?,
           })
         },
       )
@@ -599,11 +759,24 @@ impl SessionIndex {
       .map_err(Into::into)
   }
 
+  /// Returns SQLite's per-connection data version for this index.
+  ///
+  /// The value changes when another SQLite connection commits to the same
+  /// database. It is intentionally not a durable application cursor; callers
+  /// use it only to notice that a sibling process updated shared index rows and
+  /// should trigger a fresh read.
+  pub fn data_version(&self) -> Result<i64> {
+    let connection = self.connection()?;
+    connection
+      .pragma_query_value(None, "data_version", |row| row.get(0))
+      .map_err(Into::into)
+  }
+
   /// Lists every successfully indexed source for a provider.
   pub fn list_sources(&self, provider: &str) -> Result<Vec<SourceState>> {
     let connection = self.connection()?;
     let mut statement = connection.prepare(
-      "SELECT source_key, cursor, scanned_at_ms
+      "SELECT source_key, cursor, scanned_at_ms, generation
        FROM sources
        WHERE provider = ?1
        ORDER BY source_key ASC",
@@ -616,6 +789,7 @@ impl SessionIndex {
         },
         cursor: row.get(1)?,
         scanned_at_ms: row.get(2)?,
+        generation: row.get(3)?,
       })
     })?;
     collect_rows(rows)
@@ -699,11 +873,13 @@ impl SessionIndex {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let source_id = transaction
       .query_row(
-        "SELECT id FROM sources WHERE provider = ?1 AND source_key = ?2 AND cursor = ?3",
+        "SELECT id FROM sources
+         WHERE provider = ?1 AND source_key = ?2 AND cursor = ?3 AND generation = ?4",
         params![
           expected_source.key.provider,
           expected_source.key.source_key,
           expected_source.cursor,
+          expected_source.generation,
         ],
         |row| row.get::<_, i64>(0),
       )
@@ -726,6 +902,12 @@ impl SessionIndex {
     } else {
       pending.attention_revision
     };
+    let committed_source = SourceState {
+      key: next_source.key.clone(),
+      cursor: next_source.cursor.clone(),
+      scanned_at_ms: next_source.scanned_at_ms,
+      generation: next_source_generation(expected_source.generation)?,
+    };
     complete_session_attention_baseline(
       &transaction,
       pending.id,
@@ -733,9 +915,12 @@ impl SessionIndex {
       attention_revision,
       pending.seen_attention_revision,
     )?;
-    advance_source_state(&transaction, source_id, next_source)?;
+    advance_source_state(&transaction, source_id, &committed_source)?;
     transaction.commit()?;
-    Ok(SessionBaselineCompletion::Applied { attention_changed })
+    Ok(SessionBaselineCompletion::Applied {
+      attention_changed,
+      source: committed_source,
+    })
   }
 
   /// Returns one session, including tombstoned rows when present in the index.
@@ -752,6 +937,19 @@ impl SessionIndex {
   pub fn list_present_sessions(&self) -> Result<Vec<IndexedSession>> {
     let connection = self.connection()?;
     select_sessions(&connection, "WHERE session.present = 1", [])
+  }
+
+  /// Lists currently present sessions for one provider in stable update order.
+  ///
+  /// Consumers that expose one provider at a time can use this instead of
+  /// loading every provider's rows and filtering in memory.
+  pub fn list_present_sessions_for_provider(&self, provider: &str) -> Result<Vec<IndexedSession>> {
+    let connection = self.connection()?;
+    select_sessions(
+      &connection,
+      "WHERE session.present = 1 AND source.provider = ?1",
+      params![provider],
+    )
   }
 
   /// Lists every indexed session, including tombstoned rows.
@@ -807,21 +1005,47 @@ impl SessionIndex {
 
 fn configure_connection(connection: &mut Connection) -> Result<()> {
   connection.busy_timeout(BUSY_TIMEOUT)?;
-  connection.pragma_update(None, "foreign_keys", "ON")?;
-  connection.pragma_update(None, "journal_mode", "WAL")?;
   Ok(())
 }
 
+fn configure_owned_connection(connection: &mut Connection) -> Result<()> {
+  connection.pragma_update(None, "foreign_keys", "ON")?;
+  // Switching a database into WAL mode needs an exclusive SQLite lock. Two
+  // viewer processes can arrive here just after ownership is established, so
+  // retry the transient lock rather than making one startup fail.
+  let deadline = Instant::now() + BUSY_TIMEOUT;
+  loop {
+    match connection.pragma_update(None, "journal_mode", "WAL") {
+      Ok(()) => break,
+      Err(error) if sqlite_lock_is_transient(&error) && Instant::now() < deadline => {
+        std::thread::sleep(Duration::from_millis(10));
+      }
+      Err(error) => return Err(error.into()),
+    }
+  }
+  Ok(())
+}
+
+fn sqlite_lock_is_transient(error: &rusqlite::Error) -> bool {
+  matches!(
+    error,
+    rusqlite::Error::SqliteFailure(code, _)
+      if matches!(code.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+  )
+}
+
 fn ensure_ownership(connection: &mut Connection) -> Result<()> {
-  let application_id: i32 = connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
+  let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+  let application_id: i32 = transaction.pragma_query_value(None, "application_id", |row| row.get(0))?;
   if application_id == APPLICATION_ID {
+    transaction.commit()?;
     return Ok(());
   }
   if application_id != 0 {
     return Err(SessionIndexError::UnexpectedDatabase(application_id));
   }
 
-  let existing_object_count: i64 = connection.query_row(
+  let existing_object_count: i64 = transaction.query_row(
     "SELECT COUNT(*)
      FROM sqlite_schema
      WHERE name NOT LIKE 'sqlite_%'",
@@ -831,12 +1055,18 @@ fn ensure_ownership(connection: &mut Connection) -> Result<()> {
   if existing_object_count != 0 {
     return Err(SessionIndexError::UnexpectedDatabase(application_id));
   }
-  connection.pragma_update(None, "application_id", APPLICATION_ID)?;
+  transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
+  transaction.commit()?;
   Ok(())
 }
 
 fn migrate(connection: &mut Connection) -> Result<()> {
-  connection.execute_batch(
+  // Hold one write transaction from ledger creation through every pending
+  // migration. A second viewer process otherwise can read the same old ledger
+  // just before the first process applies an ALTER TABLE, then fail on a
+  // duplicate column after it acquires its own transaction.
+  let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+  transaction.execute_batch(
     "CREATE TABLE IF NOT EXISTS schema_migrations (
        version INTEGER PRIMARY KEY,
        checksum TEXT NOT NULL,
@@ -845,7 +1075,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
   )?;
 
   let applied = {
-    let mut statement = connection.prepare("SELECT version, checksum FROM schema_migrations ORDER BY version ASC")?;
+    let mut statement = transaction.prepare("SELECT version, checksum FROM schema_migrations ORDER BY version ASC")?;
     let rows = statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
     collect_rows(rows)?
   };
@@ -881,15 +1111,14 @@ fn migrate(connection: &mut Connection) -> Result<()> {
   }
 
   for migration in MIGRATIONS.iter().skip(applied.len()) {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(migration.sql)?;
     transaction.execute(
       "INSERT INTO schema_migrations(version, checksum, applied_at_ms) VALUES(?1, ?2, ?3)",
       params![migration.version, migration_checksum(migration.sql), current_time_ms()],
     )?;
-    transaction.commit()?;
   }
 
+  transaction.commit()?;
   Ok(())
 }
 
@@ -989,15 +1218,17 @@ fn validate_source_cursor_preconditions(
   for replacement in replacements {
     let actual = transaction
       .query_row(
-        "SELECT cursor FROM sources WHERE provider = ?1 AND source_key = ?2",
+        "SELECT cursor, generation FROM sources WHERE provider = ?1 AND source_key = ?2",
         params![replacement.source.key.provider, replacement.source.key.source_key],
-        |row| row.get::<_, String>(0),
+        |row| {
+          Ok(SourceCheckpoint {
+            cursor: row.get(0)?,
+            generation: row.get(1)?,
+          })
+        },
       )
       .optional()?;
-    if !replacement
-      .source_cursor_precondition
-      .is_satisfied_by(actual.as_deref())
-    {
+    if !replacement.source_cursor_precondition.is_satisfied_by(actual.as_ref()) {
       return Err(SessionIndexError::SourceCursorConflict {
         source: replacement.source.key.clone(),
         expected: replacement.source_cursor_precondition.clone(),
@@ -1014,9 +1245,14 @@ fn replace_source_in_transaction(
 ) -> Result<ReplaceSummary> {
   let existing_source = transaction
     .query_row(
-      "SELECT id FROM sources WHERE provider = ?1 AND source_key = ?2",
+      "SELECT id, generation FROM sources WHERE provider = ?1 AND source_key = ?2",
       params![replacement.source.key.provider, replacement.source.key.source_key],
-      |row| Ok(ExistingSource { id: row.get(0)? }),
+      |row| {
+        Ok(ExistingSource {
+          id: row.get(0)?,
+          generation: row.get(1)?,
+        })
+      },
     )
     .optional()?;
 
@@ -1025,21 +1261,26 @@ fn replace_source_in_transaction(
     Some(source) => {
       transaction.execute(
         "UPDATE sources
-         SET cursor = ?3, scanned_at_ms = ?4, updated_at_ms = ?4
+         SET cursor = ?3,
+             scanned_at_ms = ?4,
+             updated_at_ms = ?4,
+             generation = ?5
          WHERE provider = ?1 AND source_key = ?2",
         params![
           replacement.source.key.provider,
           replacement.source.key.source_key,
           replacement.source.cursor,
           replacement.source.scanned_at_ms,
+          next_source_generation(source.generation)?,
         ],
       )?;
       source.id
     }
     None => {
       transaction.execute(
-        "INSERT INTO sources(provider, source_key, cursor, scanned_at_ms, created_at_ms, updated_at_ms)
-         VALUES(?1, ?2, ?3, ?4, ?4, ?4)",
+        "INSERT INTO sources(
+           provider, source_key, cursor, scanned_at_ms, created_at_ms, updated_at_ms, generation
+         ) VALUES(?1, ?2, ?3, ?4, ?4, ?4, 1)",
         params![
           replacement.source.key.provider,
           replacement.source.key.source_key,
@@ -1134,6 +1375,7 @@ fn replace_source_in_transaction(
 #[derive(Debug)]
 struct ExistingSource {
   id: i64,
+  generation: i64,
 }
 
 #[derive(Debug)]
@@ -1207,21 +1449,43 @@ fn complete_session_attention_baseline(
   attention_revision: i64,
   seen_attention_revision: i64,
 ) -> Result<()> {
-  transaction.execute(
-    "UPDATE sessions
-     SET attention_marker = ?2,
-         attention_baselined = 1,
-         notify_on_baseline = 0,
-         attention_revision = ?3,
-         seen_attention_revision = ?4
-     WHERE id = ?1",
-    params![
-      id,
-      request.attention_marker,
-      attention_revision,
-      seen_attention_revision,
-    ],
-  )?;
+  if let Some(presentation) = &request.presentation {
+    transaction.execute(
+      "UPDATE sessions
+       SET attention_marker = ?2,
+           attention_baselined = 1,
+           notify_on_baseline = 0,
+           attention_revision = ?3,
+           seen_attention_revision = ?4,
+           body_title = ?5,
+           body_preview = ?6
+       WHERE id = ?1",
+      params![
+        id,
+        request.attention_marker,
+        attention_revision,
+        seen_attention_revision,
+        presentation.title,
+        presentation.preview,
+      ],
+    )?;
+  } else {
+    transaction.execute(
+      "UPDATE sessions
+       SET attention_marker = ?2,
+           attention_baselined = 1,
+           notify_on_baseline = 0,
+           attention_revision = ?3,
+           seen_attention_revision = ?4
+       WHERE id = ?1",
+      params![
+        id,
+        request.attention_marker,
+        attention_revision,
+        seen_attention_revision,
+      ],
+    )?;
+  }
   Ok(())
 }
 
@@ -1230,11 +1494,23 @@ fn advance_source_state(transaction: &Transaction<'_>, source_id: i64, next_sour
     "UPDATE sources
      SET cursor = ?2,
          scanned_at_ms = ?3,
-         updated_at_ms = ?3
+         updated_at_ms = ?3,
+         generation = ?4
      WHERE id = ?1",
-    params![source_id, next_source.cursor, next_source.scanned_at_ms],
+    params![
+      source_id,
+      next_source.cursor,
+      next_source.scanned_at_ms,
+      next_source.generation,
+    ],
   )?;
   Ok(())
+}
+
+fn next_source_generation(generation: i64) -> Result<i64> {
+  generation
+    .checked_add(1)
+    .ok_or_else(|| SessionIndexError::InvalidReplacement("source generation overflow".to_owned()))
 }
 
 fn next_attention_revision(revision: i64) -> Result<i64> {
@@ -1253,14 +1529,14 @@ fn insert_session(
 ) -> Result<()> {
   transaction.execute(
     "INSERT INTO sessions(
-       source_id, session_id, source_path, title, preview, cwd, timestamp,
+       source_id, session_id, source_path, title, preview, body_title, body_preview, cwd, timestamp,
        updated_at, updated_at_ms, parent_session_id, agent_path, agent_nickname,
        agent_role, attention_marker, attention_baselined, notify_on_baseline,
        attention_revision, seen_attention_revision, seen_at_ms, present,
        first_indexed_at_ms, indexed_at_ms
      ) VALUES(
        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-       ?17, ?18, NULL, 1, ?19, ?19
+       ?17, ?18, ?19, ?20, NULL, 1, ?21, ?21
      )",
     params![
       source_id,
@@ -1268,6 +1544,8 @@ fn insert_session(
       session.source_path,
       session.title,
       session.preview,
+      session.body_title,
+      session.body_preview,
       session.cwd,
       session.timestamp,
       session.updated_at,
@@ -1300,27 +1578,31 @@ fn update_session(
      SET source_path = ?2,
          title = ?3,
          preview = ?4,
-         cwd = ?5,
-         timestamp = ?6,
-         updated_at = ?7,
-         updated_at_ms = ?8,
-         parent_session_id = ?9,
-         agent_path = ?10,
-         agent_nickname = ?11,
-         agent_role = ?12,
-         attention_marker = ?13,
-         attention_baselined = ?14,
-         notify_on_baseline = ?15,
-         attention_revision = ?16,
-         seen_attention_revision = ?17,
+         body_title = COALESCE(?5, body_title),
+         body_preview = COALESCE(?6, body_preview),
+         cwd = ?7,
+         timestamp = ?8,
+         updated_at = ?9,
+         updated_at_ms = ?10,
+         parent_session_id = ?11,
+         agent_path = ?12,
+         agent_nickname = ?13,
+         agent_role = ?14,
+         attention_marker = ?15,
+         attention_baselined = ?16,
+         notify_on_baseline = ?17,
+         attention_revision = ?18,
+         seen_attention_revision = ?19,
          present = 1,
-         indexed_at_ms = ?18
+         indexed_at_ms = ?20
      WHERE id = ?1",
     params![
       id,
       session.source_path,
       session.title,
       session.preview,
+      session.body_title,
+      session.body_preview,
       session.cwd,
       session.timestamp,
       session.updated_at,
@@ -1345,8 +1627,12 @@ const SESSION_COLUMNS: &str = "
   source.source_key,
   session.session_id,
   session.source_path,
+  COALESCE(session.title, session.body_title),
+  COALESCE(session.preview, session.body_preview),
   session.title,
   session.preview,
+  session.body_title,
+  session.body_preview,
   session.cwd,
   session.timestamp,
   session.updated_at,
@@ -1401,7 +1687,7 @@ where
 }
 
 fn indexed_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedSession> {
-  let present: i64 = row.get(20)?;
+  let present: i64 = row.get(24)?;
   Ok(IndexedSession {
     key: SessionKey {
       provider: row.get(0)?,
@@ -1411,20 +1697,24 @@ fn indexed_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Indexed
     source_path: row.get(3)?,
     title: row.get(4)?,
     preview: row.get(5)?,
-    cwd: row.get(6)?,
-    timestamp: row.get(7)?,
-    updated_at: row.get(8)?,
-    updated_at_ms: row.get(9)?,
-    parent_session_id: row.get(10)?,
-    agent_path: row.get(11)?,
-    agent_nickname: row.get(12)?,
-    agent_role: row.get(13)?,
-    attention_marker: row.get(14)?,
-    attention_baselined: row.get(15)?,
-    notify_on_baseline: row.get(16)?,
-    attention_revision: row.get(17)?,
-    seen_attention_revision: row.get(18)?,
-    seen_at_ms: row.get(19)?,
+    catalog_title: row.get(6)?,
+    catalog_preview: row.get(7)?,
+    body_title: row.get(8)?,
+    body_preview: row.get(9)?,
+    cwd: row.get(10)?,
+    timestamp: row.get(11)?,
+    updated_at: row.get(12)?,
+    updated_at_ms: row.get(13)?,
+    parent_session_id: row.get(14)?,
+    agent_path: row.get(15)?,
+    agent_nickname: row.get(16)?,
+    agent_role: row.get(17)?,
+    attention_marker: row.get(18)?,
+    attention_baselined: row.get(19)?,
+    notify_on_baseline: row.get(20)?,
+    attention_revision: row.get(21)?,
+    seen_attention_revision: row.get(22)?,
+    seen_at_ms: row.get(23)?,
     present: present != 0,
   })
 }
@@ -1493,6 +1783,20 @@ mod tests {
     request
   }
 
+  fn completion_request_with_presentation(
+    id: &str,
+    marker: Option<&str>,
+    title: Option<&str>,
+    preview: Option<&str>,
+  ) -> SessionBaselineCompletionRequest {
+    let mut request = completion_request(id, marker, false);
+    request.presentation = Some(SessionPresentation {
+      title: title.map(str::to_owned),
+      preview: preview.map(str::to_owned),
+    });
+    request
+  }
+
   #[test]
   fn creates_and_records_migrations() {
     let directory = tempdir().expect("temporary directory should exist");
@@ -1514,6 +1818,8 @@ mod tests {
         (1, migration_checksum(MIGRATION_001)),
         (2, migration_checksum(MIGRATION_002)),
         (3, migration_checksum(MIGRATION_003)),
+        (4, migration_checksum(MIGRATION_004)),
+        (5, migration_checksum(MIGRATION_005)),
       ]
     );
   }
@@ -1554,10 +1860,11 @@ mod tests {
     connection
       .execute(
         "INSERT INTO sessions(
-           source_id, session_id, source_path, attention_revision,
-           seen_attention_revision, present, first_indexed_at_ms, indexed_at_ms
-         ) VALUES(1, ?1, ?2, 0, 0, 1, 10, 10)",
-        params!["a", "/sessions/a.jsonl"],
+           source_id, session_id, source_path, title, preview,
+           attention_revision, seen_attention_revision, present,
+           first_indexed_at_ms, indexed_at_ms
+         ) VALUES(1, ?1, ?2, ?3, ?4, 0, 0, 1, 10, 10)",
+        params!["a", "/sessions/a.jsonl", "legacy title", "legacy preview"],
       )
       .expect("old session should be inserted");
     drop(connection);
@@ -1569,6 +1876,8 @@ mod tests {
       .expect("migrated session should exist");
     assert!(indexed.attention_baselined);
     assert!(!indexed.notify_on_baseline);
+    assert_eq!(indexed.title.as_deref(), Some("legacy title"));
+    assert_eq!(indexed.preview.as_deref(), Some("legacy preview"));
     drop(index);
 
     let connection = Connection::open(&path).expect("migrated database should reopen");
@@ -1580,6 +1889,78 @@ mod tests {
       )
       .expect("joined session view should expose migrated provider");
     assert_eq!(provider, PROVIDER);
+  }
+
+  #[test]
+  fn concurrent_processes_upgrade_one_v3_index_without_racing_migrations() {
+    let directory = tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("session-index.sqlite3");
+    let connection = Connection::open(&path).expect("database should open");
+    connection
+      .pragma_update(None, "application_id", APPLICATION_ID)
+      .expect("database should become index-owned");
+    connection
+      .execute_batch(
+        "CREATE TABLE schema_migrations (
+           version INTEGER PRIMARY KEY,
+           checksum TEXT NOT NULL,
+           applied_at_ms INTEGER NOT NULL
+         );",
+      )
+      .expect("migration ledger should be created");
+    for migration in [
+      Migration {
+        version: 1,
+        sql: MIGRATION_001,
+      },
+      Migration {
+        version: 2,
+        sql: MIGRATION_002,
+      },
+      Migration {
+        version: 3,
+        sql: MIGRATION_003,
+      },
+    ] {
+      connection
+        .execute_batch(migration.sql)
+        .expect("legacy migration should apply");
+      connection
+        .execute(
+          "INSERT INTO schema_migrations(version, checksum, applied_at_ms) VALUES(?1, ?2, 0)",
+          params![migration.version, migration_checksum(migration.sql)],
+        )
+        .expect("legacy migration should be recorded");
+    }
+    drop(connection);
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let open_index = |barrier: std::sync::Arc<std::sync::Barrier>, path: std::path::PathBuf| {
+      std::thread::spawn(move || {
+        barrier.wait();
+        SessionIndex::open(path).map(|_| ()).map_err(|error| error.to_string())
+      })
+    };
+    let first = open_index(std::sync::Arc::clone(&barrier), path.clone());
+    let second = open_index(barrier, path.clone());
+    first
+      .join()
+      .expect("first migration thread should not panic")
+      .expect("first migration should succeed");
+    second
+      .join()
+      .expect("second migration thread should not panic")
+      .expect("second migration should succeed");
+
+    let connection = Connection::open(&path).expect("migrated database should reopen");
+    let versions = connection
+      .prepare("SELECT version FROM schema_migrations ORDER BY version")
+      .expect("migration query should prepare")
+      .query_map([], |row| row.get::<_, i64>(0))
+      .expect("migration query should run")
+      .collect::<rusqlite::Result<Vec<_>>>()
+      .expect("migration versions should decode");
+    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
   }
 
   #[test]
@@ -1632,6 +2013,30 @@ mod tests {
         ("pi".to_string(), "pi-source".to_string(), "pi-session".to_string()),
       ]
     );
+  }
+
+  #[test]
+  fn lists_present_sessions_for_one_provider() {
+    let index = SessionIndex::open_in_memory().expect("index should open");
+    index
+      .replace_source(SourceReplacement::baseline(
+        source_for("codex", "codex-source", "one", 10),
+        vec![session_for("codex", "codex-source", "codex-session", Some("message"))],
+      ))
+      .expect("Codex source should be indexed");
+    index
+      .replace_source(SourceReplacement::baseline(
+        source_for("pi", "pi-source", "one", 10),
+        vec![session_for("pi", "pi-source", "pi-session", Some("message"))],
+      ))
+      .expect("Pi source should be indexed");
+
+    let codex = index
+      .list_present_sessions_for_provider("codex")
+      .expect("provider session query should work");
+    assert_eq!(codex.len(), 1);
+    assert_eq!(codex[0].key.provider, "codex");
+    assert_eq!(codex[0].key.session_id, "codex-session");
   }
 
   #[test]
@@ -1701,6 +2106,10 @@ mod tests {
         vec![cataloged, pending_session("b", false)],
       ))
       .expect("catalog replacement should succeed");
+    let staged_source = index
+      .source_state(&staged_source.key)
+      .expect("source query should work")
+      .expect("catalog source should exist");
 
     let first = index
       .complete_session_baseline(
@@ -1709,12 +2118,13 @@ mod tests {
         completion_request("a", Some("message-a"), true),
       )
       .expect("first completion should run");
-    assert_eq!(
+    assert!(matches!(
       first,
       SessionBaselineCompletion::Applied {
-        attention_changed: true
+        attention_changed: true,
+        ..
       }
-    );
+    ));
     assert!(first.was_applied());
     assert!(first.attention_changed());
 
@@ -1748,12 +2158,139 @@ mod tests {
     assert!(sibling.present);
     assert!(!sibling.attention_baselined);
     assert!(!sibling.has_unread());
+    let completed_state = index
+      .source_state(&staged_source.key)
+      .expect("source query should work")
+      .expect("completed source should exist");
+    assert_eq!(completed_state.cursor, completed_source.cursor);
+    assert_eq!(completed_state.scanned_at_ms, completed_source.scanned_at_ms);
+    assert_eq!(completed_state.generation, 2);
+    assert_eq!(first.committed_source(), Some(&completed_state));
+  }
+
+  #[test]
+  fn completing_a_pending_baseline_can_backfill_body_presentation() {
+    let index = SessionIndex::open_in_memory().expect("index should open");
+    let staged_source = source("catalog-one", 10);
+    let completed_source = source("body-one", 11);
+    let mut cataloged = pending_session("a", false);
+    cataloged.title = None;
+    cataloged.preview = None;
+    index
+      .replace_source(SourceReplacement::new(staged_source.clone(), vec![cataloged]))
+      .expect("catalog replacement should succeed");
+    let staged_source = index
+      .source_state(&staged_source.key)
+      .expect("source query should work")
+      .expect("catalog source should exist");
+
+    assert!(matches!(
+      index
+        .complete_session_baseline(
+          &staged_source,
+          &completed_source,
+          completion_request_with_presentation("a", Some("message-a"), Some("Body title"), Some("Body preview"),),
+        )
+        .expect("completion should succeed"),
+      SessionBaselineCompletion::Applied {
+        attention_changed: false,
+        ..
+      }
+    ));
+
+    let completed = index
+      .session(&SessionKey::new(PROVIDER, SOURCE_KEY, "a"))
+      .expect("session query should work")
+      .expect("completed session should exist");
+    assert_eq!(completed.title.as_deref(), Some("Body title"));
+    assert_eq!(completed.preview.as_deref(), Some("Body preview"));
+
     assert_eq!(
       index
-        .source_state(&staged_source.key)
-        .expect("source query should work"),
-      Some(completed_source)
+        .complete_session_baseline(
+          &completed_source,
+          &source("body-two", 12),
+          completion_request_with_presentation("a", Some("message-b"), Some("Stale title"), None),
+        )
+        .expect("stale completion should not fail"),
+      SessionBaselineCompletion::Stale
     );
+    let unchanged = index
+      .session(&SessionKey::new(PROVIDER, SOURCE_KEY, "a"))
+      .expect("session query should work")
+      .expect("completed session should exist");
+    assert_eq!(unchanged.title.as_deref(), Some("Body title"));
+    assert_eq!(unchanged.preview.as_deref(), Some("Body preview"));
+  }
+
+  #[test]
+  fn catalog_presentation_wins_over_a_delayed_body_completion_and_can_be_removed() {
+    let index = SessionIndex::open_in_memory().expect("index should open");
+    let staged_source = source("catalog-one", 10);
+    let completed_source = source("body-one", 11);
+    let mut pending = pending_session("a", false);
+    pending.title = None;
+    pending.preview = None;
+    index
+      .replace_source(SourceReplacement::new(staged_source.clone(), vec![pending]))
+      .expect("initial catalog should commit");
+    let initial_staged_source = index
+      .source_state(&staged_source.key)
+      .expect("source query should work")
+      .expect("initial source should exist");
+
+    // A later header scan can update presentation without changing the body
+    // source cursor. The delayed body completion must not overwrite it.
+    let mut newer_catalog = pending_session("a", false);
+    newer_catalog.title = Some("New catalog title".to_owned());
+    newer_catalog.preview = Some("New catalog preview".to_owned());
+    index
+      .replace_source(SourceReplacement::new(staged_source.clone(), vec![newer_catalog]))
+      .expect("same-cursor catalog metadata should commit");
+    assert_eq!(
+      index
+        .complete_session_baseline(
+          &initial_staged_source,
+          &completed_source,
+          completion_request_with_presentation("a", Some("message-a"), Some("Stale body title"), None),
+        )
+        .expect("delayed body completion should stay safe"),
+      SessionBaselineCompletion::Stale,
+      "a same-cursor catalog mutation must invalidate a body job planned before it"
+    );
+    let staged_source = index
+      .source_state(&staged_source.key)
+      .expect("source query should work")
+      .expect("newer catalog source should exist");
+    index
+      .complete_session_baseline(
+        &staged_source,
+        &completed_source,
+        completion_request_with_presentation("a", Some("message-a"), Some("Body title"), Some("Body preview")),
+      )
+      .expect("delayed body completion should apply");
+
+    let catalog_wins = index
+      .session(&SessionKey::new(PROVIDER, SOURCE_KEY, "a"))
+      .expect("session query should work")
+      .expect("completed session should exist");
+    assert_eq!(catalog_wins.title.as_deref(), Some("New catalog title"));
+    assert_eq!(catalog_wins.preview.as_deref(), Some("New catalog preview"));
+
+    // Removing the catalog values exposes the completed body fallback without
+    // requiring a second provider body read.
+    let mut removed_catalog = session("a", Some("message-a"));
+    removed_catalog.title = None;
+    removed_catalog.preview = None;
+    index
+      .replace_source(SourceReplacement::new(completed_source, vec![removed_catalog]))
+      .expect("same-cursor catalog removal should commit");
+    let body_fallback = index
+      .session(&SessionKey::new(PROVIDER, SOURCE_KEY, "a"))
+      .expect("session query should work")
+      .expect("completed session should exist");
+    assert_eq!(body_fallback.title.as_deref(), Some("Body title"));
+    assert_eq!(body_fallback.preview.as_deref(), Some("Body preview"));
   }
 
   #[test]
@@ -1825,12 +2362,16 @@ mod tests {
         vec![pending_session("a", true)],
       ))
       .expect("catalog replacement should succeed");
+    let staged_source = first
+      .source_state(&staged_source.key)
+      .expect("source query should work")
+      .expect("catalog source should exist");
 
     let prepared_catalog_replacement =
       SourceReplacement::new(source("catalog-two", 20), vec![pending_session("a", true)])
-        .with_source_cursor_precondition(SourceCursorPrecondition::existing(staged_source.cursor.clone()));
+        .with_source_cursor_precondition(SourceCursorPrecondition::existing(&staged_source));
 
-    assert_eq!(
+    assert!(matches!(
       first
         .complete_session_baseline(
           &staged_source,
@@ -1839,9 +2380,10 @@ mod tests {
         )
         .expect("completion should succeed"),
       SessionBaselineCompletion::Applied {
-        attention_changed: true
+        attention_changed: true,
+        ..
       }
-    );
+    ));
 
     let error = second
       .replace_source(prepared_catalog_replacement)
@@ -1852,7 +2394,11 @@ mod tests {
         source: conflict_source,
         expected: SourceCursorPrecondition::Exact(Some(expected)),
         actual: Some(actual),
-      } if conflict_source == staged_source.key && expected == "catalog-one" && actual == "body-one"
+      } if conflict_source == staged_source.key
+        && expected.cursor == "catalog-one"
+        && expected.generation == 1
+        && actual.cursor == "body-one"
+        && actual.generation == 2
     ));
   }
 
@@ -2073,12 +2619,13 @@ mod tests {
     }
 
     let index = SessionIndex::open(&path).expect("index should reopen");
-    assert_eq!(
-      index
-        .source_state(&SourceKey::new(PROVIDER, SOURCE_KEY))
-        .expect("source query should work"),
-      Some(source("two", 20))
-    );
+    let source = index
+      .source_state(&SourceKey::new(PROVIDER, SOURCE_KEY))
+      .expect("source query should work")
+      .expect("source should persist");
+    assert_eq!(source.cursor, "two");
+    assert_eq!(source.scanned_at_ms, 20);
+    assert_eq!(source.generation, 2);
     let indexed = index
       .session(&SessionKey::new(PROVIDER, SOURCE_KEY, "a"))
       .expect("session query should work")
@@ -2103,7 +2650,7 @@ mod tests {
     first_writer
       .replace_source(
         baseline_replacement("one", 10, vec![session("a", Some("message-a"))]).with_source_cursor_precondition(
-          SourceCursorPrecondition::Exact(initial_snapshot.map(|state| state.cursor)),
+          SourceCursorPrecondition::Exact(initial_snapshot.as_ref().map(SourceCheckpoint::from)),
         ),
       )
       .expect("an absent-source precondition should match an absent source");
@@ -2117,12 +2664,12 @@ mod tests {
     second_writer
       .replace_source(
         replacement("two", 20, vec![newer_session])
-          .with_source_cursor_precondition(SourceCursorPrecondition::existing(stale_snapshot.cursor.clone())),
+          .with_source_cursor_precondition(SourceCursorPrecondition::existing(&stale_snapshot)),
       )
       .expect("the current cursor should satisfy the second writer");
 
     let stale_replacement = replacement("three", 30, vec![session("a", Some("message-c"))])
-      .with_source_cursor_precondition(SourceCursorPrecondition::existing(stale_snapshot.cursor));
+      .with_source_cursor_precondition(SourceCursorPrecondition::existing(&stale_snapshot));
     let error = first_writer
       .replace_source(stale_replacement)
       .expect_err("a stale source cursor must reject the replacement");
@@ -2132,20 +2679,101 @@ mod tests {
         source,
         expected: SourceCursorPrecondition::Exact(Some(expected)),
         actual: Some(actual),
-      } if source == source_key && expected == "one" && actual == "two"
+      } if source == source_key
+        && expected.cursor == "one"
+        && expected.generation == 1
+        && actual.cursor == "two"
+        && actual.generation == 2
     ));
 
-    assert_eq!(
-      first_writer
-        .source_state(&source_key)
-        .expect("source query should work"),
-      Some(source("two", 20))
-    );
+    let current_source = first_writer
+      .source_state(&source_key)
+      .expect("source query should work")
+      .expect("newer source should remain indexed");
+    assert_eq!(current_source.cursor, "two");
+    assert_eq!(current_source.scanned_at_ms, 20);
+    assert_eq!(current_source.generation, 2);
     let current = first_writer
       .session(&SessionKey::new(PROVIDER, SOURCE_KEY, "a"))
       .expect("session query should work")
       .expect("newer row should remain indexed");
     assert_eq!(current.title.as_deref(), Some("newer writer title"));
+  }
+
+  #[test]
+  fn source_generation_rejects_a_same_cursor_stale_metadata_writer() {
+    let directory = tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("session-index.sqlite3");
+    let first_writer = SessionIndex::open(&path).expect("first index should open");
+    let second_writer = SessionIndex::open(&path).expect("second index should open");
+    let source_key = SourceKey::new(PROVIDER, SOURCE_KEY);
+
+    first_writer
+      .replace_source(baseline_replacement(
+        "unchanged-provider-cursor",
+        10,
+        vec![session("a", Some("message-a"))],
+      ))
+      .expect("initial catalog should commit");
+    let stale_snapshot = first_writer
+      .source_state(&source_key)
+      .expect("source query should work")
+      .expect("source should be indexed");
+
+    let mut winning_session = session("a", Some("message-a"));
+    winning_session.title = Some("newer catalog title".to_owned());
+    winning_session.parent_session_id = Some("newer-parent".to_owned());
+    second_writer
+      .replace_source(
+        replacement("unchanged-provider-cursor", 20, vec![winning_session])
+          .with_source_cursor_precondition(SourceCursorPrecondition::existing(&stale_snapshot)),
+      )
+      .expect("same-cursor metadata update should commit");
+
+    let mut stale_session = session("a", Some("message-a"));
+    stale_session.title = Some("stale catalog title".to_owned());
+    stale_session.parent_session_id = Some("stale-parent".to_owned());
+    let error = first_writer
+      .replace_source(
+        replacement("unchanged-provider-cursor", 30, vec![stale_session])
+          .with_source_cursor_precondition(SourceCursorPrecondition::existing(&stale_snapshot)),
+      )
+      .expect_err("same provider cursor must not permit a stale metadata overwrite");
+    assert!(matches!(
+      error,
+      SessionIndexError::SourceCursorConflict {
+        source,
+        expected: SourceCursorPrecondition::Exact(Some(expected)),
+        actual: Some(actual),
+      } if source == source_key
+        && expected.cursor == "unchanged-provider-cursor"
+        && expected.generation == 1
+        && actual.cursor == "unchanged-provider-cursor"
+        && actual.generation == 2
+    ));
+
+    let current = first_writer
+      .session(&SessionKey::new(PROVIDER, SOURCE_KEY, "a"))
+      .expect("session query should work")
+      .expect("winning session should remain indexed");
+    assert_eq!(current.title.as_deref(), Some("newer catalog title"));
+    assert_eq!(current.parent_session_id.as_deref(), Some("newer-parent"));
+  }
+
+  #[test]
+  fn data_version_observes_a_commit_from_another_connection() {
+    let directory = tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("session-index.sqlite3");
+    let observer = SessionIndex::open(&path).expect("observer index should open");
+    let writer = SessionIndex::open(&path).expect("writer index should open");
+    let before = observer.data_version().expect("data version should query");
+
+    writer
+      .replace_source(baseline_replacement("one", 10, vec![session("a", Some("message-a"))]))
+      .expect("writer replacement should commit");
+
+    let after = observer.data_version().expect("data version should query");
+    assert_ne!(after, before);
   }
 
   #[test]
@@ -2171,6 +2799,14 @@ mod tests {
         ),
       ])
       .expect("initial batch should succeed");
+    let first_snapshot = index
+      .source_state(&first_key)
+      .expect("first source query should work")
+      .expect("first source should be indexed");
+    let second_snapshot = index
+      .source_state(&second_key)
+      .expect("second source query should work")
+      .expect("second source should be indexed");
 
     let mut current_second_session = session_for(PROVIDER, second_source_key, "other", Some("message-current"));
     current_second_session.title = Some("current second title".to_owned());
@@ -2180,7 +2816,7 @@ mod tests {
           source_for(PROVIDER, second_source_key, "two", 20),
           vec![current_second_session],
         )
-        .with_source_cursor_precondition(SourceCursorPrecondition::existing("one")),
+        .with_source_cursor_precondition(SourceCursorPrecondition::existing(&second_snapshot)),
       )
       .expect("second source should advance before the stale batch");
 
@@ -2192,12 +2828,12 @@ mod tests {
         source_for(PROVIDER, first_source_key, "two", 30),
         vec![first_pending_session],
       )
-      .with_source_cursor_precondition(SourceCursorPrecondition::existing("one")),
+      .with_source_cursor_precondition(SourceCursorPrecondition::existing(&first_snapshot)),
       SourceReplacement::new(
         source_for(PROVIDER, second_source_key, "three", 30),
         vec![session_for(PROVIDER, second_source_key, "other", Some("message-stale"))],
       )
-      .with_source_cursor_precondition(SourceCursorPrecondition::existing("one")),
+      .with_source_cursor_precondition(SourceCursorPrecondition::existing(&second_snapshot)),
     ];
 
     let error = index
@@ -2209,13 +2845,20 @@ mod tests {
         source,
         expected: SourceCursorPrecondition::Exact(Some(expected)),
         actual: Some(actual),
-      } if source == second_key && expected == "one" && actual == "two"
+      } if source == second_key
+        && expected.cursor == "one"
+        && expected.generation == 1
+        && actual.cursor == "two"
+        && actual.generation == 2
     ));
 
-    assert_eq!(
-      index.source_state(&first_key).expect("first source query should work"),
-      Some(source_for(PROVIDER, first_source_key, "one", 10))
-    );
+    let retained_source = index
+      .source_state(&first_key)
+      .expect("first source query should work")
+      .expect("first source should remain indexed");
+    assert_eq!(retained_source.cursor, "one");
+    assert_eq!(retained_source.scanned_at_ms, 10);
+    assert_eq!(retained_source.generation, 1);
     let retained = index
       .session(&SessionKey::new(PROVIDER, first_source_key, "keep"))
       .expect("first session query should work")
@@ -2229,12 +2872,13 @@ mod tests {
         .expect("omitted session should remain indexed")
         .present
     );
-    assert_eq!(
-      index
-        .source_state(&second_key)
-        .expect("second source query should work"),
-      Some(source_for(PROVIDER, second_source_key, "two", 20))
-    );
+    let current_second_source = index
+      .source_state(&second_key)
+      .expect("second source query should work")
+      .expect("second source should remain indexed");
+    assert_eq!(current_second_source.cursor, "two");
+    assert_eq!(current_second_source.scanned_at_ms, 20);
+    assert_eq!(current_second_source.generation, 2);
   }
 
   #[test]

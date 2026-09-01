@@ -148,12 +148,12 @@ export function mergeEvents(
 
 export function preserveSessionSelection(
   currentKey: string | null,
-  sessions: SessionSummary[],
 ): string | null {
-  if (currentKey && sessions.some((session) => session.session_key === currentKey)) {
-    return currentKey;
-  }
-  return sessions[0]?.session_key ?? null;
+  // A catalog refresh must never choose a session on the user's behalf: that
+  // would immediately turn a metadata-only sidebar load into a provider
+  // timeline read. It must also leave an explicit root or subagent selection
+  // alone: root pages do not include every lazily loaded descendant.
+  return currentKey;
 }
 
 /** Finds a selected root or any child page that has already been loaded. */

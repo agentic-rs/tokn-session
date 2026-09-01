@@ -78,6 +78,10 @@ pub struct ListSessionsRequest {
 pub struct ListSessionsResponse {
   pub sessions: Vec<SessionSummary>,
   pub next_cursor: Option<String>,
+  /// Providers whose durable header catalog has not yet committed. Their
+  /// rows are deliberately absent from this response rather than triggering
+  /// a synchronous provider scan on the UI request path.
+  pub pending_providers: Vec<ViewerProvider>,
   pub source_errors: Vec<SourceError>,
 }
 

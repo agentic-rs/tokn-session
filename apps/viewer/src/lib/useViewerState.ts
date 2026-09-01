@@ -121,6 +121,7 @@ export function useViewerState() {
     () => new Set(PROVIDERS),
   );
   const providerKey = PROVIDERS.filter((provider) => enabledProviders.has(provider)).join(",");
+  const sessionQueryKey = `${providerKey}\u0000${debouncedSearch}`;
 
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [sessionChildren, setSessionChildren] = useState<Map<string, SessionChildrenState>>(
@@ -135,9 +136,12 @@ export function useViewerState() {
   const [sessionsLoadingMore, setSessionsLoadingMore] = useState(false);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
   const [sourceErrors, setSourceErrors] = useState<SourceError[]>([]);
+  const [pendingProviders, setPendingProviders] = useState<ViewerProvider[]>([]);
   const [sessionsCursor, setSessionsCursor] = useState<string | null>(null);
   const [sessionsAttempt, setSessionsAttempt] = useState(0);
   const sessionsRequest = useRef(0);
+  const previousSessionQueryKey = useRef<string | null>(null);
+  const [sessionIndexListenerReady, setSessionIndexListenerReady] = useState(false);
 
   const [events, setEvents] = useState<EventSummary[]>([]);
   const [eventsOwnerKey, setEventsOwnerKey] = useState<string | null>(null);
@@ -225,10 +229,18 @@ export function useViewerState() {
           return;
         }
         unlisten = stop;
+        // Do not begin the first catalog read until its change subscription is
+        // live. Otherwise an index commit between the read and registration
+        // can leave an initially empty sidebar stale until the next refresh.
+        setSessionIndexListenerReady(true);
       })
       // Browser-based tests and the static Vite preview do not expose Tauri's
       // event bridge. Listings continue to work without background refreshes.
-      .catch(() => {});
+      .catch(() => {
+        if (!disposed) {
+          setSessionIndexListenerReady(true);
+        }
+      });
 
     return () => {
       disposed = true;
@@ -653,15 +665,21 @@ export function useViewerState() {
   }, [applySessionSelection, requestSessionChildPage, updateSessionChildren]);
 
   useEffect(() => {
+    if (!sessionIndexListenerReady) {
+      return;
+    }
     const requestId = ++sessionsRequest.current;
+    const queryChanged = previousSessionQueryKey.current !== sessionQueryKey;
+    previousSessionQueryKey.current = sessionQueryKey;
     setSessionsLoadingMore(false);
-    clearSessionChildren();
     if (enabledProviders.size === 0) {
+      clearSessionChildren();
       setSessions([]);
       setSessionsCursor(null);
       setSessionsLoading(false);
       setSessionsError(null);
       setSourceErrors([]);
+      setPendingProviders([]);
       applySessionSelection(null);
       return;
     }
@@ -682,17 +700,33 @@ export function useViewerState() {
         setSessions(response.sessions);
         setSessionsCursor(response.next_cursor);
         setSourceErrors(response.source_errors);
-        applySessionSelection(
-          preserveSessionSelection(selectedSessionKeyRef.current, response.sessions),
-        );
+        setPendingProviders(response.pending_providers);
+        if (queryChanged) {
+          // Root responses deliberately omit lazy child rows. Replace the
+          // tree only once the changed query is accepted, retaining an
+          // explicit root selection only when it still belongs to the new
+          // first page. Background index refreshes keep the cached tree and
+          // can therefore leave a selected child visible.
+          clearSessionChildren();
+          const currentSelection = selectedSessionKeyRef.current;
+          const selectedRootIsVisible = currentSelection !== null
+            && response.sessions.some((session) => session.session_key === currentSelection);
+          applySessionSelection(selectedRootIsVisible ? currentSelection : null);
+        } else {
+          applySessionSelection(preserveSessionSelection(selectedSessionKeyRef.current));
+        }
       })
       .catch((error: unknown) => {
         if (sessionsRequest.current === requestId) {
-          setSessions([]);
-          setSessionsCursor(null);
-          setSourceErrors([]);
+          if (queryChanged) {
+            clearSessionChildren();
+            setSessions([]);
+            setSessionsCursor(null);
+            setSourceErrors([]);
+            setPendingProviders([]);
+            applySessionSelection(null);
+          }
           setSessionsError(errorMessage(error));
-          applySessionSelection(null);
         }
       })
       .finally(() => {
@@ -700,7 +734,16 @@ export function useViewerState() {
           setSessionsLoading(false);
         }
       });
-  }, [applySessionSelection, clearSessionChildren, debouncedSearch, enabledProviders, providerKey, sessionsAttempt]);
+  }, [
+    applySessionSelection,
+    clearSessionChildren,
+    debouncedSearch,
+    enabledProviders,
+    providerKey,
+    sessionQueryKey,
+    sessionIndexListenerReady,
+    sessionsAttempt,
+  ]);
 
   useEffect(() => {
     const requestId = ++eventsRequest.current;
@@ -1187,6 +1230,7 @@ export function useViewerState() {
         setSessions((current) => mergeSessions(current, response.sessions));
         setSessionsCursor(response.next_cursor);
         setSourceErrors(response.source_errors);
+        setPendingProviders(response.pending_providers);
       })
       .catch((error: unknown) => {
         if (sessionsRequest.current === requestGeneration) {
@@ -1296,6 +1340,7 @@ export function useViewerState() {
     sessionsLoadingMore,
     sessionsError,
     sourceErrors,
+    pendingProviders,
     sessionsCursor,
     retrySessions: () => setSessionsAttempt((attempt) => attempt + 1),
     loadMoreSessions,

@@ -5,7 +5,6 @@ use crate::model::{SessionLocator, ViewerProvider};
 
 pub(crate) trait ViewerRepository: Send + Sync {
   fn list_session_headers(&self, provider: ViewerProvider) -> Result<Vec<SessionHeader>, String>;
-  fn hydrate_session_header(&self, provider: ViewerProvider, header: SessionHeader) -> Result<SessionHeader, String>;
   fn load_session(&self, locator: &SessionLocator) -> Result<LoadedSession, String>;
 }
 
@@ -14,10 +13,6 @@ pub(crate) struct NativeRepository;
 impl ViewerRepository for NativeRepository {
   fn list_session_headers(&self, provider: ViewerProvider) -> Result<Vec<SessionHeader>, String> {
     AgentClient::list_session_headers(provider.source(), None)
-  }
-
-  fn hydrate_session_header(&self, provider: ViewerProvider, header: SessionHeader) -> Result<SessionHeader, String> {
-    AgentClient::hydrate_session_header(provider.source(), header)
   }
 
   fn load_session(&self, locator: &SessionLocator) -> Result<LoadedSession, String> {
