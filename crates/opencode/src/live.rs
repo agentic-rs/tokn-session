@@ -51,6 +51,7 @@ impl OpenCodeLiveNormalizer {
         let session_id = session_id.unwrap_or_default();
         let message_id = part.identity.message_id.unwrap_or_else(|| "live".to_string());
         vec![wrap_agent_event(tool_event(
+          Provider::OpenCode,
           session_id,
           message_id,
           None,

@@ -262,6 +262,8 @@ export function providerLabel(provider: ViewerProvider): string {
       return "Pi";
     case "opencode":
       return "OpenCode";
+    case "zcode":
+      return "ZCode";
     case "dsh":
       return "DSH";
   }

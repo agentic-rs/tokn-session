@@ -789,7 +789,7 @@ fn apply_cached_session_header(
 
 fn source_revision(locator: &SessionLocator) -> Option<SourceRevision> {
   let mut paths = vec![locator.source_path.clone()];
-  if locator.provider == ViewerProvider::OpenCode {
+  if matches!(locator.provider, ViewerProvider::OpenCode | ViewerProvider::ZCode) {
     // The SHM sidecar is a reader-writable WAL index. It can change during our
     // own reads without any session content changing, so only track the WAL.
     let mut wal = locator.source_path.as_os_str().to_os_string();
@@ -2040,6 +2040,7 @@ fn viewer_provider(provider: Provider) -> ViewerProvider {
     Provider::Codex => ViewerProvider::Codex,
     Provider::Pi => ViewerProvider::Pi,
     Provider::OpenCode => ViewerProvider::OpenCode,
+    Provider::ZCode => ViewerProvider::ZCode,
     Provider::Dsh => ViewerProvider::Dsh,
   }
 }

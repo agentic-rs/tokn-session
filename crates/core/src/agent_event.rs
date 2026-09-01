@@ -310,6 +310,8 @@ pub enum Provider {
   Codex,
   #[serde(rename = "opencode")]
   OpenCode,
+  #[serde(rename = "zcode")]
+  ZCode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -443,11 +445,28 @@ pub fn tool_kind_for_name(name: &str) -> ToolKind {
     "ls" | "list_dir" | "list_directory" | "read" | "read_file" | "view" => ToolKind::FileRead,
     "write" | "write_file" | "create_file" => ToolKind::FileWrite,
     "edit" | "apply_patch" | "patch" | "str_replace" => ToolKind::FileEdit,
-    "code_search" | "file_search" | "find" | "glob" | "grep" | "rg" | "search" | "tool_search" | "web_search" => {
-      ToolKind::Search
-    }
-    "fetch" | "fetch_content" | "get_search_content" | "open" | "web_fetch" => ToolKind::Web,
-    "followup_task" | "send_message" | "spawn_agent" | "subagent" | "task" | "todo" | "update_plan" | "wait"
+    "code_search" | "file_search" | "find" | "glob" | "grep" | "rg" | "search" | "tool_search" | "web_search"
+    | "websearch" => ToolKind::Search,
+    "fetch" | "fetch_content" | "get_search_content" | "open" | "web_fetch" | "webfetch" => ToolKind::Web,
+    "agent"
+    | "askuserquestion"
+    | "enterplanmode"
+    | "exitplanmode"
+    | "followup_task"
+    | "respondtocoordinator"
+    | "send_message"
+    | "sendmessage"
+    | "skill"
+    | "spawn_agent"
+    | "subagent"
+    | "task"
+    | "taskoutput"
+    | "taskstop"
+    | "todo"
+    | "todoread"
+    | "todowrite"
+    | "update_plan"
+    | "wait"
     | "wait_agent" => ToolKind::Task,
     _ => ToolKind::Unknown,
   }
@@ -706,6 +725,19 @@ mod tests {
     }
 
     assert!(matches!(tool_kind_for_name("ask_user_question"), ToolKind::Unknown));
+  }
+
+  #[test]
+  fn classifies_zcode_tool_spellings() {
+    for name in ["WebSearch"] {
+      assert!(matches!(tool_kind_for_name(name), ToolKind::Search));
+    }
+    for name in ["WebFetch"] {
+      assert!(matches!(tool_kind_for_name(name), ToolKind::Web));
+    }
+    for name in ["Agent", "AskUserQuestion", "TodoRead", "TodoWrite"] {
+      assert!(matches!(tool_kind_for_name(name), ToolKind::Task));
+    }
   }
 
   #[test]

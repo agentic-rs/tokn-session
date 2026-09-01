@@ -4,7 +4,8 @@ Read `AGENTS.md` first for the project goal, stable architecture, and working ru
 
 ## Current Status
 
-`tokn-session` can list and show existing sessions from Pi, Codex, OpenCode, and DSH.
+`tokn-session` can list and show existing sessions from Pi, Codex, OpenCode,
+ZCode, and DSH.
 
 Implemented CLI:
 
@@ -13,6 +14,7 @@ tokn-session list --source codex --limit 5
 tokn-session show --source opencode <session-id> --format pretty
 tokn-session show --source codex <session-id> --scope tree
 tokn-session show --source pi <session-id> --format jsonl
+tokn-session list --source zcode --limit 5
 tokn-session browse --source codex <session-id>
 tokn-session create --source opencode --executor "tokn-gateway proxy opencode --npx --" "create a todo app"
 tokn-session append --source opencode --executor "tokn-gateway proxy opencode --npx --" --session <session-id> "next turn"
@@ -265,7 +267,7 @@ the project.
 ## Desktop Session Viewer
 
 `apps/viewer` is a read-only Tauri 2/React desktop viewer for historical Pi,
-Codex, OpenCode, and DSH sessions. It aggregates root sessions into one
+Codex, OpenCode, ZCode, and DSH sessions. It aggregates root sessions into one
 searchable, provider-filterable sidebar, lazily expands known subagents into a
 tree, renders the selected session's normalized events as a conversation, and
 keeps reasoning, tools, metadata, errors, and unknown events inspectable
@@ -408,6 +410,16 @@ subtype-specific unknown events.
 - OpenCode opens its database with a WAL-aware read-only SQLite URI so active WAL data is visible without application writes; if that cannot open, it falls back to immutable read-only mode. Viewing sessions never runs migrations.
 - OpenCode validates the required `session`, `message`, and `part` tables and columns, then detects optional session columns from the actual SQLite schema.
 - OpenCode accepts schemas both with and without the optional `session.model` column; it never runs migrations against the user database.
+- ZCode reads its extended OpenCode-compatible SQLite store from
+  `--session-dir`, `$ZCODE_STORAGE_DIR/cli/db/db.sqlite`, or
+  `~/.zcode/cli/db/db.sqlite`. Explicit directories may be either the storage
+  root or the directory containing `db.sqlite`. The database is opened
+  read-only with WAL visibility and the same immutable fallback as OpenCode.
+  ZCode message semantics preserve model-only records as hidden provenance,
+  reasoning signatures remain available, and known runtime model/shell,
+  checkpoint, and input-resolution entries normalize into provider or metadata
+  events. Metadata entries retain their native envelopes, while future runtime
+  entry kinds remain visible as unknown events.
 
 `SessionRef` and `SessionHeader` carry optional `title` and `preview` fields in
 addition to relationship and agent identity. Codex uses a read-only, fail-soft
@@ -419,12 +431,13 @@ bounded rollout scan as fallbacks. Its state location follows `config.toml`
 `session/title` event and first direct user message. OpenCode reads its optional
 session title column, filters strict generated `New session` and `Child session`
 placeholders, and lazily queries the first user text or subtask when needed.
+ZCode uses the same title behavior.
 
 Relationship metadata still includes optional `parent_session_id`,
 `agent_path`, `agent_nickname`, and `agent_role`. Codex takes owning identity
 only from the first valid `session_meta`, because subagent rollouts can contain
 copied parent headers. Pi resolves `parentSession` paths to parent IDs, and
-OpenCode uses its session `parent_id`.
+OpenCode and ZCode use their session `parent_id`.
 
 For Codex, only `parent_thread_id` establishes a subagent relationship.
 `forked_from_id` records that a user fork was created from another thread, but
@@ -469,6 +482,12 @@ inspectable instead of preventing the rest of a session from loading. The
 OpenCode source crate still owns SQLite queries, relational row identity, and
 normalization into `AgentEvent`.
 
+ZCode 3.7.3 persists the same tolerant V1 message/part payload family with
+additional envelope fields, so `tokn-session-zcode` deliberately shares that
+wire decoder while assigning the distinct `zcode` provider identity. The
+ZCode application itself is closed source; compatibility is based on its
+read-only local schema and retained native records rather than an upstream API.
+
 Current event families include:
 
 - `session_started`
@@ -497,8 +516,9 @@ accounting/metadata/hidden content for activity and lease handling.
 Messages carry an orthogonal `delivery` field: `commentary`, `final`, or
 `unspecified`. Codex preserves the provider's response phase. Pi and OpenCode
 assistant text is final because those persisted message records do not expose a
-separate commentary channel. Current Codex `final_answer` and legacy `final`
-phases both normalize to `final`; user and other messages use `unspecified`.
+separate commentary channel; ZCode has the same persisted distinction. Current
+Codex `final_answer` and legacy `final` phases both normalize to `final`; user
+and other messages use `unspecified`.
 
 Tool calls carry explicit operation roles and semantic display metadata:
 
@@ -656,6 +676,8 @@ OpenCode has the first live-output normalizer: `OpenCodeLiveNormalizer` parses `
 ## Known Gaps
 
 - No `attach` command yet.
+- ZCode support is historical-only. Relay watching, create/append, and live
+  input are not implemented.
 - Codex and Pi have normalization fixtures. OpenCode now has wire-format
   fixtures plus adapter/source regression tests; full SQLite-backed CLI golden
   tests are still missing.
@@ -676,6 +698,7 @@ dependencies because the viewer backend is a workspace member.
 ```sh
 cargo run -p tokn-session-cli -- list --source codex --limit 1
 cargo run -p tokn-session-cli -- list --source opencode --limit 1
+cargo run -p tokn-session-cli -- list --source zcode --limit 1
 cargo run -p tokn-session-cli -- show --source opencode <session-id> --format pretty
 cargo run -p tokn-session-relay -- stdout
 cargo run -p tokn-session-relay -- zeromq
