@@ -213,6 +213,10 @@ export interface SessionIndexBodyProviderProgress {
   provider: ViewerProvider;
   pending_jobs: number;
   failed_jobs: number;
+  /** Completed detail loads in the provider's current catalog baseline. */
+  completed_jobs: number;
+  /** Total detail loads in the provider's current catalog baseline. */
+  total_jobs: number;
 }
 
 export interface SessionIndexBodyProgress {

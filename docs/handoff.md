@@ -360,13 +360,18 @@ categories; it never reads provider storage or caches historical bodies.
 update does not reload the session list. The React client subscribes before it
 reads the snapshot and ignores an older revision that arrives afterward.
 
-A persistent bottom status bar summarizes cataloging, bounded body backfill,
-warnings, or a settled index. Its bell opens a non-modal operational center
-with all provider states, exact remaining jobs, readable provider warnings,
-and generic scheduler failures. The normal progress label is intentionally not
-a live announcement on every count tick. Retrying queues a coalesced wake for
-the existing scheduler and forces its next pass to be a catalog pass; it never
-starts a second competing provider scan.
+A persistent bottom status bar describes the work in plain language: `Finding
+sessions`, `Loading details`, `Queued`, or `Up to date`. Its bell opens a
+non-modal operational center with every provider's state, readable warnings,
+and a durable `completed / total` detail count for its current catalog
+baseline. Only the provider owning the current bounded body job is shown as
+loading; providers with work waiting behind it are queued. The fraction derives
+from staged source-cursor generations plus unbaselined rows, so it survives a
+viewer restart and resets cleanly when a catalog establishes fresh body work.
+The normal progress label is intentionally not a live announcement on every
+count tick. Retrying queues a coalesced wake for the existing scheduler and
+forces its next pass to be a catalog pass; it never starts a second competing
+provider scan.
 
 `sources` remains the normalized owner of `provider` and `source_key`.
 `indexed_sessions` is a read-only SQLite view that joins those fields onto every

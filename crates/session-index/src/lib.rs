@@ -620,6 +620,24 @@ pub struct PendingSessionBaselineCount {
   pub pending_sessions: usize,
 }
 
+/// A compact, per-source snapshot of staged body-baseline work.
+///
+/// The index intentionally leaves cursor interpretation to its caller. A
+/// caller that owns a versioned staged cursor can combine its generation with
+/// `pending_sessions` to recover durable progress across process restarts,
+/// while callers without that convention can conservatively use
+/// `present_sessions - pending_sessions`.
+///
+/// This is grouped by source rather than session, so a status surface can
+/// inspect progress without loading or sorting historical metadata rows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StagedSessionBaselineSourceCount {
+  pub provider: String,
+  pub source_cursor: String,
+  pub present_sessions: usize,
+  pub pending_sessions: usize,
+}
+
 /// Result details from one committed source replacement.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReplaceSummary {
@@ -1012,6 +1030,59 @@ impl SessionIndex {
         provider: row.get(0)?,
         pending_sessions: usize::try_from(pending_sessions)
           .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, pending_sessions))?,
+      })
+    })?;
+    collect_rows(rows)
+  }
+
+  /// Counts present and unbaselined sessions for every staged source whose
+  /// opaque cursor begins with one of `source_cursor_prefixes`.
+  ///
+  /// Unlike [`Self::pending_session_baseline_counts`], this preserves each
+  /// source cursor. The caller owns the cursor schema and can therefore
+  /// recover application-specific cumulative progress without this generic
+  /// index interpreting opaque provider state.
+  pub fn staged_session_baseline_source_counts(
+    &self,
+    source_cursor_prefixes: &[&str],
+  ) -> Result<Vec<StagedSessionBaselineSourceCount>> {
+    if source_cursor_prefixes.is_empty() {
+      return Ok(Vec::new());
+    }
+
+    let cursor_matches = source_cursor_prefixes
+      .iter()
+      .enumerate()
+      .map(|(index, _)| {
+        let parameter = index + 1;
+        format!("substr(source.cursor, 1, length(?{parameter})) = ?{parameter}")
+      })
+      .collect::<Vec<_>>()
+      .join(" OR ");
+    let statement = format!(
+      "SELECT source.provider,
+              source.cursor,
+              COUNT(*),
+              SUM(CASE WHEN session.attention_baselined = 0 THEN 1 ELSE 0 END)
+       FROM sessions AS session
+       INNER JOIN sources AS source ON source.id = session.source_id
+       WHERE session.present = 1
+         AND ({cursor_matches})
+       GROUP BY source.id
+       ORDER BY source.provider ASC, source.source_key ASC"
+    );
+    let connection = self.connection()?;
+    let mut statement = connection.prepare(&statement)?;
+    let rows = statement.query_map(params_from_iter(source_cursor_prefixes.iter()), |row| {
+      let present_sessions = row.get::<_, i64>(2)?;
+      let pending_sessions = row.get::<_, i64>(3)?;
+      Ok(StagedSessionBaselineSourceCount {
+        provider: row.get(0)?,
+        source_cursor: row.get(1)?,
+        present_sessions: usize::try_from(present_sessions)
+          .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, present_sessions))?,
+        pending_sessions: usize::try_from(pending_sessions)
+          .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, pending_sessions))?,
       })
     })?;
     collect_rows(rows)
@@ -2154,6 +2225,33 @@ mod tests {
       index
         .pending_session_baseline_counts(&[])
         .expect("empty prefix count should query")
+        .is_empty()
+    );
+
+    let source_counts = index
+      .staged_session_baseline_source_counts(&["pending.v3.", "pending.v2."])
+      .expect("per-source pending baseline counts should query");
+    assert_eq!(
+      source_counts,
+      vec![
+        StagedSessionBaselineSourceCount {
+          provider: "codex".to_owned(),
+          source_cursor: "pending.v3.current".to_owned(),
+          present_sessions: 3,
+          pending_sessions: 2,
+        },
+        StagedSessionBaselineSourceCount {
+          provider: "pi".to_owned(),
+          source_cursor: "pending.v2.legacy".to_owned(),
+          present_sessions: 1,
+          pending_sessions: 1,
+        },
+      ]
+    );
+    assert!(
+      index
+        .staged_session_baseline_source_counts(&[])
+        .expect("empty source count should query")
         .is_empty()
     );
   }

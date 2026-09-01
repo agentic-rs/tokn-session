@@ -43,15 +43,15 @@ function describeStatusAnnouncement(
       };
   }
   if (progress.catalog.pending_providers.length > 0 || progress.activity === "catalog") {
-    return { key: "catalog", text: "Session catalog indexing started." };
+    return { key: "finding-sessions", text: "Finding saved sessions started." };
   }
   if (progress.body.pending_jobs > 0 || progress.activity === "body") {
     return progress.activity === "waiting_to_retry"
       ? {
         key: "details-waiting",
-        text: "Session detail indexing is waiting for the next batch.",
+        text: "Session details are queued for the next batch.",
       }
-      : { key: "details", text: "Session detail indexing started." };
+      : { key: "details", text: "Loading session details started." };
   }
   if (progress.activity === "waiting_to_retry") {
     return { key: "refresh-waiting", text: "Session index refresh scheduled." };
@@ -75,9 +75,13 @@ export function StatusBar({
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const notificationTriggerRef = useRef<HTMLButtonElement | null>(null);
   const summary = describeSessionIndexProgress(progress, is_loading, error, source_errors);
-  const hasPendingWork = (progress?.catalog.pending_providers.length ?? 0) > 0
-    || (progress?.body.pending_jobs ?? 0) > 0;
-  const isActive = (progress?.is_refreshing ?? false) || is_loading || hasPendingWork;
+  // A queued retry is visible in the summary, but does not spin as if its
+  // provider were currently being read. The active-provider fields cover the
+  // small transition between scheduler phases where is_refreshing is not yet
+  // reflected in a received snapshot.
+  const hasActiveProvider = (progress?.catalog.active_provider ?? null) !== null
+    || (progress?.body.active_provider ?? null) !== null;
+  const isActive = (progress?.is_refreshing ?? false) || is_loading || hasActiveProvider;
   const hasAttention = summary.tone === "warning";
   const announcement = describeStatusAnnouncement(progress, is_loading, error, hasAttention);
   const closeNotifications = useCallback(() => setNotificationsOpen(false), []);

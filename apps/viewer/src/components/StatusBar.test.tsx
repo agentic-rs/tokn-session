@@ -67,18 +67,97 @@ describe("StatusBar", () => {
       body: {
         ...progress().body,
         pending_jobs: 3,
-        providers: [{ provider: "opencode", pending_jobs: 3, failed_jobs: 0 }],
+        providers: [{
+          provider: "opencode",
+          pending_jobs: 3,
+          failed_jobs: 0,
+          completed_jobs: 0,
+          total_jobs: 3,
+        }],
       },
     }), [{ provider: "dsh", message: "Session log is unavailable." }]);
 
-    expect(screen.getByText("Indexing catalog · 1 of 6 providers")).toBeInTheDocument();
+    expect(screen.getByText("Finding sessions · 1 / 6 providers")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /open notifications/i }));
 
     expect(screen.getByRole("dialog", { name: "Notifications" })).toHaveFocus();
-    expect(screen.getByLabelText("Cataloging: Reading session headers.")).toBeInTheDocument();
-    expect(screen.getByLabelText("Backfilling: 3 session details pending.")).toBeInTheDocument();
+    expect(screen.getByLabelText("Finding sessions: Looking for saved sessions.")).toBeInTheDocument();
+    expect(screen.getByLabelText("Queued: Waiting to find sessions.")).toBeInTheDocument();
+    expect(screen.getByLabelText("Queued · 0 / 3: Waiting to load session details.")).toBeInTheDocument();
     expect(screen.getByLabelText("Needs attention: Session log is unavailable.")).toBeInTheDocument();
-    expect(screen.getAllByLabelText("Ready: Catalog is current.")).toHaveLength(2);
+    expect(screen.getAllByLabelText("Up to date: Session details are current.")).toHaveLength(2);
+  });
+
+  it("shows per-provider detail progress and only marks the active provider as loading", () => {
+    renderStatusBar(progress({
+      activity: "body",
+      is_refreshing: true,
+      body: {
+        ...progress().body,
+        active_provider: "codex",
+        pending_jobs: 219,
+        providers: [
+          {
+            provider: "codex",
+            pending_jobs: 182,
+            failed_jobs: 0,
+            completed_jobs: 10,
+            total_jobs: 192,
+          },
+          {
+            provider: "pi",
+            pending_jobs: 37,
+            failed_jobs: 0,
+            completed_jobs: 0,
+            total_jobs: 37,
+          },
+          {
+            provider: "opencode",
+            pending_jobs: 0,
+            failed_jobs: 0,
+            completed_jobs: 4,
+            total_jobs: 4,
+          },
+        ],
+      },
+    }));
+
+    fireEvent.click(screen.getByRole("button", { name: /open notifications/i }));
+
+    expect(screen.getByText("Loading details · 10 / 192")).toBeInTheDocument();
+    expect(screen.getByText("Queued · 0 / 37")).toBeInTheDocument();
+    expect(screen.getByText("Up to date · 4 / 4")).toBeInTheDocument();
+    expect(screen.getByText("Codex").closest("li")).toHaveAttribute("data-tone", "active");
+    expect(screen.getByText("Pi").closest("li")).toHaveAttribute("data-tone", "neutral");
+  });
+
+  it("keeps an active provider's detail progress visible after an earlier job fails", () => {
+    renderStatusBar(progress({
+      activity: "body",
+      is_refreshing: true,
+      body: {
+        ...progress().body,
+        active_provider: "codex",
+        pending_jobs: 182,
+        failed_jobs: 1,
+        providers: [{
+          provider: "codex",
+          pending_jobs: 182,
+          failed_jobs: 1,
+          completed_jobs: 10,
+          total_jobs: 192,
+        }],
+      },
+    }));
+
+    fireEvent.click(screen.getByRole("button", { name: /open notifications/i }));
+
+    const codexStatus = screen.getByLabelText(
+      "Loading details · 10 / 192: A previous indexing attempt needs attention; retry indexing to try it again. Loading remaining saved session details.",
+    );
+    expect(codexStatus).toHaveTextContent("Loading details · 10 / 192");
+    const codex = codexStatus.closest("li");
+    expect(codex).toHaveAttribute("data-tone", "warning");
   });
 
   it("closes on Escape and outside click while restoring focus to its bell", () => {
@@ -106,7 +185,8 @@ describe("StatusBar", () => {
       },
     }));
 
-    expect(screen.getByText("Indexing session details · 2 remaining")).toBeInTheDocument();
+    expect(screen.getByText("Details queued · 2 remaining")).toBeInTheDocument();
+    expect(document.querySelector(".status-bar__spinner")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /open notifications/i }));
     fireEvent.click(screen.getByRole("button", { name: "Retry indexing" }));
 
@@ -165,7 +245,7 @@ describe("StatusBar", () => {
     );
 
     expect(container.querySelector(".status-bar__summary")).not.toHaveAttribute("aria-live");
-    expect(screen.getByRole("status")).toHaveTextContent("Session detail indexing started.");
+    expect(screen.getByRole("status")).toHaveTextContent("Loading session details started.");
     expect(screen.getByRole("status")).not.toHaveTextContent("4");
 
     rerender(
@@ -182,7 +262,7 @@ describe("StatusBar", () => {
         source_errors={[]}
       />,
     );
-    expect(screen.getByRole("status")).toHaveTextContent("Session detail indexing started.");
+    expect(screen.getByRole("status")).toHaveTextContent("Loading session details started.");
     expect(screen.getByRole("status")).not.toHaveTextContent("3");
 
     rerender(

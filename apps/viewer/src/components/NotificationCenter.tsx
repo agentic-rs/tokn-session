@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, type RefObject } from "react";
 import { PROVIDERS } from "../lib/types";
 import type {
+  SessionIndexBodyProviderProgress,
   SessionIndexProgress,
   SessionIndexWorkerError,
   SourceError,
@@ -47,9 +48,14 @@ function workerErrorMessage(workerError: SessionIndexWorkerError): string {
 
 interface ProviderIndexStatus {
   provider: ViewerProvider;
-  label: "Cataloging" | "Backfilling" | "Ready" | "Needs attention";
+  label: "Finding sessions" | "Loading details" | "Queued" | "Up to date" | "Needs attention";
+  display_label: string;
   detail: string;
   tone: "active" | "neutral" | "warning";
+}
+
+function detailProgress(body: SessionIndexBodyProviderProgress | undefined): string {
+  return `${body?.completed_jobs ?? 0} / ${body?.total_jobs ?? 0}`;
 }
 
 function providerStatuses(
@@ -63,44 +69,69 @@ function providerStatuses(
 
   return PROVIDERS.map((provider) => {
     const body = bodyProgress.get(provider);
+    const sourceError = sourceErrors.find((error) => error.provider === provider);
     const hasFailure = sourceErrorProviders.has(provider)
       || (progress?.catalog.error_providers.includes(provider) ?? false)
       || (body?.failed_jobs ?? 0) > 0;
+    const failureDetail = sourceError?.message
+      ?? "A previous indexing attempt needs attention; retry indexing to try it again.";
+    const isActiveCatalogProvider = progress?.catalog.active_provider === provider;
+    if (isActiveCatalogProvider) {
+      return {
+        provider,
+        label: "Finding sessions",
+        display_label: "Finding sessions",
+        detail: hasFailure
+          ? `${failureDetail} Looking for remaining saved sessions.`
+          : "Looking for saved sessions.",
+        tone: hasFailure ? "warning" : "active",
+      };
+    }
+    const isActiveBodyProvider = progress?.body.active_provider === provider;
+    if (isActiveBodyProvider) {
+      return {
+        provider,
+        label: "Loading details",
+        display_label: `Loading details · ${detailProgress(body)}`,
+        detail: hasFailure
+          ? `${failureDetail} Loading remaining saved session details.`
+          : "Loading saved session details.",
+        tone: hasFailure ? "warning" : "active",
+      };
+    }
     if (hasFailure) {
       return {
         provider,
         label: "Needs attention",
-        detail: sourceErrors.find((error) => error.provider === provider)?.message
-          ?? "Retry indexing to try this provider again.",
+        display_label: "Needs attention",
+        detail: failureDetail,
         tone: "warning",
       };
     }
-    const isActiveCatalogProvider = progress?.catalog.active_provider === provider;
-    if (isActiveCatalogProvider || progress?.catalog.pending_providers.includes(provider)) {
+    if (progress?.catalog.pending_providers.includes(provider)) {
       return {
         provider,
-        label: "Cataloging",
-        detail: isActiveCatalogProvider
-          ? "Reading session headers."
-          : "Catalog queued.",
-        tone: "active",
+        label: "Queued",
+        display_label: "Queued",
+        detail: "Waiting to find sessions.",
+        tone: "neutral",
       };
     }
-    const isActiveBodyProvider = progress?.body.active_provider === provider;
-    if (isActiveBodyProvider || (body?.pending_jobs ?? 0) > 0) {
+    if ((body?.pending_jobs ?? 0) > 0) {
       return {
         provider,
-        label: "Backfilling",
-        detail: isActiveBodyProvider
-          ? "Reading bounded session details."
-          : `${body?.pending_jobs ?? 0} session details pending.`,
-        tone: "active",
+        label: "Queued",
+        display_label: `Queued · ${detailProgress(body)}`,
+        detail: "Waiting to load session details.",
+        tone: "neutral",
       };
     }
+    const hasKnownDetailJobs = (body?.total_jobs ?? 0) > 0;
     return {
       provider,
-      label: "Ready",
-      detail: progress ? "Catalog is current." : "Waiting for index status.",
+      label: "Up to date",
+      display_label: hasKnownDetailJobs ? `Up to date · ${detailProgress(body)}` : "Up to date",
+      detail: progress ? "Session details are current." : "Waiting for index status.",
       tone: "neutral",
     };
   });
@@ -150,45 +181,45 @@ export function describeSessionIndexProgress(
   // the index is current during that small but visible window.
   if (progress.catalog.pending_providers.length > 0) {
     return {
-      label: `Indexing catalog · ${progress.catalog.processed_providers} of ${progress.catalog.total_providers} providers`,
+      label: `Finding sessions · ${progress.catalog.processed_providers} / ${progress.catalog.total_providers} providers`,
       detail: activeCatalogProvider
-        ? `Reading ${activeCatalogProvider} session headers.`
-        : `${progress.catalog.pending_providers.length} provider catalog${progress.catalog.pending_providers.length === 1 ? "" : "s"} queued.`,
+        ? `Looking for saved ${activeCatalogProvider} sessions.`
+        : `${progress.catalog.pending_providers.length} provider${progress.catalog.pending_providers.length === 1 ? " is" : "s are"} queued.`,
       tone: failures ? "warning" : "active",
     };
   }
   if (progress.body.pending_jobs > 0 && progress.activity === "idle") {
     return {
-      label: `Indexing session details · ${progress.body.pending_jobs} remaining`,
-      detail: "Reading bounded session details.",
+      label: `Details queued · ${progress.body.pending_jobs} remaining`,
+      detail: "Session details are waiting to be loaded.",
       tone,
     };
   }
   if (progress.body.pending_jobs > 0 && progress.activity === "waiting_to_retry") {
     return {
-      label: `Indexing session details · ${progress.body.pending_jobs} remaining`,
-      detail: "Next bounded batch is scheduled.",
-      tone: failures ? "warning" : "active",
+      label: `Details queued · ${progress.body.pending_jobs} remaining`,
+      detail: "The next batch is scheduled.",
+      tone: failures ? "warning" : "neutral",
     };
   }
 
   switch (progress.activity) {
     case "catalog":
       return {
-        label: `Indexing catalog · ${progress.catalog.processed_providers} of ${progress.catalog.total_providers} providers`,
+        label: `Finding sessions · ${progress.catalog.processed_providers} / ${progress.catalog.total_providers} providers`,
         detail: activeCatalogProvider
-          ? `Reading ${activeCatalogProvider} session headers.`
-          : "Reading session headers.",
+          ? `Looking for saved ${activeCatalogProvider} sessions.`
+          : "Looking for saved sessions.",
         tone,
       };
     case "body":
       return {
         label: progress.body.pending_jobs > 0
-          ? `Indexing session details · ${progress.body.pending_jobs} remaining`
-          : "Indexing session details",
+          ? `Loading details · ${progress.body.pending_jobs} remaining`
+          : "Loading details",
         detail: activeBodyProvider
-          ? `Reading bounded details from ${activeBodyProvider}.`
-          : "Reading bounded session details.",
+          ? `Loading ${activeBodyProvider} session details.`
+          : "Loading saved session details.",
         tone,
       };
     case "waiting_to_retry":
@@ -197,7 +228,7 @@ export function describeSessionIndexProgress(
         detail: failures
           ? "A provider needs another attempt before indexing can continue."
           : "The scheduler will run another index pass shortly.",
-        tone: failures ? "warning" : "active",
+        tone: failures ? "warning" : "neutral",
       };
     case "idle":
       return failures
@@ -353,11 +384,11 @@ export function NotificationCenter({
         {progress ? (
           <dl className="notification-task__metrics">
             <div>
-              <dt>Catalog</dt>
+              <dt>Providers checked</dt>
               <dd>{progress.catalog.processed_providers} / {progress.catalog.total_providers} providers</dd>
             </div>
             <div>
-              <dt>Session details</dt>
+              <dt>Details queued</dt>
               <dd>{progress.body.pending_jobs} pending</dd>
             </div>
             <div>
@@ -374,7 +405,7 @@ export function NotificationCenter({
               {currentProviderStatuses.map((provider) => (
                 <li data-tone={provider.tone} key={provider.provider}>
                   <span>{providerLabel(provider.provider)}</span>
-                  <span aria-label={`${provider.label}: ${provider.detail}`}>{provider.label}</span>
+                  <span aria-label={`${provider.display_label}: ${provider.detail}`}>{provider.display_label}</span>
                 </li>
               ))}
             </ul>
