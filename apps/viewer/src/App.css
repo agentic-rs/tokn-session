@@ -561,6 +561,7 @@ button:disabled {
 
 .provider-avatar {
   display: grid;
+  position: relative;
   width: 28px;
   height: 28px;
   flex: 0 0 28px;
@@ -570,6 +571,19 @@ button:disabled {
   font-size: 11px;
   font-weight: 750;
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.13);
+}
+
+.session-row__unread-dot {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  width: 9px;
+  height: 9px;
+  pointer-events: none;
+  background: var(--focus);
+  border: 2px solid var(--sidebar-bg);
+  border-radius: 50%;
+  box-shadow: 0 1px 2px rgba(35, 32, 25, 0.22);
 }
 
 .provider-avatar[data-provider="codex"] {

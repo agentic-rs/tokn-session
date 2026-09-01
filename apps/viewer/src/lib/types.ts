@@ -135,6 +135,10 @@ export interface SessionSummary {
   message_count: number | null;
   event_count: number | null;
   history_status: SessionHistoryStatus | null;
+  /** True when this session has a visible message the viewer has not opened. */
+  has_unread: boolean;
+  /** True when a known descendant has unread visible activity. */
+  has_unread_descendant?: boolean;
 }
 
 export interface SessionListQuery {
@@ -170,6 +174,17 @@ export interface ListSessionChildrenRequest {
 export interface ListSessionChildrenResponse {
   sessions: SessionSummary[];
   next_cursor: string | null;
+}
+
+/**
+ * Metadata-only signal emitted after a durable sidebar index refresh.
+ * The keys identify only sessions with newly eligible visible messages; they
+ * let an already open matching timeline refresh without disturbing one that
+ * belongs to an unrelated provider or source.
+ */
+export interface SessionIndexChangedEvent {
+  changed: boolean;
+  attention_session_keys: string[];
 }
 
 /** Local sidebar state for one lazily loaded direct-child page sequence. */
@@ -245,12 +260,24 @@ export interface LoadEventPageRequest {
   limit?: number;
 }
 
+export interface AcknowledgeSessionAttentionRequest {
+  session_key: string;
+  /** Decimal string to retain an arbitrary SQLite revision exactly. */
+  attention_revision: string;
+}
+
+export interface AcknowledgeSessionAttentionResponse {
+  changed: boolean;
+}
+
 export interface EventPageResponse {
   events: EventSummary[];
   next_cursor: string | null;
   previous_cursor: string | null;
   total_events: number;
   history_status: SessionHistoryStatus;
+  /** Opaque indexed snapshot; absent while connected to an older backend. */
+  attention_revision?: string | null;
 }
 
 export interface LoadTrajectoryEventPageRequest {

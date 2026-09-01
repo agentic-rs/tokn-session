@@ -20,7 +20,8 @@ cargo run -p tokn-session-cli -- browse --source dsh
 `apps/viewer` is a read-only Tauri app that presents root sessions from all
 four providers in one searchable interface. It reuses the Rust session crates
 directly rather than parsing CLI output and safely renders conversational
-Markdown without allowing provider content to navigate the WebView.
+Markdown without allowing provider content to navigate the WebView. A local,
+metadata-only index keeps its sidebar current without writing provider data.
 
 ```sh
 cd apps/viewer

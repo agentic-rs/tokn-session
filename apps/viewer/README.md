@@ -90,8 +90,12 @@ Provider storage is resolved as follows:
 - DSH: `$DSH_HOME/sessions`, then the platform home directory's `.dsh/sessions`
   folder.
 
-Restart the app to discover provider changes made after it opened. This first
-version is historical and read-only: it has no composer and never mutates the
+The app reconciles compact sidebar metadata in the background every 10 seconds.
+Its first complete scan creates a no-dot baseline; later scans show a dot only
+for new unhidden user messages or final assistant replies. A dot on a collapsed
+parent can represent unread activity in a known subagent. The currently open
+timeline refreshes only when that exact session gains such activity. This
+version remains historical and read-only: it has no composer and never mutates
 provider session files.
 
 ## Architecture
@@ -104,8 +108,16 @@ cross the IPC boundary. Source errors remain isolated so one unavailable
 provider does not hide sessions from the others.
 
 Session discovery starts with provider headers or catalog rows and deliberately
-does not compute message or event counts. Indexed native titles are returned in
-that cheap pass. Visible untitled rows are then hydrated lazily with a
+does not compute message or event counts. The first complete background scan
+then establishes an app-local SQLite sidebar index; later sidebar/tree queries
+read that index. It retains opaque source checkpoints, session identity/paths,
+bounded title/preview/cwd/timestamp/relationship metadata, and unread
+revisions, but never event records, native payloads, reasoning, tool I/O, or
+full message bodies. Header-only metadata changes update the index without a
+body replay. Each provider's staged source replacements commit atomically, and
+optimistic source-cursor checks prevent another viewer process from replacing a
+newer source snapshot with an older scan. Visible
+untitled rows are then hydrated lazily with a
 provider-specific history scan, while a prompt-text search may hydrate
 additional candidates to determine whether they match. Hydrated headers are
 cached by source revision, and overlapping requests share each session's
@@ -124,10 +136,11 @@ requested. Inline tool output keeps at most 64 KiB using a head-and-tail preview
 the full normalized and native inspector representations retain their separate
 512 KiB limits. The backend keeps at most one normalized session snapshot and
 reuses it across page and inspector requests while the source revision is
-unchanged; OpenCode revision checks include its SQLite WAL and SHM sidecars. The
-current provider readers may still load an entire selected session before
-producing an event page, so paging does not yet bound parser memory for very
-large histories.
+unchanged; those OpenCode revision checks include SQLite WAL and SHM sidecars.
+The independent durable index checkpoint uses the database and WAL but excludes
+the reader-writable SHM file. The current provider readers may still load an
+entire selected session before producing an event page, so paging does not yet
+bound parser memory for very large histories.
 Trajectory items are a viewer presentation projection over that normalized
 timeline: user prompts, final assistant replies, their terminal bookkeeping,
 and hidden-event boundaries remain outside the item, while intermediate

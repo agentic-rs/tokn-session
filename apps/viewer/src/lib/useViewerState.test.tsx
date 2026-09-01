@@ -1,9 +1,11 @@
-import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { eventButtonId } from "./state";
 import {
+  acknowledgeSessionAttention,
   listSessionChildren,
   listSessions,
+  listenForSessionIndexChanges,
   loadEventDetail,
   loadEventPage,
   loadTrajectoryEventPage,
@@ -11,22 +13,27 @@ import {
 import type {
   EventDetail,
   EventPageResponse,
+  SessionIndexChangedEvent,
   SessionSummary,
   TrajectoryEventPageResponse,
 } from "./types";
 import { useViewerState } from "./useViewerState";
 
 vi.mock("./tauri", () => ({
+  acknowledgeSessionAttention: vi.fn(() => Promise.resolve({ changed: false })),
   listSessionChildren: vi.fn(() => new Promise(() => undefined)),
   listSessions: vi.fn(() => new Promise(() => undefined)),
+  listenForSessionIndexChanges: vi.fn(() => Promise.resolve(vi.fn())),
   loadEventDetail: vi.fn(() => new Promise(() => undefined)),
   loadEventPage: vi.fn(() => new Promise(() => undefined)),
   loadTrajectoryEventPage: vi.fn(() => new Promise(() => undefined)),
 }));
 
 beforeEach(() => {
+  vi.mocked(acknowledgeSessionAttention).mockReset().mockResolvedValue({ changed: false });
   vi.mocked(listSessionChildren).mockReset().mockImplementation(() => new Promise(() => undefined));
   vi.mocked(listSessions).mockReset().mockImplementation(() => new Promise(() => undefined));
+  vi.mocked(listenForSessionIndexChanges).mockReset().mockResolvedValue(vi.fn());
   vi.mocked(loadEventPage).mockReset().mockImplementation(() => new Promise(() => undefined));
   vi.mocked(loadEventDetail).mockReset().mockImplementation(() => new Promise(() => undefined));
   vi.mocked(loadTrajectoryEventPage).mockReset().mockImplementation(
@@ -67,6 +74,7 @@ function session(sessionKey: string): SessionSummary {
     message_count: null,
     event_count: 1,
     history_status: "complete",
+    has_unread: false,
   };
 }
 
@@ -223,6 +231,186 @@ function trajectoryChildPage(): TrajectoryEventPageResponse {
   };
 }
 
+function ViewerPageCommitProbe() {
+  const state = useViewerState();
+  return (
+    <output
+      data-owner={state.eventsOwnerKey ?? ""}
+      data-session={state.selectedSessionKey ?? ""}
+      data-testid="viewer-page-commit-state"
+    >
+      {state.initialPageLoaded ? "ready" : "loading"}
+    </output>
+  );
+}
+
+describe("useViewerState session-index signalling", () => {
+  it("acknowledges only after React commits an accepted initial event page", async () => {
+    const indexedSession = session("codex:indexed");
+    const page = deferred<EventPageResponse>();
+    const pageStateAtAcknowledgement: Array<{
+      eventsOwnerKey: string | null;
+      initialPageLoaded: boolean;
+      sessionKey: string | null;
+    }> = [];
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [indexedSession],
+      next_cursor: null,
+      source_errors: [],
+    });
+    vi.mocked(loadEventPage).mockImplementationOnce(() => page.promise);
+
+    render(<ViewerPageCommitProbe />);
+
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledOnce());
+    vi.mocked(acknowledgeSessionAttention).mockImplementation(() => {
+      const pageState = screen.getByTestId("viewer-page-commit-state");
+      pageStateAtAcknowledgement.push({
+        eventsOwnerKey: pageState.getAttribute("data-owner"),
+        initialPageLoaded: pageState.textContent === "ready",
+        sessionKey: pageState.getAttribute("data-session"),
+      });
+      return Promise.resolve({ changed: true });
+    });
+    await act(async () => {
+      page.resolve({
+        ...toolEventPage(),
+        attention_revision: "7",
+      });
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(acknowledgeSessionAttention).toHaveBeenCalledWith({
+        session_key: indexedSession.session_key,
+        attention_revision: "7",
+      });
+    });
+    expect(pageStateAtAcknowledgement).toEqual([{
+      eventsOwnerKey: indexedSession.session_key,
+      initialPageLoaded: true,
+      sessionKey: indexedSession.session_key,
+    }]);
+    await waitFor(() => expect(listSessions).toHaveBeenCalledTimes(2));
+  });
+
+  it("does not acknowledge a page invalidated by a selection change before commit", async () => {
+    const first = session("codex:first");
+    const second = session("codex:second");
+    const firstPage = deferred<EventPageResponse>();
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [first, second],
+      next_cursor: null,
+      source_errors: [],
+    });
+    vi.mocked(loadEventPage)
+      .mockImplementationOnce(() => firstPage.promise)
+      .mockImplementationOnce(() => new Promise(() => undefined));
+    const { result } = renderHook(() => useViewerState());
+
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledOnce());
+    await act(async () => {
+      firstPage.resolve({
+        ...toolEventPage(),
+        attention_revision: "10",
+      });
+      // The response handler runs in this microtask, but React has not
+      // committed its state updates yet. Selecting another session here is
+      // the race that must suppress the acknowledgement.
+      await Promise.resolve();
+      result.current.selectSession(second.session_key);
+    });
+
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(2));
+    expect(acknowledgeSessionAttention).not.toHaveBeenCalled();
+  });
+
+  it("does not acknowledge an event page React discarded as stale", async () => {
+    const first = session("codex:first");
+    const second = session("codex:second");
+    const stalePage = deferred<EventPageResponse>();
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [first, second],
+      next_cursor: null,
+      source_errors: [],
+    });
+    vi.mocked(loadEventPage)
+      .mockImplementationOnce(() => stalePage.promise)
+      .mockResolvedValueOnce(toolEventPage());
+    const { result } = renderHook(() => useViewerState());
+
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(1));
+    act(() => result.current.selectSession(second.session_key));
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      stalePage.resolve({
+        ...toolEventPage(),
+        attention_revision: "9",
+      });
+      await stalePage.promise;
+    });
+
+    expect(acknowledgeSessionAttention).not.toHaveBeenCalled();
+  });
+
+  it("reloads the sidebar after an index-change event and unregisters on cleanup", async () => {
+    const unlisten = vi.fn();
+    let emitIndexChange: ((change: SessionIndexChangedEvent) => void) | undefined;
+    vi.mocked(listenForSessionIndexChanges).mockImplementation((handler) => {
+      emitIndexChange = handler;
+      return Promise.resolve(unlisten);
+    });
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [session("codex:listener")],
+      next_cursor: null,
+      source_errors: [],
+    });
+    vi.mocked(loadEventPage).mockResolvedValue(toolEventPage());
+    const { unmount } = renderHook(() => useViewerState());
+
+    await waitFor(() => expect(emitIndexChange).toBeDefined());
+    await waitFor(() => expect(listSessions).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(1));
+    act(() => emitIndexChange?.({ changed: true, attention_session_keys: [] }));
+    await waitFor(() => expect(listSessions).toHaveBeenCalledTimes(2));
+    expect(loadEventPage).toHaveBeenCalledTimes(1);
+    unmount();
+    expect(unlisten).toHaveBeenCalledOnce();
+  });
+
+  it("reloads and acknowledges only a selected session named by index attention", async () => {
+    const selected = session("codex:selected");
+    let emitIndexChange: ((change: SessionIndexChangedEvent) => void) | undefined;
+    vi.mocked(listenForSessionIndexChanges).mockImplementation((handler) => {
+      emitIndexChange = handler;
+      return Promise.resolve(vi.fn());
+    });
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [selected],
+      next_cursor: null,
+      source_errors: [],
+    });
+    vi.mocked(loadEventPage)
+      .mockResolvedValueOnce(toolEventPage())
+      .mockResolvedValueOnce({ ...toolEventPage(), attention_revision: "12" });
+
+    renderHook(() => useViewerState());
+
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(1));
+    act(() => emitIndexChange?.({
+      changed: true,
+      attention_session_keys: [selected.session_key],
+    }));
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(2));
+    await waitFor(() => {
+      expect(acknowledgeSessionAttention).toHaveBeenCalledWith({
+        session_key: selected.session_key,
+        attention_revision: "12",
+      });
+    });
+  });
+});
+
 describe("useViewerState inspector focus", () => {
   it("restores focus to the selected event button after a pointer-style selection", () => {
     vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
@@ -268,6 +456,7 @@ describe("useViewerState expanded tool detail", () => {
         message_count: null,
         event_count: 1,
         history_status: "complete",
+        has_unread: false,
       }],
       next_cursor: null,
       source_errors: [],

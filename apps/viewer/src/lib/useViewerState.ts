@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  acknowledgeSessionAttention,
   listSessionChildren,
   listSessions,
+  listenForSessionIndexChanges,
   loadEventDetail,
   loadEventPage,
   loadTrajectoryEventPage,
@@ -101,6 +103,17 @@ interface ExpandedTrajectoryEvent {
   event_key: string;
 }
 
+/**
+ * A newest-page response that has been accepted by the request-generation
+ * guard. It is kept in React state so the acknowledgement effect runs only
+ * after the same render commits the corresponding timeline page.
+ */
+interface AcceptedInitialEventPage {
+  sessionKey: string;
+  requestId: number;
+  attentionRevision: string;
+}
+
 export function useViewerState() {
   const [search, setSearchValue] = useState("");
   const debouncedSearch = useDebouncedValue(search.trim(), 180);
@@ -142,6 +155,10 @@ export function useViewerState() {
   const [historyStatus, setHistoryStatus] = useState<SessionHistoryStatus | null>(null);
   const [eventsAttempt, setEventsAttempt] = useState(0);
   const eventsRequest = useRef(0);
+  const [acceptedInitialEventPage, setAcceptedInitialEventPage] = useState<
+    AcceptedInitialEventPage | null
+  >(null);
+  const acknowledgedInitialPageRequest = useRef<number | null>(null);
   const [trajectoryPages, setTrajectoryPages] = useState<
     Map<string, Map<string, TrajectoryEventPageState>>
   >(() => new Map());
@@ -185,6 +202,58 @@ export function useViewerState() {
   );
   const [expandedTrajectoryDetailAttempt, setExpandedTrajectoryDetailAttempt] = useState(0);
   const expandedTrajectoryDetailRequest = useRef(0);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    void listenForSessionIndexChanges((change) => {
+      setSessionsAttempt((attempt) => attempt + 1);
+      const selectedSessionKey = selectedSessionKeyRef.current;
+      if (selectedSessionKey && change.attention_session_keys.includes(selectedSessionKey)) {
+        // A committed index change can contain a new final reply for the
+        // session already on screen. Reload only that newest page, so an
+        // unrelated provider/source cannot reset a timeline the user is
+        // reading. Its revision is still acknowledged only after React
+        // commits the matching response.
+        setEventsAttempt((attempt) => attempt + 1);
+      }
+    })
+      .then((stop) => {
+        if (disposed) {
+          stop();
+          return;
+        }
+        unlisten = stop;
+      })
+      // Browser-based tests and the static Vite preview do not expose Tauri's
+      // event bridge. Listings continue to work without background refreshes.
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  const acknowledgeAcceptedAttention = useCallback((sessionKey: string, attentionRevision: string | null | undefined) => {
+    if (!attentionRevision) {
+      return;
+    }
+    void acknowledgeSessionAttention({
+      session_key: sessionKey,
+      attention_revision: attentionRevision,
+    })
+      .then((response) => {
+        if (!response.changed) {
+          return;
+        }
+        // Refresh the sidebar only after SQLite committed the seen cursor.
+        // A failed acknowledgement must leave the visible dot intact.
+        setSessionsAttempt((attempt) => attempt + 1);
+      })
+      .catch(() => {});
+  }, []);
 
   const requestDetail = useCallback((sessionKey: string, eventKey: string) => {
     const cacheKey = `${sessionKey}:${eventKey}`;
@@ -635,6 +704,10 @@ export function useViewerState() {
 
   useEffect(() => {
     const requestId = ++eventsRequest.current;
+    // An acknowledgement belongs to one exact newest-page request. A retry
+    // or selected-session change invalidates any response that has not yet
+    // reached a committed React render.
+    setAcceptedInitialEventPage(null);
     clearTrajectoryPages();
     const ownsSession = eventsOwnerKeyRef.current === selectedSessionKey;
     if (!ownsSession) {
@@ -678,6 +751,13 @@ export function useViewerState() {
           preserveEventSelection(selectedEventKeyRef.current, response.events),
           false,
         );
+        if (response.attention_revision) {
+          setAcceptedInitialEventPage({
+            sessionKey: selectedSessionKey,
+            requestId,
+            attentionRevision: response.attention_revision,
+          });
+        }
       })
       .catch((error: unknown) => {
         if (eventsRequest.current === requestId) {
@@ -694,6 +774,48 @@ export function useViewerState() {
     clearTrajectoryPages,
     eventsAttempt,
     invalidateEventDetails,
+    selectedSessionKey,
+  ]);
+
+  useEffect(() => {
+    if (!acceptedInitialEventPage) {
+      return;
+    }
+
+    const { attentionRevision, requestId, sessionKey } = acceptedInitialEventPage;
+    const matchesCommittedCurrentPage = (
+      selectedSessionKey === sessionKey
+      && selectedSessionKeyRef.current === sessionKey
+      && eventsOwnerKey === sessionKey
+      && eventsOwnerKeyRef.current === sessionKey
+      && initialPageSessionKey === sessionKey
+      && eventsRequest.current === requestId
+    );
+    if (!matchesCommittedCurrentPage) {
+      // A new selection or refresh won before this page was rendered. Do not
+      // advance the seen cursor for a timeline the user never actually saw.
+      setAcceptedInitialEventPage((current) => (
+        current?.requestId === requestId ? null : current
+      ));
+      return;
+    }
+
+    if (acknowledgedInitialPageRequest.current === requestId) {
+      return;
+    }
+    // Consume the request before the asynchronous IPC call. This keeps a
+    // Strict Mode effect replay or an unrelated render from issuing a second
+    // acknowledgement for the same accepted page.
+    acknowledgedInitialPageRequest.current = requestId;
+    setAcceptedInitialEventPage((current) => (
+      current?.requestId === requestId ? null : current
+    ));
+    acknowledgeAcceptedAttention(sessionKey, attentionRevision);
+  }, [
+    acceptedInitialEventPage,
+    acknowledgeAcceptedAttention,
+    eventsOwnerKey,
+    initialPageSessionKey,
     selectedSessionKey,
   ]);
 

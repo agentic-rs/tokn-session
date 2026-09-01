@@ -79,6 +79,7 @@ function subagent(overrides: Partial<SessionSummary> = {}): SessionSummary {
     message_count: null,
     event_count: null,
     history_status: null,
+    has_unread: false,
     ...overrides,
   };
 }

@@ -118,6 +118,14 @@ pub struct SessionSummary {
   pub message_count: Option<usize>,
   pub event_count: Option<usize>,
   pub history_status: Option<HistoryStatus>,
+  /// True when this session has a newly indexed, visible user message or
+  /// final assistant message that has not yet been acknowledged by opening
+  /// its event page.
+  pub has_unread: bool,
+  /// True when any known canonical descendant has unread visible activity.
+  /// This lets a collapsed parent communicate attention without conflating it
+  /// with an update to the parent session itself.
+  pub has_unread_descendant: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -163,6 +171,24 @@ pub struct EventPage {
   pub previous_cursor: Option<String>,
   pub total_events: usize,
   pub history_status: HistoryStatus,
+  /// Opaque snapshot of the session's indexed attention state. The frontend
+  /// acknowledges this only after React has committed the page, preventing a
+  /// stale request from consuming a newer update.
+  pub attention_revision: Option<String>,
+}
+
+/// Acknowledges the exact attention revision represented by an accepted event
+/// page. Revisions cross IPC as decimal strings so they never lose precision
+/// in JavaScript.
+#[derive(Clone, Debug, Deserialize)]
+pub struct AcknowledgeSessionAttentionRequest {
+  pub session_key: String,
+  pub attention_revision: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AcknowledgeSessionAttentionResponse {
+  pub changed: bool,
 }
 
 #[derive(Debug, Serialize)]
