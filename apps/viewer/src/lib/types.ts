@@ -162,6 +162,8 @@ export interface ListSessionsResponse {
   sessions: SessionSummary[];
   next_cursor: string | null;
   source_errors: SourceError[];
+  /** Selected provider catalogs that have not completed their first durable index pass. */
+  pending_providers: ViewerProvider[];
 }
 
 export interface ListSessionChildrenRequest {

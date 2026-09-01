@@ -42,7 +42,7 @@ pub fn run() {
 
       // Initial discovery is deliberately background-only: an established
       // sidebar remains responsive from its previous index, while a first run
-      // retains native header discovery until its compact catalog commits.
+      // exposes its compact catalog as soon as the catalog pass commits.
       tauri::async_runtime::spawn(async move {
         let mut next_catalog_refresh = Instant::now();
         let mut consecutive_catalog_retries = 0_u8;
@@ -51,7 +51,7 @@ pub fn run() {
           let service = refresh_service.clone();
           let result = tauri::async_runtime::spawn_blocking(move || {
             if catalog_due {
-              service.refresh_session_index()
+              service.refresh_session_catalog()
             } else {
               service.refresh_pending_session_index()
             }

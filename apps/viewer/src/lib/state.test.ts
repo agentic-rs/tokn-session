@@ -3,6 +3,7 @@ import type { SessionSummary } from "./types";
 import {
   findKnownSession,
   knownSessionAncestors,
+  preserveSessionSelection,
   sessionDisplayTitle,
   shortSessionId,
 } from "./state";
@@ -94,5 +95,10 @@ describe("session identity", () => {
     expect(findKnownSession([root], children, grandchild.session_key)).toBe(grandchild);
     expect(knownSessionAncestors([root], children, grandchild.session_key))
       .toEqual([root.session_key, child.session_key]);
+  });
+
+  it("keeps an explicit selection when a root catalog refresh omits it", () => {
+    expect(preserveSessionSelection("codex:child")).toBe("codex:child");
+    expect(preserveSessionSelection(null)).toBeNull();
   });
 });

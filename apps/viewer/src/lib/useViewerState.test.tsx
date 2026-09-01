@@ -1,4 +1,4 @@
-import { act, cleanup, render, renderHook, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { eventButtonId } from "./state";
 import {
@@ -52,6 +52,16 @@ function deferred<T>() {
     resolve = resolvePromise;
   });
   return { promise, resolve };
+}
+
+async function selectListedSession(
+  result: { current: { sessions: SessionSummary[]; selectSession: (sessionKey: string) => void } },
+  sessionKey: string,
+) {
+  await waitFor(() => {
+    expect(result.current.sessions.some((session) => session.session_key === sessionKey)).toBe(true);
+  });
+  act(() => result.current.selectSession(sessionKey));
 }
 
 function session(sessionKey: string): SessionSummary {
@@ -234,17 +244,72 @@ function trajectoryChildPage(): TrajectoryEventPageResponse {
 function ViewerPageCommitProbe() {
   const state = useViewerState();
   return (
-    <output
-      data-owner={state.eventsOwnerKey ?? ""}
-      data-session={state.selectedSessionKey ?? ""}
-      data-testid="viewer-page-commit-state"
-    >
-      {state.initialPageLoaded ? "ready" : "loading"}
-    </output>
+    <>
+      <button
+        disabled={state.sessions.length === 0}
+        onClick={() => state.selectSession(state.sessions[0]!.session_key)}
+        type="button"
+      >
+        Select indexed session
+      </button>
+      <output
+        data-owner={state.eventsOwnerKey ?? ""}
+        data-session={state.selectedSessionKey ?? ""}
+        data-testid="viewer-page-commit-state"
+      >
+        {state.initialPageLoaded ? "ready" : "loading"}
+      </output>
+    </>
   );
 }
 
 describe("useViewerState session-index signalling", () => {
+  it("keeps the initial catalog metadata-only until the user chooses a session", async () => {
+    const indexedSession = session("codex:index-only");
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [indexedSession],
+      next_cursor: null,
+      source_errors: [],
+      pending_providers: [],
+    });
+    vi.mocked(loadEventPage).mockResolvedValue(toolEventPage());
+    const { result } = renderHook(() => useViewerState());
+
+    await waitFor(() => expect(result.current.sessions).toEqual([indexedSession]));
+    expect(result.current.selectedSessionKey).toBeNull();
+    expect(result.current.selectedSession).toBeNull();
+    expect(loadEventPage).not.toHaveBeenCalled();
+
+    act(() => result.current.selectSession(indexedSession.session_key));
+    await waitFor(() => {
+      expect(loadEventPage).toHaveBeenCalledWith({
+        session_key: indexedSession.session_key,
+        direction: "backward",
+        limit: 80,
+      });
+    });
+  });
+
+  it("subscribes to index changes before the initial catalog query", async () => {
+    const subscription = deferred<() => void>();
+    vi.mocked(listenForSessionIndexChanges).mockImplementation(() => subscription.promise);
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [],
+      next_cursor: null,
+      source_errors: [],
+      pending_providers: ["codex"],
+    });
+
+    renderHook(() => useViewerState());
+
+    expect(listSessions).not.toHaveBeenCalled();
+    await act(async () => {
+      subscription.resolve(vi.fn());
+      await subscription.promise;
+    });
+    await waitFor(() => expect(listSessions).toHaveBeenCalledOnce());
+  });
+
   it("acknowledges only after React commits an accepted initial event page", async () => {
     const indexedSession = session("codex:indexed");
     const page = deferred<EventPageResponse>();
@@ -257,11 +322,15 @@ describe("useViewerState session-index signalling", () => {
       sessions: [indexedSession],
       next_cursor: null,
       source_errors: [],
+      pending_providers: [],
     });
     vi.mocked(loadEventPage).mockImplementationOnce(() => page.promise);
 
     render(<ViewerPageCommitProbe />);
 
+    await waitFor(() => expect(listSessions).toHaveBeenCalledOnce());
+    expect(loadEventPage).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Select indexed session" }));
     await waitFor(() => expect(loadEventPage).toHaveBeenCalledOnce());
     vi.mocked(acknowledgeSessionAttention).mockImplementation(() => {
       const pageState = screen.getByTestId("viewer-page-commit-state");
@@ -302,12 +371,14 @@ describe("useViewerState session-index signalling", () => {
       sessions: [first, second],
       next_cursor: null,
       source_errors: [],
+      pending_providers: [],
     });
     vi.mocked(loadEventPage)
       .mockImplementationOnce(() => firstPage.promise)
       .mockImplementationOnce(() => new Promise(() => undefined));
     const { result } = renderHook(() => useViewerState());
 
+    await selectListedSession(result, first.session_key);
     await waitFor(() => expect(loadEventPage).toHaveBeenCalledOnce());
     await act(async () => {
       firstPage.resolve({
@@ -333,12 +404,14 @@ describe("useViewerState session-index signalling", () => {
       sessions: [first, second],
       next_cursor: null,
       source_errors: [],
+      pending_providers: [],
     });
     vi.mocked(loadEventPage)
       .mockImplementationOnce(() => stalePage.promise)
       .mockResolvedValueOnce(toolEventPage());
     const { result } = renderHook(() => useViewerState());
 
+    await selectListedSession(result, first.session_key);
     await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(1));
     act(() => result.current.selectSession(second.session_key));
     await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(2));
@@ -364,18 +437,83 @@ describe("useViewerState session-index signalling", () => {
       sessions: [session("codex:listener")],
       next_cursor: null,
       source_errors: [],
+      pending_providers: [],
     });
     vi.mocked(loadEventPage).mockResolvedValue(toolEventPage());
     const { unmount } = renderHook(() => useViewerState());
 
     await waitFor(() => expect(emitIndexChange).toBeDefined());
     await waitFor(() => expect(listSessions).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(1));
+    expect(loadEventPage).not.toHaveBeenCalled();
     act(() => emitIndexChange?.({ changed: true, attention_session_keys: [] }));
     await waitFor(() => expect(listSessions).toHaveBeenCalledTimes(2));
-    expect(loadEventPage).toHaveBeenCalledTimes(1);
+    expect(loadEventPage).not.toHaveBeenCalled();
     unmount();
     expect(unlisten).toHaveBeenCalledOnce();
+  });
+
+  it("retains an explicitly selected child across a root catalog refresh", async () => {
+    const root = session("codex:parent");
+    root.child_count = 1;
+    const child = session("codex:child");
+    child.parent_session_id = root.session_id;
+    child.is_subagent = true;
+    let emitIndexChange: ((change: SessionIndexChangedEvent) => void) | undefined;
+    vi.mocked(listenForSessionIndexChanges).mockImplementation((handler) => {
+      emitIndexChange = handler;
+      return Promise.resolve(vi.fn());
+    });
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [root],
+      next_cursor: null,
+      source_errors: [],
+      pending_providers: [],
+    });
+    vi.mocked(loadEventPage).mockResolvedValue(toolEventPage());
+    const { result } = renderHook(() => useViewerState());
+
+    await selectListedSession(result, root.session_key);
+    await waitFor(() => expect(result.current.selectedSessionKey).toBe(root.session_key));
+    act(() => result.current.openSubagent(root.session_key, child));
+    await waitFor(() => expect(result.current.selectedSessionKey).toBe(child.session_key));
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(2));
+
+    act(() => emitIndexChange?.({ changed: true, attention_session_keys: [] }));
+    await waitFor(() => expect(listSessions).toHaveBeenCalledTimes(2));
+    expect(result.current.selectedSessionKey).toBe(child.session_key);
+    expect(result.current.selectedSession?.session_key).toBe(child.session_key);
+    expect(loadEventPage).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the visible session when a background catalog refresh fails", async () => {
+    const selected = session("codex:refresh-failure");
+    let emitIndexChange: ((change: SessionIndexChangedEvent) => void) | undefined;
+    vi.mocked(listenForSessionIndexChanges).mockImplementation((handler) => {
+      emitIndexChange = handler;
+      return Promise.resolve(vi.fn());
+    });
+    vi.mocked(listSessions)
+      .mockResolvedValueOnce({
+        sessions: [selected],
+        next_cursor: null,
+        source_errors: [],
+        pending_providers: [],
+      })
+      .mockRejectedValueOnce(new Error("local index is temporarily unavailable"));
+    vi.mocked(loadEventPage).mockResolvedValue(toolEventPage());
+    const { result } = renderHook(() => useViewerState());
+
+    await selectListedSession(result, selected.session_key);
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledOnce());
+    act(() => emitIndexChange?.({ changed: true, attention_session_keys: [] }));
+
+    await waitFor(() => {
+      expect(result.current.sessionsError).toBe("local index is temporarily unavailable");
+    });
+    expect(result.current.sessions).toEqual([selected]);
+    expect(result.current.selectedSessionKey).toBe(selected.session_key);
+    expect(result.current.selectedSession?.session_key).toBe(selected.session_key);
+    expect(loadEventPage).toHaveBeenCalledOnce();
   });
 
   it("reloads and acknowledges only a selected session named by index attention", async () => {
@@ -389,13 +527,15 @@ describe("useViewerState session-index signalling", () => {
       sessions: [selected],
       next_cursor: null,
       source_errors: [],
+      pending_providers: [],
     });
     vi.mocked(loadEventPage)
       .mockResolvedValueOnce(toolEventPage())
       .mockResolvedValueOnce({ ...toolEventPage(), attention_revision: "12" });
 
-    renderHook(() => useViewerState());
+    const { result } = renderHook(() => useViewerState());
 
+    await selectListedSession(result, selected.session_key);
     await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(1));
     act(() => emitIndexChange?.({
       changed: true,
@@ -460,6 +600,7 @@ describe("useViewerState expanded tool detail", () => {
       }],
       next_cursor: null,
       source_errors: [],
+      pending_providers: [],
     });
     vi.mocked(loadEventPage).mockResolvedValue({
       events: [{
@@ -511,6 +652,7 @@ describe("useViewerState expanded tool detail", () => {
     });
     const { result } = renderHook(() => useViewerState());
 
+    await selectListedSession(result, "codex:session-1");
     await waitFor(() => expect(result.current.events).toHaveLength(1));
     expect(loadEventDetail).not.toHaveBeenCalled();
 
@@ -531,6 +673,7 @@ describe("useViewerState expanded tool detail", () => {
       sessions: [session("codex:a"), session("codex:b")],
       next_cursor: null,
       source_errors: [],
+      pending_providers: [],
     });
     vi.mocked(loadEventPage).mockResolvedValue(toolEventPage());
     vi.mocked(loadEventDetail)
@@ -538,6 +681,7 @@ describe("useViewerState expanded tool detail", () => {
       .mockImplementationOnce(() => freshA.promise);
     const { result } = renderHook(() => useViewerState());
 
+    await selectListedSession(result, "codex:a");
     await waitFor(() => expect(result.current.eventsOwnerKey).toBe("codex:a"));
     act(() => result.current.toggleEventExpanded("event.v1.1"));
     await waitFor(() => expect(loadEventDetail).toHaveBeenCalledTimes(1));
@@ -584,6 +728,7 @@ describe("useViewerState expanded tool detail", () => {
       sessions: [session("codex:session-1")],
       next_cursor: null,
       source_errors: [],
+      pending_providers: [],
     });
     vi.mocked(loadEventPage)
       .mockResolvedValueOnce(pendingToolEventPage())
@@ -593,6 +738,7 @@ describe("useViewerState expanded tool detail", () => {
       .mockImplementationOnce(() => fresh.promise);
     const { result } = renderHook(() => useViewerState());
 
+    await selectListedSession(result, "codex:session-1");
     await waitFor(() => expect(result.current.events).toHaveLength(1));
     act(() => result.current.selectEvent("event.v1.1"));
     act(() => result.current.toggleEventExpanded("event.v1.1"));
@@ -641,6 +787,7 @@ describe("useViewerState expanded reasoning detail", () => {
       sessions: [session("codex:reasoning")],
       next_cursor: null,
       source_errors: [],
+      pending_providers: [],
     });
     vi.mocked(loadEventPage).mockResolvedValue(reasoningEventPage());
     vi.mocked(loadEventDetail).mockResolvedValue({
@@ -652,6 +799,7 @@ describe("useViewerState expanded reasoning detail", () => {
     });
     const { result } = renderHook(() => useViewerState());
 
+    await selectListedSession(result, "codex:reasoning");
     await waitFor(() => expect(result.current.events).toHaveLength(1));
     expect(loadEventDetail).not.toHaveBeenCalled();
 
@@ -669,6 +817,7 @@ describe("useViewerState expanded reasoning detail", () => {
       sessions: [session("codex:opaque")],
       next_cursor: null,
       source_errors: [],
+      pending_providers: [],
     });
     vi.mocked(loadEventPage).mockResolvedValue(reasoningEventPage({
       event_key: "event.v1.opaque",
@@ -684,6 +833,7 @@ describe("useViewerState expanded reasoning detail", () => {
     }));
     const { result } = renderHook(() => useViewerState());
 
+    await selectListedSession(result, "codex:opaque");
     await waitFor(() => expect(result.current.events).toHaveLength(1));
     act(() => result.current.toggleEventExpanded("event.v1.opaque"));
     await waitFor(() => expect(result.current.expandedEventKey).toBe("event.v1.opaque"));
@@ -699,6 +849,7 @@ describe("useViewerState whole-turn trajectories", () => {
       sessions: [root],
       next_cursor: null,
       source_errors: [],
+      pending_providers: [],
     });
     vi.mocked(loadEventPage).mockResolvedValue(trajectoryEventPage());
     vi.mocked(loadTrajectoryEventPage).mockResolvedValue(trajectoryChildPage());
@@ -716,6 +867,7 @@ describe("useViewerState whole-turn trajectories", () => {
     });
     const { result } = renderHook(() => useViewerState());
 
+    await selectListedSession(result, root.session_key);
     await waitFor(() => expect(result.current.events).toHaveLength(1));
     expect(loadTrajectoryEventPage).not.toHaveBeenCalled();
     expect(loadEventDetail).not.toHaveBeenCalled();
@@ -764,11 +916,13 @@ describe("useViewerState whole-turn trajectories", () => {
       sessions: [root, nextSession],
       next_cursor: null,
       source_errors: [],
+      pending_providers: [],
     });
     vi.mocked(loadEventPage).mockResolvedValue(trajectoryEventPage());
     vi.mocked(loadTrajectoryEventPage).mockImplementation(() => childPage.promise);
     const { result } = renderHook(() => useViewerState());
 
+    await selectListedSession(result, root.session_key);
     await waitFor(() => expect(result.current.selectedSessionKey).toBe(root.session_key));
     act(() => result.current.toggleEventExpanded("trajectory.v1.turn-1"));
     await waitFor(() => expect(loadTrajectoryEventPage).toHaveBeenCalledOnce());
@@ -796,11 +950,13 @@ describe("useViewerState whole-turn trajectories", () => {
       sessions: [root],
       next_cursor: null,
       source_errors: [],
+      pending_providers: [],
     });
     vi.mocked(loadEventPage).mockResolvedValue(trajectoryEventPage());
     vi.mocked(loadTrajectoryEventPage).mockResolvedValue(initial);
     const { result } = renderHook(() => useViewerState());
 
+    await selectListedSession(result, root.session_key);
     await waitFor(() => expect(result.current.events).toHaveLength(1));
     act(() => result.current.toggleEventExpanded("trajectory.v1.turn-1"));
     await waitFor(() => {
@@ -846,6 +1002,7 @@ describe("useViewerState subagent discovery", () => {
       sessions: [root],
       next_cursor: null,
       source_errors: [],
+      pending_providers: [],
     });
     vi.mocked(listSessionChildren).mockResolvedValue({
       sessions: [child],
@@ -853,6 +1010,7 @@ describe("useViewerState subagent discovery", () => {
     });
 
     const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, root.session_key);
     await waitFor(() => expect(result.current.selectedSession?.session_key).toBe(root.session_key));
     expect(listSessionChildren).not.toHaveBeenCalled();
 
@@ -882,11 +1040,13 @@ describe("useViewerState subagent discovery", () => {
       sessions: [root],
       next_cursor: null,
       source_errors: [],
+      pending_providers: [],
     });
     vi.mocked(loadEventPage).mockResolvedValue(toolEventPage());
     vi.mocked(listSessionChildren).mockImplementation(() => childPage.promise);
 
     const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, root.session_key);
     await waitFor(() => expect(result.current.selectedSession?.session_key).toBe(root.session_key));
 
     act(() => result.current.openSubagent(root.session_key, child));
