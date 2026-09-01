@@ -337,22 +337,26 @@ opaque attention markers/revisions. It never stores normalized event records,
 provider-native payloads, reasoning, tool input/output, or full message bodies.
 Title and preview are retained presentation text, and a preview can derive from
 a user prompt, so index-only does not mean zero textual metadata. A successful
-stable header pass commits the provider catalog immediately, so sidebar and
-tree IPC read durable index rows without waiting for every session body. Native
-headers remain a fail-soft fallback. The viewer lazily hydrates visible untitled
-rows with a provider-specific history scan; prompt-text searches may hydrate
-additional candidates to determine whether they match. Hydrated metadata is
-cached by source revision, and per-session in-flight gates prevent overlapping
-searches from repeating the same scan. The selected session's normalized
-`total_events` arrives with its first event page. The existing CLI continues to
-use the counted `list_sessions` API.
+stable header pass commits a provider catalog sentinel immediately, so sidebar,
+search, and tree IPC read only durable index rows without waiting for every
+session body. A provider without that sentinel is reported as indexing; the UI
+never falls back to native headers or synchronously hydrates missing metadata.
+The background body pass backfills its bounded title/preview metadata together
+with attention, while later blank lightweight headers preserve that backfill
+until a successful body refresh replaces it. The initial viewer leaves its main
+pane unselected, so an explicit user selection is the first action that reads a
+provider session body. The selected session's normalized `total_events` arrives
+with its first event page. The existing CLI continues to use the counted
+`list_sessions` API. The scheduler emits its sidebar refresh as soon as that
+catalog transaction commits, before later bounded body work.
 
 `sources` remains the normalized owner of `provider` and `source_key`.
 `indexed_sessions` is a read-only SQLite view that joins those fields onto every
 session row for diagnostics and future read-only consumers.
 
-After cataloging, reconciliation backfills bodies and attention in bounded
-newest-first batches. The full header catalog stays on a 10-second cadence;
+After cataloging, reconciliation backfills bodies, bounded presentation
+metadata, and attention in newest-first batches. The full header catalog stays
+on a 10-second cadence;
 while any row remains unbaselined, a one-second body-only pass advances the next
 batch without rediscovering the whole provider. A membership or source-revision
 race during a catalog pass keeps the prior rows visible and makes up to two
@@ -380,15 +384,17 @@ database and WAL, deliberately excluding its reader-writable SHM file. A
 header-only metadata change is written without replaying an unchanged session
 body, preserving its attention state. The catalog pass and its later body pass
 both carry optimistic source-cursor preconditions: the body result must still
-match the catalog snapshot before it can commit. Catalog source replacements
-commit atomically, and these staged checks prevent concurrent viewers from
-overwriting a newer catalog or attention snapshot with stale work. A failed or
-racing scan retains the last good index rows; actual provider read failures
-report an isolated warning, while ordinary catalog races retry quietly. Warning
-changes refresh the sidebar too. When a session file moves
-between sources, a staged target preserves any existing unread state until its
-body validation succeeds, so a transient archive read failure cannot clear a
-dot.
+match the catalog snapshot before it can commit. A checkpoint contains both the
+provider-owned cursor and an index-owned mutation generation, so an unchanged
+provider cursor cannot let a stale catalog/body write overwrite newer metadata.
+Catalog source replacements commit atomically, and these staged checks prevent
+concurrent viewers from overwriting a newer catalog or attention snapshot with
+stale work. A failed or racing scan retains the last good index rows; actual
+provider read failures report an isolated warning, while ordinary catalog races
+retry quietly. Warning changes refresh the sidebar too. When a session file
+moves between sources, a staged target preserves any existing unread state and
+body-derived title/preview fallback until its body validation succeeds, so a
+transient archive read failure cannot clear a dot or an established label.
 
 Session rows prefer a non-placeholder provider title, then the first meaningful
 user-prompt preview, then a child agent nickname, role, or path, and finally
@@ -475,7 +481,10 @@ subtype-specific unknown events.
   entry kinds remain visible as unknown events.
 
 `SessionRef` and `SessionHeader` carry optional `title` and `preview` fields in
-addition to relationship and agent identity. Codex uses a read-only, fail-soft
+addition to relationship and agent identity. Successful background body loads
+can persist their bounded reference title/preview in the index when header-only
+discovery lacks those fields; no selected-session load writes presentation data
+back. Codex uses a read-only, fail-soft
 lookup of the optional private `state_5.sqlite` title metadata, correlated by
 both thread id and rollout path, with legacy `session_index.jsonl` names and a
 bounded rollout scan as fallbacks. Its state location follows `config.toml`
@@ -489,9 +498,9 @@ ZCode uses the same title behavior.
 Codex Desktop can copy a root thread's state-db title, preview, and first user
 message into each subagent row. The Codex adapter intentionally ignores those
 private-state presentation fields for sessions with `parent_thread_id`; the
-viewer then labels the child from its nickname, role, or agent path. A selected
-child can still hydrate an owned post-boundary preview without writing that
-body-derived text into the durable index.
+viewer then labels the child from its nickname, role, or agent path. The
+background body pass can later backfill the child's own bounded presentation
+metadata into the durable index.
 
 Relationship metadata still includes optional `parent_session_id`,
 `agent_path`, `agent_nickname`, and `agent_role`. Codex takes owning identity

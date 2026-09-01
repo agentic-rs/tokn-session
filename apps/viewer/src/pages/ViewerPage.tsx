@@ -23,6 +23,7 @@ export function ViewerPage() {
           on_retry={viewer.retrySessions}
           on_search_change={viewer.setSearch}
           on_session_select={viewer.selectSession}
+          pending_providers={viewer.pendingProviders}
           search={viewer.search}
           session_children={viewer.sessionChildren}
           selected_session_key={viewer.selectedSessionKey}

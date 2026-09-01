@@ -28,18 +28,20 @@ pnpm tauri build
 
 ## Using the viewer
 
-The sidebar discovers root sessions from every provider at startup. Use the
-provider pills to include or exclude sources, type in the search box to match a
-root title, first user prompt, session id, project, or working directory, and
-select a row to load its newest normalized events. A disclosure control loads
-that session's direct subagents as metadata only; nested controls continue the
-tree, and selecting a child opens the child's independent timeline. This does
-not merge child events into the parent conversation or infer live completion
-states. Rows prefer the provider's native title, fall back to a preview of the
-first meaningful user prompt, then an agent label for known subagents, and
-otherwise show **Untitled session**. The shortened id beside the title remains a
-separate identity field; the full id is available to assistive technology and
-on hover.
+The sidebar starts from the local session index rather than reading provider
+storage in the initial viewport. On a fresh database, it shows an indexing
+state until the background cataloger has committed each selected provider. Use
+the provider pills to include or exclude sources, type in the search box to
+match indexed title, preview, session id, project, working directory, or agent
+identity, and select a row to load its newest normalized events. A disclosure
+control loads that session's direct subagents as indexed metadata only; nested
+controls continue the tree, and selecting a child opens the child's independent
+timeline. This does not merge child events into the parent conversation or
+infer live completion states. Rows prefer the indexed provider title, then an
+indexed preview of the first meaningful user prompt, then an agent label for
+known subagents, and otherwise show **Untitled session**. The shortened id
+beside the title remains a separate identity field; the full id is available to
+assistive technology and on hover.
 Historical agent-activity records become delegation cards when their native
 target id resolves to a canonical direct child of the selected session within
 the same provider. **Open** selects that child and makes it available in the
@@ -92,15 +94,17 @@ Provider storage is resolved as follows:
 - DSH: `$DSH_HOME/sessions`, then the platform home directory's `.dsh/sessions`
   folder.
 
-The app first commits a stable provider-header catalog to its shared index at
-`~/.tokn/sessions/index.sqlite`, so the sidebar can use the index without
-waiting to read every session body. It then backfills event-derived attention in
-bounded, newest-first batches. Header catalogs refresh every 10 seconds; while
-body work is pending, a body-only pass runs every second without rediscovering
-the whole provider catalog. If active source membership changes during a
-catalog pass, the previous catalog remains visible and the app quietly retries;
-mutable titles, previews, and modification times do not become false
-provider-read errors. A row has no dot until its body has finished
+The app commits a stable provider-header catalog to its shared index at
+`~/.tokn/sessions/index.sqlite`, then uses only that durable index for sidebar,
+search, and subagent-tree requests. Provider reads at startup belong to the
+background cataloger, not those UI requests. It then backfills event-derived
+attention and any body-derived title/preview metadata in bounded, newest-first
+batches. Header catalogs refresh every 10 seconds; while body work is pending,
+a body-only pass runs every second without rediscovering the whole provider
+catalog. If active source membership changes during a catalog pass, the
+previous catalog remains visible and the app quietly retries; mutable titles,
+previews, and modification times do not become false provider-read errors. A
+row has no dot until its body has finished
 backfilling, except that a relocated row retains an already-unread dot while
 its new path is validated. Sessions first discovered after a provider catalog
 exists can become unread only after that body confirmation finds a new unhidden
@@ -118,24 +122,26 @@ histories normalize to `AgentEvent` before source-neutral, snake-case DTOs
 cross the IPC boundary. Source errors remain isolated so one unavailable
 provider does not hide sessions from the others.
 
-Session discovery starts with provider headers or catalog rows and deliberately
-does not compute message or event counts. A complete header catalog is committed
-promptly to the shared SQLite sidebar index at `~/.tokn/sessions/index.sqlite`;
-sidebar and tree queries use it immediately. The separate body pass backfills
-attention in bounded newest-first batches; the one-second pending worker reads
-only those selected bodies, while header discovery remains on the 10-second
-catalog cadence. The index retains opaque source checkpoints, session
-identity/paths, bounded title/preview/cwd/timestamp/relationship metadata, and
-unread revisions, but never event records, native payloads, reasoning, tool
-I/O, or full message bodies. Header-only metadata changes update the index
-without a body replay. Catalog and body replacements are staged with optimistic
-source-cursor checks: a body result must still match the catalog snapshot before
-it can replace it, preventing concurrent viewers from publishing stale metadata
-or attention. Visible untitled rows are then hydrated lazily with a
-provider-specific history scan, while a prompt-text search may hydrate
-additional candidates to determine whether they match. Hydrated headers are
-cached by source revision, and overlapping requests share each session's
-in-flight scan. Codex can also
+Session discovery starts with provider headers in the background and
+deliberately does not compute message or event counts. A complete header
+catalog is committed promptly to the shared SQLite sidebar index at
+`~/.tokn/sessions/index.sqlite`; sidebar, search, and tree queries are strictly
+index-only. Before a provider's complete-catalog sentinel exists, its rows are
+reported as indexing rather than read directly from that provider. The separate
+body pass backfills attention and missing title/preview metadata in bounded
+newest-first batches; the one-second pending worker reads only those selected
+bodies, while header discovery remains on the 10-second catalog cadence. The
+index retains opaque source checkpoints, session identity/paths, bounded
+title/preview/cwd/timestamp/relationship metadata, and unread revisions, but
+never event records, native payloads, reasoning, tool I/O, or full message
+bodies. Header-only metadata changes update the index without a body replay.
+Catalog and body replacements are staged with optimistic source-cursor checks:
+a body result must still match the catalog snapshot before it can apply.
+Checkpoints include an index-owned mutation generation as well as the
+provider-owned cursor, so a same-cursor metadata update cannot be overwritten
+by a second viewer. The initial main pane intentionally has no selected
+timeline; only an explicit session selection reads provider history. Codex can
+also
 read title metadata from its optional private `state_5.sqlite` in read-only
 mode; rows are correlated by both thread id and rollout path, and incompatible
 or unavailable private state fails softly. Known Codex subagents intentionally
