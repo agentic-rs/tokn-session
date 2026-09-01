@@ -30,6 +30,44 @@ function providerLabel(provider: ViewerProvider | null): string | null {
   return provider ? PROVIDER_LABELS[provider] : null;
 }
 
+type CatalogStatusLabel = "Finding sessions" | "Checking for changes";
+
+/**
+ * A provider without its first durable catalog still needs a full discovery
+ * pass. This also makes a missing field from an older hot-reloaded backend
+ * safely read as the established full-scan behavior.
+ */
+export function isTargetedCatalog(progress: SessionIndexProgress | null): boolean {
+  return progress?.catalog.scope === "targeted"
+    && progress.catalog.pending_providers.length === 0;
+}
+
+function catalogStatusLabel(progress: SessionIndexProgress | null): CatalogStatusLabel {
+  return isTargetedCatalog(progress) ? "Checking for changes" : "Finding sessions";
+}
+
+function catalogDetail(
+  progress: SessionIndexProgress | null,
+  provider: ViewerProvider | null,
+  remaining = false,
+): string {
+  const providerName = providerLabel(provider);
+  if (isTargetedCatalog(progress)) {
+    if (providerName) {
+      return `${remaining ? "Checking remaining saved" : "Checking saved"} ${providerName} sessions for changes.`;
+    }
+    return "Checking saved sessions for changes.";
+  }
+  if (providerName) {
+    return `${remaining ? "Looking for remaining saved" : "Looking for saved"} ${providerName} sessions.`;
+  }
+  return "Looking for saved sessions.";
+}
+
+function catalogSummaryLabel(progress: SessionIndexProgress): string {
+  return `${catalogStatusLabel(progress)} · ${progress.catalog.processed_providers} / ${progress.catalog.total_providers} providers`;
+}
+
 function hasIndexFailures(progress: SessionIndexProgress | null, sourceErrors: SourceError[]): boolean {
   return sourceErrors.length > 0
     || (progress?.worker_error ?? null) !== null
@@ -48,7 +86,7 @@ function workerErrorMessage(workerError: SessionIndexWorkerError): string {
 
 interface ProviderIndexStatus {
   provider: ViewerProvider;
-  label: "Finding sessions" | "Loading details" | "Queued" | "Up to date" | "Needs attention";
+  label: CatalogStatusLabel | "Loading details" | "Queued" | "Up to date" | "Needs attention";
   display_label: string;
   detail: string;
   tone: "active" | "neutral" | "warning";
@@ -77,13 +115,18 @@ function providerStatuses(
       ?? "A previous indexing attempt needs attention; retry indexing to try it again.";
     const isActiveCatalogProvider = progress?.catalog.active_provider === provider;
     if (isActiveCatalogProvider) {
+      const label = catalogStatusLabel(progress);
       return {
         provider,
-        label: "Finding sessions",
-        display_label: "Finding sessions",
+        label,
+        display_label: label,
         detail: hasFailure
-          ? `${failureDetail} Looking for remaining saved sessions.`
-          : "Looking for saved sessions.",
+          ? `${failureDetail} ${isTargetedCatalog(progress)
+            ? catalogDetail(progress, provider, true)
+            : "Looking for remaining saved sessions."}`
+          : isTargetedCatalog(progress)
+            ? catalogDetail(progress, provider)
+            : "Looking for saved sessions.",
         tone: hasFailure ? "warning" : "active",
       };
     }
@@ -113,7 +156,9 @@ function providerStatuses(
         provider,
         label: "Queued",
         display_label: "Queued",
-        detail: "Waiting to find sessions.",
+        detail: isTargetedCatalog(progress)
+          ? "Waiting to check saved sessions for changes."
+          : "Waiting to find sessions.",
         tone: "neutral",
       };
     }
@@ -181,9 +226,9 @@ export function describeSessionIndexProgress(
   // the index is current during that small but visible window.
   if (progress.catalog.pending_providers.length > 0) {
     return {
-      label: `Finding sessions · ${progress.catalog.processed_providers} / ${progress.catalog.total_providers} providers`,
+      label: catalogSummaryLabel(progress),
       detail: activeCatalogProvider
-        ? `Looking for saved ${activeCatalogProvider} sessions.`
+        ? catalogDetail(progress, progress.catalog.active_provider)
         : `${progress.catalog.pending_providers.length} provider${progress.catalog.pending_providers.length === 1 ? " is" : "s are"} queued.`,
       tone: failures ? "warning" : "active",
     };
@@ -206,10 +251,8 @@ export function describeSessionIndexProgress(
   switch (progress.activity) {
     case "catalog":
       return {
-        label: `Finding sessions · ${progress.catalog.processed_providers} / ${progress.catalog.total_providers} providers`,
-        detail: activeCatalogProvider
-          ? `Looking for saved ${activeCatalogProvider} sessions.`
-          : "Looking for saved sessions.",
+        label: catalogSummaryLabel(progress),
+        detail: catalogDetail(progress, progress.catalog.active_provider),
         tone,
       };
     case "body":

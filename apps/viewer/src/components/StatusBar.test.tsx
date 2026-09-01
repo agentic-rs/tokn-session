@@ -11,6 +11,7 @@ function progress(overrides: Partial<SessionIndexProgress> = {}): SessionIndexPr
     is_refreshing: false,
     activity: "idle",
     catalog: {
+      scope: "full",
       active_provider: null,
       processed_providers: 6,
       total_providers: 6,
@@ -86,6 +87,47 @@ describe("StatusBar", () => {
     expect(screen.getByLabelText("Queued · 0 / 3: Waiting to load session details.")).toBeInTheDocument();
     expect(screen.getByLabelText("Needs attention: Session log is unavailable.")).toBeInTheDocument();
     expect(screen.getAllByLabelText("Up to date: Session details are current.")).toHaveLength(2);
+  });
+
+  it("describes a targeted catalog as a check for changes", () => {
+    renderStatusBar(progress({
+      activity: "catalog",
+      is_refreshing: true,
+      catalog: {
+        scope: "targeted",
+        active_provider: "codex",
+        processed_providers: 0,
+        total_providers: 1,
+        pending_providers: [],
+        error_providers: [],
+      },
+    }));
+
+    expect(screen.getByText("Checking for changes · 0 / 1 providers")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Checking saved sessions for changes started.");
+
+    fireEvent.click(screen.getByRole("button", { name: /open notifications/i }));
+
+    expect(
+      screen.getByLabelText("Checking for changes: Checking saved Codex sessions for changes."),
+    ).toBeInTheDocument();
+  });
+
+  it("treats a catalog payload without scope as a full discovery scan", () => {
+    const legacyCatalog = { ...progress().catalog };
+    delete legacyCatalog.scope;
+    renderStatusBar(progress({
+      activity: "catalog",
+      is_refreshing: true,
+      catalog: {
+        ...legacyCatalog,
+        active_provider: "codex",
+        processed_providers: 0,
+        total_providers: 1,
+      },
+    }));
+
+    expect(screen.getByText("Finding sessions · 0 / 1 providers")).toBeInTheDocument();
   });
 
   it("shows per-provider detail progress and only marks the active provider as loading", () => {

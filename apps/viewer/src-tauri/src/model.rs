@@ -11,7 +11,7 @@ pub const MAX_PAGE_LIMIT: usize = 200;
 const MAX_SESSION_KEY_BYTES: usize = 64 * 1024;
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ViewerProvider {
   Codex,
@@ -142,6 +142,9 @@ impl SessionIndexProgress {
       is_refreshing: false,
       activity: IndexActivity::Idle,
       catalog: CatalogIndexProgress {
+        // Startup always establishes a complete durable catalog before the
+        // scheduler can use targeted change checks.
+        scope: CatalogRefreshScope::Full,
         active_provider: None,
         processed_providers: 0,
         total_providers: ViewerProvider::ALL.len(),
@@ -195,6 +198,10 @@ pub enum IndexWorkerError {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct CatalogIndexProgress {
+  /// Whether this is a complete provider discovery pass or a targeted
+  /// follow-up for known changed session files. The UI uses this to describe
+  /// a normal lightweight refresh without implying a full rescan.
+  pub scope: CatalogRefreshScope,
   pub active_provider: Option<ViewerProvider>,
   pub processed_providers: usize,
   pub total_providers: usize,
@@ -203,6 +210,13 @@ pub struct CatalogIndexProgress {
   /// Providers whose most recent catalog attempt failed. Detail text stays in
   /// `ListSessionsResponse.source_errors`.
   pub error_providers: Vec<ViewerProvider>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogRefreshScope {
+  Full,
+  Targeted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -746,6 +760,8 @@ mod tests {
     assert_eq!(value["revision"], "0");
     assert_eq!(value["is_refreshing"], false);
     assert_eq!(value["activity"], "idle");
+    assert_eq!(value["catalog"]["scope"], "full");
+    assert_eq!(serde_json::to_value(CatalogRefreshScope::Targeted).unwrap(), "targeted");
     assert_eq!(value["catalog"]["total_providers"], ViewerProvider::ALL.len());
     assert_eq!(value["catalog"]["pending_providers"][0], "codex");
     assert_eq!(value["body"]["batch_size"], 8);

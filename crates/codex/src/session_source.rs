@@ -38,6 +38,39 @@ impl CodexSessionSource {
     Ok(references)
   }
 
+  /// Returns the session directory roots that this source would discover.
+  ///
+  /// Consumers that maintain a file watcher should use these effective roots
+  /// instead of recreating Codex's environment and archive-directory
+  /// resolution themselves.
+  pub fn session_roots(&self) -> Result<Vec<PathBuf>, String> {
+    self.roots()
+  }
+
+  /// Reads the header relation for one known rollout path without scanning its
+  /// conversation body or sibling session files.
+  ///
+  /// This applies the same optional Codex Desktop metadata as bulk relation
+  /// discovery. Callers that need a complete catalog-compatible presentation
+  /// should use this method; high-frequency file watchers should use
+  /// [`Self::session_relation_at_path_for_incremental_catalog`] instead.
+  pub fn session_relation_at_path(&self, path: &Path) -> Result<SessionRef, String> {
+    let mut reference = inspect_session_header(path)?;
+    self.apply_indexed_metadata(std::slice::from_mut(&mut reference));
+    Ok(reference)
+  }
+
+  /// Reads one rollout's native header for an incremental catalog update.
+  ///
+  /// Unlike [`Self::session_relation_at_path`], this never opens Codex
+  /// Desktop's optional state database or legacy session index. An active
+  /// rollout can receive many append notifications, so that external metadata
+  /// belongs to the infrequent complete catalog path rather than the append
+  /// hot path.
+  pub fn session_relation_at_path_for_incremental_catalog(&self, path: &Path) -> Result<SessionRef, String> {
+    inspect_session_header(path)
+  }
+
   /// Resolves prompt-derived metadata for one already-discovered session.
   ///
   /// Bulk listing deliberately does not scan rollout bodies. Callers can use
@@ -51,7 +84,7 @@ impl CodexSessionSource {
 
   fn list_session_refs(&self, inspect: fn(&Path) -> Result<SessionRef, String>) -> Result<Vec<SessionRef>, String> {
     let mut paths = Vec::new();
-    for root in self.roots()? {
+    for root in self.session_roots()? {
       collect_jsonl_files(&root, &mut paths)?;
     }
 

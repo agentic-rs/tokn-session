@@ -3,6 +3,7 @@ import type { SessionIndexProgress, SourceError } from "../lib/types";
 import { BellIcon } from "./Icons";
 import {
   describeSessionIndexProgress,
+  isTargetedCatalog,
   NotificationCenter,
 } from "./NotificationCenter";
 
@@ -43,6 +44,9 @@ function describeStatusAnnouncement(
       };
   }
   if (progress.catalog.pending_providers.length > 0 || progress.activity === "catalog") {
+    if (isTargetedCatalog(progress)) {
+      return { key: "checking-changes", text: "Checking saved sessions for changes started." };
+    }
     return { key: "finding-sessions", text: "Finding saved sessions started." };
   }
   if (progress.body.pending_jobs > 0 || progress.activity === "body") {

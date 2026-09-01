@@ -361,7 +361,10 @@ update does not reload the session list. The React client subscribes before it
 reads the snapshot and ignores an older revision that arrives afterward.
 
 A persistent bottom status bar describes the work in plain language: `Finding
-sessions`, `Loading details`, `Queued`, or `Up to date`. Its bell opens a
+sessions`, `Checking for changes`, `Loading details`, `Queued`, or `Up to date`.
+`Finding sessions` is reserved for provider discovery; a watcher-led check of
+an already indexed Codex or Pi rollout file says `Checking for changes`.
+Its bell opens a
 non-modal operational center with every provider's state, readable warnings,
 and a durable `completed / total` detail count for its current catalog
 baseline. Only the provider owning the current bounded body job is shown as
@@ -378,14 +381,40 @@ provider scan.
 session row for diagnostics and future read-only consumers.
 
 After cataloging, reconciliation backfills bodies, bounded presentation
-metadata, and attention in newest-first batches. The full header catalog stays
-on a 10-second cadence;
-while any row remains unbaselined, a one-second body-only pass advances the next
-batch without rediscovering the whole provider. A membership or source-revision
-race during a catalog pass keeps the prior rows visible and makes up to two
-one-second full-catalog retries before returning to the normal cadence; mutable
-title, preview, and modification-time changes are intentionally not catalog
-races. A newly cataloged row never
+metadata, and attention in newest-first batches. Codex and Pi session roots use
+the cross-platform `notify` watcher: an ordinary data or metadata change to an
+already indexed JSONL file reads only that file's header and stages only its
+body source. Notifications coalesce for 200 ms (with a one-second maximum
+batch age), so one appended record does not produce several reads. A created
+JSONL path receives that same identity-checked direct read; it commits only if
+it is the existing one-to-one source, while a new, moved, replaced, or unknown
+source immediately requests a complete catalog. A direct header read that races
+a write retries that same source after one second, up to three times, before it
+uses the full recovery path. Remove, rename, directory, overflow/rescan, and
+source-identity events deliberately use complete cataloging, preserving atomic
+relocation and unread handling. Each existing rollout root also keeps a small
+non-recursive parent watch, so a later root removal or rename reaches that same
+recovery path instead of stranding its recursive watcher. A Notify backend
+error first runs one complete recovery catalog, then disables the native watcher
+and falls back to the provider-local cadence instead of repeatedly rescanning
+on every error.
+
+The full all-provider header catalog now runs at startup, on an explicit retry,
+for those structural/recovery cases, and every five minutes as a safety sweep;
+it is no longer the normal steady-state update mechanism for active Codex/Pi
+rollouts. macOS waits two background-only seconds after FSEvents registration
+before the first catalog, so the first snapshot follows the watcher stream's
+asynchronous startup; an existing SQLite sidebar remains immediately usable.
+OpenCode, ZCode, WorkBuddy, and DSH retain a ten-second *provider-local*
+catalog cadence, and a Codex/Pi root with no working native registration joins
+that subset. This preserves their update latency without repeatedly discovering
+large watched rollout trees. While any row remains unbaselined, a one-second
+body-only pass advances the next batch without rediscovering the whole provider.
+A membership or source-revision race, provider catalog warning, or transient
+refresh failure keeps the prior rows visible and makes up to two one-second
+retries of the relevant catalog scope before returning to its normal cadence;
+mutable title, preview, and modification-time changes are intentionally not
+catalog races. A newly cataloged row never
 shows a dot before its body finishes, except a relocated row that retains an
 existing unread state while its new path is validated. The initial catalog
 establishes no unread attention; a session first discovered after that catalog
@@ -434,9 +463,14 @@ producing a page. A one-entry normalized-session cache avoids reparsing between
 page and inspector requests and invalidates on source revision changes,
 including OpenCode's SQLite WAL/SHM sidecars. This cache is separate from the
 durable sidebar index checkpoint, which tracks OpenCode's database/WAL only.
-Periodic sidebar reconciliation exists; native filesystem invalidation and
-authoritative incremental parsing remain follow-up work. Each normalized and
-provider-native inspector representation is capped at 512 KiB before IPC;
+Periodic sidebar reconciliation remains the fallback. Native incremental
+cataloging currently covers only Codex and Pi JSONL rollouts; OpenCode, ZCode,
+WorkBuddy, and DSH receive a ten-second provider-local header catalog until
+they gain precise invalidation paths. When all Codex roots are watched, Codex
+`state_5.sqlite`-only presentation changes still wait for the all-provider
+recovery catalog (or an explicit Retry); if native Codex watching is unavailable,
+the ten-second provider-local fallback reads that metadata too.
+Each normalized and provider-native inspector representation is capped at 512 KiB before IPC;
 oversized values are replaced by structured JSON truncation metadata. A full,
 uncapped export path is not implemented yet.
 
@@ -800,9 +834,10 @@ OpenCode has the first live-output normalizer: `OpenCodeLiveNormalizer` parses `
   delivery acknowledgement; subscribers that are disconnected can miss events.
 - The terminal pet cannot distinguish every runtime state authoritatively until
   provider task lifecycle and interaction events are represented in `AgentEvent`.
-- The desktop viewer remains historical and read-only. Sidebar and a matching
-  selected timeline refresh through polling, not provider live streams, native
-  watchers, or authoritative incremental parsing.
+- The desktop viewer remains historical and read-only. Codex and Pi sidebar
+  metadata use native watcher-driven catalog invalidation, but the viewer has
+  no provider live stream or authoritative incremental event parser; selected
+  timelines still refresh from the durable index and historical source reads.
 - Viewer session-file relocation is deliberately conservative. Repeated or
   overlapping moves can make the retired source ambiguous, in which case the
   later path is treated as a new row instead of transferring prior attention.
@@ -841,8 +876,8 @@ cd apps/viewer && pnpm tauri dev
 - Decide whether live stream consumption should live in `client` as callbacks/iterators or in the CLI command path.
 - Extend provider fixture coverage with OpenCode SQLite normalization.
 - Add CLI golden tests for tiny fixture-backed `list` and `show` outputs.
-- Add native storage invalidation and incremental source paging to the desktop
-  viewer after the historical read-only surface stabilizes.
+- Extend native storage invalidation beyond Codex/Pi and add incremental source
+  paging to the desktop viewer after the historical read-only surface stabilizes.
 - Map Codex lifecycle next and teach terminal pet to use authoritative lifecycle
   instead of heuristics. Pi live boundaries require a bridge feature; do not
   infer them from historical assistant/tool records. OpenCode input-request

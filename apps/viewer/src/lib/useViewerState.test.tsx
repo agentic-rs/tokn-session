@@ -104,6 +104,7 @@ function indexProgress(overrides: Partial<SessionIndexProgress> = {}): SessionIn
     is_refreshing: false,
     activity: "idle",
     catalog: {
+      scope: "full",
       active_provider: null,
       processed_providers: 6,
       total_providers: 6,

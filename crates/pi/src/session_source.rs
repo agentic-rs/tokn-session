@@ -24,6 +24,21 @@ impl PiSessionSource {
     self.list_session_refs(inspect_session_header)
   }
 
+  /// Returns the effective session root used for discovery.
+  ///
+  /// Consumers that maintain a file watcher should use this resolved root so
+  /// environment overrides and platform-specific home-directory handling stay
+  /// consistent with ordinary Pi discovery.
+  pub fn session_roots(&self) -> Result<Vec<PathBuf>, String> {
+    Ok(vec![self.root()?])
+  }
+
+  /// Reads the header relation for one known session path without scanning its
+  /// conversation body or sibling session files.
+  pub fn session_relation_at_path(&self, path: &Path) -> Result<SessionRef, String> {
+    inspect_session_header(path)
+  }
+
   /// Populate presentation metadata stored outside Pi's first session row.
   ///
   /// Relation discovery deliberately remains a header-only operation. Callers
@@ -38,8 +53,9 @@ impl PiSessionSource {
 
   fn list_session_refs(&self, inspect: fn(&Path) -> Result<SessionRef, String>) -> Result<Vec<SessionRef>, String> {
     let mut sessions = Vec::new();
-    let root = self.root()?;
-    collect_jsonl_files(&root, &mut sessions)?;
+    for root in self.session_roots()? {
+      collect_jsonl_files(&root, &mut sessions)?;
+    }
 
     let mut refs = Vec::new();
     for path in sessions {

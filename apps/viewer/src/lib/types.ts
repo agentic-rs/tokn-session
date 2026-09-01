@@ -198,10 +198,17 @@ export interface SessionIndexChangedEvent {
  * from being replaced by that older snapshot.
  */
 export type SessionIndexActivity = "idle" | "catalog" | "body" | "waiting_to_retry";
+/** Whether a catalog activity is complete discovery or a targeted change check. */
+export type SessionIndexCatalogScope = "full" | "targeted";
 /** Sanitized scheduler-wide failure categories; no provider path or raw error crosses IPC. */
 export type SessionIndexWorkerError = "refresh_failed" | "task_failed";
 
 export interface SessionIndexCatalogProgress {
+  /**
+   * Older hot-reloaded backends omit this field; treat that conservatively as
+   * a complete discovery pass in the UI.
+   */
+  scope?: SessionIndexCatalogScope;
   active_provider: ViewerProvider | null;
   processed_providers: number;
   total_providers: number;
