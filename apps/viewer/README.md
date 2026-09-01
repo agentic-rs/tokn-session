@@ -50,6 +50,19 @@ while their **Inspect** action opens the full inspector. Messages and reasoning
 have a readable **Content** view, while **Normalized** and **Native** expose the
 debugging representations.
 
+User prompts and final assistant replies remain in the outer conversation.
+Contiguous stretches of intermediate assistant progress and non-message work
+are initially folded into a compact **Worked** timeline item, keeping the
+surrounding conversation easy to scan. A non-final assistant message itself is
+enough to make a stretch fold; metadata-only stretches remain flat. Terminal
+bookkeeping after a final reply remains as ordinary chronological rows instead
+of creating a second **Worked** item. It shows
+**Worked for …** only when its provider event timestamps establish an observed
+duration; the viewer never infers a duration from a session file's modification
+time. Expanding it fetches its contained event rows in bounded pages and shows
+them as their normal event cards. Each row remains independently inspectable,
+and a recorded delegation can still open its verified direct child session.
+
 Known shell, file, search, web, and task tools use compact semantic headers.
 Expanding a tool fetches its output lazily, including the matching result when a
 provider records invocation and result separately under the same call id. The
@@ -115,6 +128,12 @@ unchanged; OpenCode revision checks include its SQLite WAL and SHM sidecars. The
 current provider readers may still load an entire selected session before
 producing an event page, so paging does not yet bound parser memory for very
 large histories.
+Trajectory items are a viewer presentation projection over that normalized
+timeline: user prompts, final assistant replies, their terminal bookkeeping,
+and hidden-event boundaries remain outside the item, while intermediate
+assistant progress is folded into it. The item's inner rows are loaded only
+after expansion. Their page is bounded separately from the outer conversation
+page, so a long turn cannot make initial timeline loading unbounded.
 Each normalized and provider-native inspector representation is capped at 512
 KiB before IPC. Oversized values become structured JSON truncation placeholders;
 an uncapped export path is future work.

@@ -1,8 +1,19 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { eventButtonId } from "./state";
-import { listSessionChildren, listSessions, loadEventDetail, loadEventPage } from "./tauri";
-import type { EventDetail, EventPageResponse, SessionSummary } from "./types";
+import {
+  listSessionChildren,
+  listSessions,
+  loadEventDetail,
+  loadEventPage,
+  loadTrajectoryEventPage,
+} from "./tauri";
+import type {
+  EventDetail,
+  EventPageResponse,
+  SessionSummary,
+  TrajectoryEventPageResponse,
+} from "./types";
 import { useViewerState } from "./useViewerState";
 
 vi.mock("./tauri", () => ({
@@ -10,6 +21,7 @@ vi.mock("./tauri", () => ({
   listSessions: vi.fn(() => new Promise(() => undefined)),
   loadEventDetail: vi.fn(() => new Promise(() => undefined)),
   loadEventPage: vi.fn(() => new Promise(() => undefined)),
+  loadTrajectoryEventPage: vi.fn(() => new Promise(() => undefined)),
 }));
 
 beforeEach(() => {
@@ -17,6 +29,9 @@ beforeEach(() => {
   vi.mocked(listSessions).mockReset().mockImplementation(() => new Promise(() => undefined));
   vi.mocked(loadEventPage).mockReset().mockImplementation(() => new Promise(() => undefined));
   vi.mocked(loadEventDetail).mockReset().mockImplementation(() => new Promise(() => undefined));
+  vi.mocked(loadTrajectoryEventPage).mockReset().mockImplementation(
+    () => new Promise(() => undefined),
+  );
 });
 
 afterEach(() => {
@@ -155,6 +170,56 @@ function reasoningEventPage(overrides: Partial<EventPageResponse["events"][numbe
     previous_cursor: null,
     total_events: 1,
     history_status: "complete",
+  };
+}
+
+function trajectoryEventPage(): EventPageResponse {
+  return {
+    events: [{
+      event_key: "trajectory.v1.turn-1",
+      type: "trajectory",
+      provider: "codex",
+      timestamp: "2026-08-31T01:00:00Z",
+      phase: null,
+      role: null,
+      title: "Turn trajectory",
+      summary: "Whole turn",
+      summary_truncated: false,
+      is_hidden: false,
+      is_error: false,
+      trajectory: {
+        event_count: 2,
+        tool_count: 1,
+        reasoning_count: 0,
+        agent_activity_count: 0,
+        error_count: 0,
+        unknown_count: 0,
+        started_at: "2026-08-31T00:00:00Z",
+        ended_at: "2026-08-31T01:00:00Z",
+        duration_ms: "3600000",
+      },
+      tool: null,
+      usage: null,
+      reasoning: null,
+    }],
+    next_cursor: null,
+    previous_cursor: null,
+    total_events: 1,
+    history_status: "complete",
+  };
+}
+
+function trajectoryChildPage(): TrajectoryEventPageResponse {
+  const child = toolEventPage().events[0]!;
+  return {
+    events: [{
+      ...child,
+      event_key: "event.v1.trajectory-tool",
+      timestamp: "2026-08-31T00:10:00Z",
+    }],
+    next_cursor: null,
+    previous_cursor: null,
+    total_events: 1,
   };
 }
 
@@ -435,6 +500,148 @@ describe("useViewerState expanded reasoning detail", () => {
     await waitFor(() => expect(result.current.expandedEventKey).toBe("event.v1.opaque"));
     expect(result.current.expandedDetailLoading).toBe(false);
     expect(loadEventDetail).not.toHaveBeenCalled();
+  });
+});
+
+describe("useViewerState whole-turn trajectories", () => {
+  it("loads a bounded child page only after opening and gives child tools their normal detail path", async () => {
+    const root = session("codex:trajectory-root");
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [root],
+      next_cursor: null,
+      source_errors: [],
+    });
+    vi.mocked(loadEventPage).mockResolvedValue(trajectoryEventPage());
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValue(trajectoryChildPage());
+    vi.mocked(loadEventDetail).mockResolvedValue({
+      event_key: "event.v1.trajectory-tool",
+      event: { type: "tool_call" },
+      native: null,
+      is_hidden: false,
+      tool_output: {
+        sections: [{ label: "stdout", text: "nested output", format: "text" }],
+        truncated: false,
+        original_size_bytes: 13,
+        source_event_key: "event.v1.trajectory-tool",
+      },
+    });
+    const { result } = renderHook(() => useViewerState());
+
+    await waitFor(() => expect(result.current.events).toHaveLength(1));
+    expect(loadTrajectoryEventPage).not.toHaveBeenCalled();
+    expect(loadEventDetail).not.toHaveBeenCalled();
+
+    act(() => result.current.toggleEventExpanded("trajectory.v1.turn-1"));
+    await waitFor(() => {
+      expect(result.current.trajectoryPages.get(root.session_key)?.get("trajectory.v1.turn-1")?.events)
+        .toHaveLength(1);
+    });
+    expect(loadTrajectoryEventPage).toHaveBeenCalledWith({
+      session_key: root.session_key,
+      trajectory_key: "trajectory.v1.turn-1",
+      cursor: undefined,
+      direction: "forward",
+      limit: 40,
+    });
+    expect(loadEventDetail).not.toHaveBeenCalled();
+
+    act(() => result.current.toggleTrajectoryEventExpanded(
+      "trajectory.v1.turn-1",
+      "event.v1.trajectory-tool",
+    ));
+    await waitFor(() => {
+      expect(result.current.expandedTrajectoryDetail?.tool_output?.sections[0]?.text)
+        .toBe("nested output");
+    });
+    expect(result.current.expandedEventKey).toBe("trajectory.v1.turn-1");
+    expect(result.current.expandedTrajectoryEventKey).toBe("event.v1.trajectory-tool");
+    expect(loadEventDetail).toHaveBeenCalledWith({
+      session_key: root.session_key,
+      event_key: "event.v1.trajectory-tool",
+    });
+
+    act(() => result.current.selectEvent("event.v1.trajectory-tool"));
+    await waitFor(() => {
+      expect(result.current.selectedEvent?.event_key).toBe("event.v1.trajectory-tool");
+    });
+    expect(loadEventDetail).toHaveBeenCalledOnce();
+  });
+
+  it("ignores a stale child page after the selected session changes", async () => {
+    const root = session("codex:trajectory-root");
+    const nextSession = session("codex:next-session");
+    const childPage = deferred<TrajectoryEventPageResponse>();
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [root, nextSession],
+      next_cursor: null,
+      source_errors: [],
+    });
+    vi.mocked(loadEventPage).mockResolvedValue(trajectoryEventPage());
+    vi.mocked(loadTrajectoryEventPage).mockImplementation(() => childPage.promise);
+    const { result } = renderHook(() => useViewerState());
+
+    await waitFor(() => expect(result.current.selectedSessionKey).toBe(root.session_key));
+    act(() => result.current.toggleEventExpanded("trajectory.v1.turn-1"));
+    await waitFor(() => expect(loadTrajectoryEventPage).toHaveBeenCalledOnce());
+
+    act(() => result.current.selectSession(nextSession.session_key));
+    await waitFor(() => expect(result.current.selectedSessionKey).toBe(nextSession.session_key));
+
+    await act(async () => {
+      childPage.resolve(trajectoryChildPage());
+      await childPage.promise;
+    });
+
+    expect(result.current.trajectoryPages.has(root.session_key)).toBe(false);
+  });
+
+  it("preserves cursor direction for earlier and later child pages", async () => {
+    const root = session("codex:trajectory-cursors");
+    const initial = {
+      ...trajectoryChildPage(),
+      previous_cursor: "earlier-cursor",
+      next_cursor: "later-cursor",
+      total_events: 3,
+    };
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [root],
+      next_cursor: null,
+      source_errors: [],
+    });
+    vi.mocked(loadEventPage).mockResolvedValue(trajectoryEventPage());
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValue(initial);
+    const { result } = renderHook(() => useViewerState());
+
+    await waitFor(() => expect(result.current.events).toHaveLength(1));
+    act(() => result.current.toggleEventExpanded("trajectory.v1.turn-1"));
+    await waitFor(() => {
+      expect(result.current.trajectoryPages.get(root.session_key)?.get("trajectory.v1.turn-1")
+        ?.previous_cursor).toBe("earlier-cursor");
+    });
+
+    act(() => result.current.loadOlderTrajectoryEvents("trajectory.v1.turn-1"));
+    await waitFor(() => expect(loadTrajectoryEventPage).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(loadTrajectoryEventPage).mock.calls[1]?.[0]).toMatchObject({
+      session_key: root.session_key,
+      trajectory_key: "trajectory.v1.turn-1",
+      cursor: "earlier-cursor",
+      direction: "backward",
+      limit: 40,
+    });
+    await waitFor(() => {
+      expect(result.current.trajectoryPages.get(root.session_key)?.get("trajectory.v1.turn-1")
+        ?.is_loading_older).toBe(false);
+    });
+
+    act(() => result.current.loadNewerTrajectoryEvents("trajectory.v1.turn-1"));
+    await waitFor(() => expect(loadTrajectoryEventPage).toHaveBeenCalledTimes(3));
+    expect(vi.mocked(loadTrajectoryEventPage).mock.calls[2]?.[0]).toMatchObject({
+      session_key: root.session_key,
+      trajectory_key: "trajectory.v1.turn-1",
+      cursor: "later-cursor",
+      direction: "forward",
+      limit: 40,
+    });
   });
 });
 

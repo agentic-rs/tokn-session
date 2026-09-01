@@ -5,8 +5,11 @@ import type {
   EventSummary,
   SessionSummary,
   ToolCardSummary,
+  TrajectoryCardSummary,
+  TrajectoryEventPageState,
 } from "../lib/types";
 import {
+  eventButtonId,
   formatTimestamp,
   sessionDisplayTitle,
   shortSessionId,
@@ -29,6 +32,7 @@ interface EventCardProps {
   event: EventSummary;
   button_id: string;
   is_selected: boolean;
+  selected_event_key?: string | null;
   is_expanded: boolean;
   detail: EventDetail | null;
   detail_error: string | null;
@@ -37,6 +41,16 @@ interface EventCardProps {
   on_toggle: (event_key: string) => void;
   on_open_subagent?: (target: SessionSummary) => void;
   on_retry_detail: () => void;
+  trajectory_page?: TrajectoryEventPageState | null;
+  on_trajectory_load_older?: (trajectory_key: string) => void;
+  on_trajectory_load_newer?: (trajectory_key: string) => void;
+  on_trajectory_retry?: (trajectory_key: string) => void;
+  trajectory_expanded_event_key?: string | null;
+  trajectory_expanded_detail?: EventDetail | null;
+  trajectory_expanded_detail_error?: string | null;
+  trajectory_expanded_detail_loading?: boolean;
+  on_trajectory_event_toggle?: (trajectory_key: string, event_key: string) => void;
+  on_trajectory_retry_expanded_detail?: (trajectory_key: string, event_key: string) => void;
 }
 
 function isMessage(event: EventSummary): boolean {
@@ -176,6 +190,79 @@ function agentActivityHeading(event: EventSummary): TechnicalCardHeading {
     action: "Subagent",
     primary: targetLabel,
     secondary: null,
+    monospace: false,
+  };
+}
+
+function pluralize(count: number, singular: string, plural = `${singular}s`): string {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+/**
+ * Formats a decimal millisecond value without coercing it through Number.
+ *
+ * The backend keeps this as a string because it may be a Rust u64, which can
+ * exceed JavaScript's safe integer range. BigInt lets the UI retain every
+ * recorded millisecond while still presenting a compact, exact duration.
+ */
+export function formatTrajectoryDuration(durationMs: string | null): string | null {
+  const source = durationMs?.trim() ?? "";
+  if (!/^\d+$/.test(source)) {
+    return null;
+  }
+
+  let remaining: bigint;
+  try {
+    remaining = BigInt(source);
+  } catch {
+    return null;
+  }
+
+  const units: Array<[bigint, string]> = [
+    [86_400_000n, "d"],
+    [3_600_000n, "h"],
+    [60_000n, "m"],
+    [1_000n, "s"],
+    [1n, "ms"],
+  ];
+  const parts: string[] = [];
+  for (const [unitMs, label] of units) {
+    const count = remaining / unitMs;
+    if (count > 0n) {
+      parts.push(`${count.toString()}${label}`);
+      remaining %= unitMs;
+    }
+  }
+  return parts.join(" ") || "0ms";
+}
+
+function trajectoryFacts(trajectory: TrajectoryCardSummary): string {
+  const facts = [pluralize(trajectory.event_count, "event")];
+  if (trajectory.tool_count > 0) {
+    facts.push(pluralize(trajectory.tool_count, "tool"));
+  }
+  if (trajectory.reasoning_count > 0) {
+    facts.push(pluralize(trajectory.reasoning_count, "reasoning", "reasoning"));
+  }
+  if (trajectory.agent_activity_count > 0) {
+    facts.push(pluralize(trajectory.agent_activity_count, "subagent activity", "subagent activities"));
+  }
+  if (trajectory.error_count > 0) {
+    facts.push(pluralize(trajectory.error_count, "error"));
+  }
+  if (trajectory.unknown_count > 0) {
+    facts.push(pluralize(trajectory.unknown_count, "unknown event"));
+  }
+  return facts.join(" · ");
+}
+
+function trajectoryHeading(event: EventSummary): TechnicalCardHeading {
+  const trajectory = event.trajectory;
+  const duration = formatTrajectoryDuration(trajectory?.duration_ms ?? null);
+  return {
+    action: "Turn",
+    primary: duration ? `Worked for ${duration}` : "Worked",
+    secondary: trajectory ? trajectoryFacts(trajectory) : event.summary || null,
     monospace: false,
   };
 }
@@ -341,6 +428,177 @@ function AgentActivityBody({
   return <p>{event.summary || "No child session was recorded for this activity."}</p>;
 }
 
+function TrajectorySection({
+  button_id,
+  event,
+  is_expanded,
+  is_selected,
+  on_load_newer,
+  on_load_older,
+  on_open_subagent,
+  on_retry,
+  on_retry_child_detail,
+  on_select,
+  on_toggle,
+  on_toggle_child,
+  page,
+  selected_event_key,
+  expanded_child_detail,
+  expanded_child_detail_error,
+  expanded_child_detail_loading,
+  expanded_child_event_key,
+}: {
+  button_id: string;
+  event: EventSummary;
+  is_expanded: boolean;
+  is_selected: boolean;
+  on_load_newer?: (trajectory_key: string) => void;
+  on_load_older?: (trajectory_key: string) => void;
+  on_open_subagent?: (target: SessionSummary) => void;
+  on_retry?: (trajectory_key: string) => void;
+  on_retry_child_detail?: (trajectory_key: string, event_key: string) => void;
+  on_select: (event_key: string) => void;
+  on_toggle: (event_key: string) => void;
+  on_toggle_child?: (trajectory_key: string, event_key: string) => void;
+  page: TrajectoryEventPageState | null | undefined;
+  selected_event_key: string | null | undefined;
+  expanded_child_detail: EventDetail | null;
+  expanded_child_detail_error: string | null;
+  expanded_child_detail_loading: boolean;
+  expanded_child_event_key: string | null;
+}) {
+  const heading = trajectoryHeading(event);
+  const regionId = `${button_id}-details`;
+  const labelId = `${button_id}-label`;
+  const isLoadingPage = page?.is_loading_older || page?.is_loading_newer;
+  return (
+    <section className="trajectory-section" data-selected={is_selected}>
+      <div className="trajectory-section__header">
+        <button
+          aria-controls={regionId}
+          aria-expanded={is_expanded}
+          aria-label={heading.primary}
+          className="trajectory-section__toggle"
+          onClick={() => on_toggle(event.event_key)}
+          type="button"
+        >
+          <span aria-hidden="true" className="trajectory-section__line" />
+          <span className="trajectory-section__label" id={labelId}>{heading.primary}</span>
+          {heading.secondary ? (
+            <span className="trajectory-section__facts">{heading.secondary}</span>
+          ) : null}
+          <span aria-hidden="true" className="trajectory-section__line" />
+          <ChevronIcon className={is_expanded ? "chevron chevron--open" : "chevron"} />
+        </button>
+        <button
+          aria-label={`Inspect ${heading.primary}`}
+          className="trajectory-section__inspect"
+          id={button_id}
+          onClick={() => on_select(event.event_key)}
+          type="button"
+        >
+          Inspect
+        </button>
+      </div>
+
+      {is_expanded ? (
+        <div
+          aria-labelledby={labelId}
+          className="trajectory-section__body"
+          id={regionId}
+          role="region"
+        >
+          {!page || page.is_loading || (!page.has_loaded && !page.error) ? (
+            <div className="trajectory-section__state" role="status">
+              <span className="inline-spinner" aria-hidden="true" />
+              Loading turn events…
+            </div>
+          ) : (
+            <>
+              {page.error ? (
+                <div className="trajectory-section__error" role="alert">
+                  <span>
+                    <strong>Turn events unavailable</strong>
+                    <small>{page.error}</small>
+                  </span>
+                  <button
+                    className="text-button"
+                    disabled={!on_retry}
+                    onClick={() => on_retry?.(event.event_key)}
+                    type="button"
+                  >
+                    Try again
+                  </button>
+                </div>
+              ) : null}
+
+              {page.previous_cursor !== null ? (
+                <button
+                  className="trajectory-section__page-button"
+                  disabled={isLoadingPage || !on_load_older}
+                  onClick={() => on_load_older?.(event.event_key)}
+                  type="button"
+                >
+                  {page.is_loading_older ? "Loading earlier events…" : "Load earlier events"}
+                </button>
+              ) : null}
+
+              {page.events.length > 0 ? (
+                <div aria-label="Events in this turn" className="trajectory-section__events" role="list">
+                  {page.events.map((childEvent) => (
+                    <div key={childEvent.event_key} role="listitem">
+                      <EventCard
+                        button_id={eventButtonId(childEvent.event_key)}
+                        detail={childEvent.event_key === expanded_child_event_key
+                          ? expanded_child_detail
+                          : null}
+                        detail_error={childEvent.event_key === expanded_child_event_key
+                          ? expanded_child_detail_error
+                          : null}
+                        detail_loading={childEvent.event_key === expanded_child_event_key
+                          && expanded_child_detail_loading}
+                        event={childEvent}
+                        is_expanded={childEvent.event_key === expanded_child_event_key}
+                        is_selected={childEvent.event_key === selected_event_key}
+                        on_open_subagent={on_open_subagent}
+                        on_retry_detail={() => {
+                          on_retry_child_detail?.(event.event_key, childEvent.event_key);
+                        }}
+                        on_select={on_select}
+                        on_toggle={(eventKey) => on_toggle_child?.(event.event_key, eventKey)}
+                        selected_event_key={selected_event_key}
+                      />
+                    </div>
+                  ))}
+                </div>
+              ) : !page.error ? (
+                <p className="trajectory-section__empty" role="status">No events in this turn.</p>
+              ) : null}
+
+              {page.next_cursor !== null ? (
+                <button
+                  className="trajectory-section__page-button"
+                  disabled={isLoadingPage || !on_load_newer}
+                  onClick={() => on_load_newer?.(event.event_key)}
+                  type="button"
+                >
+                  {page.is_loading_newer ? "Loading more events…" : "Load more events"}
+                </button>
+              ) : null}
+
+              {page.total_events !== null && page.events.length < page.total_events ? (
+                <p className="trajectory-section__count" role="status">
+                  Showing {page.events.length} of {page.total_events} events.
+                </p>
+              ) : null}
+            </>
+          )}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 function ToolOutput({
   detail,
   error,
@@ -420,6 +678,7 @@ export function EventCard({
   event,
   button_id,
   is_selected,
+  selected_event_key,
   is_expanded,
   detail,
   detail_error,
@@ -428,16 +687,57 @@ export function EventCard({
   on_toggle,
   on_open_subagent,
   on_retry_detail,
+  trajectory_page,
+  on_trajectory_load_older,
+  on_trajectory_load_newer,
+  on_trajectory_retry,
+  trajectory_expanded_event_key,
+  trajectory_expanded_detail,
+  trajectory_expanded_detail_error,
+  trajectory_expanded_detail_loading,
+  on_trajectory_event_toggle,
+  on_trajectory_retry_expanded_detail,
 }: EventCardProps) {
   const [isLocallyExpanded, setIsLocallyExpanded] = useState(
     event.type === "unknown" || event.type === "error",
   );
   const timestampLabel = formatTimestamp(event.timestamp);
 
+  if (event.type === "trajectory") {
+    return (
+      <TrajectorySection
+        button_id={button_id}
+        event={event}
+        expanded_child_detail={trajectory_expanded_detail ?? null}
+        expanded_child_detail_error={trajectory_expanded_detail_error ?? null}
+        expanded_child_detail_loading={trajectory_expanded_detail_loading ?? false}
+        expanded_child_event_key={trajectory_expanded_event_key ?? null}
+        is_expanded={is_expanded}
+        is_selected={is_selected}
+        on_load_newer={on_trajectory_load_newer}
+        on_load_older={on_trajectory_load_older}
+        on_open_subagent={on_open_subagent}
+        on_retry={on_trajectory_retry}
+        on_retry_child_detail={on_trajectory_retry_expanded_detail}
+        on_select={on_select}
+        on_toggle={on_toggle}
+        on_toggle_child={on_trajectory_event_toggle}
+        page={trajectory_page}
+        selected_event_key={selected_event_key}
+      />
+    );
+  }
+
   if (isMessage(event)) {
     const role = event.role ?? "unknown";
+    const presentation = role === "user" ? "bubble" : role === "assistant" ? "transcript" : "technical";
     return (
-      <article className="message-event" data-role={role} data-selected={is_selected}>
+      <article
+        className="message-event"
+        data-presentation={presentation}
+        data-role={role}
+        data-selected={is_selected}
+      >
         <div className="message-event__surface">
           <span className="message-event__role">{role}</span>
           {usesMarkdown(event) ? (

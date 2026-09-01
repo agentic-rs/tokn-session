@@ -6,9 +6,11 @@ import type {
   ReasoningCardSummary,
   SessionSummary,
   ToolCardSummary,
+  TrajectoryCardSummary,
+  TrajectoryEventPageState,
   UsageCardSummary,
 } from "../lib/types";
-import { EventCard } from "./EventCard";
+import { EventCard, formatTrajectoryDuration } from "./EventCard";
 
 afterEach(cleanup);
 
@@ -112,6 +114,40 @@ function detail(overrides: Partial<EventDetail> = {}): EventDetail {
   };
 }
 
+function trajectory(overrides: Partial<TrajectoryCardSummary> = {}): TrajectoryCardSummary {
+  return {
+    event_count: 4,
+    tool_count: 1,
+    reasoning_count: 1,
+    agent_activity_count: 1,
+    error_count: 0,
+    unknown_count: 0,
+    started_at: "2026-08-31T00:00:00Z",
+    ended_at: "2026-08-31T01:00:00Z",
+    duration_ms: "3600000",
+    ...overrides,
+  };
+}
+
+function trajectoryPage(
+  overrides: Partial<TrajectoryEventPageState> = {},
+): TrajectoryEventPageState {
+  return {
+    events: [],
+    next_cursor: null,
+    previous_cursor: null,
+    total_events: 0,
+    has_loaded: true,
+    is_loading: false,
+    is_loading_older: false,
+    is_loading_newer: false,
+    error: null,
+    error_direction: null,
+    error_cursor: null,
+    ...overrides,
+  };
+}
+
 function renderCard(
   cardEvent: EventSummary,
   overrides: Partial<React.ComponentProps<typeof EventCard>> = {},
@@ -142,6 +178,21 @@ describe("EventCard conversation content", () => {
     expect(container.querySelector("button strong")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Inspect assistant message" }));
     expect(onSelect).toHaveBeenCalledWith("event.v1.1");
+  });
+
+  it("uses the user bubble presentation and keeps the user role label", () => {
+    const { container } = renderCard(event({
+      role: "user",
+      title: "User message",
+      summary: "My Request:",
+    }));
+
+    expect(container.querySelector(".message-event")).toHaveAttribute(
+      "data-presentation",
+      "bubble",
+    );
+    expect(screen.getByText("user")).toBeInTheDocument();
+    expect(screen.getByText("My Request:")).toBeInTheDocument();
   });
 
   it("keeps hidden messages redacted and exposes the full-message action for truncation", () => {
@@ -300,6 +351,149 @@ describe("EventCard subagent activity", () => {
     fireEvent.click(screen.getByRole("button", { name: "Subagent: /root/missing" }));
     expect(screen.getByText(/Child session is not available in this viewer/)).toBeInTheDocument();
     expect(screen.getByText(/Recorded target: missing-child/)).toBeInTheDocument();
+  });
+});
+
+describe("EventCard whole-turn trajectories", () => {
+  const trajectoryEvent = event({
+    event_key: "trajectory.v1.turn-1",
+    type: "trajectory",
+    role: null,
+    title: "Turn trajectory",
+    summary: "Whole turn",
+    trajectory: trajectory(),
+  });
+
+  it("stays collapsed until explicitly opened, then renders child events as normal timeline cards", () => {
+    const onToggle = vi.fn();
+    const onToggleChild = vi.fn();
+    const onSelect = vi.fn();
+    const onOpenSubagent = vi.fn();
+    const child = subagent();
+    const message = event({
+      event_key: "event.v1.turn-message",
+      role: "assistant",
+      summary: "I checked the source files.",
+    });
+    const delegation = event({
+      event_key: "event.v1.turn-agent",
+      type: "agent_activity",
+      role: null,
+      title: "Agent activity",
+      summary: "agent activity interacted /root/reviewer",
+      agent_activity: {
+        kind: "interacted",
+        event_id: "activity-turn-1",
+        target_session_id: child.session_id,
+        target_agent_path: child.agent_path,
+        target: child,
+      },
+    });
+    const nestedTool = event({
+      event_key: "event.v1.turn-tool",
+      type: "tool_call",
+      role: null,
+      title: "exec_command",
+      summary: "shell exit 0 cargo test",
+      tool: tool(),
+    });
+    const { container, rerender } = renderCard(trajectoryEvent, {
+      on_open_subagent: onOpenSubagent,
+      on_select: onSelect,
+      on_toggle: onToggle,
+    });
+
+    const toggle = screen.getByRole("button", { name: "Worked for 1h" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText(message.summary)).not.toBeInTheDocument();
+
+    fireEvent.click(toggle);
+    expect(onToggle).toHaveBeenCalledWith(trajectoryEvent.event_key);
+    expect(onSelect).not.toHaveBeenCalled();
+
+    rerender(
+      <EventCard
+        button_id="event-button"
+        detail={null}
+        detail_error={null}
+        detail_loading={false}
+        event={trajectoryEvent}
+        is_expanded
+        is_selected={false}
+        on_open_subagent={onOpenSubagent}
+        on_retry_detail={vi.fn()}
+        on_select={onSelect}
+        on_toggle={onToggle}
+        on_trajectory_event_toggle={onToggleChild}
+        selected_event_key={message.event_key}
+        trajectory_page={trajectoryPage({
+          events: [message, nestedTool, delegation],
+          next_cursor: "next-page",
+          previous_cursor: "previous-page",
+          total_events: 4,
+        })}
+      />,
+    );
+
+    expect(screen.getByRole("region", { name: "Worked for 1h" })).toBeInTheDocument();
+    expect(screen.getByRole("list", { name: "Events in this turn" })).toBeInTheDocument();
+    expect(screen.getByText(message.summary)).toBeInTheDocument();
+    expect(container.querySelector(".trajectory-section")).toBeInTheDocument();
+    expect(container.querySelector(".trajectory-section .message-event")).toBeInTheDocument();
+    expect(container.querySelector(".trajectory-section .technical-event")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Shell: cargo test" })).toBeInTheDocument();
+    expect(screen.getByText("Showing 3 of 4 events.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Load earlier events" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Load more events" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Inspect assistant message" }));
+    expect(onSelect).toHaveBeenCalledWith(message.event_key);
+
+    fireEvent.click(screen.getByRole("button", { name: "Shell: cargo test" }));
+    expect(onToggleChild).toHaveBeenCalledWith(trajectoryEvent.event_key, nestedTool.event_key);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open subagent Hubble" }));
+    expect(onOpenSubagent).toHaveBeenCalledWith(child);
+  });
+
+  it("shows loading and retryable child-page failures without using event detail", () => {
+    const onRetry = vi.fn();
+    const { rerender } = renderCard(trajectoryEvent, {
+      is_expanded: true,
+      trajectory_page: null,
+    });
+
+    expect(screen.getByRole("status")).toHaveTextContent("Loading turn events");
+
+    rerender(
+      <EventCard
+        button_id="event-button"
+        detail={null}
+        detail_error={null}
+        detail_loading={false}
+        event={trajectoryEvent}
+        is_expanded
+        is_selected={false}
+        on_retry_detail={vi.fn()}
+        on_select={vi.fn()}
+        on_toggle={vi.fn()}
+        on_trajectory_retry={onRetry}
+        trajectory_page={trajectoryPage({
+          error: "trajectory record was unavailable",
+          error_direction: "initial",
+        })}
+      />,
+    );
+
+    expect(screen.getByRole("alert")).toHaveTextContent("trajectory record was unavailable");
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(onRetry).toHaveBeenCalledWith(trajectoryEvent.event_key);
+  });
+
+  it("formats decimal millisecond strings exactly without Number precision loss", () => {
+    expect(formatTrajectoryDuration("9007199254740993")).toBe("104249991d 8h 59m 993ms");
+    expect(formatTrajectoryDuration("0")).toBe("0ms");
+    expect(formatTrajectoryDuration("not-a-duration")).toBeNull();
   });
 });
 

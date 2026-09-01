@@ -4,6 +4,7 @@ import type {
   EventSummary,
   SessionHistoryStatus,
   SessionSummary,
+  TrajectoryEventPageState,
 } from "../lib/types";
 import {
   eventButtonId,
@@ -39,6 +40,17 @@ interface ConversationProps {
   on_inspector_toggle: () => void;
   on_event_select: (event_key: string) => void;
   on_event_toggle: (event_key: string) => void;
+  trajectory_pages: ReadonlyMap<string, ReadonlyMap<string, TrajectoryEventPageState>>;
+  trajectory_expanded_key: string | null;
+  trajectory_expanded_event_key: string | null;
+  trajectory_expanded_detail: EventDetail | null;
+  trajectory_expanded_detail_error: string | null;
+  trajectory_expanded_detail_loading: boolean;
+  on_trajectory_load_older: (trajectory_key: string) => void;
+  on_trajectory_load_newer: (trajectory_key: string) => void;
+  on_trajectory_retry: (trajectory_key: string) => void;
+  on_trajectory_event_toggle: (trajectory_key: string, event_key: string) => void;
+  on_trajectory_retry_expanded_detail: (trajectory_key: string, event_key: string) => void;
   on_open_subagent: (parent_session_key: string, target: SessionSummary) => void;
   on_load_older: () => void;
   on_load_newer: () => void;
@@ -68,6 +80,17 @@ export function Conversation({
   on_inspector_toggle,
   on_event_select,
   on_event_toggle,
+  trajectory_pages,
+  trajectory_expanded_key,
+  trajectory_expanded_event_key,
+  trajectory_expanded_detail,
+  trajectory_expanded_detail_error,
+  trajectory_expanded_detail_loading,
+  on_trajectory_load_older,
+  on_trajectory_load_newer,
+  on_trajectory_retry,
+  on_trajectory_event_toggle,
+  on_trajectory_retry_expanded_detail,
   on_open_subagent,
   on_load_older,
   on_load_newer,
@@ -252,6 +275,11 @@ export function Conversation({
                 is_expanded={event.event_key === expanded_event_key}
                 is_selected={event.event_key === selected_event_key}
                 key={`${session.session_key}:${event.event_key}`}
+                on_trajectory_load_newer={on_trajectory_load_newer}
+                on_trajectory_load_older={on_trajectory_load_older}
+                on_trajectory_retry={on_trajectory_retry}
+                on_trajectory_event_toggle={on_trajectory_event_toggle}
+                on_trajectory_retry_expanded_detail={on_trajectory_retry_expanded_detail}
                 on_select={on_event_select}
                 on_toggle={on_event_toggle}
                 on_open_subagent={(target) => {
@@ -260,6 +288,25 @@ export function Conversation({
                   }
                 }}
                 on_retry_detail={on_retry_expanded_detail}
+                selected_event_key={selected_event_key}
+                trajectory_page={event.type === "trajectory"
+                  ? trajectory_pages.get(session.session_key)?.get(event.event_key) ?? null
+                  : null}
+                trajectory_expanded_detail={event.type === "trajectory"
+                  && event.event_key === trajectory_expanded_key
+                  ? trajectory_expanded_detail
+                  : null}
+                trajectory_expanded_detail_error={event.type === "trajectory"
+                  && event.event_key === trajectory_expanded_key
+                  ? trajectory_expanded_detail_error
+                  : null}
+                trajectory_expanded_detail_loading={event.type === "trajectory"
+                  && event.event_key === trajectory_expanded_key
+                  && trajectory_expanded_detail_loading}
+                trajectory_expanded_event_key={event.type === "trajectory"
+                  && event.event_key === trajectory_expanded_key
+                  ? trajectory_expanded_event_key
+                  : null}
               />
             ))}
 
