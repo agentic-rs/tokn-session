@@ -7,8 +7,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokn_session_client::SessionHeader;
 use tokn_session_core::{
-  AgentActivity, AgentEvent, LifecycleOutcome, LoadedSession, Phase, Provider, Role, TerminalAction, ToolCallEvent,
-  ToolKind, ToolOperation, ToolOperationStatus, ToolSummary, UsageKind, assemble_tool_operations,
+  AgentActivity, AgentEvent, LifecycleOutcome, LoadedSession, MessageDelivery, Phase, Provider, Role, TerminalAction,
+  ToolCallEvent, ToolKind, ToolOperation, ToolOperationStatus, ToolSummary, UsageKind, assemble_tool_operations,
 };
 use tokn_session_render::render_event_summary;
 
@@ -95,9 +95,9 @@ enum TimelineEntry {
     source_event_index: usize,
     operation: ToolOperation,
   },
-  /// A synthetic high-level item over a maximal run of non-message, visible base
-  /// timeline entries. Its source children remain addressable through their
-  /// own ordinary `event.v1.*` keys.
+  /// A synthetic high-level item over a maximal run of visible work entries,
+  /// including intermediate assistant messages. Its source children remain
+  /// addressable through their own ordinary `event.v1.*` keys.
   Trajectory {
     trajectory: Trajectory,
   },
@@ -1148,9 +1148,14 @@ fn base_timeline_entries(events: &[AgentEvent]) -> Vec<TimelineEntry> {
   entries
 }
 
-/// Folds each maximal visible non-message base run that contains substantive
-/// work into one synthetic card. Flat metadata-only runs deliberately remain
-/// inspectable in the parent timeline, and every message stays visible.
+/// Folds each maximal visible work run into one synthetic high-level item.
+///
+/// User prompts and explicit final assistant replies remain in the outer
+/// conversation. Assistant commentary and legacy/unspecified assistant
+/// messages instead belong to the surrounding work trajectory so expanding a
+/// turn reveals the ordinary assistant cards that led to its final reply. All
+/// other message roles remain visible boundaries because their delivery
+/// semantics are not reliable enough to fold safely.
 fn timeline_entries(events: &[AgentEvent]) -> Vec<TimelineEntry> {
   let base_entries = base_timeline_entries(events);
   let mut entries = Vec::with_capacity(base_entries.len());
@@ -1203,28 +1208,40 @@ fn is_trajectory_boundary(entry: &TimelineEntry, events: &[AgentEvent]) -> bool 
   let Some(event) = events.get(*source_event_index) else {
     return true;
   };
-  event.is_hidden()
-    || matches!(
-      event,
-      AgentEvent::Message(_) | AgentEvent::SessionStarted(_) | AgentEvent::ProviderChanged(_)
-    )
+  if event.is_hidden() {
+    return true;
+  }
+
+  match event {
+    AgentEvent::Message(message) => !is_non_final_assistant_message(message.role, message.delivery),
+    AgentEvent::SessionStarted(_) | AgentEvent::ProviderChanged(_) => true,
+    _ => false,
+  }
 }
 
 fn is_substantive_work_entry(entry: &TimelineEntry, events: &[AgentEvent]) -> bool {
   match entry {
     TimelineEntry::ToolOperation { .. } => true,
-    TimelineEntry::Event { source_event_index } => matches!(
-      events.get(*source_event_index),
+    TimelineEntry::Event { source_event_index } => match events.get(*source_event_index) {
+      // A non-final assistant message is itself part of the agent's work
+      // trace. Treat it as substantive so standalone commentary/delta runs
+      // are consistently represented by the parent `Worked for …` item.
+      Some(AgentEvent::Message(message)) => is_non_final_assistant_message(message.role, message.delivery),
       Some(
         AgentEvent::Reasoning(_)
-          | AgentEvent::AgentActivity(_)
-          | AgentEvent::Lifecycle(_)
-          | AgentEvent::Usage(_)
-          | AgentEvent::Error(_)
-      )
-    ),
+        | AgentEvent::AgentActivity(_)
+        | AgentEvent::Lifecycle(_)
+        | AgentEvent::Usage(_)
+        | AgentEvent::Error(_),
+      ) => true,
+      _ => false,
+    },
     TimelineEntry::Trajectory { .. } => false,
   }
+}
+
+fn is_non_final_assistant_message(role: Role, delivery: MessageDelivery) -> bool {
+  role == Role::Assistant && delivery != MessageDelivery::Final
 }
 
 fn timeline_entry_anchor_source_event_index(entry: &TimelineEntry) -> Option<usize> {
@@ -3151,6 +3168,127 @@ mod tests {
   }
 
   #[test]
+  fn trajectory_folds_non_final_assistant_messages_but_keeps_conversation_boundaries_visible() {
+    let events = vec![
+      message_event_with_role("My request", Role::User, MessageDelivery::Unspecified),
+      with_timestamp(
+        message_event_with_role("I will inspect this", Role::Assistant, MessageDelivery::Commentary),
+        "2026-09-01T00:00:00Z",
+      ),
+      metadata_event("turn context"),
+      with_timestamp(
+        message_event_with_role("legacy progress", Role::Assistant, MessageDelivery::Unspecified),
+        "2026-09-01T00:00:30Z",
+      ),
+      message_event("Final answer"),
+      message_event_with_role("System note", Role::System, MessageDelivery::Unspecified),
+      message_event_with_role("Tool output", Role::Tool, MessageDelivery::Unspecified),
+      message_event_with_role("Unknown message", Role::Unknown, MessageDelivery::Unspecified),
+      with_timestamp(
+        message_event_with_role("standalone progress", Role::Assistant, MessageDelivery::Commentary),
+        "2026-09-01T00:01:00Z",
+      ),
+      message_event("Second final answer"),
+    ];
+    let directory = tempfile::tempdir().unwrap();
+    let session_key = key_for_cached_source(&directory, "fixture");
+    let service = service_with_session(loaded_session(events));
+
+    let first = service
+      .load_event_page(EventPageRequest {
+        session_key: session_key.clone(),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: Some(2),
+      })
+      .unwrap();
+
+    assert_eq!(first.total_events, 8);
+    assert_eq!(
+      first
+        .events
+        .iter()
+        .map(|event| (event.event_type.as_str(), event.summary.as_str()))
+        .collect::<Vec<_>>(),
+      [("message", "My request"), ("trajectory", "3 events")]
+    );
+    assert_eq!(first.events[0].role.as_deref(), Some("user"));
+    let first_trajectory = first.events[1].trajectory.as_ref().unwrap();
+    assert_eq!(first_trajectory.event_count, 3);
+    assert_eq!(first_trajectory.started_at.as_deref(), Some("2026-09-01T00:00:00Z"));
+    assert_eq!(first_trajectory.ended_at.as_deref(), Some("2026-09-01T00:00:30Z"));
+    assert_eq!(first_trajectory.duration_ms.as_deref(), Some("30000"));
+
+    let trajectory_key = first.events[1].event_key.clone();
+    let trajectory_first_page = service
+      .load_trajectory_event_page(LoadTrajectoryEventPageRequest {
+        session_key: session_key.clone(),
+        trajectory_key: trajectory_key.clone(),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: Some(2),
+      })
+      .unwrap();
+    assert_eq!(trajectory_first_page.total_events, 3);
+    assert_eq!(
+      trajectory_first_page
+        .events
+        .iter()
+        .map(|event| (event.event_type.as_str(), event.summary.as_str()))
+        .collect::<Vec<_>>(),
+      [
+        ("message", "I will inspect this"),
+        ("metadata", "[fixture_metadata] turn context"),
+      ]
+    );
+    let trajectory_second_page = service
+      .load_trajectory_event_page(LoadTrajectoryEventPageRequest {
+        session_key: session_key.clone(),
+        trajectory_key,
+        cursor: trajectory_first_page.next_cursor,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: Some(2),
+      })
+      .unwrap();
+    assert_eq!(trajectory_second_page.events.len(), 1);
+    assert_eq!(trajectory_second_page.events[0].summary, "legacy progress");
+    assert_eq!(trajectory_second_page.events[0].role.as_deref(), Some("assistant"));
+
+    let second = service
+      .load_event_page(EventPageRequest {
+        session_key,
+        cursor: first.next_cursor,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: Some(6),
+      })
+      .unwrap();
+    assert_eq!(
+      second
+        .events
+        .iter()
+        .map(|event| (event.event_type.as_str(), event.summary.as_str()))
+        .collect::<Vec<_>>(),
+      [
+        ("message", "Final answer"),
+        ("message", "System note"),
+        ("message", "Tool output"),
+        ("message", "Unknown message"),
+        ("trajectory", "1 events"),
+        ("message", "Second final answer"),
+      ]
+    );
+    assert_eq!(second.events[0].role.as_deref(), Some("assistant"));
+    assert_eq!(second.events[1].role.as_deref(), Some("system"));
+    assert_eq!(second.events[2].role.as_deref(), Some("tool"));
+    assert_eq!(second.events[3].role.as_deref(), Some("unknown"));
+    assert_eq!(second.events[4].trajectory.as_ref().unwrap().event_count, 1);
+  }
+
+  #[test]
   fn top_level_trajectory_paging_uses_projected_cards_without_losing_messages() {
     let events = vec![
       message_event("before"),
@@ -3938,7 +4076,12 @@ mod tests {
     ];
 
     let trajectory = trajectory_for_anchor(&events, 2).expect("terminal tool operation is a trajectory");
-    let operation = timeline_entry_event_summary(&trajectory.entries[0], &events, &HashMap::new());
+    let operation_entry = trajectory
+      .entries
+      .iter()
+      .find(|entry| matches!(entry, TimelineEntry::ToolOperation { .. }))
+      .expect("assembled tool operation should stay inside the trajectory");
+    let operation = timeline_entry_event_summary(operation_entry, &events, &HashMap::new());
     let operation_tool = operation.tool.as_ref().unwrap();
 
     let page = service_with_session(loaded_session(events))
@@ -3950,10 +4093,9 @@ mod tests {
         limit: None,
       })
       .unwrap();
-    assert_eq!(page.total_events, 2);
-    assert_eq!(page.events.len(), 2);
-    assert_eq!(page.events[0].event_type, "message");
-    assert_eq!(page.events[1].event_type, "trajectory");
+    assert_eq!(page.total_events, 1);
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.events[0].event_type, "trajectory");
 
     assert_eq!(
       operation_tool.command.as_ref().unwrap().chars().count(),
@@ -4823,14 +4965,18 @@ mod tests {
   }
 
   fn message_event(text: &str) -> AgentEvent {
+    message_event_with_role(text, Role::Assistant, MessageDelivery::Final)
+  }
+
+  fn message_event_with_role(text: &str, role: Role, delivery: MessageDelivery) -> AgentEvent {
     AgentEvent::Message(MessageEvent {
       provenance: None,
       provider: Provider::Codex,
       session_id: Some("fixture".to_string()),
       message_id: Some("message".to_string()),
       parent_id: None,
-      role: Role::Assistant,
-      delivery: MessageDelivery::Final,
+      role,
+      delivery,
       phase: Phase::Finished,
       text: text.to_string(),
       timestamp: None,

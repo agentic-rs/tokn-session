@@ -1342,7 +1342,7 @@ fn codex_role(role: &str) -> Role {
 fn codex_message_delivery(phase: Option<&str>) -> MessageDelivery {
   match phase {
     Some("commentary") => MessageDelivery::Commentary,
-    Some("final") | Some("final_answer") => MessageDelivery::Final,
+    Some("completed") | Some("final") | Some("final_answer") => MessageDelivery::Final,
     _ => MessageDelivery::Unspecified,
   }
 }
@@ -1476,9 +1476,10 @@ mod tests {
     assert!(
       matches!(&events[2], AgentEvent::Message(event) if matches!(event.role, Role::User) && event.text == "build a tiny test")
     );
-    assert!(
-      matches!(&events[3], AgentEvent::Message(event) if event.message_id.as_deref() == Some("msg-assistant") && event.text == "done")
-    );
+    assert!(matches!(&events[3], AgentEvent::Message(event)
+        if event.message_id.as_deref() == Some("msg-assistant")
+          && matches!(event.delivery, MessageDelivery::Final)
+          && event.text == "done"));
     assert!(matches!(&events[4], AgentEvent::Reasoning(event) if event.summary.as_deref() == Some("checked files")));
     assert!(
       matches!(&events[5], AgentEvent::ToolCall(event) if matches!(event.phase, Phase::Started) && matches!(event.tool_kind, ToolKind::Shell))
@@ -2109,12 +2110,14 @@ mod tests {
       r#"{"type":"session_meta","payload":{"id":"session-1"}}
 {"type":"response_item","payload":{"type":"message","id":"commentary","role":"assistant","content":[{"type":"output_text","text":"working"}],"phase":"commentary"}}
 {"type":"response_item","payload":{"type":"message","id":"final","role":"assistant","content":[{"type":"output_text","text":"done"}],"phase":"final"}}
-{"type":"response_item","payload":{"type":"message","id":"final-answer","role":"assistant","content":[{"type":"output_text","text":"current done"}],"phase":"final_answer"}}"#,
+{"type":"response_item","payload":{"type":"message","id":"final-answer","role":"assistant","content":[{"type":"output_text","text":"current done"}],"phase":"final_answer"}}
+{"type":"response_item","payload":{"type":"message","id":"completed","role":"assistant","content":[{"type":"output_text","text":"legacy done"}],"phase":"completed"}}"#,
     );
 
     assert!(matches!(&events[1], AgentEvent::Message(event) if matches!(event.delivery, MessageDelivery::Commentary)));
     assert!(matches!(&events[2], AgentEvent::Message(event) if matches!(event.delivery, MessageDelivery::Final)));
     assert!(matches!(&events[3], AgentEvent::Message(event) if matches!(event.delivery, MessageDelivery::Final)));
+    assert!(matches!(&events[4], AgentEvent::Message(event) if matches!(event.delivery, MessageDelivery::Final)));
   }
 
   #[test]

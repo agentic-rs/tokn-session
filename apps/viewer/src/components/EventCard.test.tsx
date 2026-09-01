@@ -180,6 +180,21 @@ describe("EventCard conversation content", () => {
     expect(onSelect).toHaveBeenCalledWith("event.v1.1");
   });
 
+  it("uses the transcript presentation and keeps the user role label", () => {
+    const { container } = renderCard(event({
+      role: "user",
+      title: "User message",
+      summary: "My Request:",
+    }));
+
+    expect(container.querySelector(".message-event")).toHaveAttribute(
+      "data-presentation",
+      "transcript",
+    );
+    expect(screen.getByText("user")).toBeInTheDocument();
+    expect(screen.getByText("My Request:")).toBeInTheDocument();
+  });
+
   it("keeps hidden messages redacted and exposes the full-message action for truncation", () => {
     const { rerender } = renderCard(event({ is_hidden: true, summary: "secret" }));
 

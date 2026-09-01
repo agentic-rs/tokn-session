@@ -730,8 +730,14 @@ export function EventCard({
 
   if (isMessage(event)) {
     const role = event.role ?? "unknown";
+    const isTranscriptMessage = role === "user" || role === "assistant";
     return (
-      <article className="message-event" data-role={role} data-selected={is_selected}>
+      <article
+        className="message-event"
+        data-presentation={isTranscriptMessage ? "transcript" : "technical"}
+        data-role={role}
+        data-selected={is_selected}
+      >
         <div className="message-event__surface">
           <span className="message-event__role">{role}</span>
           {usesMarkdown(event) ? (
