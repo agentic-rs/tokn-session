@@ -29,7 +29,7 @@ The core abstraction is `AgentEvent`: provider-native historical sessions and li
 
 - The CLI binary is `tokn-session`.
 - Commands are top-level. Do not reintroduce a `sessions` namespace.
-- Historical sources today are `pi`, `codex`, `opencode`, and `dsh`.
+- Historical sources today are `pi`, `codex`, `opencode`, `zcode`, and `dsh`.
 - Current implemented commands are `list` and `show`.
 - Future likely commands are `create` and `attach`.
 - Provider-native events are normalized for display first; exact round-trip preservation is not a current goal.
@@ -48,6 +48,8 @@ The core abstraction is `AgentEvent`: provider-native historical sessions and li
 - `crates/pi`: Pi JSONL session source and normalization.
 - `crates/codex`: Codex JSONL session source and normalization.
 - `crates/opencode`: OpenCode SQLite session source and normalization.
+- `crates/zcode`: ZCode SQLite session source using the compatible tolerant
+  OpenCode V1 wire decoder with ZCode-specific provider semantics.
 - `vendor/`: source-of-truth checkouts for upstream projects. Do not edit vendored code unless explicitly asked.
 
 ## Before Non-Trivial Work

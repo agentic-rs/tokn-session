@@ -6,7 +6,7 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
-export const PROVIDERS = ["codex", "pi", "opencode", "dsh"] as const;
+export const PROVIDERS = ["codex", "pi", "opencode", "zcode", "dsh"] as const;
 
 export type ViewerProvider = (typeof PROVIDERS)[number];
 

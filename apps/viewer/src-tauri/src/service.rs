@@ -1990,7 +1990,7 @@ fn source_revision(locator: &SessionLocator) -> Option<SourceRevision> {
 
 fn source_revision_for(provider: ViewerProvider, source_path: &Path) -> Option<SourceRevision> {
   let mut paths = vec![source_path.to_path_buf()];
-  if provider == ViewerProvider::OpenCode {
+  if matches!(provider, ViewerProvider::OpenCode | ViewerProvider::ZCode) {
     // The SHM sidecar is a reader-writable WAL index. It can change during our
     // own reads without any session content changing, so only track the WAL.
     let mut wal = source_path.as_os_str().to_os_string();
@@ -3345,6 +3345,7 @@ fn viewer_provider(provider: Provider) -> ViewerProvider {
     Provider::Codex => ViewerProvider::Codex,
     Provider::Pi => ViewerProvider::Pi,
     Provider::OpenCode => ViewerProvider::OpenCode,
+    Provider::ZCode => ViewerProvider::ZCode,
     Provider::Dsh => ViewerProvider::Dsh,
   }
 }
@@ -7629,27 +7630,29 @@ mod tests {
   }
 
   #[test]
-  fn opencode_source_revisions_ignore_the_transient_shm_index() {
+  fn opencode_compatible_source_revisions_ignore_the_transient_shm_index() {
     let directory = tempfile::tempdir().unwrap();
-    let database = directory.path().join("opencode.db");
-    let wal = directory.path().join("opencode.db-wal");
-    let shm = directory.path().join("opencode.db-shm");
-    std::fs::write(&database, b"database").unwrap();
-    std::fs::write(&wal, b"wal").unwrap();
-    std::fs::write(&shm, b"shm").unwrap();
-    let locator = SessionLocator {
-      version: 1,
-      provider: ViewerProvider::OpenCode,
-      session_id: "fixture".to_string(),
-      source_path: database,
-    };
+    for provider in [ViewerProvider::OpenCode, ViewerProvider::ZCode] {
+      let database = directory.path().join(format!("{}.db", provider.as_str()));
+      let wal = directory.path().join(format!("{}.db-wal", provider.as_str()));
+      let shm = directory.path().join(format!("{}.db-shm", provider.as_str()));
+      std::fs::write(&database, b"database").unwrap();
+      std::fs::write(&wal, b"wal").unwrap();
+      std::fs::write(&shm, b"shm").unwrap();
+      let locator = SessionLocator {
+        version: 1,
+        provider,
+        session_id: "fixture".to_string(),
+        source_path: database,
+      };
 
-    let revision = source_revision(&locator);
-    std::fs::write(&shm, b"reader-owned shm change").unwrap();
-    assert_eq!(source_revision(&locator), revision);
+      let revision = source_revision(&locator);
+      std::fs::write(&shm, b"reader-owned shm change").unwrap();
+      assert_eq!(source_revision(&locator), revision);
 
-    std::fs::write(&wal, b"durable wal change").unwrap();
-    assert_ne!(source_revision(&locator), revision);
+      std::fs::write(&wal, b"durable wal change").unwrap();
+      assert_ne!(source_revision(&locator), revision);
+    }
   }
 
   #[test]

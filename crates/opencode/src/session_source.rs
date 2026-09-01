@@ -2,19 +2,56 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::normalize::OpenCodeNormalizer;
-use crate::row::{OpenCodeMessageRow, OpenCodePartRow, OpenCodeSessionRow};
+use crate::row::{OpenCodeMessageRow, OpenCodePartRow, OpenCodeSessionEntryRow, OpenCodeSessionRow};
 use crate::schema::OpenCodeCapabilities;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
+use serde_json::Value;
 use tokn_opencode_protocol::v1::{MessageData, MessageItem, PartData, PartItem, SessionModel};
-use tokn_session_core::{LoadedSession, SessionHeader, SessionHistoryStatus, SessionRef};
+use tokn_session_core::{LoadedSession, Provider, SessionHeader, SessionHistoryStatus, SessionRef};
+
+#[derive(Clone, Copy)]
+enum SessionDatabaseFlavor {
+  OpenCode,
+  ZCode,
+}
+
+impl SessionDatabaseFlavor {
+  fn name(self) -> &'static str {
+    match self {
+      Self::OpenCode => "opencode",
+      Self::ZCode => "zcode",
+    }
+  }
+
+  fn provider(self) -> Provider {
+    match self {
+      Self::OpenCode => Provider::OpenCode,
+      Self::ZCode => Provider::ZCode,
+    }
+  }
+}
 
 pub struct OpenCodeSessionSource {
   session_dir: Option<PathBuf>,
+  flavor: SessionDatabaseFlavor,
 }
 
 impl OpenCodeSessionSource {
   pub fn new(session_dir: Option<PathBuf>) -> Self {
-    Self { session_dir }
+    Self {
+      session_dir,
+      flavor: SessionDatabaseFlavor::OpenCode,
+    }
+  }
+
+  /// Build the compatible SQLite reader for ZCode's extended session store.
+  /// Public provider dispatch should use `tokn-session-zcode` instead.
+  #[doc(hidden)]
+  pub fn for_zcode(session_dir: Option<PathBuf>) -> Self {
+    Self {
+      session_dir,
+      flavor: SessionDatabaseFlavor::ZCode,
+    }
   }
 
   pub fn list_sessions(&self) -> Result<Vec<SessionRef>, String> {
@@ -32,7 +69,7 @@ impl OpenCodeSessionSource {
   pub fn list_session_headers(&self) -> Result<Vec<SessionHeader>, String> {
     let (connection, capabilities) = self.connect()?;
     let database_path = self.database_path()?;
-    list_session_catalog(&connection, capabilities)?
+    list_session_catalog(&connection, capabilities, self.flavor.name())?
       .into_iter()
       .map(|row| {
         let updated_at_ms = row.time_updated.or(row.time_created);
@@ -61,11 +98,11 @@ impl OpenCodeSessionSource {
   pub fn hydrate_session_header(&self, mut header: SessionHeader) -> Result<SessionHeader, String> {
     let connection = connect_database(&header.path)?;
     let capabilities = OpenCodeCapabilities::detect(&connection)?;
-    let session = load_session_row(&connection, capabilities, &header.id)?
-      .ok_or_else(|| format!("no opencode session found for `{}`", header.id))?;
+    let session = load_session_row(&connection, capabilities, &header.id, self.flavor.name())?
+      .ok_or_else(|| format!("no {} session found for `{}`", self.flavor.name(), header.id))?;
     header.title = native_title(session.title);
     header.preview = if header.title.is_none() {
-      first_user_preview(&connection, &header.id)?
+      first_user_preview(&connection, &header.id, self.flavor.name())?
     } else {
       None
     };
@@ -80,9 +117,9 @@ impl OpenCodeSessionSource {
   ) -> Result<Vec<SessionRef>, String> {
     let database_path = self.database_path()?;
     let mut sessions = Vec::new();
-    for row in list_session_catalog(connection, capabilities)? {
+    for row in list_session_catalog(connection, capabilities, self.flavor.name())? {
       let message_count = if include_message_count {
-        message_count(connection, &row.id)?
+        message_count(connection, &row.id, self.flavor.name())?
       } else {
         0
       };
@@ -117,11 +154,11 @@ impl OpenCodeSessionSource {
   fn load_session_from_database(&self, database_path: PathBuf, session_id: &str) -> Result<LoadedSession, String> {
     let connection = connect_database(&database_path)?;
     let capabilities = OpenCodeCapabilities::detect(&connection)?;
-    let session = load_session_row(&connection, capabilities, session_id)?
-      .ok_or_else(|| format!("no opencode session found for `{session_id}`"))?;
+    let session = load_session_row(&connection, capabilities, session_id, self.flavor.name())?
+      .ok_or_else(|| format!("no {} session found for `{session_id}`", self.flavor.name()))?;
     let title = native_title(session.title.clone());
     let preview = if title.is_none() {
-      first_user_preview(&connection, &session.id)?
+      first_user_preview(&connection, &session.id, self.flavor.name())?
     } else {
       None
     };
@@ -136,13 +173,36 @@ impl OpenCodeSessionSource {
       path: database_path,
       cwd: session.directory.clone(),
       timestamp: timestamp(session.time_updated.or(session.time_created)),
-      message_count: message_count(&connection, &session.id)?,
+      message_count: message_count(&connection, &session.id, self.flavor.name())?,
     };
 
-    let mut normalizer = OpenCodeNormalizer::new(session.id.clone());
+    let mut normalizer = match self.flavor {
+      SessionDatabaseFlavor::OpenCode => OpenCodeNormalizer::new(session.id.clone()),
+      SessionDatabaseFlavor::ZCode => OpenCodeNormalizer::with_provider(session.id.clone(), self.flavor.provider()),
+    };
     let mut events = normalizer.normalize_session(&session);
-    for message in load_messages(&connection, &session.id)? {
-      events.extend(normalizer.normalize_message(message));
+    let mut timeline: Vec<_> = load_messages(&connection, &session.id, self.flavor.name())?
+      .into_iter()
+      .map(SessionTimelineRow::Message)
+      .collect();
+    if matches!(self.flavor, SessionDatabaseFlavor::ZCode) && capabilities.has_session_entry {
+      timeline.extend(
+        load_session_entries(&connection, &session.id, self.flavor.name())?
+          .into_iter()
+          .map(SessionTimelineRow::Entry),
+      );
+    }
+    timeline.sort_by(|left, right| {
+      left
+        .time_created()
+        .cmp(&right.time_created())
+        .then_with(|| left.id().cmp(right.id()))
+    });
+    for row in timeline {
+      match row {
+        SessionTimelineRow::Message(message) => events.extend(normalizer.normalize_message(message)),
+        SessionTimelineRow::Entry(entry) => events.push(normalizer.normalize_session_entry(entry)),
+      }
     }
 
     Ok(LoadedSession {
@@ -155,9 +215,10 @@ impl OpenCodeSessionSource {
   fn resolve_session(&self, id_or_path: &str) -> Result<(PathBuf, String), String> {
     let candidate = PathBuf::from(id_or_path);
     if candidate.exists() {
-      return Err(
-        "opencode sessions are stored in sqlite; pass a session id and use --session-dir for the database".to_string(),
-      );
+      return Err(format!(
+        "{} sessions are stored in sqlite; pass a session id and use --session-dir for the database",
+        self.flavor.name()
+      ));
     }
 
     let matches: Vec<_> = self
@@ -168,8 +229,8 @@ impl OpenCodeSessionSource {
 
     match matches.as_slice() {
       [session] => Ok((session.path.clone(), session.id.clone())),
-      [] => Err(format!("no opencode session found for `{id_or_path}`")),
-      _ => Err(format!("multiple opencode sessions match `{id_or_path}`")),
+      [] => Err(format!("no {} session found for `{id_or_path}`", self.flavor.name())),
+      _ => Err(format!("multiple {} sessions match `{id_or_path}`", self.flavor.name())),
     }
   }
 
@@ -180,13 +241,42 @@ impl OpenCodeSessionSource {
   }
 
   pub fn database_path(&self) -> Result<PathBuf, String> {
-    resolve_database_path(
-      self.session_dir.clone(),
-      std::env::var_os("OPENCODE_DB"),
-      std::env::var_os("XDG_DATA_HOME"),
-      std::env::var_os("HOME"),
-      std::env::var_os("USERPROFILE"),
-    )
+    match self.flavor {
+      SessionDatabaseFlavor::OpenCode => resolve_database_path(
+        self.session_dir.clone(),
+        std::env::var_os("OPENCODE_DB"),
+        std::env::var_os("XDG_DATA_HOME"),
+        std::env::var_os("HOME"),
+        std::env::var_os("USERPROFILE"),
+      ),
+      SessionDatabaseFlavor::ZCode => resolve_zcode_database_path(
+        self.session_dir.clone(),
+        std::env::var_os("ZCODE_STORAGE_DIR"),
+        std::env::var_os("HOME"),
+        std::env::var_os("USERPROFILE"),
+      ),
+    }
+  }
+}
+
+enum SessionTimelineRow {
+  Message(OpenCodeMessageRow),
+  Entry(OpenCodeSessionEntryRow),
+}
+
+impl SessionTimelineRow {
+  fn id(&self) -> &str {
+    match self {
+      Self::Message(row) => &row.id,
+      Self::Entry(row) => &row.id,
+    }
+  }
+
+  fn time_created(&self) -> Option<i64> {
+    match self {
+      Self::Message(row) => row.time_created,
+      Self::Entry(row) => row.time_created,
+    }
   }
 }
 
@@ -203,6 +293,7 @@ struct SessionCatalogRow {
 fn list_session_catalog(
   connection: &Connection,
   capabilities: OpenCodeCapabilities,
+  source_name: &str,
 ) -> Result<Vec<SessionCatalogRow>, String> {
   let mut statement = connection
     .prepare(&format!(
@@ -211,7 +302,7 @@ fn list_session_catalog(
        order by time_created desc, id desc",
       capabilities.session_catalog_projection()
     ))
-    .map_err(|err| format!("failed to prepare opencode session query: {err}"))?;
+    .map_err(|err| format!("failed to prepare {source_name} session query: {err}"))?;
   let rows = statement
     .query_map([], |row| {
       Ok(SessionCatalogRow {
@@ -224,10 +315,10 @@ fn list_session_catalog(
         time_updated: row.get(5)?,
       })
     })
-    .map_err(|err| format!("failed to query opencode sessions: {err}"))?;
+    .map_err(|err| format!("failed to query {source_name} sessions: {err}"))?;
 
   rows
-    .map(|row| row.map_err(|err| format!("failed to read opencode session row: {err}")))
+    .map(|row| row.map_err(|err| format!("failed to read {source_name} session row: {err}")))
     .collect()
 }
 
@@ -267,6 +358,35 @@ fn resolve_database_path(
   }
 }
 
+fn resolve_zcode_database_path(
+  explicit: Option<PathBuf>,
+  storage_dir: Option<OsString>,
+  home: Option<OsString>,
+  user_profile: Option<OsString>,
+) -> Result<PathBuf, String> {
+  if let Some(path) = explicit {
+    if !path.is_dir() {
+      return Ok(path);
+    }
+    let direct = path.join("db.sqlite");
+    let nested = path.join("cli").join("db").join("db.sqlite");
+    return Ok(if direct.exists() || !nested.exists() {
+      direct
+    } else {
+      nested
+    });
+  }
+
+  let storage_dir = non_empty(storage_dir).map(PathBuf::from).or_else(|| {
+    non_empty(home)
+      .or_else(|| non_empty(user_profile))
+      .map(|home| PathBuf::from(home).join(".zcode"))
+  });
+  storage_dir
+    .map(|root| root.join("cli").join("db").join("db.sqlite"))
+    .ok_or_else(|| "set ZCODE_STORAGE_DIR, HOME, USERPROFILE, or --session-dir to locate zcode sessions".to_string())
+}
+
 fn non_empty(value: Option<OsString>) -> Option<OsString> {
   value.filter(|value| !value.is_empty())
 }
@@ -280,7 +400,7 @@ fn connect_database(path: &Path) -> Result<Connection, String> {
       let immutable_uri = format!("file:{}?mode=ro&immutable=1", sqlite_uri_path(path));
       Connection::open_with_flags(&immutable_uri, flags).map_err(|immutable_error| {
         format!(
-          "failed to open opencode database {} read-only ({read_only_error}); immutable fallback also failed ({immutable_error})",
+          "failed to open session database {} read-only ({read_only_error}); immutable fallback also failed ({immutable_error})",
           path.display()
         )
       })
@@ -306,6 +426,7 @@ fn load_session_row(
   connection: &Connection,
   capabilities: OpenCodeCapabilities,
   session_id: &str,
+  source_name: &str,
 ) -> Result<Option<OpenCodeSessionRow>, String> {
   connection
     .query_row(
@@ -317,7 +438,7 @@ fn load_session_row(
       read_session_row,
     )
     .optional()
-    .map_err(|err| format!("failed to load opencode session `{session_id}`: {err}"))
+    .map_err(|err| format!("failed to load {source_name} session `{session_id}`: {err}"))
 }
 
 fn read_session_row(row: &Row<'_>) -> rusqlite::Result<OpenCodeSessionRow> {
@@ -333,7 +454,7 @@ fn read_session_row(row: &Row<'_>) -> rusqlite::Result<OpenCodeSessionRow> {
   })
 }
 
-fn first_user_preview(connection: &Connection, session_id: &str) -> Result<Option<String>, String> {
+fn first_user_preview(connection: &Connection, session_id: &str, source_name: &str) -> Result<Option<String>, String> {
   let mut statement = connection
     .prepare(
       "select message.data, part.data
@@ -342,16 +463,16 @@ fn first_user_preview(connection: &Connection, session_id: &str) -> Result<Optio
        where message.session_id = ?1
        order by message.time_created asc, message.id asc, part.time_created asc, part.id asc",
     )
-    .map_err(|err| format!("failed to prepare opencode preview query for `{session_id}`: {err}"))?;
+    .map_err(|err| format!("failed to prepare {source_name} preview query for `{session_id}`: {err}"))?;
   let rows = statement
     .query_map(params![session_id], |row| {
       Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })
-    .map_err(|err| format!("failed to query opencode preview for `{session_id}`: {err}"))?;
+    .map_err(|err| format!("failed to query {source_name} preview for `{session_id}`: {err}"))?;
 
   for row in rows {
     let (message, part) =
-      row.map_err(|err| format!("failed to read opencode preview row for `{session_id}`: {err}"))?;
+      row.map_err(|err| format!("failed to read {source_name} preview row for `{session_id}`: {err}"))?;
     let Ok(message) = serde_json::from_str::<MessageData>(&message) else {
       continue;
     };
@@ -374,7 +495,11 @@ fn first_user_preview(connection: &Connection, session_id: &str) -> Result<Optio
   Ok(None)
 }
 
-fn load_messages(connection: &Connection, session_id: &str) -> Result<Vec<OpenCodeMessageRow>, String> {
+fn load_messages(
+  connection: &Connection,
+  session_id: &str,
+  source_name: &str,
+) -> Result<Vec<OpenCodeMessageRow>, String> {
   let mut statement = connection
     .prepare(
       "select id, time_created, data
@@ -382,20 +507,20 @@ fn load_messages(connection: &Connection, session_id: &str) -> Result<Vec<OpenCo
        where session_id = ?1
        order by time_created asc, id asc",
     )
-    .map_err(|err| format!("failed to prepare opencode message query: {err}"))?;
+    .map_err(|err| format!("failed to prepare {source_name} message query: {err}"))?;
   let rows = statement
     .query_map(params![session_id], |row| {
       let data: String = row.get(2)?;
       Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?, data))
     })
-    .map_err(|err| format!("failed to query opencode messages: {err}"))?;
+    .map_err(|err| format!("failed to query {source_name} messages: {err}"))?;
 
   let mut messages = Vec::new();
   for row in rows {
-    let (id, time_created, data) = row.map_err(|err| format!("failed to read opencode message row: {err}"))?;
+    let (id, time_created, data) = row.map_err(|err| format!("failed to read {source_name} message row: {err}"))?;
     let data: MessageData =
-      serde_json::from_str(&data).map_err(|err| format!("invalid opencode message `{id}`: {err}"))?;
-    let parts = load_parts(connection, session_id, &id)?;
+      serde_json::from_str(&data).map_err(|err| format!("invalid {source_name} message `{id}`: {err}"))?;
+    let parts = load_parts(connection, session_id, &id, source_name)?;
     messages.push(OpenCodeMessageRow {
       id,
       time_created,
@@ -406,7 +531,12 @@ fn load_messages(connection: &Connection, session_id: &str) -> Result<Vec<OpenCo
   Ok(messages)
 }
 
-fn load_parts(connection: &Connection, session_id: &str, message_id: &str) -> Result<Vec<OpenCodePartRow>, String> {
+fn load_parts(
+  connection: &Connection,
+  session_id: &str,
+  message_id: &str,
+  source_name: &str,
+) -> Result<Vec<OpenCodePartRow>, String> {
   let mut statement = connection
     .prepare(
       "select id, time_created, data
@@ -414,24 +544,64 @@ fn load_parts(connection: &Connection, session_id: &str, message_id: &str) -> Re
        where session_id = ?1 and message_id = ?2
        order by time_created asc, id asc",
     )
-    .map_err(|err| format!("failed to prepare opencode part query: {err}"))?;
+    .map_err(|err| format!("failed to prepare {source_name} part query: {err}"))?;
   let rows = statement
     .query_map(params![session_id, message_id], |row| {
       let data: String = row.get(2)?;
       Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?, data))
     })
-    .map_err(|err| format!("failed to query opencode parts: {err}"))?;
+    .map_err(|err| format!("failed to query {source_name} parts: {err}"))?;
 
   let mut parts = Vec::new();
   for row in rows {
-    let (id, time_created, data) = row.map_err(|err| format!("failed to read opencode part row: {err}"))?;
-    let data: PartData = serde_json::from_str(&data).map_err(|err| format!("invalid opencode part `{id}`: {err}"))?;
+    let (id, time_created, data) = row.map_err(|err| format!("failed to read {source_name} part row: {err}"))?;
+    let data: PartData =
+      serde_json::from_str(&data).map_err(|err| format!("invalid {source_name} part `{id}`: {err}"))?;
     parts.push(OpenCodePartRow { id, time_created, data });
   }
   Ok(parts)
 }
 
-fn message_count(connection: &Connection, session_id: &str) -> Result<usize, String> {
+fn load_session_entries(
+  connection: &Connection,
+  session_id: &str,
+  source_name: &str,
+) -> Result<Vec<OpenCodeSessionEntryRow>, String> {
+  let mut statement = connection
+    .prepare(
+      "select id, type, time_created, data
+       from session_entry
+       where session_id = ?1
+       order by time_created asc, id asc",
+    )
+    .map_err(|err| format!("failed to prepare {source_name} session-entry query: {err}"))?;
+  let rows = statement
+    .query_map(params![session_id], |row| {
+      Ok((
+        row.get::<_, String>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, Option<i64>>(2)?,
+        row.get::<_, String>(3)?,
+      ))
+    })
+    .map_err(|err| format!("failed to query {source_name} session entries: {err}"))?;
+
+  let mut entries = Vec::new();
+  for row in rows {
+    let (id, native_type, time_created, data) =
+      row.map_err(|err| format!("failed to read {source_name} session-entry row: {err}"))?;
+    let data = serde_json::from_str(&data).unwrap_or(Value::String(data));
+    entries.push(OpenCodeSessionEntryRow {
+      id,
+      native_type,
+      time_created,
+      data,
+    });
+  }
+  Ok(entries)
+}
+
+fn message_count(connection: &Connection, session_id: &str, source_name: &str) -> Result<usize, String> {
   connection
     .query_row(
       "select count(*) from message where session_id = ?1",
@@ -439,7 +609,7 @@ fn message_count(connection: &Connection, session_id: &str) -> Result<usize, Str
       |row| row.get::<_, i64>(0),
     )
     .map(|count| count as usize)
-    .map_err(|err| format!("failed to count opencode messages for `{session_id}`: {err}"))
+    .map_err(|err| format!("failed to count {source_name} messages for `{session_id}`: {err}"))
 }
 
 fn parse_optional_model(value: Option<String>) -> Option<SessionModel> {
@@ -694,7 +864,7 @@ mod tests {
       .expect("fixture schema with model should be created");
 
     let capabilities = OpenCodeCapabilities::detect(&connection).expect("schema with model should be detected");
-    let session = load_session_row(&connection, capabilities, "ses_with_model")
+    let session = load_session_row(&connection, capabilities, "ses_with_model", "opencode")
       .expect("schema with model should remain loadable")
       .expect("fixture session should exist");
     let model = session.model.expect("session model should be preserved");
@@ -837,7 +1007,7 @@ mod tests {
       )
       .expect("part fixture should insert");
 
-    let messages = load_messages(&connection, "ses_1").expect("unknown payloads should remain loadable");
+    let messages = load_messages(&connection, "ses_1", "opencode").expect("unknown payloads should remain loadable");
     assert_eq!(messages.len(), 1);
     assert!(matches!(
       messages[0].data.item(),

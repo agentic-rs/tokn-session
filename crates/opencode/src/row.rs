@@ -1,3 +1,4 @@
+use serde_json::Value;
 use tokn_opencode_protocol::v1::{MessageData, PartData, SessionModel};
 
 #[derive(Debug)]
@@ -24,4 +25,12 @@ pub struct OpenCodePartRow {
   pub id: String,
   pub time_created: Option<i64>,
   pub data: PartData,
+}
+
+#[derive(Debug)]
+pub struct OpenCodeSessionEntryRow {
+  pub id: String,
+  pub native_type: String,
+  pub time_created: Option<i64>,
+  pub data: Value,
 }

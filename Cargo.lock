@@ -4107,6 +4107,7 @@ dependencies = [
  "tokn-session-dsh",
  "tokn-session-opencode",
  "tokn-session-pi",
+ "tokn-session-zcode",
 ]
 
 [[package]]
@@ -4216,6 +4217,17 @@ dependencies = [
  "tokn-session-core",
  "tokn-session-index",
  "tokn-session-render",
+]
+
+[[package]]
+name = "tokn-session-zcode"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "tokn-session-core",
+ "tokn-session-opencode",
 ]
 
 [[package]]
