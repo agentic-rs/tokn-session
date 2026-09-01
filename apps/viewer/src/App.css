@@ -879,6 +879,11 @@ button:disabled {
   margin: 0 0 24px;
 }
 
+.message-event[data-presentation="bubble"] {
+  justify-content: flex-end;
+  padding-left: 14%;
+}
+
 .message-event[data-presentation="transcript"] {
   justify-content: flex-start;
   padding-right: 8%;
@@ -903,6 +908,12 @@ button:disabled {
   background: transparent;
   border: 1px solid transparent;
   border-radius: 14px;
+}
+
+.message-event[data-presentation="bubble"] .message-event__surface {
+  padding: 11px 14px;
+  background: var(--surface-selected);
+  border-radius: 15px 15px 4px 15px;
 }
 
 .message-event[data-presentation="transcript"] .message-event__surface {
@@ -2265,6 +2276,10 @@ button:disabled {
 
   .timeline {
     padding: 24px 13px 28px;
+  }
+
+  .message-event[data-presentation="bubble"] {
+    padding-left: 7%;
   }
 
   .message-event[data-presentation="transcript"] {

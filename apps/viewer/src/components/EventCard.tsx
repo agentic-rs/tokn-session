@@ -730,11 +730,11 @@ export function EventCard({
 
   if (isMessage(event)) {
     const role = event.role ?? "unknown";
-    const isTranscriptMessage = role === "user" || role === "assistant";
+    const presentation = role === "user" ? "bubble" : role === "assistant" ? "transcript" : "technical";
     return (
       <article
         className="message-event"
-        data-presentation={isTranscriptMessage ? "transcript" : "technical"}
+        data-presentation={presentation}
         data-role={role}
         data-selected={is_selected}
       >

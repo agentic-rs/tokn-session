@@ -180,7 +180,7 @@ describe("EventCard conversation content", () => {
     expect(onSelect).toHaveBeenCalledWith("event.v1.1");
   });
 
-  it("uses the transcript presentation and keeps the user role label", () => {
+  it("uses the user bubble presentation and keeps the user role label", () => {
     const { container } = renderCard(event({
       role: "user",
       title: "User message",
@@ -189,7 +189,7 @@ describe("EventCard conversation content", () => {
 
     expect(container.querySelector(".message-event")).toHaveAttribute(
       "data-presentation",
-      "transcript",
+      "bubble",
     );
     expect(screen.getByText("user")).toBeInTheDocument();
     expect(screen.getByText("My Request:")).toBeInTheDocument();
