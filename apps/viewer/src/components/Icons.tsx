@@ -103,6 +103,15 @@ export function WarningIcon(props: IconProps) {
   );
 }
 
+export function BellIcon(props: IconProps) {
+  return (
+    <IconBase {...props}>
+      <path d="M18 10.5a6 6 0 0 0-12 0c0 6-2.5 6.8-2.5 7.8h17c0-1-2.5-1.8-2.5-7.8Z" stroke="currentColor" strokeLinejoin="round" strokeWidth="1.6" />
+      <path d="M9.5 21h5" stroke="currentColor" strokeLinecap="round" strokeWidth="1.6" />
+    </IconBase>
+  );
+}
+
 export function MoreIcon(props: IconProps) {
   return (
     <IconBase {...props}>

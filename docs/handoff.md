@@ -351,6 +351,23 @@ with its first event page. The existing CLI continues to use the counted
 `list_sessions` API. The scheduler emits its sidebar refresh as soon as that
 catalog transaction commits, before later bounded body work.
 
+The viewer also keeps a process-local operational snapshot for its one index
+scheduler. It contains only a monotonic string revision, provider identities
+and counts, the remaining body queue, and sanitized scheduler failure
+categories; it never reads provider storage or caches historical bodies.
+`session-index-progress` is deliberately separate from the durable
+`session-index-changed` sidebar signal, so an active-provider or queue-count
+update does not reload the session list. The React client subscribes before it
+reads the snapshot and ignores an older revision that arrives afterward.
+
+A persistent bottom status bar summarizes cataloging, bounded body backfill,
+warnings, or a settled index. Its bell opens a non-modal operational center
+with all provider states, exact remaining jobs, readable provider warnings,
+and generic scheduler failures. The normal progress label is intentionally not
+a live announcement on every count tick. Retrying queues a coalesced wake for
+the existing scheduler and forces its next pass to be a catalog pass; it never
+starts a second competing provider scan.
+
 `sources` remains the normalized owner of `provider` and `source_key`.
 `indexed_sessions` is a read-only SQLite view that joins those fields onto every
 session row for diagnostics and future read-only consumers.

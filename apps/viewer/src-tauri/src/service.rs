@@ -5,26 +5,29 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde_json::{Value, json};
+use tokio::sync::{mpsc, watch};
 use tokn_session_client::SessionHeader;
 use tokn_session_core::{
   AgentActivity, AgentEvent, LifecycleOutcome, LoadedSession, MessageDelivery, Phase, Provider, Role, TerminalAction,
   ToolCallEvent, ToolKind, ToolOperation, ToolOperationStatus, ToolSummary, UsageKind, assemble_tool_operations,
 };
 use tokn_session_index::{
-  IndexedSession, SessionBaselineCompletionRequest, SessionIndex, SessionIndexError, SessionKey as IndexedSessionKey,
-  SessionMetadata, SessionPresentation, SourceCursorPrecondition, SourceKey, SourceReplacement, SourceState,
+  IndexedSession, PendingSessionBaselineCount, SessionBaselineCompletionRequest, SessionIndex, SessionIndexError,
+  SessionKey as IndexedSessionKey, SessionMetadata, SessionPresentation, SourceCursorPrecondition, SourceKey,
+  SourceReplacement, SourceState,
 };
 use tokn_session_render::render_event_summary;
 
 use crate::model::{
   AcknowledgeSessionAttentionRequest, AcknowledgeSessionAttentionResponse, AgentActivityCardSummary, EventDetail,
-  EventPage, EventPageRequest, EventSummary, ListSessionChildrenRequest, ListSessionChildrenResponse,
-  ListSessionsRequest, ListSessionsResponse, LoadEventDetailRequest, LoadTrajectoryEventPageRequest, PageDirection,
-  ReasoningCardSummary, SessionLocator, SessionSummary, SourceError, ToolCardSummary, ToolOutputPreview,
-  ToolOutputSection, TrajectoryCardSummary, TrajectoryEventPage, UsageCardSummary, ViewerProvider, bounded_limit,
-  decode_event_cursor, decode_event_key, decode_list_cursor, decode_session_key, decode_trajectory_event_cursor,
-  decode_trajectory_key, encode_event_cursor, encode_event_key, encode_list_cursor, encode_session_key,
-  encode_trajectory_event_cursor, encode_trajectory_key, parse_updated_at_ms, requested_offset,
+  EventPage, EventPageRequest, EventSummary, IndexActivity, IndexWorkerError, ListSessionChildrenRequest,
+  ListSessionChildrenResponse, ListSessionsRequest, ListSessionsResponse, LoadEventDetailRequest,
+  LoadTrajectoryEventPageRequest, PageDirection, ProviderBody, ReasoningCardSummary, SessionIndexProgress,
+  SessionLocator, SessionSummary, SourceError, ToolCardSummary, ToolOutputPreview, ToolOutputSection,
+  TrajectoryCardSummary, TrajectoryEventPage, UsageCardSummary, ViewerProvider, bounded_limit, decode_event_cursor,
+  decode_event_key, decode_list_cursor, decode_session_key, decode_trajectory_event_cursor, decode_trajectory_key,
+  encode_event_cursor, encode_event_key, encode_list_cursor, encode_session_key, encode_trajectory_event_cursor,
+  encode_trajectory_key, parse_updated_at_ms, requested_offset,
 };
 use crate::repository::{NativeRepository, ViewerRepository};
 
@@ -57,6 +60,8 @@ pub(crate) struct ViewerService {
   repository: Arc<dyn ViewerRepository>,
   session_index: Arc<SessionIndex>,
   index_refresh_gate: Arc<Mutex<()>>,
+  index_progress: IndexProgressStore,
+  index_retry_sender: Arc<Mutex<Option<mpsc::UnboundedSender<()>>>>,
   /// Header-discovery failures remain visible until a later full catalog
   /// succeeds, even if a direct body retry happens to work in the meantime.
   catalog_errors: Arc<Mutex<HashMap<ViewerProvider, String>>>,
@@ -67,6 +72,219 @@ pub(crate) struct ViewerService {
   observed_index_data_version: Arc<Mutex<Option<i64>>>,
   failed_body_jobs: Arc<Mutex<HashMap<(SourceKey, String), FailedBodyJob>>>,
   loaded_session_cache: Arc<Mutex<Option<CachedSession>>>,
+}
+
+/// The progress center must never need to touch provider storage. This store
+/// owns one compact snapshot and publishes replacements to every window. A
+/// separate mutex gives synchronous service code a cheap, race-free update
+/// path while Tokio's watch channel handles asynchronous fan-out.
+#[derive(Clone)]
+struct IndexProgressStore {
+  state: Arc<Mutex<IndexProgressState>>,
+  sender: watch::Sender<SessionIndexProgress>,
+}
+
+struct IndexProgressState {
+  next_revision: u64,
+  /// Changes whenever a user explicitly queues a retry. It is
+  /// intentionally internal: the scheduler uses it to distinguish its own
+  /// stale post-refresh transition from a newer user request without adding
+  /// another Tauri payload field.
+  manual_retry_generation: u64,
+  /// The manual-retry generation observed when the most recent synchronous
+  /// refresh began. A terminal state is valid only while this still matches
+  /// `manual_retry_generation`.
+  latest_refresh_retry_generation: u64,
+  snapshot: SessionIndexProgress,
+}
+
+struct ManualRetryRequest {
+  generation: u64,
+  previous_generation: u64,
+  snapshot: SessionIndexProgress,
+  previous_snapshot: Option<SessionIndexProgress>,
+  published_revision: Option<String>,
+}
+
+enum IndexProgressSettlement {
+  Idle,
+  WaitingToRetry {
+    retry_at_ms: Option<i64>,
+    worker_error: Option<IndexWorkerError>,
+  },
+}
+
+fn set_index_progress_waiting_to_retry(
+  progress: &mut SessionIndexProgress,
+  retry_at_ms: Option<i64>,
+  worker_error: Option<IndexWorkerError>,
+) {
+  progress.is_refreshing = false;
+  progress.activity = IndexActivity::WaitingToRetry;
+  progress.catalog.active_provider = None;
+  progress.body.active_provider = None;
+  progress.worker_error = worker_error;
+  progress.retry_at_ms = retry_at_ms;
+}
+
+fn set_index_progress_idle(progress: &mut SessionIndexProgress) {
+  progress.is_refreshing = false;
+  progress.activity = IndexActivity::Idle;
+  progress.catalog.active_provider = None;
+  progress.body.active_provider = None;
+  progress.worker_error = None;
+  progress.retry_at_ms = None;
+}
+
+impl IndexProgressSettlement {
+  fn apply(self, progress: &mut SessionIndexProgress) {
+    match self {
+      Self::Idle => set_index_progress_idle(progress),
+      Self::WaitingToRetry {
+        retry_at_ms,
+        worker_error,
+      } => set_index_progress_waiting_to_retry(progress, retry_at_ms, worker_error),
+    }
+  }
+}
+
+impl IndexProgressStore {
+  fn new(body_batch_size: usize) -> Self {
+    let snapshot = SessionIndexProgress::initial(body_batch_size);
+    let (sender, _receiver) = watch::channel(snapshot.clone());
+    Self {
+      state: Arc::new(Mutex::new(IndexProgressState {
+        next_revision: 0,
+        manual_retry_generation: 0,
+        latest_refresh_retry_generation: 0,
+        snapshot,
+      })),
+      sender,
+    }
+  }
+
+  fn snapshot(&self) -> SessionIndexProgress {
+    self
+      .state
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .snapshot
+      .clone()
+  }
+
+  fn subscribe(&self) -> watch::Receiver<SessionIndexProgress> {
+    self.sender.subscribe()
+  }
+
+  fn update_state(&self, update: impl FnOnce(&mut IndexProgressState)) -> SessionIndexProgress {
+    let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = state.snapshot.clone();
+    update(&mut state);
+    if state.snapshot == previous {
+      return previous;
+    }
+    state.next_revision = state.next_revision.saturating_add(1);
+    state.snapshot.revision = state.next_revision.to_string();
+    let snapshot = state.snapshot.clone();
+    drop(state);
+    // `send_replace` retains the latest state even before the first viewer
+    // window subscribes, and it is intentionally harmless with no listeners.
+    self.sender.send_replace(snapshot.clone());
+    snapshot
+  }
+
+  fn update(&self, update: impl FnOnce(&mut SessionIndexProgress)) -> SessionIndexProgress {
+    self.update_state(|state| update(&mut state.snapshot))
+  }
+
+  /// Begins one synchronous worker pass and captures the manual-retry state
+  /// against which its later terminal transition must be checked.
+  fn begin_refresh(&self, update: impl FnOnce(&mut SessionIndexProgress)) -> SessionIndexProgress {
+    self.update_state(|state| {
+      state.latest_refresh_retry_generation = state.manual_retry_generation;
+      update(&mut state.snapshot);
+    })
+  }
+
+  /// Applies a terminal transition only when no manual retry was accepted
+  /// after the current refresh started. Both the synchronous refresh and the
+  /// async scheduler use this gate, closing the handoff window between them.
+  fn settle_after_latest_refresh(&self, settlement: IndexProgressSettlement) -> SessionIndexProgress {
+    self.update_state(|state| {
+      if state.manual_retry_generation != state.latest_refresh_retry_generation {
+        set_index_progress_waiting_to_retry(&mut state.snapshot, None, None);
+      } else {
+        settlement.apply(&mut state.snapshot);
+      }
+    })
+  }
+
+  /// Records a manually requested retry. If a worker is currently active, the
+  /// visible active state remains truthful while the internal generation still
+  /// prevents that worker's stale terminal transition from hiding the request.
+  fn request_manual_retry(&self) -> ManualRetryRequest {
+    let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous_generation = state.manual_retry_generation;
+    state.manual_retry_generation = state.manual_retry_generation.wrapping_add(1);
+    let generation = state.manual_retry_generation;
+    let previous = state.snapshot.clone();
+    if previous.is_refreshing {
+      return ManualRetryRequest {
+        generation,
+        previous_generation,
+        snapshot: previous,
+        previous_snapshot: None,
+        published_revision: None,
+      };
+    }
+    set_index_progress_waiting_to_retry(&mut state.snapshot, None, None);
+    if state.snapshot == previous {
+      return ManualRetryRequest {
+        generation,
+        previous_generation,
+        snapshot: previous,
+        previous_snapshot: None,
+        published_revision: None,
+      };
+    }
+    state.next_revision = state.next_revision.saturating_add(1);
+    state.snapshot.revision = state.next_revision.to_string();
+    let snapshot = state.snapshot.clone();
+    drop(state);
+    self.sender.send_replace(snapshot.clone());
+    ManualRetryRequest {
+      generation,
+      previous_generation,
+      snapshot: snapshot.clone(),
+      previous_snapshot: Some(previous),
+      published_revision: Some(snapshot.revision),
+    }
+  }
+
+  /// Rolls back a retry that could not reach the scheduler. It never erases a
+  /// newer manual request or a scheduler state transition.
+  fn cancel_manual_retry_if_current(&self, request: ManualRetryRequest) {
+    let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.manual_retry_generation != request.generation {
+      return;
+    }
+    state.manual_retry_generation = request.previous_generation;
+    let Some(previous) = request.previous_snapshot else {
+      return;
+    };
+    let Some(published_revision) = request.published_revision else {
+      return;
+    };
+    if state.snapshot.revision != published_revision {
+      return;
+    }
+    state.snapshot = previous;
+    state.next_revision = state.next_revision.saturating_add(1);
+    state.snapshot.revision = state.next_revision.to_string();
+    let snapshot = state.snapshot.clone();
+    drop(state);
+    self.sender.send_replace(snapshot);
+  }
 }
 
 struct CachedSession {
@@ -145,6 +363,12 @@ pub(crate) struct IndexRefresh {
   /// committed catalog remains safe to show.
   #[serde(skip)]
   pub retry_catalog_soon: bool,
+  /// Internal scheduler hint for a provider catalog failure. It stays out of
+  /// sidebar events because readable provider failures already travel through
+  /// the durable index listing, but it prevents the scheduler from replacing
+  /// the progress store's truthful waiting state with idle.
+  #[serde(skip)]
+  pub has_catalog_errors: bool,
 }
 
 #[derive(Default)]
@@ -177,6 +401,72 @@ struct FailedBodyJob {
 struct BodyBackfillRefresh {
   refresh: IndexRefresh,
   errors: HashMap<ViewerProvider, String>,
+}
+
+fn ordered_providers(providers: &[ViewerProvider]) -> Vec<ViewerProvider> {
+  ViewerProvider::ALL
+    .into_iter()
+    .filter(|provider| providers.contains(provider))
+    .collect()
+}
+
+fn ordered_error_providers(errors: &HashMap<ViewerProvider, String>) -> Vec<ViewerProvider> {
+  ViewerProvider::ALL
+    .into_iter()
+    .filter(|provider| errors.contains_key(provider))
+    .collect()
+}
+
+fn body_queue_progress(jobs: &[PendingBodyJob]) -> (usize, usize, Vec<ProviderBody>) {
+  let mut providers = ViewerProvider::ALL
+    .into_iter()
+    .map(|provider| ProviderBody {
+      provider,
+      pending_jobs: 0,
+      failed_jobs: 0,
+    })
+    .collect::<Vec<_>>();
+  for job in jobs {
+    let current = providers
+      .iter_mut()
+      .find(|current| current.provider == job.provider)
+      .expect("every pending body job should use a known viewer provider");
+    current.pending_jobs = current.pending_jobs.saturating_add(1);
+    if job.deprioritized {
+      current.failed_jobs = current.failed_jobs.saturating_add(1);
+    }
+  }
+  let pending_jobs = providers.iter().map(|provider| provider.pending_jobs).sum();
+  let failed_jobs = providers.iter().map(|provider| provider.failed_jobs).sum();
+  (pending_jobs, failed_jobs, providers)
+}
+
+/// Builds a startup-only progress summary from the durable aggregate. A fresh
+/// viewer has no in-memory failed or unavailable jobs yet, so these staged
+/// baseline counts match the normal queue without loading or sorting every
+/// historical session.
+fn indexed_body_queue_progress(counts: &[PendingSessionBaselineCount]) -> (usize, Vec<ProviderBody>) {
+  let mut providers = ViewerProvider::ALL
+    .into_iter()
+    .map(|provider| ProviderBody {
+      provider,
+      pending_jobs: 0,
+      failed_jobs: 0,
+    })
+    .collect::<Vec<_>>();
+  for count in counts {
+    let Some(provider) = providers
+      .iter_mut()
+      .find(|provider| provider.provider.as_str() == count.provider)
+    else {
+      // The shared index can retain rows from a provider this viewer no
+      // longer supports. Its scheduler would ignore the row too.
+      continue;
+    };
+    provider.pending_jobs = provider.pending_jobs.saturating_add(count.pending_sessions);
+  }
+  let pending_jobs = providers.iter().map(|provider| provider.pending_jobs).sum();
+  (pending_jobs, providers)
 }
 
 /// Result of a complete provider-header pass before any session body is read.
@@ -261,16 +551,285 @@ impl ViewerService {
     // pass, the pass will detect the revision change and ask this UI to read
     // the durable catalog again.
     let observed_index_data_version = session_index.data_version().ok();
-    Self {
+    let service = Self {
       repository,
       session_index,
       index_refresh_gate: Arc::new(Mutex::new(())),
+      index_progress: IndexProgressStore::new(INDEX_BODY_SCAN_BATCH_SIZE),
+      index_retry_sender: Arc::new(Mutex::new(None)),
       catalog_errors: Arc::new(Mutex::new(HashMap::new())),
       index_errors: Arc::new(Mutex::new(HashMap::new())),
       observed_index_data_version: Arc::new(Mutex::new(observed_index_data_version)),
       failed_body_jobs: Arc::new(Mutex::new(HashMap::new())),
       loaded_session_cache: Arc::new(Mutex::new(None)),
+    };
+    // Existing durable rows should be reflected immediately when a viewer is
+    // reopened. This is SQLite-only bookkeeping; the progress snapshot itself
+    // remains a pure in-memory clone.
+    service.refresh_index_progress_from_index();
+    service
+  }
+
+  /// Returns the latest in-memory index worker state without touching SQLite
+  /// or provider storage. The Tauri command and event bridge both use this.
+  pub(crate) fn session_index_progress(&self) -> SessionIndexProgress {
+    self.index_progress.snapshot()
+  }
+
+  /// Subscribes a window-level bridge to compact progress replacements.
+  pub(crate) fn subscribe_session_index_progress(&self) -> watch::Receiver<SessionIndexProgress> {
+    self.index_progress.subscribe()
+  }
+
+  /// Supplies the scheduler wake channel created during Tauri setup. The
+  /// service never owns the scheduler task and therefore cannot refresh a
+  /// provider directly from a UI command.
+  pub(crate) fn set_session_index_retry_sender(&self, sender: mpsc::UnboundedSender<()>) {
+    let mut current = self
+      .index_retry_sender
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *current = Some(sender);
+  }
+
+  /// Enqueues an immediate scheduler wake for a user-requested retry. The
+  /// resulting snapshot intentionally says `waiting_to_retry`: acceptance by
+  /// the queue is not evidence that a provider scan has begun.
+  pub(crate) fn request_session_index_retry(&self) -> Result<SessionIndexProgress, String> {
+    let sender = self
+      .index_retry_sender
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .clone()
+      .ok_or_else(|| "session index scheduler is not available".to_string())?;
+    // Publish before waking an idle scheduler. If work is already active, do
+    // not overwrite its truthful catalog/body state; the internal generation
+    // still ensures the queued wake cannot be erased by that pass finishing.
+    let request = self.index_progress.request_manual_retry();
+    if sender.send(()).is_ok() {
+      return Ok(request.snapshot);
     }
+    self.index_progress.cancel_manual_retry_if_current(request);
+    Err("session index scheduler is no longer available".to_string())
+  }
+
+  /// Applies the scheduler's exact delayed retry only if a manual retry was
+  /// not accepted after the just-finished worker pass began. A manual wake
+  /// remains an immediate, visible `waiting_to_retry` state instead.
+  pub(crate) fn settle_session_index_waiting_to_retry_after_refresh(
+    &self,
+    retry_at_ms: Option<i64>,
+  ) -> SessionIndexProgress {
+    self
+      .index_progress
+      .settle_after_latest_refresh(IndexProgressSettlement::WaitingToRetry {
+        retry_at_ms,
+        worker_error: None,
+      })
+  }
+
+  /// Applies the scheduler's idle state only if it is still newer than every
+  /// accepted manual retry.
+  pub(crate) fn settle_session_index_idle_after_refresh(&self) -> SessionIndexProgress {
+    self
+      .index_progress
+      .settle_after_latest_refresh(IndexProgressSettlement::Idle)
+  }
+
+  /// Applies a scheduler-level error only if a user did not explicitly queue
+  /// another attempt while that worker pass was completing.
+  pub(crate) fn settle_session_index_worker_error_after_refresh(
+    &self,
+    worker_error: IndexWorkerError,
+    retry_at_ms: Option<i64>,
+  ) -> SessionIndexProgress {
+    self
+      .index_progress
+      .settle_after_latest_refresh(IndexProgressSettlement::WaitingToRetry {
+        retry_at_ms,
+        worker_error: Some(worker_error),
+      })
+  }
+
+  fn begin_session_index_catalog_refresh(&self) {
+    let catalog_errors = self
+      .catalog_errors
+      .lock()
+      .map(|errors| ordered_error_providers(&errors))
+      .unwrap_or_default();
+    self.index_progress.begin_refresh(|progress| {
+      progress.is_refreshing = true;
+      progress.activity = IndexActivity::Catalog;
+      progress.worker_error = None;
+      progress.retry_at_ms = None;
+      progress.catalog.active_provider = None;
+      progress.catalog.processed_providers = 0;
+      progress.catalog.total_providers = ViewerProvider::ALL.len();
+      progress.catalog.error_providers = catalog_errors;
+      progress.body.active_provider = None;
+      progress.body.completed_in_run = 0;
+      progress.body.stale_in_run = 0;
+    });
+  }
+
+  fn begin_session_index_body_refresh(&self) {
+    self.index_progress.begin_refresh(|progress| {
+      progress.is_refreshing = true;
+      progress.activity = IndexActivity::Body;
+      progress.worker_error = None;
+      progress.retry_at_ms = None;
+      progress.catalog.active_provider = None;
+      progress.body.active_provider = None;
+      progress.body.completed_in_run = 0;
+      progress.body.stale_in_run = 0;
+      progress.body.batch_size = INDEX_BODY_SCAN_BATCH_SIZE;
+    });
+  }
+
+  /// Moves a combined catalog-and-body refresh to its body phase without
+  /// replacing the retry generation captured at the start of that top-level
+  /// refresh. A manual retry during catalog still belongs to that same pass.
+  #[cfg(test)]
+  fn continue_session_index_body_refresh(&self) {
+    self.index_progress.update(|progress| {
+      progress.is_refreshing = true;
+      progress.activity = IndexActivity::Body;
+      progress.worker_error = None;
+      progress.retry_at_ms = None;
+      progress.catalog.active_provider = None;
+      progress.body.active_provider = None;
+      progress.body.completed_in_run = 0;
+      progress.body.stale_in_run = 0;
+      progress.body.batch_size = INDEX_BODY_SCAN_BATCH_SIZE;
+    });
+  }
+
+  /// Settles the synchronous worker transition without producing a false
+  /// up-to-date state between a completed pass and the scheduler choosing its
+  /// next delay. The scheduler replaces a `None` retry time with its exact
+  /// deadline immediately after it receives the refresh result.
+  fn finish_session_index_refresh(&self, result: &Result<IndexRefresh, String>) {
+    let catalog_has_errors = self
+      .catalog_errors
+      .lock()
+      .map(|errors| !errors.is_empty())
+      .unwrap_or(true);
+    let needs_retry = match result {
+      Ok(refresh) => refresh.has_pending_body_jobs || refresh.retry_catalog_soon || catalog_has_errors,
+      Err(_) => true,
+    };
+    let settlement = if needs_retry {
+      IndexProgressSettlement::WaitingToRetry {
+        retry_at_ms: None,
+        worker_error: None,
+      }
+    } else {
+      IndexProgressSettlement::Idle
+    };
+    self.index_progress.settle_after_latest_refresh(settlement);
+  }
+
+  fn refresh_index_progress_from_index(&self) {
+    if let Ok(pending_providers) = self.pending_catalog_providers() {
+      self.index_progress.update(|progress| {
+        progress.catalog.pending_providers = pending_providers;
+      });
+    }
+    if let Ok(counts) = self
+      .session_index
+      .pending_session_baseline_counts(&[INDEX_PENDING_BODY_CURSOR_PREFIX, LEGACY_PENDING_BODY_CURSOR_PREFIX])
+    {
+      self.replace_indexed_body_progress_counts(&counts);
+    }
+  }
+
+  fn pending_catalog_providers(&self) -> Result<Vec<ViewerProvider>, String> {
+    ViewerProvider::ALL
+      .into_iter()
+      .map(|provider| {
+        self
+          .session_index
+          .source_state(&index_catalog_source_key(provider))
+          .map_err(|error| format!("failed to read the local {provider:?} session catalog: {error}"))
+          .map(|catalog| catalog.is_none().then_some(provider))
+      })
+      .collect::<Result<Vec<_>, _>>()
+      .map(|providers| providers.into_iter().flatten().collect())
+  }
+
+  fn set_catalog_active_provider(&self, provider: ViewerProvider) {
+    self.index_progress.update(|progress| {
+      progress.is_refreshing = true;
+      progress.activity = IndexActivity::Catalog;
+      progress.worker_error = None;
+      progress.retry_at_ms = None;
+      progress.catalog.active_provider = Some(provider);
+    });
+  }
+
+  fn finish_catalog_provider(&self, provider: ViewerProvider, failed: bool) {
+    self.index_progress.update(|progress| {
+      progress.catalog.active_provider = None;
+      progress.catalog.processed_providers = progress
+        .catalog
+        .processed_providers
+        .saturating_add(1)
+        .min(progress.catalog.total_providers);
+      if failed {
+        if !progress.catalog.error_providers.contains(&provider) {
+          progress.catalog.error_providers.push(provider);
+        }
+      } else {
+        progress.catalog.error_providers.retain(|current| *current != provider);
+      }
+      progress.catalog.error_providers = ordered_providers(&progress.catalog.error_providers);
+    });
+  }
+
+  fn replace_body_progress_queue(&self, jobs: &[PendingBodyJob]) {
+    let (pending_jobs, failed_jobs, providers) = body_queue_progress(jobs);
+    self.index_progress.update(|progress| {
+      progress.body.active_provider = None;
+      progress.body.pending_jobs = pending_jobs;
+      progress.body.failed_jobs = failed_jobs;
+      progress.body.batch_size = INDEX_BODY_SCAN_BATCH_SIZE;
+      progress.body.providers = providers;
+    });
+  }
+
+  fn replace_indexed_body_progress_counts(&self, counts: &[PendingSessionBaselineCount]) {
+    let (pending_jobs, providers) = indexed_body_queue_progress(counts);
+    self.index_progress.update(|progress| {
+      progress.body.active_provider = None;
+      progress.body.pending_jobs = pending_jobs;
+      // Failed jobs are intentionally process-local. A fresh process has no
+      // durable failure record to show until its own worker observes one.
+      progress.body.failed_jobs = 0;
+      progress.body.batch_size = INDEX_BODY_SCAN_BATCH_SIZE;
+      progress.body.providers = providers;
+    });
+  }
+
+  fn set_body_active_provider(&self, provider: ViewerProvider) {
+    self.index_progress.update(|progress| {
+      progress.is_refreshing = true;
+      progress.activity = IndexActivity::Body;
+      progress.worker_error = None;
+      progress.retry_at_ms = None;
+      progress.body.active_provider = Some(provider);
+    });
+  }
+
+  fn record_body_progress_completion(&self) {
+    self.index_progress.update(|progress| {
+      progress.body.completed_in_run = progress.body.completed_in_run.saturating_add(1);
+    });
+  }
+
+  fn record_body_progress_stale(&self) {
+    self.index_progress.update(|progress| {
+      progress.body.stale_in_run = progress.body.stale_in_run.saturating_add(1);
+    });
   }
 
   pub fn list_sessions(&self, request: ListSessionsRequest) -> Result<ListSessionsResponse, String> {
@@ -567,20 +1126,26 @@ impl ViewerService {
       .index_refresh_gate
       .lock()
       .map_err(|_| "session index refresh gate is poisoned".to_string())?;
-    let catalog_refresh = self.refresh_session_catalogs();
-    let body_refresh = self.refresh_pending_body_jobs(&catalog_refresh.unavailable)?;
-    let mut refresh = catalog_refresh.refresh;
-    refresh.changed |= body_refresh.refresh.changed;
-    refresh
-      .attention_session_keys
-      .extend(body_refresh.refresh.attention_session_keys);
-    refresh.has_pending_body_jobs = body_refresh.refresh.has_pending_body_jobs;
-    refresh.attention_session_keys.sort();
-    refresh.attention_session_keys.dedup();
-    self.finalize_index_refresh(
-      refresh,
-      combined_index_errors(catalog_refresh.errors, body_refresh.errors),
-    )
+    self.begin_session_index_catalog_refresh();
+    let result = (|| {
+      let catalog_refresh = self.refresh_session_catalogs();
+      self.continue_session_index_body_refresh();
+      let body_refresh = self.refresh_pending_body_jobs(&catalog_refresh.unavailable)?;
+      let mut refresh = catalog_refresh.refresh;
+      refresh.changed |= body_refresh.refresh.changed;
+      refresh
+        .attention_session_keys
+        .extend(body_refresh.refresh.attention_session_keys);
+      refresh.has_pending_body_jobs = body_refresh.refresh.has_pending_body_jobs;
+      refresh.attention_session_keys.sort();
+      refresh.attention_session_keys.dedup();
+      self.finalize_index_refresh(
+        refresh,
+        combined_index_errors(catalog_refresh.errors, body_refresh.errors),
+      )
+    })();
+    self.finish_session_index_refresh(&result);
+    result
   }
 
   /// Commits only provider catalogs and returns before any session body is
@@ -593,17 +1158,23 @@ impl ViewerService {
       .index_refresh_gate
       .lock()
       .map_err(|_| "session index refresh gate is poisoned".to_string())?;
-    let catalog_refresh = self.refresh_session_catalogs();
-    let remaining_jobs = self.pending_body_jobs(&HashSet::new())?;
-    let mut refresh = catalog_refresh.refresh;
-    refresh.has_pending_body_jobs = !remaining_jobs.is_empty();
-    self.finalize_index_refresh(
-      refresh,
-      combined_index_errors(
-        catalog_refresh.errors,
-        self.body_errors_for_pending_jobs(&remaining_jobs),
-      ),
-    )
+    self.begin_session_index_catalog_refresh();
+    let result = (|| {
+      let catalog_refresh = self.refresh_session_catalogs();
+      let remaining_jobs = self.pending_body_jobs(&HashSet::new())?;
+      self.replace_body_progress_queue(&remaining_jobs);
+      let mut refresh = catalog_refresh.refresh;
+      refresh.has_pending_body_jobs = !remaining_jobs.is_empty();
+      self.finalize_index_refresh(
+        refresh,
+        combined_index_errors(
+          catalog_refresh.errors,
+          self.body_errors_for_pending_jobs(&remaining_jobs),
+        ),
+      )
+    })();
+    self.finish_session_index_refresh(&result);
+    result
   }
 
   /// Advances only the bounded body queue from an already committed catalog.
@@ -614,16 +1185,22 @@ impl ViewerService {
       .index_refresh_gate
       .lock()
       .map_err(|_| "session index refresh gate is poisoned".to_string())?;
-    let catalog_errors = self
-      .catalog_errors
-      .lock()
-      .map(|current_errors| current_errors.clone())
-      .unwrap_or_default();
-    let body_refresh = self.refresh_pending_body_jobs(&HashSet::new())?;
-    let mut refresh = body_refresh.refresh;
-    refresh.attention_session_keys.sort();
-    refresh.attention_session_keys.dedup();
-    self.finalize_index_refresh(refresh, combined_index_errors(catalog_errors, body_refresh.errors))
+    self.begin_session_index_body_refresh();
+    let result = (|| {
+      let catalog_errors = self
+        .catalog_errors
+        .lock()
+        .map(|current_errors| current_errors.clone())
+        .unwrap_or_default();
+      let body_refresh = self.refresh_pending_body_jobs(&HashSet::new())?;
+      let mut refresh = body_refresh.refresh;
+      refresh.has_catalog_errors = !catalog_errors.is_empty();
+      refresh.attention_session_keys.sort();
+      refresh.attention_session_keys.dedup();
+      self.finalize_index_refresh(refresh, combined_index_errors(catalog_errors, body_refresh.errors))
+    })();
+    self.finish_session_index_refresh(&result);
+    result
   }
 
   /// Performs a complete header pass while the caller holds
@@ -634,6 +1211,7 @@ impl ViewerService {
     let mut errors = HashMap::new();
     let mut unavailable = HashSet::new();
     for provider in ViewerProvider::ALL {
+      self.set_catalog_active_provider(provider);
       match self.refresh_provider_catalog(provider) {
         Ok(provider_refresh) => {
           refresh.changed |= provider_refresh.changed;
@@ -641,14 +1219,22 @@ impl ViewerService {
           refresh
             .attention_session_keys
             .extend(provider_refresh.attention_session_keys);
+          self.finish_catalog_provider(provider, false);
         }
         Err(message) => {
           unavailable.insert(provider);
           errors.insert(provider, message);
+          self.finish_catalog_provider(provider, true);
         }
       }
     }
     self.replace_catalog_errors(errors.clone());
+    refresh.has_catalog_errors = !errors.is_empty();
+    if let Ok(pending_providers) = self.pending_catalog_providers() {
+      self.index_progress.update(|progress| {
+        progress.catalog.pending_providers = pending_providers;
+      });
+    }
     CatalogRefresh {
       refresh,
       errors,
@@ -665,12 +1251,15 @@ impl ViewerService {
     let mut refresh = IndexRefresh::default();
     let mut attention_session_keys = HashSet::new();
     let mut pending_jobs = self.pending_body_jobs(unavailable)?;
+    self.replace_body_progress_queue(&pending_jobs);
     let batch_len = pending_jobs.len().min(INDEX_BODY_SCAN_BATCH_SIZE);
     for index in 0..batch_len {
       let job = pending_jobs[index].clone();
+      self.set_body_active_provider(job.provider);
       match self.refresh_pending_body_job(&job) {
         Ok(BodyJobRefresh::Stale) => {
           self.clear_failed_body_job(&job);
+          self.record_body_progress_stale();
           // A stale body job commonly means another viewer process committed
           // the same source while this process was loading it. Request a
           // sidebar reread so this window observes that durable winner's
@@ -683,6 +1272,7 @@ impl ViewerService {
           next_source,
         }) => {
           self.clear_failed_body_job(&job);
+          self.record_body_progress_completion();
           refresh.changed |= provider_refresh.changed;
           attention_session_keys.extend(provider_refresh.attention_session_keys);
           Self::retarget_pending_body_jobs(&mut pending_jobs[index + 1..], &job.source, next_source);
@@ -696,6 +1286,7 @@ impl ViewerService {
     // staged work still keeps the one-second body scheduler alive. The next
     // body-only pass can make progress without waiting for another catalog.
     let remaining_jobs = self.pending_body_jobs(&HashSet::new())?;
+    self.replace_body_progress_queue(&remaining_jobs);
     refresh.has_pending_body_jobs = !remaining_jobs.is_empty();
     refresh.attention_session_keys = attention_session_keys.into_iter().collect();
     Ok(BodyBackfillRefresh {
@@ -708,6 +1299,14 @@ impl ViewerService {
     if let Ok(mut current_errors) = self.catalog_errors.lock() {
       *current_errors = errors;
     }
+    let error_providers = self
+      .catalog_errors
+      .lock()
+      .map(|current_errors| ordered_error_providers(&current_errors))
+      .unwrap_or_default();
+    self.index_progress.update(|progress| {
+      progress.catalog.error_providers = error_providers;
+    });
   }
 
   fn finish_index_refresh(&self, mut refresh: IndexRefresh, errors: HashMap<ViewerProvider, String>) -> IndexRefresh {
@@ -5343,6 +5942,349 @@ mod tests {
       .refresh_pending_session_index()
       .expect("body backfill should succeed");
     assert_eq!(repository.load_calls.load(Ordering::SeqCst), 1);
+  }
+
+  #[test]
+  fn index_progress_is_index_only_and_tracks_a_bounded_body_backfill() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let mut specs = Vec::new();
+    for index in 0..=INDEX_BODY_SCAN_BATCH_SIZE {
+      let id = format!("progress-{index}");
+      let path = directory.path().join(format!("{id}.jsonl"));
+      std::fs::write(&path, format!("fixture {index}")).expect("fixture source should be written");
+      let mut header = indexed_header(path, &id, None);
+      header.updated_at_ms = Some(i64::try_from(index).expect("fixture index should fit"));
+      specs.push(IndexedLoadSpec {
+        header,
+        messages: vec![indexed_message(Role::User, MessageDelivery::Unspecified)],
+      });
+    }
+    let repository = indexing_repository(specs);
+    let service = ViewerService::new_with_index(
+      repository.clone(),
+      Arc::new(SessionIndex::open_in_memory().expect("test index should open")),
+    );
+
+    let cold = service.session_index_progress();
+    assert_eq!(cold.activity, IndexActivity::Idle);
+    assert_eq!(cold.catalog.pending_providers, ViewerProvider::ALL.to_vec());
+    assert_eq!(cold.body.pending_jobs, 0);
+    for _ in 0..3 {
+      let _ = service.session_index_progress();
+    }
+    assert_eq!(repository.header_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(repository.load_calls.load(Ordering::SeqCst), 0);
+
+    service.refresh_session_catalog().expect("catalog should refresh");
+    let cataloged = service.session_index_progress();
+    assert_ne!(cataloged.revision, cold.revision);
+    assert_eq!(cataloged.activity, IndexActivity::WaitingToRetry);
+    assert!(!cataloged.is_refreshing);
+    assert!(cataloged.catalog.pending_providers.is_empty());
+    assert_eq!(cataloged.catalog.processed_providers, ViewerProvider::ALL.len());
+    assert_eq!(cataloged.body.pending_jobs, INDEX_BODY_SCAN_BATCH_SIZE + 1);
+    assert_eq!(cataloged.body.failed_jobs, 0);
+    assert_eq!(cataloged.body.batch_size, INDEX_BODY_SCAN_BATCH_SIZE);
+    assert_eq!(cataloged.body.providers[0].provider, ViewerProvider::Codex);
+    assert_eq!(cataloged.body.providers[0].pending_jobs, INDEX_BODY_SCAN_BATCH_SIZE + 1);
+
+    service
+      .refresh_pending_session_index()
+      .expect("first body batch should refresh");
+    let first_body_batch = service.session_index_progress();
+    assert_eq!(first_body_batch.activity, IndexActivity::WaitingToRetry);
+    assert_eq!(first_body_batch.body.pending_jobs, 1);
+    assert_eq!(first_body_batch.body.completed_in_run, INDEX_BODY_SCAN_BATCH_SIZE);
+    assert_eq!(first_body_batch.body.stale_in_run, 0);
+
+    service
+      .refresh_pending_session_index()
+      .expect("last body job should refresh");
+    let complete = service.session_index_progress();
+    assert_eq!(complete.body.pending_jobs, 0);
+    assert_eq!(complete.body.completed_in_run, 1);
+    assert_eq!(complete.body.failed_jobs, 0);
+  }
+
+  #[test]
+  fn reopened_index_progress_matches_staged_body_jobs_without_provider_reads() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let codex_path = directory.path().join("codex.jsonl");
+    let pi_path = directory.path().join("pi.jsonl");
+    let completed_path = directory.path().join("completed.jsonl");
+    let retired_path = directory.path().join("retired.jsonl");
+    for path in [&codex_path, &pi_path, &completed_path, &retired_path] {
+      std::fs::write(path, "fixture body").expect("fixture source should be written");
+    }
+
+    let index = Arc::new(SessionIndex::open_in_memory().expect("test index should open"));
+    let codex_source = index_source_key_for_path(ViewerProvider::Codex, &codex_path).expect("Codex key should encode");
+    let pi_source = index_source_key_for_path(ViewerProvider::Pi, &pi_path).expect("Pi key should encode");
+    let completed_source =
+      index_source_key_for_path(ViewerProvider::ZCode, &completed_path).expect("completed key should encode");
+    let retired_source = SourceKey::new("retired", "path.v1.fixture");
+
+    let mut codex_session = session_metadata_from_header(
+      &codex_source,
+      indexed_header(codex_path.clone(), "codex-pending", None),
+      None,
+      false,
+    )
+    .expect("Codex session should be indexable");
+    codex_session.attention_baselined = false;
+    let mut pi_session = session_metadata_from_header(
+      &pi_source,
+      indexed_header(pi_path.clone(), "pi-pending", None),
+      None,
+      false,
+    )
+    .expect("Pi session should be indexable");
+    pi_session.attention_baselined = false;
+    let mut completed_session = session_metadata_from_header(
+      &completed_source,
+      indexed_header(completed_path, "completed-pending", None),
+      None,
+      false,
+    )
+    .expect("completed session should be indexable");
+    completed_session.attention_baselined = false;
+    let mut retired_session = session_metadata_from_header(
+      &retired_source,
+      indexed_header(retired_path, "retired-pending", None),
+      None,
+      false,
+    )
+    .expect("retired session should be indexable");
+    retired_session.attention_baselined = false;
+
+    index
+      .replace_sources(&[
+        SourceReplacement::new(
+          SourceState::new(codex_source, pending_body_cursor("codex"), 0),
+          vec![codex_session],
+        ),
+        SourceReplacement::new(
+          SourceState::new(pi_source, format!("{LEGACY_PENDING_BODY_CURSOR_PREFIX}pi"), 0),
+          vec![pi_session],
+        ),
+        SourceReplacement::new(
+          SourceState::new(completed_source, completed_body_cursor("zcode"), 0),
+          vec![completed_session],
+        ),
+        SourceReplacement::new(
+          SourceState::new(retired_source, pending_body_cursor("retired"), 0),
+          vec![retired_session],
+        ),
+      ])
+      .expect("fixture sources should be indexed");
+
+    let repository = indexing_repository(Vec::new());
+    let service = ViewerService::new_with_index(repository.clone(), Arc::clone(&index));
+    let startup = service.session_index_progress();
+    assert_eq!(repository.header_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(repository.load_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(startup.body.pending_jobs, 2);
+    assert_eq!(startup.body.failed_jobs, 0);
+    assert_eq!(
+      startup.body.providers,
+      vec![
+        ProviderBody {
+          provider: ViewerProvider::Codex,
+          pending_jobs: 1,
+          failed_jobs: 0,
+        },
+        ProviderBody {
+          provider: ViewerProvider::Pi,
+          pending_jobs: 1,
+          failed_jobs: 0,
+        },
+        ProviderBody {
+          provider: ViewerProvider::OpenCode,
+          pending_jobs: 0,
+          failed_jobs: 0,
+        },
+        ProviderBody {
+          provider: ViewerProvider::ZCode,
+          pending_jobs: 0,
+          failed_jobs: 0,
+        },
+        ProviderBody {
+          provider: ViewerProvider::WorkBuddy,
+          pending_jobs: 0,
+          failed_jobs: 0,
+        },
+        ProviderBody {
+          provider: ViewerProvider::Dsh,
+          pending_jobs: 0,
+          failed_jobs: 0,
+        },
+      ]
+    );
+
+    let all_jobs = service
+      .pending_body_jobs(&HashSet::new())
+      .expect("staged body jobs should query");
+    let (pending_jobs, failed_jobs, providers) = body_queue_progress(&all_jobs);
+    assert_eq!(pending_jobs, startup.body.pending_jobs);
+    assert_eq!(failed_jobs, startup.body.failed_jobs);
+    assert_eq!(providers, startup.body.providers);
+
+    let unavailable_jobs = service
+      .pending_body_jobs(&HashSet::from([ViewerProvider::Pi]))
+      .expect("unavailable provider should be skippable");
+    assert_eq!(unavailable_jobs.len(), 1);
+    service.record_failed_body_job(&all_jobs[0], "fixture body failure".to_owned());
+    let failed_jobs = service
+      .pending_body_jobs(&HashSet::new())
+      .expect("failed job should remain queued");
+    assert_eq!(body_queue_progress(&failed_jobs).1, 1);
+    // Failed and unavailable state is process-local. The fresh startup
+    // snapshot therefore reports durable work only; later scheduler passes
+    // replace it with their live failed/unavailable view.
+    assert_eq!(startup.body.failed_jobs, 0);
+  }
+
+  #[test]
+  fn index_progress_exposes_catalog_failures_without_provider_error_text() {
+    let service = ViewerService::new(Arc::new(FakeRepository {
+      listings: HashMap::from([(ViewerProvider::Codex, Err("fixture catalog failure".to_string()))]),
+      loaded: Mutex::new(None),
+    }));
+
+    let refresh = service
+      .refresh_session_catalog()
+      .expect("one provider failure should not abort other catalogs");
+    assert!(refresh.has_catalog_errors);
+
+    let progress = service.session_index_progress();
+    assert_eq!(progress.activity, IndexActivity::WaitingToRetry);
+    assert_eq!(progress.catalog.error_providers, vec![ViewerProvider::Codex]);
+    assert_eq!(progress.catalog.pending_providers, vec![ViewerProvider::Codex]);
+    let serialized = serde_json::to_string(&progress).expect("progress should serialize");
+    assert!(!serialized.contains("fixture catalog failure"));
+
+    let body_only = service
+      .refresh_pending_session_index()
+      .expect("body-only refresh should retain the catalog retry hint");
+    assert!(body_only.has_catalog_errors);
+  }
+
+  #[test]
+  fn index_progress_retry_publishes_waiting_state_and_wakes_the_scheduler() {
+    let service = ViewerService::new(Arc::new(FakeRepository {
+      listings: HashMap::new(),
+      loaded: Mutex::new(None),
+    }));
+    let mut progress_updates = service.subscribe_session_index_progress();
+    let (retry_sender, mut retry_receiver) = tokio::sync::mpsc::unbounded_channel();
+    service.set_session_index_retry_sender(retry_sender);
+
+    let before = service.session_index_progress();
+    let queued = service
+      .request_session_index_retry()
+      .expect("configured scheduler should accept a retry wake");
+
+    assert_eq!(queued.activity, IndexActivity::WaitingToRetry);
+    assert!(!queued.is_refreshing);
+    assert_eq!(queued.retry_at_ms, None);
+    assert_ne!(queued.revision, before.revision);
+    assert!(progress_updates.has_changed().expect("watch sender should remain open"));
+    assert_eq!(progress_updates.borrow_and_update().revision, queued.revision);
+    assert!(retry_receiver.try_recv().is_ok());
+  }
+
+  #[test]
+  fn index_progress_retry_does_not_hide_an_active_refresh() {
+    let service = ViewerService::new(Arc::new(FakeRepository {
+      listings: HashMap::new(),
+      loaded: Mutex::new(None),
+    }));
+    let (retry_sender, mut retry_receiver) = tokio::sync::mpsc::unbounded_channel();
+    service.set_session_index_retry_sender(retry_sender);
+    service.begin_session_index_catalog_refresh();
+
+    let queued = service
+      .request_session_index_retry()
+      .expect("configured scheduler should accept an active retry wake");
+
+    assert_eq!(queued.activity, IndexActivity::Catalog);
+    assert!(queued.is_refreshing);
+    assert_eq!(queued.retry_at_ms, None);
+    assert!(retry_receiver.try_recv().is_ok());
+  }
+
+  #[test]
+  fn manual_retry_between_worker_finish_and_scheduler_settlement_stays_visible() {
+    let service = ViewerService::new(Arc::new(FakeRepository {
+      listings: HashMap::new(),
+      loaded: Mutex::new(None),
+    }));
+    let (retry_sender, mut retry_receiver) = tokio::sync::mpsc::unbounded_channel();
+    service.set_session_index_retry_sender(retry_sender);
+
+    service.begin_session_index_catalog_refresh();
+    let result = Ok(IndexRefresh::default());
+    service.finish_session_index_refresh(&result);
+    assert_eq!(service.session_index_progress().activity, IndexActivity::Idle);
+
+    let queued = service
+      .request_session_index_retry()
+      .expect("configured scheduler should accept a retry wake after the worker finishes");
+    assert_eq!(queued.activity, IndexActivity::WaitingToRetry);
+    assert_eq!(queued.retry_at_ms, None);
+
+    // This mirrors the async scheduler applying its exact normal-poll state
+    // after `spawn_blocking` returns. It must not replace the newer manual
+    // wake with a stale idle snapshot.
+    let settled = service.settle_session_index_idle_after_refresh();
+    assert_eq!(settled.activity, IndexActivity::WaitingToRetry);
+    assert_eq!(settled.retry_at_ms, None);
+    assert!(retry_receiver.try_recv().is_ok());
+  }
+
+  #[test]
+  fn manual_retry_during_a_worker_pass_suppresses_its_stale_error() {
+    let service = ViewerService::new(Arc::new(FakeRepository {
+      listings: HashMap::new(),
+      loaded: Mutex::new(None),
+    }));
+    let (retry_sender, mut retry_receiver) = tokio::sync::mpsc::unbounded_channel();
+    service.set_session_index_retry_sender(retry_sender);
+
+    service.begin_session_index_catalog_refresh();
+    let queued = service
+      .request_session_index_retry()
+      .expect("configured scheduler should accept an active retry wake");
+    assert_eq!(queued.activity, IndexActivity::Catalog);
+    service.continue_session_index_body_refresh();
+    assert_eq!(service.session_index_progress().activity, IndexActivity::Body);
+
+    let result = Err("fixture worker failure".to_string());
+    service.finish_session_index_refresh(&result);
+    let settled = service.settle_session_index_worker_error_after_refresh(IndexWorkerError::TaskFailed, Some(42));
+    assert_eq!(settled.activity, IndexActivity::WaitingToRetry);
+    assert_eq!(settled.worker_error, None);
+    assert_eq!(settled.retry_at_ms, None);
+    assert!(retry_receiver.try_recv().is_ok());
+  }
+
+  #[test]
+  fn index_progress_exposes_only_a_sanitized_worker_failure_category() {
+    let service = ViewerService::new(Arc::new(FakeRepository {
+      listings: HashMap::new(),
+      loaded: Mutex::new(None),
+    }));
+
+    let failed = service.settle_session_index_worker_error_after_refresh(IndexWorkerError::TaskFailed, Some(42));
+    assert_eq!(failed.activity, IndexActivity::WaitingToRetry);
+    assert_eq!(failed.worker_error, Some(IndexWorkerError::TaskFailed));
+    assert_eq!(failed.retry_at_ms, Some(42));
+    let serialized = serde_json::to_string(&failed).expect("progress should serialize");
+    assert!(serialized.contains("task_failed"));
+
+    let recovered = service.settle_session_index_waiting_to_retry_after_refresh(Some(43));
+    assert_eq!(recovered.worker_error, None);
+    assert_eq!(recovered.retry_at_ms, Some(43));
   }
 
   #[test]

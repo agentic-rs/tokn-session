@@ -22,7 +22,7 @@ use std::{
   time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter};
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const APPLICATION_ID: i32 = 0x544f_4b4e; // "TOKN"
@@ -607,6 +607,19 @@ impl IndexedSession {
   }
 }
 
+/// A compact count of present sessions whose attention baseline is still
+/// pending for one provider.
+///
+/// The cursor prefix is selected by the caller because body-work staging is
+/// app-specific. This summary deliberately contains no session metadata, so a
+/// status surface can describe outstanding work without materializing or
+/// sorting historical rows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingSessionBaselineCount {
+  pub provider: String,
+  pub pending_sessions: usize,
+}
+
 /// Result details from one committed source replacement.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReplaceSummary {
@@ -956,6 +969,52 @@ impl SessionIndex {
   pub fn list_all_sessions(&self) -> Result<Vec<IndexedSession>> {
     let connection = self.connection()?;
     select_sessions(&connection, "", [])
+  }
+
+  /// Counts present, unbaselined sessions by provider for sources whose
+  /// opaque cursor begins with one of `source_cursor_prefixes`.
+  ///
+  /// This is intentionally a grouped aggregate rather than a session listing:
+  /// callers can initialize a progress indicator without allocating or
+  /// sorting all historical rows. Empty prefixes produce an empty summary.
+  pub fn pending_session_baseline_counts(
+    &self,
+    source_cursor_prefixes: &[&str],
+  ) -> Result<Vec<PendingSessionBaselineCount>> {
+    if source_cursor_prefixes.is_empty() {
+      return Ok(Vec::new());
+    }
+
+    let cursor_matches = source_cursor_prefixes
+      .iter()
+      .enumerate()
+      .map(|(index, _)| {
+        let parameter = index + 1;
+        format!("substr(source.cursor, 1, length(?{parameter})) = ?{parameter}")
+      })
+      .collect::<Vec<_>>()
+      .join(" OR ");
+    let statement = format!(
+      "SELECT source.provider, COUNT(*)
+       FROM sessions AS session
+       INNER JOIN sources AS source ON source.id = session.source_id
+       WHERE session.present = 1
+         AND session.attention_baselined = 0
+         AND ({cursor_matches})
+       GROUP BY source.provider
+       ORDER BY source.provider ASC"
+    );
+    let connection = self.connection()?;
+    let mut statement = connection.prepare(&statement)?;
+    let rows = statement.query_map(params_from_iter(source_cursor_prefixes.iter()), |row| {
+      let pending_sessions = row.get::<_, i64>(1)?;
+      Ok(PendingSessionBaselineCount {
+        provider: row.get(0)?,
+        pending_sessions: usize::try_from(pending_sessions)
+          .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, pending_sessions))?,
+      })
+    })?;
+    collect_rows(rows)
   }
 
   /// Acknowledges attention only through the revision captured by a successful
@@ -2037,6 +2096,66 @@ mod tests {
     assert_eq!(codex.len(), 1);
     assert_eq!(codex[0].key.provider, "codex");
     assert_eq!(codex[0].key.session_id, "codex-session");
+  }
+
+  #[test]
+  fn counts_pending_session_baselines_by_provider_and_cursor_prefix() {
+    let index = SessionIndex::open_in_memory().expect("index should open");
+    let mut codex_first = session_for("codex", "codex-pending", "first", None);
+    codex_first.attention_baselined = false;
+    let mut codex_second = session_for("codex", "codex-pending", "second", None);
+    codex_second.attention_baselined = false;
+    index
+      .replace_source(SourceReplacement::new(
+        source_for("codex", "codex-pending", "pending.v3.current", 10),
+        vec![
+          codex_first,
+          codex_second,
+          session_for("codex", "codex-pending", "done", None),
+        ],
+      ))
+      .expect("pending Codex source should be indexed");
+
+    let mut pi_pending = session_for("pi", "pi-pending", "waiting", None);
+    pi_pending.attention_baselined = false;
+    index
+      .replace_source(SourceReplacement::new(
+        source_for("pi", "pi-pending", "pending.v2.legacy", 10),
+        vec![pi_pending],
+      ))
+      .expect("pending Pi source should be indexed");
+
+    let mut completed_pending = session_for("zcode", "zcode-complete", "stale", None);
+    completed_pending.attention_baselined = false;
+    index
+      .replace_source(SourceReplacement::new(
+        source_for("zcode", "zcode-complete", "completed.v3.current", 10),
+        vec![completed_pending],
+      ))
+      .expect("completed ZCode source should be indexed");
+
+    let counts = index
+      .pending_session_baseline_counts(&["pending.v3.", "pending.v2."])
+      .expect("pending baseline counts should query");
+    assert_eq!(
+      counts,
+      vec![
+        PendingSessionBaselineCount {
+          provider: "codex".to_owned(),
+          pending_sessions: 2,
+        },
+        PendingSessionBaselineCount {
+          provider: "pi".to_owned(),
+          pending_sessions: 1,
+        },
+      ]
+    );
+    assert!(
+      index
+        .pending_session_baseline_counts(&[])
+        .expect("empty prefix count should query")
+        .is_empty()
+    );
   }
 
   #[test]
