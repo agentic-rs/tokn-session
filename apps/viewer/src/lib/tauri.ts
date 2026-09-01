@@ -8,6 +8,8 @@ import type {
   LoadEventDetailRequest,
   EventDetail,
   LoadEventPageRequest,
+  LoadTrajectoryEventPageRequest,
+  TrajectoryEventPageResponse,
 } from "./types";
 
 export function listSessions(request: ListSessionsRequest): Promise<ListSessionsResponse> {
@@ -22,6 +24,12 @@ export function listSessionChildren(
 
 export function loadEventPage(request: LoadEventPageRequest): Promise<EventPageResponse> {
   return invoke<EventPageResponse>("load_event_page", { request });
+}
+
+export function loadTrajectoryEventPage(
+  request: LoadTrajectoryEventPageRequest,
+): Promise<TrajectoryEventPageResponse> {
+  return invoke<TrajectoryEventPageResponse>("load_trajectory_event_page", { request });
 }
 
 export function loadEventDetail(request: LoadEventDetailRequest): Promise<EventDetail> {

@@ -64,9 +64,20 @@ export function ViewerPage() {
         on_retry={viewer.retryEvents}
         on_retry_expanded_detail={viewer.retryExpandedDetail}
         on_sidebar_open={() => viewer.setMobileSidebarOpen(true)}
+        on_trajectory_load_newer={viewer.loadNewerTrajectoryEvents}
+        on_trajectory_load_older={viewer.loadOlderTrajectoryEvents}
+        on_trajectory_retry={viewer.retryTrajectoryEvents}
+        on_trajectory_event_toggle={viewer.toggleTrajectoryEventExpanded}
+        on_trajectory_retry_expanded_detail={viewer.retryExpandedTrajectoryDetail}
         selected_event_key={viewer.selectedEventKey}
         session={viewer.selectedSession}
         total_events={viewer.totalEvents}
+        trajectory_expanded_detail={viewer.expandedTrajectoryDetail}
+        trajectory_expanded_detail_error={viewer.expandedTrajectoryDetailError}
+        trajectory_expanded_detail_loading={viewer.expandedTrajectoryDetailLoading}
+        trajectory_expanded_event_key={viewer.expandedTrajectoryEventKey}
+        trajectory_expanded_key={viewer.expandedTrajectoryKey}
+        trajectory_pages={viewer.trajectoryPages}
       />
 
       <Inspector

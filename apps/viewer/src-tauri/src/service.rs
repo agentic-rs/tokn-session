@@ -14,11 +14,12 @@ use tokn_session_render::render_event_summary;
 
 use crate::model::{
   AgentActivityCardSummary, EventDetail, EventPage, EventPageRequest, EventSummary, ListSessionChildrenRequest,
-  ListSessionChildrenResponse, ListSessionsRequest, ListSessionsResponse, LoadEventDetailRequest, PageDirection,
-  ReasoningCardSummary, SessionLocator, SessionSummary, SourceError, ToolCardSummary, ToolOutputPreview,
-  ToolOutputSection, UsageCardSummary, ViewerProvider, bounded_limit, decode_event_cursor, decode_event_key,
-  decode_list_cursor, decode_session_key, encode_event_cursor, encode_event_key, encode_list_cursor,
-  encode_session_key, parse_updated_at_ms, requested_offset,
+  ListSessionChildrenResponse, ListSessionsRequest, ListSessionsResponse, LoadEventDetailRequest,
+  LoadTrajectoryEventPageRequest, PageDirection, ReasoningCardSummary, SessionLocator, SessionSummary, SourceError,
+  ToolCardSummary, ToolOutputPreview, ToolOutputSection, TrajectoryCardSummary, TrajectoryEventPage, UsageCardSummary,
+  ViewerProvider, bounded_limit, decode_event_cursor, decode_event_key, decode_list_cursor, decode_session_key,
+  decode_trajectory_event_cursor, decode_trajectory_key, encode_event_cursor, encode_event_key, encode_list_cursor,
+  encode_session_key, encode_trajectory_event_cursor, encode_trajectory_key, parse_updated_at_ms, requested_offset,
 };
 use crate::repository::{NativeRepository, ViewerRepository};
 
@@ -32,6 +33,9 @@ const MAX_TECHNICAL_SUMMARY_CHARS: usize = 500;
 const MAX_TOOL_CARD_STRING_CHARS: usize = 500;
 const MAX_TOOL_NAME_CHARS: usize = 120;
 const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_TRAJECTORY_TIMESTAMP_CHARS: usize = 128;
+const MAX_TRAJECTORY_DETAIL_SOURCE_RECORDS: usize = 100;
+const MAX_TRAJECTORY_DETAIL_SOURCE_RECORD_BYTES: usize = 64 * 1024;
 const TOOL_OUTPUT_TRUNCATION_MARKER: &str = "\n\u{2026} output truncated \u{2026}\n";
 
 #[derive(Clone)]
@@ -82,6 +86,7 @@ struct SessionRelationIndex {
 /// One visible historical timeline row. Tool operations intentionally retain
 /// their source event index as the stable detail key while hiding intermediate
 /// invocation/progress/result fragments from the presentation timeline.
+#[derive(Clone, Debug)]
 enum TimelineEntry {
   Event {
     source_event_index: usize,
@@ -90,6 +95,20 @@ enum TimelineEntry {
     source_event_index: usize,
     operation: ToolOperation,
   },
+  /// A synthetic high-level item over a maximal run of non-message, visible base
+  /// timeline entries. Its source children remain addressable through their
+  /// own ordinary `event.v1.*` keys.
+  Trajectory {
+    trajectory: Trajectory,
+  },
+}
+
+#[derive(Clone, Debug)]
+struct Trajectory {
+  /// The final base-timeline source position, used only in the opaque
+  /// `trajectory.v1.*` key. It intentionally does not alias an event key.
+  anchor_source_event_index: usize,
+  entries: Vec<TimelineEntry>,
 }
 
 impl ViewerService {
@@ -371,30 +390,15 @@ impl ViewerService {
       PageDirection::Backward => total_events,
     });
     let (start, end) = event_page_bounds(total_events, boundary, request.direction, limit)?;
-    let has_targeted_agent_activity = timeline[start..end].iter().any(|entry| match entry {
-      TimelineEntry::Event { source_event_index } => matches!(
-        loaded.events.get(*source_event_index),
-        Some(AgentEvent::AgentActivity(activity)) if present_string(activity.target_session_id.as_deref()).is_some()
-      ),
-      TimelineEntry::ToolOperation { .. } => false,
-    });
+    let has_targeted_agent_activity = timeline[start..end]
+      .iter()
+      .any(|entry| timeline_entry_has_targeted_agent_activity(entry, &loaded.events));
     let delegation_targets = has_targeted_agent_activity
       .then(|| self.delegation_targets_for_parent(&locator))
       .unwrap_or_default();
     let events = timeline[start..end]
       .iter()
-      .map(|entry| match entry {
-        TimelineEntry::Event { source_event_index } => event_summary_with_delegation_targets(
-          &loaded.events,
-          *source_event_index,
-          &loaded.events[*source_event_index],
-          &delegation_targets,
-        ),
-        TimelineEntry::ToolOperation {
-          source_event_index,
-          operation,
-        } => tool_operation_event_summary(*source_event_index, operation),
-      })
+      .map(|entry| timeline_entry_event_summary(entry, &loaded.events, &delegation_targets))
       .collect();
 
     Ok(EventPage {
@@ -406,11 +410,58 @@ impl ViewerService {
     })
   }
 
+  /// Returns the ordinary normalized rows represented by one synthetic
+  /// trajectory. The opaque trajectory key pins the request to the run's
+  /// final source position, while a trajectory-specific cursor prevents a
+  /// cursor from one item being replayed against another.
+  pub fn load_trajectory_event_page(
+    &self,
+    request: LoadTrajectoryEventPageRequest,
+  ) -> Result<TrajectoryEventPage, String> {
+    let limit = bounded_limit(request.limit)?;
+    let locator = decode_session_key(&request.session_key)?;
+    let anchor_source_event_index = decode_trajectory_key(&request.trajectory_key)?;
+    let loaded = self.load_verified(&locator)?;
+    let trajectory = trajectory_for_anchor(&loaded.events, anchor_source_event_index)
+      .ok_or_else(|| "trajectory key is outside the session".to_string())?;
+    let total_events = trajectory.entries.len();
+    let requested = requested_trajectory_offset(request.cursor.as_deref(), request.offset, anchor_source_event_index)?;
+    let boundary = requested.unwrap_or(match request.direction {
+      PageDirection::Forward => 0,
+      PageDirection::Backward => total_events,
+    });
+    let (start, end) = event_page_bounds(total_events, boundary, request.direction, limit)?;
+    let has_targeted_agent_activity = trajectory.entries[start..end]
+      .iter()
+      .any(|entry| timeline_entry_has_targeted_agent_activity(entry, &loaded.events));
+    let delegation_targets = has_targeted_agent_activity
+      .then(|| self.delegation_targets_for_parent(&locator))
+      .unwrap_or_default();
+    let events = trajectory.entries[start..end]
+      .iter()
+      .map(|entry| timeline_entry_event_summary(entry, &loaded.events, &delegation_targets))
+      .collect();
+
+    Ok(TrajectoryEventPage {
+      events,
+      next_cursor: (end < total_events).then(|| encode_trajectory_event_cursor(anchor_source_event_index, end)),
+      previous_cursor: (start > 0).then(|| encode_trajectory_event_cursor(anchor_source_event_index, start)),
+      total_events,
+    })
+  }
+
   pub fn load_event_detail(&self, request: LoadEventDetailRequest) -> Result<EventDetail, String> {
     let locator = decode_session_key(&request.session_key)?;
-    let source_event_index = decode_event_key(&request.event_key)?;
     let loaded = self.load_verified(&locator)?;
-    let entry = timeline_entry_for_source(&loaded.events, source_event_index)
+    if request.event_key.starts_with("trajectory.v1.") {
+      let anchor_source_event_index = decode_trajectory_key(&request.event_key)?;
+      let trajectory = trajectory_for_anchor(&loaded.events, anchor_source_event_index)
+        .ok_or_else(|| "trajectory key is outside the session".to_string())?;
+      return trajectory_detail(request.event_key, &trajectory, &loaded.events);
+    }
+
+    let source_event_index = decode_event_key(&request.event_key)?;
+    let entry = base_timeline_entry_for_source(&loaded.events, source_event_index)
       .ok_or_else(|| "event key is outside the session".to_string())?;
 
     match entry {
@@ -427,6 +478,7 @@ impl ViewerService {
         source_event_index,
         operation,
       } => tool_operation_detail(encode_event_key(source_event_index), &operation, &loaded.events),
+      TimelineEntry::Trajectory { .. } => unreachable!("base timeline never contains trajectories"),
     }
   }
 
@@ -570,6 +622,120 @@ fn tool_operation_detail(
     is_hidden: false,
     tool_output,
   })
+}
+
+/// Builds one bounded inspector payload over all raw source records represented
+/// by a synthetic trajectory. Source rows retain their own ordinary event keys
+/// so this aggregate never becomes a second identity layer for those records.
+fn trajectory_detail(event_key: String, trajectory: &Trajectory, events: &[AgentEvent]) -> Result<EventDetail, String> {
+  let source_event_indices = trajectory_source_event_indices(trajectory);
+  let source_event_count = source_event_indices.len();
+  let mut normalized_records = Vec::new();
+  let mut native_records = Vec::new();
+  let mut normalized_size_bytes: usize = 0;
+  let mut native_size_bytes: usize = 0;
+  let mut normalized_truncated = false;
+  let mut native_truncated = false;
+
+  for (position, source_event_index) in source_event_indices.iter().copied().enumerate() {
+    if position >= MAX_TRAJECTORY_DETAIL_SOURCE_RECORDS {
+      normalized_truncated = true;
+      native_truncated = true;
+      break;
+    }
+    let Some(event) = events.get(source_event_index) else {
+      normalized_truncated = true;
+      native_truncated = true;
+      continue;
+    };
+    let detail = event_detail(encode_event_key(source_event_index), event, events, source_event_index)?;
+    let normalized_record = bounded_detail_value_with_limit(
+      json!({
+        "event_key": detail.event_key,
+        "event": detail.event,
+        "is_hidden": detail.is_hidden,
+      }),
+      "trajectory_normalized_source_record",
+      MAX_TRAJECTORY_DETAIL_SOURCE_RECORD_BYTES,
+    )?;
+    let normalized_record_size = serialized_value_size(&normalized_record, "trajectory normalized source record")?;
+    if normalized_size_bytes.saturating_add(normalized_record_size) <= trajectory_detail_record_budget() {
+      normalized_size_bytes = normalized_size_bytes.saturating_add(normalized_record_size);
+      normalized_records.push(normalized_record);
+    } else {
+      normalized_truncated = true;
+    }
+
+    // Direct ToolCall details intentionally aggregate through a logical tool
+    // operation and therefore omit native payloads. A trajectory inspector is
+    // explicitly a source-record view, so retain that raw tool record here.
+    let native = detail.native.or_else(|| match event {
+      AgentEvent::ToolCall(event) => event.native.clone(),
+      _ => None,
+    });
+    let Some(native) = native else {
+      continue;
+    };
+    let native_record = bounded_detail_value_with_limit(
+      json!({
+        "event_key": encode_event_key(source_event_index),
+        "native": native,
+      }),
+      "trajectory_native_source_record",
+      MAX_TRAJECTORY_DETAIL_SOURCE_RECORD_BYTES,
+    )?;
+    let native_record_size = serialized_value_size(&native_record, "trajectory native source record")?;
+    if native_size_bytes.saturating_add(native_record_size) <= trajectory_detail_record_budget() {
+      native_size_bytes = native_size_bytes.saturating_add(native_record_size);
+      native_records.push(native_record);
+    } else {
+      native_truncated = true;
+    }
+  }
+
+  let card = serde_json::to_value(trajectory_card_summary(trajectory, events))
+    .map_err(|error| format!("failed to serialize trajectory summary: {error}"))?;
+  let normalized = bounded_detail_value(
+    json!({
+      "type": "trajectory",
+      "anchor_event_key": encode_event_key(trajectory.anchor_source_event_index),
+      "summary": card,
+      "source_event_count": source_event_count,
+      "source_records": normalized_records,
+      "truncated": normalized_truncated,
+    }),
+    "trajectory_normalized_records",
+  )?;
+  let native = (!native_records.is_empty() || native_truncated).then(|| {
+    bounded_detail_value(
+      json!({
+        "source_event_count": source_event_count,
+        "source_records": native_records,
+        "truncated": native_truncated,
+      }),
+      "trajectory_native_records",
+    )
+  });
+  let native = native.transpose()?;
+
+  Ok(EventDetail {
+    event_key,
+    event: normalized,
+    native,
+    is_hidden: false,
+    tool_output: None,
+  })
+}
+
+fn trajectory_detail_record_budget() -> usize {
+  // Leave room for aggregate framing and a final bounded-detail fallback.
+  MAX_DETAIL_VALUE_BYTES.saturating_sub(8 * 1024)
+}
+
+fn serialized_value_size(value: &Value, representation: &'static str) -> Result<usize, String> {
+  serde_json::to_vec(value)
+    .map(|value| value.len())
+    .map_err(|error| format!("failed to size {representation}: {error}"))
 }
 
 fn tool_operation_native_detail(operation: &ToolOperation, events: &[AgentEvent]) -> Option<Value> {
@@ -937,7 +1103,10 @@ fn event_page_bounds(
   })
 }
 
-fn timeline_entries(events: &[AgentEvent]) -> Vec<TimelineEntry> {
+/// Builds the pre-projection timeline. Tool operations are assembled before
+/// trajectory folding so every later consumer sees one logical tool row and
+/// stable child event keys.
+fn base_timeline_entries(events: &[AgentEvent]) -> Vec<TimelineEntry> {
   let mut operations_by_timeline_source = HashMap::new();
   let mut hidden_tool_sources = HashSet::new();
 
@@ -979,8 +1148,101 @@ fn timeline_entries(events: &[AgentEvent]) -> Vec<TimelineEntry> {
   entries
 }
 
-fn timeline_entry_for_source(events: &[AgentEvent], source_event_index: usize) -> Option<TimelineEntry> {
-  timeline_entries(events).into_iter().find(|entry| match entry {
+/// Folds each maximal visible non-message base run that contains substantive
+/// work into one synthetic card. Flat metadata-only runs deliberately remain
+/// inspectable in the parent timeline, and every message stays visible.
+fn timeline_entries(events: &[AgentEvent]) -> Vec<TimelineEntry> {
+  let base_entries = base_timeline_entries(events);
+  let mut entries = Vec::with_capacity(base_entries.len());
+  let mut pending = Vec::new();
+
+  for entry in base_entries {
+    if is_trajectory_boundary(&entry, events) {
+      flush_trajectory_candidate(&mut entries, &mut pending, events);
+      entries.push(entry);
+    } else {
+      pending.push(entry);
+    }
+  }
+  flush_trajectory_candidate(&mut entries, &mut pending, events);
+  entries
+}
+
+fn flush_trajectory_candidate(
+  output: &mut Vec<TimelineEntry>,
+  pending: &mut Vec<TimelineEntry>,
+  events: &[AgentEvent],
+) {
+  if pending.is_empty() {
+    return;
+  }
+  if !pending.iter().any(|entry| is_substantive_work_entry(entry, events)) {
+    output.append(pending);
+    return;
+  }
+
+  let Some(anchor_source_event_index) = pending.last().and_then(timeline_entry_anchor_source_event_index) else {
+    // Every base timeline row should originate from at least one source
+    // record. If that invariant is violated, retaining flat rows is safer
+    // than inventing a synthetic key with no detail target.
+    output.append(pending);
+    return;
+  };
+  output.push(TimelineEntry::Trajectory {
+    trajectory: Trajectory {
+      anchor_source_event_index,
+      entries: std::mem::take(pending),
+    },
+  });
+}
+
+fn is_trajectory_boundary(entry: &TimelineEntry, events: &[AgentEvent]) -> bool {
+  let TimelineEntry::Event { source_event_index } = entry else {
+    return false;
+  };
+  let Some(event) = events.get(*source_event_index) else {
+    return true;
+  };
+  event.is_hidden()
+    || matches!(
+      event,
+      AgentEvent::Message(_) | AgentEvent::SessionStarted(_) | AgentEvent::ProviderChanged(_)
+    )
+}
+
+fn is_substantive_work_entry(entry: &TimelineEntry, events: &[AgentEvent]) -> bool {
+  match entry {
+    TimelineEntry::ToolOperation { .. } => true,
+    TimelineEntry::Event { source_event_index } => matches!(
+      events.get(*source_event_index),
+      Some(
+        AgentEvent::Reasoning(_)
+          | AgentEvent::AgentActivity(_)
+          | AgentEvent::Lifecycle(_)
+          | AgentEvent::Usage(_)
+          | AgentEvent::Error(_)
+      )
+    ),
+    TimelineEntry::Trajectory { .. } => false,
+  }
+}
+
+fn timeline_entry_anchor_source_event_index(entry: &TimelineEntry) -> Option<usize> {
+  match entry {
+    TimelineEntry::Event { source_event_index } => Some(*source_event_index),
+    TimelineEntry::ToolOperation {
+      source_event_index,
+      operation,
+    } => operation
+      .timeline_source_event_index()
+      .or_else(|| operation.source_event_indices.last().copied())
+      .or(Some(*source_event_index)),
+    TimelineEntry::Trajectory { trajectory } => Some(trajectory.anchor_source_event_index),
+  }
+}
+
+fn base_timeline_entry_for_source(events: &[AgentEvent], source_event_index: usize) -> Option<TimelineEntry> {
+  base_timeline_entries(events).into_iter().find(|entry| match entry {
     TimelineEntry::Event {
       source_event_index: entry_index,
     } => *entry_index == source_event_index,
@@ -988,7 +1250,244 @@ fn timeline_entry_for_source(events: &[AgentEvent], source_event_index: usize) -
       source_event_index: entry_index,
       operation,
     } => *entry_index == source_event_index || operation.source_event_indices.contains(&source_event_index),
+    TimelineEntry::Trajectory { .. } => false,
   })
+}
+
+fn trajectory_for_anchor(events: &[AgentEvent], anchor_source_event_index: usize) -> Option<Trajectory> {
+  timeline_entries(events).into_iter().find_map(|entry| match entry {
+    TimelineEntry::Trajectory { trajectory } if trajectory.anchor_source_event_index == anchor_source_event_index => {
+      Some(trajectory)
+    }
+    TimelineEntry::Event { .. } | TimelineEntry::ToolOperation { .. } | TimelineEntry::Trajectory { .. } => None,
+  })
+}
+
+fn timeline_entry_has_targeted_agent_activity(entry: &TimelineEntry, events: &[AgentEvent]) -> bool {
+  match entry {
+    TimelineEntry::Event { source_event_index } => matches!(
+      events.get(*source_event_index),
+      Some(AgentEvent::AgentActivity(activity)) if present_string(activity.target_session_id.as_deref()).is_some()
+    ),
+    TimelineEntry::ToolOperation { .. } => false,
+    TimelineEntry::Trajectory { trajectory } => trajectory
+      .entries
+      .iter()
+      .any(|entry| timeline_entry_has_targeted_agent_activity(entry, events)),
+  }
+}
+
+fn timeline_entry_event_summary(
+  entry: &TimelineEntry,
+  events: &[AgentEvent],
+  delegation_targets: &HashMap<String, SessionSummary>,
+) -> EventSummary {
+  match entry {
+    TimelineEntry::Event { source_event_index } => event_summary_with_delegation_targets(
+      events,
+      *source_event_index,
+      &events[*source_event_index],
+      delegation_targets,
+    ),
+    TimelineEntry::ToolOperation {
+      source_event_index,
+      operation,
+    } => tool_operation_event_summary(*source_event_index, operation),
+    TimelineEntry::Trajectory { trajectory } => trajectory_event_summary(trajectory, events),
+  }
+}
+
+fn trajectory_event_summary(trajectory: &Trajectory, events: &[AgentEvent]) -> EventSummary {
+  let card = trajectory_card_summary(trajectory, events);
+  let provider = trajectory
+    .entries
+    .last()
+    .map(|entry| timeline_entry_provider(entry, events))
+    .unwrap_or(ViewerProvider::Codex);
+  let summary = trajectory_summary(&card);
+
+  EventSummary {
+    event_key: encode_trajectory_key(trajectory.anchor_source_event_index),
+    event_type: "trajectory".to_string(),
+    provider,
+    timestamp: card.ended_at.clone(),
+    phase: None,
+    role: None,
+    title: "Trajectory".to_string(),
+    summary,
+    summary_truncated: false,
+    is_hidden: false,
+    is_error: (card.error_count > 0).then_some(true),
+    tool: None,
+    usage: None,
+    reasoning: None,
+    trajectory: Some(card),
+    agent_activity: None,
+  }
+}
+
+fn trajectory_summary(card: &TrajectoryCardSummary) -> String {
+  let mut parts = vec![format!("{} events", card.event_count)];
+  if card.tool_count > 0 {
+    parts.push(format!("{} tools", card.tool_count));
+  }
+  if card.reasoning_count > 0 {
+    parts.push(format!("{} reasoning", card.reasoning_count));
+  }
+  if card.agent_activity_count > 0 {
+    parts.push(format!("{} agent activities", card.agent_activity_count));
+  }
+  if card.error_count > 0 {
+    parts.push(format!("{} errors", card.error_count));
+  }
+  if card.unknown_count > 0 {
+    parts.push(format!("{} unknown", card.unknown_count));
+  }
+  truncate(parts.join(", "), MAX_TECHNICAL_SUMMARY_CHARS)
+}
+
+fn timeline_entry_provider(entry: &TimelineEntry, events: &[AgentEvent]) -> ViewerProvider {
+  match entry {
+    TimelineEntry::Event { source_event_index } => events
+      .get(*source_event_index)
+      .map(provider_for_event)
+      .unwrap_or(ViewerProvider::Codex),
+    TimelineEntry::ToolOperation { operation, .. } => viewer_provider(operation.provider),
+    TimelineEntry::Trajectory { trajectory } => trajectory
+      .entries
+      .last()
+      .map(|entry| timeline_entry_provider(entry, events))
+      .unwrap_or(ViewerProvider::Codex),
+  }
+}
+
+fn trajectory_card_summary(trajectory: &Trajectory, events: &[AgentEvent]) -> TrajectoryCardSummary {
+  let mut reasoning_count = 0;
+  let mut tool_count = 0;
+  let mut agent_activity_count = 0;
+  let mut lifecycle_count = 0;
+  let mut usage_count = 0;
+  let mut error_count = 0;
+  let mut unknown_count = 0;
+  let mut first_timestamp = None;
+  let mut last_timestamp = None;
+
+  for entry in &trajectory.entries {
+    match entry {
+      TimelineEntry::ToolOperation { operation, .. } => {
+        tool_count += 1;
+        if operation.is_error == Some(true) || matches!(operation.status, ToolOperationStatus::Failed) {
+          error_count += 1;
+        }
+      }
+      TimelineEntry::Event { source_event_index } => {
+        let Some(event) = events.get(*source_event_index) else {
+          continue;
+        };
+        match event {
+          AgentEvent::Reasoning(_) => reasoning_count += 1,
+          AgentEvent::AgentActivity(_) => agent_activity_count += 1,
+          AgentEvent::Lifecycle(_) => lifecycle_count += 1,
+          AgentEvent::Usage(_) => usage_count += 1,
+          AgentEvent::Error(_) => error_count += 1,
+          AgentEvent::Unknown(_) => unknown_count += 1,
+          AgentEvent::SessionStarted(_)
+          | AgentEvent::ProviderChanged(_)
+          | AgentEvent::SessionSettingsApplied(_)
+          | AgentEvent::Message(_)
+          | AgentEvent::GoalUpdated(_)
+          | AgentEvent::ToolCall(_)
+          | AgentEvent::Metadata(_) => {}
+        }
+        if error_for_event(event) == Some(true) && !matches!(event, AgentEvent::Error(_)) {
+          error_count += 1;
+        }
+      }
+      TimelineEntry::Trajectory { .. } => {}
+    }
+
+    if let Some((timestamp, timestamp_ms)) = timeline_entry_parseable_timestamp(entry, events) {
+      if first_timestamp.is_none() {
+        first_timestamp = Some((timestamp.clone(), timestamp_ms));
+      }
+      last_timestamp = Some((timestamp, timestamp_ms));
+    }
+  }
+
+  let started_at = first_timestamp.as_ref().map(|(timestamp, _)| timestamp.clone());
+  let ended_at = last_timestamp.as_ref().map(|(timestamp, _)| timestamp.clone());
+  let duration_ms = first_timestamp
+    .zip(last_timestamp)
+    .and_then(|((_, start), (_, end))| (end >= start).then_some((end - start).to_string()));
+
+  TrajectoryCardSummary {
+    event_count: trajectory.entries.len(),
+    source_event_count: trajectory_source_event_indices(trajectory).len(),
+    reasoning_count,
+    tool_count,
+    agent_activity_count,
+    lifecycle_count,
+    usage_count,
+    error_count,
+    unknown_count,
+    started_at,
+    ended_at,
+    duration_ms,
+  }
+}
+
+fn timeline_entry_parseable_timestamp(entry: &TimelineEntry, events: &[AgentEvent]) -> Option<(String, i64)> {
+  let timestamp = match entry {
+    TimelineEntry::Event { source_event_index } => events.get(*source_event_index).and_then(timestamp_for_event),
+    TimelineEntry::ToolOperation { operation, .. } => {
+      if operation.is_finished() {
+        operation.updated_at.as_deref().or(operation.started_at.as_deref())
+      } else {
+        operation.started_at.as_deref().or(operation.updated_at.as_deref())
+      }
+    }
+    TimelineEntry::Trajectory { .. } => None,
+  }?;
+  let timestamp_ms = parse_updated_at_ms(Some(timestamp))?;
+  let timestamp = normalize_one_line_text(timestamp, MAX_TRAJECTORY_TIMESTAMP_CHARS)?;
+  Some((timestamp, timestamp_ms))
+}
+
+fn trajectory_source_event_indices(trajectory: &Trajectory) -> Vec<usize> {
+  let mut source_event_indices = trajectory
+    .entries
+    .iter()
+    .flat_map(timeline_entry_source_event_indices)
+    .collect::<Vec<_>>();
+  source_event_indices.sort_unstable();
+  source_event_indices.dedup();
+  source_event_indices
+}
+
+fn timeline_entry_source_event_indices(entry: &TimelineEntry) -> Vec<usize> {
+  match entry {
+    TimelineEntry::Event { source_event_index } => vec![*source_event_index],
+    TimelineEntry::ToolOperation { operation, .. } => operation.source_event_indices.clone(),
+    TimelineEntry::Trajectory { trajectory } => trajectory_source_event_indices(trajectory),
+  }
+}
+
+fn requested_trajectory_offset(
+  cursor: Option<&str>,
+  offset: Option<usize>,
+  anchor_source_event_index: usize,
+) -> Result<Option<usize>, String> {
+  match (cursor, offset) {
+    (Some(_), Some(_)) => Err("cursor and offset cannot be used together".to_string()),
+    (Some(cursor), None) => {
+      let (cursor_anchor, offset) = decode_trajectory_event_cursor(cursor)?;
+      if cursor_anchor != anchor_source_event_index {
+        return Err("trajectory cursor does not match the requested trajectory".to_string());
+      }
+      Ok(Some(offset))
+    }
+    (None, offset) => Ok(offset),
+  }
 }
 
 #[cfg(test)]
@@ -1055,6 +1554,7 @@ fn event_summary_with_delegation_targets(
     tool,
     usage,
     reasoning,
+    trajectory: None,
     agent_activity,
   }
 }
@@ -1097,6 +1597,7 @@ fn tool_operation_event_summary(source_event_index: usize, operation: &ToolOpera
     tool: Some(tool),
     usage: None,
     reasoning: None,
+    trajectory: None,
     agent_activity: None,
   }
 }
@@ -1899,16 +2400,24 @@ fn remove_embedded_native(event: &mut Value) {
 }
 
 fn bounded_detail_value(value: Value, representation: &'static str) -> Result<Value, String> {
+  bounded_detail_value_with_limit(value, representation, MAX_DETAIL_VALUE_BYTES)
+}
+
+fn bounded_detail_value_with_limit(
+  value: Value,
+  representation: &'static str,
+  limit_bytes: usize,
+) -> Result<Value, String> {
   let original_size_bytes = serde_json::to_vec(&value)
     .map_err(|error| format!("failed to size {representation} detail: {error}"))?
     .len();
-  if original_size_bytes <= MAX_DETAIL_VALUE_BYTES {
+  if original_size_bytes <= limit_bytes {
     return Ok(value);
   }
   Ok(json!({
     "truncated": true,
     "original_size_bytes": original_size_bytes,
-    "limit_bytes": MAX_DETAIL_VALUE_BYTES,
+    "limit_bytes": limit_bytes,
     "representation": representation,
   }))
 }
@@ -1935,9 +2444,9 @@ mod tests {
 
   use serde_json::json;
   use tokn_session_core::{
-    AgentActivity, ErrorEvent, MessageDelivery, MessageEvent, MessageProvenance, Phase, ReasoningEvent,
-    SessionHistoryStatus, SessionRef, ToolCallEvent, ToolKind, ToolRecordKind, ToolTransport, UnknownEvent, UsageEvent,
-    UsageKind,
+    AgentActivity, ErrorEvent, LifecycleEvent, LifecycleScope, MessageDelivery, MessageEvent, MessageProvenance,
+    MetadataEvent, MetadataKind, Phase, ProviderChanged, ReasoningEvent, SessionHistoryStatus, SessionRef,
+    SessionStarted, ToolCallEvent, ToolKind, ToolRecordKind, ToolTransport, UnknownEvent, UsageEvent, UsageKind,
   };
 
   use super::*;
@@ -2550,6 +3059,455 @@ mod tests {
   }
 
   #[test]
+  fn trajectory_cards_collapse_visible_work_runs_and_keep_boundaries_flat() {
+    let events = vec![
+      AgentEvent::SessionStarted(SessionStarted {
+        provider: Provider::Codex,
+        session_id: "fixture".to_string(),
+        cwd: None,
+        timestamp: Some("2026-09-01T00:00:00Z".to_string()),
+      }),
+      metadata_event("turn context"),
+      with_timestamp(
+        reasoning_event(Some("consider options"), None, None, None, None),
+        "2026-09-01T00:01:00Z",
+      ),
+      with_timestamp(
+        usage_event(UsageKind::ModelCall, Provider::Codex),
+        "2026-09-01T00:02:00Z",
+      ),
+      with_timestamp(
+        AgentEvent::Unknown(UnknownEvent {
+          provider: Provider::Codex,
+          session_id: Some("fixture".to_string()),
+          native_type: Some("future_event".to_string()),
+          native: None,
+          timestamp: None,
+        }),
+        "2026-09-01T00:03:00Z",
+      ),
+      with_timestamp(
+        AgentEvent::Error(ErrorEvent {
+          provider: Provider::Codex,
+          session_id: Some("fixture".to_string()),
+          message: "command failed".to_string(),
+          timestamp: None,
+        }),
+        "2026-09-01T00:04:00Z",
+      ),
+      message_event("A visible assistant message"),
+      metadata_event("turn metadata without work"),
+      AgentEvent::ProviderChanged(ProviderChanged {
+        provider: Provider::Codex,
+        session_id: Some("fixture".to_string()),
+        native_id: None,
+        native_parent_id: None,
+        model_provider: None,
+        model_id: None,
+        thinking_level: None,
+        timestamp: None,
+      }),
+      agent_activity("child", Some("/root/reviewer")),
+    ];
+
+    let page = service_with_session(loaded_session(events))
+      .load_event_page(EventPageRequest {
+        session_key: key_for("fixture"),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+
+    assert_eq!(
+      page
+        .events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect::<Vec<_>>(),
+      [
+        "session_started",
+        "trajectory",
+        "message",
+        "metadata",
+        "provider_changed",
+        "trajectory"
+      ]
+    );
+    let trajectory = page.events[1].trajectory.as_ref().expect("work run is collapsed");
+    assert_eq!(page.events[1].event_key, encode_trajectory_key(5));
+    assert!(decode_event_key(&page.events[1].event_key).is_err());
+    assert_eq!(trajectory.event_count, 5);
+    assert_eq!(trajectory.source_event_count, 5);
+    assert_eq!(trajectory.reasoning_count, 1);
+    assert_eq!(trajectory.usage_count, 1);
+    assert_eq!(trajectory.error_count, 1);
+    assert_eq!(trajectory.unknown_count, 1);
+    assert_eq!(trajectory.started_at.as_deref(), Some("2026-09-01T00:01:00Z"));
+    assert_eq!(trajectory.ended_at.as_deref(), Some("2026-09-01T00:04:00Z"));
+    assert_eq!(trajectory.duration_ms.as_deref(), Some("180000"));
+    assert_eq!(page.events[5].event_key, encode_trajectory_key(9));
+  }
+
+  #[test]
+  fn top_level_trajectory_paging_uses_projected_cards_without_losing_messages() {
+    let events = vec![
+      message_event("before"),
+      with_timestamp(
+        reasoning_event(Some("one"), None, None, None, None),
+        "2026-09-01T00:01:00Z",
+      ),
+      with_timestamp(
+        usage_event(UsageKind::ModelCall, Provider::Codex),
+        "2026-09-01T00:02:00Z",
+      ),
+      message_event("between"),
+      with_timestamp(lifecycle_event(), "2026-09-01T00:03:00Z"),
+      with_timestamp(
+        AgentEvent::Unknown(UnknownEvent {
+          provider: Provider::Codex,
+          session_id: Some("fixture".to_string()),
+          native_type: Some("future_event".to_string()),
+          native: None,
+          timestamp: None,
+        }),
+        "2026-09-01T00:04:00Z",
+      ),
+      message_event("after"),
+    ];
+    let directory = tempfile::tempdir().unwrap();
+    let session_key = key_for_cached_source(&directory, "fixture");
+    let service = service_with_session(loaded_session(events));
+
+    let first = service
+      .load_event_page(EventPageRequest {
+        session_key: session_key.clone(),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: Some(2),
+      })
+      .unwrap();
+    assert_eq!(first.total_events, 5);
+    assert_eq!(
+      first
+        .events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect::<Vec<_>>(),
+      ["message", "trajectory"]
+    );
+    assert_eq!(first.events[1].event_key, encode_trajectory_key(2));
+
+    let second = service
+      .load_event_page(EventPageRequest {
+        session_key: session_key.clone(),
+        cursor: first.next_cursor.clone(),
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: Some(2),
+      })
+      .unwrap();
+    assert_eq!(
+      second
+        .events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect::<Vec<_>>(),
+      ["message", "trajectory"]
+    );
+    assert_eq!(second.events[0].summary, "between");
+    assert_eq!(second.events[1].event_key, encode_trajectory_key(5));
+
+    let third = service
+      .load_event_page(EventPageRequest {
+        session_key,
+        cursor: second.next_cursor.clone(),
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: Some(2),
+      })
+      .unwrap();
+    assert_eq!(third.events.len(), 1);
+    assert_eq!(third.events[0].event_type, "message");
+    assert_eq!(third.events[0].summary, "after");
+    assert!(third.next_cursor.is_none());
+  }
+
+  #[test]
+  fn hidden_records_are_boundaries_and_metadata_only_runs_stay_flat() {
+    let hidden_reasoning = AgentEvent::Reasoning(ReasoningEvent {
+      provenance: Some(MessageProvenance {
+        source: json!({"kind": "fixture"}),
+        display: Some(false),
+        native: Some(json!({"secret": "hidden"})),
+        surface_op: None,
+        source_event_seqs: None,
+      }),
+      provider: Provider::Codex,
+      session_id: Some("fixture".to_string()),
+      message_id: Some("hidden-reasoning".to_string()),
+      parent_id: None,
+      phase: Phase::Finished,
+      text: Some("hidden".to_string()),
+      summary: None,
+      redacted: None,
+      encrypted_content: None,
+      signature: None,
+      timestamp: None,
+    });
+    let hidden_message = AgentEvent::Message(MessageEvent {
+      provenance: Some(MessageProvenance {
+        source: json!({"kind": "fixture"}),
+        display: Some(false),
+        native: None,
+        surface_op: None,
+        source_event_seqs: None,
+      }),
+      provider: Provider::Codex,
+      session_id: Some("fixture".to_string()),
+      message_id: Some("hidden-message".to_string()),
+      parent_id: None,
+      role: Role::System,
+      delivery: MessageDelivery::Unspecified,
+      phase: Phase::Finished,
+      text: "hidden".to_string(),
+      timestamp: None,
+    });
+    let events = vec![
+      metadata_event("metadata before hidden message"),
+      hidden_message,
+      reasoning_event(Some("visible work"), None, None, None, None),
+      hidden_reasoning,
+      metadata_event("metadata without work"),
+      message_event("visible message"),
+    ];
+
+    let page = service_with_session(loaded_session(events))
+      .load_event_page(EventPageRequest {
+        session_key: key_for("fixture"),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+
+    assert_eq!(
+      page
+        .events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect::<Vec<_>>(),
+      ["metadata", "message", "trajectory", "reasoning", "metadata", "message"]
+    );
+    assert!(page.events[1].is_hidden);
+    assert!(page.events[3].is_hidden);
+    assert!(page.events[2].trajectory.is_some());
+    assert!(page.events[0].trajectory.is_none());
+    assert!(page.events[4].trajectory.is_none());
+  }
+
+  #[test]
+  fn trajectory_duration_requires_ordered_parseable_provider_timestamps() {
+    let events = vec![
+      reasoning_event(Some("missing"), None, None, None, None),
+      with_timestamp(usage_event(UsageKind::ModelCall, Provider::Codex), "not-a-time"),
+      message_event("boundary"),
+      with_timestamp(
+        reasoning_event(Some("late first"), None, None, None, None),
+        "2026-09-01T00:02:00Z",
+      ),
+      with_timestamp(
+        usage_event(UsageKind::ModelCall, Provider::Codex),
+        "2026-09-01T00:01:00Z",
+      ),
+    ];
+
+    let page = service_with_session(loaded_session(events))
+      .load_event_page(EventPageRequest {
+        session_key: key_for("fixture"),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+
+    let missing = page.events[0].trajectory.as_ref().unwrap();
+    assert!(missing.started_at.is_none());
+    assert!(missing.ended_at.is_none());
+    assert!(missing.duration_ms.is_none());
+
+    let reversed = page.events[2].trajectory.as_ref().unwrap();
+    assert_eq!(reversed.started_at.as_deref(), Some("2026-09-01T00:02:00Z"));
+    assert_eq!(reversed.ended_at.as_deref(), Some("2026-09-01T00:01:00Z"));
+    assert!(reversed.duration_ms.is_none());
+  }
+
+  #[test]
+  fn trajectory_detail_is_aggregate_while_child_event_keys_keep_independent_details() {
+    let mut invocation = tool_call(
+      Provider::Codex,
+      "exec_command",
+      "call-1",
+      ToolKind::Shell,
+      None,
+      Phase::Started,
+      None,
+    );
+    let AgentEvent::ToolCall(invocation_event) = &mut invocation else {
+      unreachable!();
+    };
+    invocation_event.native = Some(json!({"record": "invocation"}));
+    let mut result = tool_call(
+      Provider::Codex,
+      "exec_command",
+      "call-1",
+      ToolKind::Shell,
+      None,
+      Phase::Finished,
+      Some(json!({"text": "final"})),
+    );
+    let AgentEvent::ToolCall(result_event) = &mut result else {
+      unreachable!();
+    };
+    result_event.native = Some(json!({"record": "result"}));
+
+    let directory = tempfile::tempdir().unwrap();
+    let session_key = key_for_cached_source(&directory, "fixture");
+    let service = service_with_session(loaded_session(vec![invocation, result]));
+    let page = service
+      .load_event_page(EventPageRequest {
+        session_key: session_key.clone(),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+    let trajectory_key = page.events[0].event_key.clone();
+    assert_eq!(trajectory_key, encode_trajectory_key(1));
+
+    let outer = service
+      .load_event_detail(LoadEventDetailRequest {
+        session_key: session_key.clone(),
+        event_key: trajectory_key.clone(),
+      })
+      .unwrap();
+    assert_eq!(outer.event_key, trajectory_key);
+    assert_eq!(outer.event["type"], "trajectory");
+    assert_eq!(outer.event["source_event_count"], 2);
+    assert_eq!(outer.event["source_records"].as_array().unwrap().len(), 2);
+    assert_eq!(
+      outer.native.as_ref().unwrap()["source_records"]
+        .as_array()
+        .unwrap()
+        .len(),
+      2
+    );
+
+    let children = service
+      .load_trajectory_event_page(LoadTrajectoryEventPageRequest {
+        session_key: session_key.clone(),
+        trajectory_key,
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+    assert_eq!(children.events.len(), 1);
+    assert_eq!(children.events[0].event_type, "tool_call");
+    let child_key = children.events[0].event_key.clone();
+    assert_eq!(child_key, encode_event_key(0));
+
+    let inner = service
+      .load_event_detail(LoadEventDetailRequest {
+        session_key: session_key.clone(),
+        event_key: child_key,
+      })
+      .unwrap();
+    assert_eq!(inner.event["source_event_indices"], json!([0, 1]));
+    assert_ne!(inner.event["type"], "trajectory");
+
+    let terminal_source = service
+      .load_event_detail(LoadEventDetailRequest {
+        session_key,
+        event_key: encode_event_key(1),
+      })
+      .unwrap();
+    assert_eq!(terminal_source.event["source_event_indices"], json!([0, 1]));
+  }
+
+  #[test]
+  fn trajectory_pages_are_bounded_and_validate_their_stable_key_and_cursor() {
+    let events = vec![
+      reasoning_event(Some("first"), None, None, None, None),
+      usage_event(UsageKind::ModelCall, Provider::Codex),
+      lifecycle_event(),
+    ];
+    let directory = tempfile::tempdir().unwrap();
+    let session_key = key_for_cached_source(&directory, "fixture");
+    let service = service_with_session(loaded_session(events));
+    let trajectory_key = encode_trajectory_key(2);
+
+    let first = service
+      .load_trajectory_event_page(LoadTrajectoryEventPageRequest {
+        session_key: session_key.clone(),
+        trajectory_key: trajectory_key.clone(),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: Some(1),
+      })
+      .unwrap();
+    assert_eq!(first.total_events, 3);
+    assert_eq!(first.events[0].event_key, encode_event_key(0));
+    let cursor = first.next_cursor.clone().unwrap();
+
+    let second = service
+      .load_trajectory_event_page(LoadTrajectoryEventPageRequest {
+        session_key: session_key.clone(),
+        trajectory_key: trajectory_key.clone(),
+        cursor: Some(cursor),
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: Some(1),
+      })
+      .unwrap();
+    assert_eq!(second.events[0].event_key, encode_event_key(1));
+
+    let wrong_key = service
+      .load_trajectory_event_page(LoadTrajectoryEventPageRequest {
+        session_key: session_key.clone(),
+        trajectory_key: encode_trajectory_key(1),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: Some(1),
+      })
+      .unwrap_err();
+    assert_eq!(wrong_key, "trajectory key is outside the session");
+
+    let wrong_cursor = service
+      .load_trajectory_event_page(LoadTrajectoryEventPageRequest {
+        session_key,
+        trajectory_key,
+        cursor: Some(encode_trajectory_event_cursor(99, 1)),
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: Some(1),
+      })
+      .unwrap_err();
+    assert_eq!(
+      wrong_cursor,
+      "trajectory cursor does not match the requested trajectory"
+    );
+  }
+
+  #[test]
   fn event_page_resolves_agent_activity_to_its_canonical_direct_child() {
     let parent = session_header("parent", None, "/projects/Alpha", "2026-08-31T00:00:00Z");
     let mut child = session_header("child", Some("parent"), "/projects/Alpha", "2026-08-31T00:02:00Z");
@@ -2570,8 +3528,9 @@ mod tests {
     }));
 
     let page = service
-      .load_event_page(EventPageRequest {
+      .load_trajectory_event_page(LoadTrajectoryEventPageRequest {
         session_key: key_for_header("parent"),
+        trajectory_key: encode_trajectory_key(0),
         cursor: None,
         offset: None,
         direction: PageDirection::Forward,
@@ -2582,7 +3541,7 @@ mod tests {
     let activity = page.events[0]
       .agent_activity
       .as_ref()
-      .expect("agent activity card should be projected");
+      .expect("nested agent activity card should be projected");
     assert_eq!(activity.kind, "started");
     assert_eq!(activity.target_session_id.as_deref(), Some("child"));
     assert_eq!(activity.target_agent_path.as_deref(), Some("/root/researcher"));
@@ -2616,8 +3575,9 @@ mod tests {
     }));
 
     let page = service
-      .load_event_page(EventPageRequest {
+      .load_trajectory_event_page(LoadTrajectoryEventPageRequest {
         session_key: key_for_header("parent"),
+        trajectory_key: encode_trajectory_key(0),
         cursor: None,
         offset: None,
         direction: PageDirection::Forward,
@@ -2628,7 +3588,7 @@ mod tests {
     let activity = page.events[0]
       .agent_activity
       .as_ref()
-      .expect("agent activity card should remain visible");
+      .expect("nested agent activity card should remain visible");
     assert_eq!(activity.target_session_id.as_deref(), Some("target"));
     assert_eq!(activity.target_agent_path.as_deref(), Some("/root/not-a-child"));
     assert!(activity.target.is_none());
@@ -2656,8 +3616,9 @@ mod tests {
     })
     .unwrap();
     let page = service
-      .load_event_page(EventPageRequest {
+      .load_trajectory_event_page(LoadTrajectoryEventPageRequest {
         session_key: stale_parent_key,
+        trajectory_key: encode_trajectory_key(0),
         cursor: None,
         offset: None,
         direction: PageDirection::Forward,
@@ -2668,7 +3629,7 @@ mod tests {
     let activity = page.events[0]
       .agent_activity
       .as_ref()
-      .expect("agent activity card should remain visible");
+      .expect("nested agent activity card should remain visible");
     assert!(activity.target.is_none());
   }
 
@@ -2683,8 +3644,9 @@ mod tests {
     }));
 
     let page = service
-      .load_event_page(EventPageRequest {
+      .load_trajectory_event_page(LoadTrajectoryEventPageRequest {
         session_key: key_for_header("parent"),
+        trajectory_key: encode_trajectory_key(0),
         cursor: None,
         offset: None,
         direction: PageDirection::Forward,
@@ -2695,7 +3657,7 @@ mod tests {
     let activity = page.events[0]
       .agent_activity
       .as_ref()
-      .expect("agent activity card should remain visible");
+      .expect("nested agent activity card should remain visible");
     assert_eq!(activity.target_session_id.as_deref(), Some("child"));
     assert!(activity.target.is_none());
   }
@@ -2766,7 +3728,7 @@ mod tests {
   }
 
   #[test]
-  fn event_pages_use_normalized_ir_discriminants() {
+  fn substantive_events_are_exposed_as_a_synthetic_trajectory() {
     let tool = AgentEvent::ToolCall(ToolCallEvent {
       provider: Provider::Codex,
       session_id: Some("fixture".to_string()),
@@ -2797,7 +3759,9 @@ mod tests {
       })
       .unwrap();
 
-    assert_eq!(page.events[0].event_type, "tool_call");
+    assert_eq!(page.events[0].event_type, "trajectory");
+    assert!(page.events[0].event_key.starts_with("trajectory.v1."));
+    assert_eq!(page.events[0].trajectory.as_ref().unwrap().tool_count, 1);
   }
 
   #[test]
@@ -2973,6 +3937,10 @@ mod tests {
       ),
     ];
 
+    let trajectory = trajectory_for_anchor(&events, 2).expect("terminal tool operation is a trajectory");
+    let operation = timeline_entry_event_summary(&trajectory.entries[0], &events, &HashMap::new());
+    let operation_tool = operation.tool.as_ref().unwrap();
+
     let page = service_with_session(loaded_session(events))
       .load_event_page(EventPageRequest {
         session_key: key_for("fixture"),
@@ -2985,8 +3953,7 @@ mod tests {
     assert_eq!(page.total_events, 2);
     assert_eq!(page.events.len(), 2);
     assert_eq!(page.events[0].event_type, "message");
-    let operation = &page.events[1];
-    let operation_tool = operation.tool.as_ref().unwrap();
+    assert_eq!(page.events[1].event_type, "trajectory");
 
     assert_eq!(
       operation_tool.command.as_ref().unwrap().chars().count(),
@@ -3129,7 +4096,20 @@ mod tests {
       .unwrap();
 
     assert_eq!(page.total_events, 1);
-    let card = page.events[0].tool.as_ref().unwrap();
+    assert_eq!(page.events[0].event_type, "trajectory");
+    let trajectory_page = service
+      .load_trajectory_event_page(LoadTrajectoryEventPageRequest {
+        session_key: session_key.clone(),
+        trajectory_key: page.events[0].event_key.clone(),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+    assert_eq!(trajectory_page.total_events, 1);
+    let operation = &trajectory_page.events[0];
+    let card = operation.tool.as_ref().unwrap();
     assert_eq!(card.kind, "terminal");
     assert_eq!(card.status, "completed");
     assert_eq!(card.provider_tool_name.as_deref(), Some("exec"));
@@ -3140,7 +4120,7 @@ mod tests {
     let detail = service
       .load_event_detail(LoadEventDetailRequest {
         session_key,
-        event_key: page.events[0].event_key.clone(),
+        event_key: operation.event_key.clone(),
       })
       .unwrap();
     assert_eq!(detail.event["output"]["text"], "Refreshing checks status");
@@ -3235,7 +4215,7 @@ mod tests {
         Some(Value::String("ambiguous result".to_string())),
       ),
     ];
-    let entries = timeline_entries(&events);
+    let entries = base_timeline_entries(&events);
     assert_eq!(entries.len(), 3);
     assert!(matches!(entries[0], TimelineEntry::ToolOperation { .. }));
     assert!(matches!(entries[1], TimelineEntry::ToolOperation { .. }));
@@ -3877,6 +4857,52 @@ mod tests {
     })
   }
 
+  fn metadata_event(summary: &str) -> AgentEvent {
+    AgentEvent::Metadata(MetadataEvent {
+      provider: Provider::Codex,
+      session_id: Some("fixture".to_string()),
+      kind: MetadataKind::Diagnostic,
+      native_type: "fixture_metadata".to_string(),
+      summary: summary.to_string(),
+      native: json!({}),
+      timestamp: None,
+    })
+  }
+
+  fn lifecycle_event() -> AgentEvent {
+    AgentEvent::Lifecycle(LifecycleEvent {
+      provider: Provider::Codex,
+      session_id: Some("fixture".to_string()),
+      turn_id: "turn-1".to_string(),
+      step_id: None,
+      scope: LifecycleScope::Turn,
+      phase: Phase::Finished,
+      outcome: None,
+      native: json!({}),
+      timestamp: None,
+    })
+  }
+
+  fn with_timestamp(mut event: AgentEvent, timestamp: &str) -> AgentEvent {
+    let timestamp = Some(timestamp.to_string());
+    match &mut event {
+      AgentEvent::SessionStarted(event) => event.timestamp = timestamp,
+      AgentEvent::ProviderChanged(event) => event.timestamp = timestamp,
+      AgentEvent::SessionSettingsApplied(event) => event.timestamp = timestamp,
+      AgentEvent::Message(event) => event.timestamp = timestamp,
+      AgentEvent::Reasoning(event) => event.timestamp = timestamp,
+      AgentEvent::GoalUpdated(event) => event.timestamp = timestamp,
+      AgentEvent::AgentActivity(event) => event.timestamp = timestamp,
+      AgentEvent::ToolCall(event) => event.timestamp = timestamp,
+      AgentEvent::Lifecycle(event) => event.timestamp = timestamp,
+      AgentEvent::Usage(event) => event.timestamp = timestamp,
+      AgentEvent::Metadata(event) => event.timestamp = timestamp,
+      AgentEvent::Error(event) => event.timestamp = timestamp,
+      AgentEvent::Unknown(event) => event.timestamp = timestamp,
+    }
+    event
+  }
+
   fn reasoning_event(
     summary: Option<&str>,
     text: Option<&str>,
@@ -4007,6 +5033,18 @@ mod tests {
       provider: ViewerProvider::Codex,
       session_id: session_id.to_string(),
       source_path: PathBuf::from("/fixtures/session.jsonl"),
+    })
+    .unwrap()
+  }
+
+  fn key_for_cached_source(directory: &tempfile::TempDir, session_id: &str) -> String {
+    let source_path = directory.path().join(format!("{session_id}.jsonl"));
+    std::fs::write(&source_path, "fixture\n").unwrap();
+    encode_session_key(&SessionLocator {
+      version: 1,
+      provider: ViewerProvider::Codex,
+      session_id: session_id.to_string(),
+      source_path,
     })
     .unwrap()
   }

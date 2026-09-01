@@ -272,6 +272,15 @@ keeps reasoning, tools, metadata, errors, and unknown events inspectable
 without adding a message composer. A failure in one provider is reported
 without preventing the other providers from loading.
 
+The conversation keeps every message visible, while a contiguous stretch of
+non-message work with substantive activity is represented by a
+collapsed `Worked` trajectory item. It says `Worked for …` only when the first
+and last provider event timestamps establish a nonnegative observed span; it
+does not derive time from session file metadata. Expanding a trajectory lazily
+loads its contained normal event cards through a separately bounded page,
+preserving per-event inspection and verified direct-child delegation navigation. A
+trajectory is a viewer projection, not a provider-authoritative turn.
+
 Visible user and assistant messages, expanded reasoning, and readable inspector
 content render GitHub-flavored Markdown. Raw HTML is disabled, images become
 inert placeholders, and links cannot navigate the WebView.

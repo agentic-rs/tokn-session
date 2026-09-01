@@ -182,10 +182,37 @@ pub struct EventSummary {
   pub tool: Option<ToolCardSummary>,
   pub usage: Option<UsageCardSummary>,
   pub reasoning: Option<ReasoningCardSummary>,
+  /// Aggregate metadata for a synthetic, contiguous work trajectory. The
+  /// individual normalized entries remain available through the trajectory
+  /// page and retain their own `event.v1.*` detail keys.
+  pub trajectory: Option<TrajectoryCardSummary>,
   /// Safe historical activity metadata. A target is present only when the
   /// activity's provider-native target ID resolves to a canonical direct child
   /// of the session being viewed.
   pub agent_activity: Option<AgentActivityCardSummary>,
+}
+
+/// Bounded, source-neutral presentation metadata for one collapsed run of
+/// historical work. Counts describe visible base-timeline entries; one tool
+/// operation can therefore represent several provider source records.
+///
+/// Timestamp strings come only from parseable provider event timestamps in
+/// source chronology. `duration_ms` is a decimal string so a renderer never
+/// loses precision when a provider reports a large interval.
+#[derive(Debug, Serialize)]
+pub struct TrajectoryCardSummary {
+  pub event_count: usize,
+  pub source_event_count: usize,
+  pub reasoning_count: usize,
+  pub tool_count: usize,
+  pub agent_activity_count: usize,
+  pub lifecycle_count: usize,
+  pub usage_count: usize,
+  pub error_count: usize,
+  pub unknown_count: usize,
+  pub started_at: Option<String>,
+  pub ended_at: Option<String>,
+  pub duration_ms: Option<String>,
 }
 
 /// Bounded presentation metadata for one historical agent-activity record.
@@ -263,6 +290,28 @@ pub struct LoadEventDetailRequest {
   pub event_key: String,
 }
 
+/// Loads a bounded page of the existing normalized entries represented by one
+/// synthetic trajectory item. The trajectory key is separate from a raw event
+/// key, so expanding an item never changes the detail identity of its children.
+#[derive(Clone, Debug, Deserialize)]
+pub struct LoadTrajectoryEventPageRequest {
+  pub session_key: String,
+  pub trajectory_key: String,
+  pub cursor: Option<String>,
+  pub offset: Option<usize>,
+  #[serde(default)]
+  pub direction: PageDirection,
+  pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TrajectoryEventPage {
+  pub events: Vec<EventSummary>,
+  pub next_cursor: Option<String>,
+  pub previous_cursor: Option<String>,
+  pub total_events: usize,
+}
+
 #[derive(Debug, Serialize)]
 pub struct EventDetail {
   pub event_key: String,
@@ -338,6 +387,38 @@ pub(crate) fn encode_event_key(index: usize) -> String {
 
 pub(crate) fn decode_event_key(key: &str) -> Result<usize, String> {
   decode_cursor(key, "event.v1.")
+}
+
+/// A synthetic trajectory identity is intentionally distinct from the stable
+/// source-event identity. Its numeric payload is the final source position of
+/// the collapsed run, not an `event.v1.*` alias.
+pub(crate) fn encode_trajectory_key(anchor: usize) -> String {
+  format!("trajectory.v1.{anchor:x}")
+}
+
+pub(crate) fn decode_trajectory_key(key: &str) -> Result<usize, String> {
+  decode_cursor(key, "trajectory.v1.")
+}
+
+pub(crate) fn encode_trajectory_event_cursor(anchor: usize, offset: usize) -> String {
+  format!("trajectory-events.v1.{anchor:x}.{offset:x}")
+}
+
+pub(crate) fn decode_trajectory_event_cursor(cursor: &str) -> Result<(usize, usize), String> {
+  let encoded = cursor
+    .strip_prefix("trajectory-events.v1.")
+    .filter(|value| !value.is_empty())
+    .ok_or_else(|| "invalid trajectory pagination cursor".to_string())?;
+  let (anchor, offset) = encoded
+    .split_once('.')
+    .filter(|(anchor, offset)| !anchor.is_empty() && !offset.is_empty())
+    .ok_or_else(|| "invalid trajectory pagination cursor".to_string())?;
+  if offset.contains('.') {
+    return Err("invalid trajectory pagination cursor".to_string());
+  }
+  let anchor = usize::from_str_radix(anchor, 16).map_err(|_| "invalid trajectory pagination cursor".to_string())?;
+  let offset = usize::from_str_radix(offset, 16).map_err(|_| "invalid trajectory pagination cursor".to_string())?;
+  Ok((anchor, offset))
 }
 
 pub(crate) fn bounded_limit(limit: Option<usize>) -> Result<usize, String> {
@@ -483,5 +564,18 @@ mod tests {
     assert_eq!(bounded_limit(Some(MAX_PAGE_LIMIT + 1)).unwrap(), MAX_PAGE_LIMIT);
     assert!(bounded_limit(Some(0)).is_err());
     assert!(requested_offset(Some("sessions.v1.1"), Some(1), decode_list_cursor).is_err());
+  }
+
+  #[test]
+  fn trajectory_keys_and_cursors_are_separate_from_raw_event_keys() {
+    let key = encode_trajectory_key(42);
+    assert_eq!(key, "trajectory.v1.2a");
+    assert_eq!(decode_trajectory_key(&key).unwrap(), 42);
+    assert!(decode_event_key(&key).is_err());
+
+    let cursor = encode_trajectory_event_cursor(42, 7);
+    assert_eq!(decode_trajectory_event_cursor(&cursor).unwrap(), (42, 7));
+    assert!(decode_trajectory_event_cursor("trajectory-events.v1.2a").is_err());
+    assert!(decode_trajectory_event_cursor("trajectory-events.v1.2a.7.extra").is_err());
   }
 }

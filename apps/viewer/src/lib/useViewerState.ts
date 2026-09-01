@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { listSessionChildren, listSessions, loadEventDetail, loadEventPage } from "./tauri";
+import {
+  listSessionChildren,
+  listSessions,
+  loadEventDetail,
+  loadEventPage,
+  loadTrajectoryEventPage,
+} from "./tauri";
 import {
   EVENT_PAGE_SIZE,
   SESSION_PAGE_SIZE,
@@ -19,6 +25,8 @@ import {
   type SessionHistoryStatus,
   type SessionSummary,
   type SourceError,
+  type TrajectoryEventPageState,
+  type TrajectoryPageLoadDirection,
   type ViewerProvider,
 } from "./types";
 
@@ -32,6 +40,7 @@ function useDebouncedValue<T>(value: T, delayMs: number): T {
 }
 
 const DETAIL_CACHE_LIMIT = 50;
+const TRAJECTORY_EVENT_PAGE_SIZE = 40;
 
 function readCachedDetail(cache: Map<string, EventDetail>, key: string): EventDetail | null {
   const detail = cache.get(key) ?? null;
@@ -65,6 +74,31 @@ function expandedEventNeedsDetail(event: EventSummary | null | undefined): boole
     && event.reasoning !== null
     && !event.reasoning.is_redacted
     && (event.reasoning.has_summary || event.reasoning.has_text);
+}
+
+function emptyTrajectoryEventPageState(): TrajectoryEventPageState {
+  return {
+    events: [],
+    next_cursor: null,
+    previous_cursor: null,
+    total_events: null,
+    has_loaded: false,
+    is_loading: false,
+    is_loading_older: false,
+    is_loading_newer: false,
+    error: null,
+    error_direction: null,
+    error_cursor: null,
+  };
+}
+
+function trajectoryRequestKey(sessionKey: string, trajectoryKey: string): string {
+  return `${sessionKey}\u0000${trajectoryKey}`;
+}
+
+interface ExpandedTrajectoryEvent {
+  trajectory_key: string;
+  event_key: string;
 }
 
 export function useViewerState() {
@@ -108,6 +142,14 @@ export function useViewerState() {
   const [historyStatus, setHistoryStatus] = useState<SessionHistoryStatus | null>(null);
   const [eventsAttempt, setEventsAttempt] = useState(0);
   const eventsRequest = useRef(0);
+  const [trajectoryPages, setTrajectoryPages] = useState<
+    Map<string, Map<string, TrajectoryEventPageState>>
+  >(() => new Map());
+  const trajectoryPagesRef = useRef<Map<string, Map<string, TrajectoryEventPageState>>>(
+    new Map(),
+  );
+  const trajectoryPageGeneration = useRef(0);
+  const trajectoryPageRequests = useRef(new Map<string, number>());
 
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const inspectorTriggerRef = useRef<HTMLElement | null>(null);
@@ -130,6 +172,19 @@ export function useViewerState() {
   const [expandedDetailError, setExpandedDetailError] = useState<string | null>(null);
   const [expandedDetailAttempt, setExpandedDetailAttempt] = useState(0);
   const expandedDetailRequest = useRef(0);
+  const [expandedTrajectoryEvent, setExpandedTrajectoryEvent] = useState<
+    ExpandedTrajectoryEvent | null
+  >(null);
+  const [expandedTrajectoryDetail, setExpandedTrajectoryDetail] = useState<EventDetail | null>(null);
+  const [expandedTrajectoryDetailOwnerKey, setExpandedTrajectoryDetailOwnerKey] = useState<
+    string | null
+  >(null);
+  const [expandedTrajectoryDetailLoading, setExpandedTrajectoryDetailLoading] = useState(false);
+  const [expandedTrajectoryDetailError, setExpandedTrajectoryDetailError] = useState<string | null>(
+    null,
+  );
+  const [expandedTrajectoryDetailAttempt, setExpandedTrajectoryDetailAttempt] = useState(0);
+  const expandedTrajectoryDetailRequest = useRef(0);
 
   const requestDetail = useCallback((sessionKey: string, eventKey: string) => {
     const cacheKey = `${sessionKey}:${eventKey}`;
@@ -162,6 +217,7 @@ export function useViewerState() {
     detailLoads.current.clear();
     detailRequest.current += 1;
     expandedDetailRequest.current += 1;
+    expandedTrajectoryDetailRequest.current += 1;
     detailOwnerKeyRef.current = null;
     setDetailOwnerKey(null);
     setDetail(null);
@@ -171,8 +227,156 @@ export function useViewerState() {
     setExpandedDetail(null);
     setExpandedDetailLoading(false);
     setExpandedDetailError(null);
+    setExpandedTrajectoryDetailOwnerKey(null);
+    setExpandedTrajectoryDetail(null);
+    setExpandedTrajectoryDetailLoading(false);
+    setExpandedTrajectoryDetailError(null);
     setDetailRevision((revision) => revision + 1);
   }, []);
+
+  const updateTrajectoryPage = useCallback(
+    (
+      sessionKey: string,
+      trajectoryKey: string,
+      update: (current: TrajectoryEventPageState | undefined) => TrajectoryEventPageState,
+    ) => {
+      const next = new Map(trajectoryPagesRef.current);
+      const sessionPages = new Map(next.get(sessionKey) ?? []);
+      sessionPages.set(trajectoryKey, update(sessionPages.get(trajectoryKey)));
+      next.set(sessionKey, sessionPages);
+      trajectoryPagesRef.current = next;
+      setTrajectoryPages(next);
+    },
+    [],
+  );
+
+  const clearTrajectoryPages = useCallback(() => {
+    trajectoryPageGeneration.current += 1;
+    trajectoryPageRequests.current.clear();
+    const next = new Map<string, Map<string, TrajectoryEventPageState>>();
+    trajectoryPagesRef.current = next;
+    setTrajectoryPages(next);
+    expandedTrajectoryDetailRequest.current += 1;
+    setExpandedTrajectoryEvent(null);
+    setExpandedTrajectoryDetailOwnerKey(null);
+    setExpandedTrajectoryDetail(null);
+    setExpandedTrajectoryDetailLoading(false);
+    setExpandedTrajectoryDetailError(null);
+  }, []);
+
+  const requestTrajectoryEventPage = useCallback(
+    (
+      sessionKey: string,
+      trajectoryKey: string,
+      cursor: string | null,
+      direction: TrajectoryPageLoadDirection,
+      retry: boolean,
+    ) => {
+      const current = trajectoryPagesRef.current.get(sessionKey)?.get(trajectoryKey);
+      if (current?.is_loading || current?.is_loading_older || current?.is_loading_newer) {
+        return;
+      }
+      if (direction === "initial") {
+        if (cursor !== null || (current?.has_loaded && !retry)) {
+          return;
+        }
+      } else {
+        const expectedCursor = direction === "older"
+          ? current?.previous_cursor
+          : current?.next_cursor;
+        if (!current || cursor === null || expectedCursor !== cursor) {
+          return;
+        }
+      }
+
+      const generation = trajectoryPageGeneration.current;
+      const requestKey = trajectoryRequestKey(sessionKey, trajectoryKey);
+      const requestId = (trajectoryPageRequests.current.get(requestKey) ?? 0) + 1;
+      trajectoryPageRequests.current.set(requestKey, requestId);
+      updateTrajectoryPage(sessionKey, trajectoryKey, (existing) => {
+        const page = existing ?? emptyTrajectoryEventPageState();
+        return {
+          ...page,
+          is_loading: direction === "initial",
+          is_loading_older: direction === "older",
+          is_loading_newer: direction === "newer",
+          error: null,
+          error_direction: null,
+          error_cursor: null,
+        };
+      });
+
+      void loadTrajectoryEventPage({
+        session_key: sessionKey,
+        trajectory_key: trajectoryKey,
+        cursor: cursor ?? undefined,
+        direction: direction === "older" ? "backward" : "forward",
+        limit: TRAJECTORY_EVENT_PAGE_SIZE,
+      })
+        .then((response) => {
+          if (
+            trajectoryPageGeneration.current !== generation
+            || trajectoryPageRequests.current.get(requestKey) !== requestId
+          ) {
+            return;
+          }
+          updateTrajectoryPage(sessionKey, trajectoryKey, (existing) => {
+            const page = existing ?? emptyTrajectoryEventPageState();
+            return {
+              ...page,
+              events: direction === "initial"
+                ? response.events
+                : mergeEvents(
+                  page.events,
+                  response.events,
+                  direction === "older" ? "before" : "after",
+                ),
+              previous_cursor: direction === "newer"
+                ? page.previous_cursor
+                : response.previous_cursor,
+              next_cursor: direction === "older" ? page.next_cursor : response.next_cursor,
+              total_events: response.total_events,
+              has_loaded: true,
+              is_loading: false,
+              is_loading_older: false,
+              is_loading_newer: false,
+              error: null,
+              error_direction: null,
+              error_cursor: null,
+            };
+          });
+        })
+        .catch((error: unknown) => {
+          if (
+            trajectoryPageGeneration.current !== generation
+            || trajectoryPageRequests.current.get(requestKey) !== requestId
+          ) {
+            return;
+          }
+          updateTrajectoryPage(sessionKey, trajectoryKey, (existing) => {
+            const page = existing ?? emptyTrajectoryEventPageState();
+            return {
+              ...page,
+              is_loading: false,
+              is_loading_older: false,
+              is_loading_newer: false,
+              error: errorMessage(error),
+              error_direction: direction,
+              error_cursor: cursor,
+            };
+          });
+        })
+        .finally(() => {
+          if (
+            trajectoryPageGeneration.current === generation
+            && trajectoryPageRequests.current.get(requestKey) === requestId
+          ) {
+            trajectoryPageRequests.current.delete(requestKey);
+          }
+        });
+    },
+    [updateTrajectoryPage],
+  );
 
   const applyEventSelection = useCallback((eventKey: string | null, openInspector: boolean) => {
     if (selectedEventKeyRef.current !== eventKey) {
@@ -205,6 +409,7 @@ export function useViewerState() {
     detailCache.current.clear();
     detailLoads.current.clear();
     expandedDetailRequest.current += 1;
+    clearTrajectoryPages();
     setSelectedSessionKey(sessionKey);
     setEventsOwnerKey(null);
     setInitialPageSessionKey(null);
@@ -223,7 +428,7 @@ export function useViewerState() {
     setExpandedDetailLoading(false);
     setExpandedDetailError(null);
     applyEventSelection(null, false);
-  }, [applyEventSelection]);
+  }, [applyEventSelection, clearTrajectoryPages]);
 
   const closeInspector = useCallback(() => {
     const trigger = inspectorTriggerRef.current;
@@ -430,6 +635,7 @@ export function useViewerState() {
 
   useEffect(() => {
     const requestId = ++eventsRequest.current;
+    clearTrajectoryPages();
     const ownsSession = eventsOwnerKeyRef.current === selectedSessionKey;
     if (!ownsSession) {
       eventsOwnerKeyRef.current = selectedSessionKey;
@@ -483,7 +689,13 @@ export function useViewerState() {
           setEventsLoading(false);
         }
       });
-  }, [applyEventSelection, eventsAttempt, invalidateEventDetails, selectedSessionKey]);
+  }, [
+    applyEventSelection,
+    clearTrajectoryPages,
+    eventsAttempt,
+    invalidateEventDetails,
+    selectedSessionKey,
+  ]);
 
   useEffect(() => {
     const requestId = ++detailRequest.current;
@@ -582,6 +794,87 @@ export function useViewerState() {
   ]);
 
   useEffect(() => {
+    if (!selectedSessionKey || !expandedEventKey) {
+      return;
+    }
+    const event = events.find((candidate) => candidate.event_key === expandedEventKey);
+    if (event?.type !== "trajectory") {
+      return;
+    }
+    requestTrajectoryEventPage(
+      selectedSessionKey,
+      event.event_key,
+      null,
+      "initial",
+      false,
+    );
+  }, [events, expandedEventKey, requestTrajectoryEventPage, selectedSessionKey]);
+
+  useEffect(() => {
+    const requestId = ++expandedTrajectoryDetailRequest.current;
+    setExpandedTrajectoryDetail(null);
+    setExpandedTrajectoryDetailError(null);
+
+    if (!selectedSessionKey || !expandedTrajectoryEvent) {
+      setExpandedTrajectoryDetailOwnerKey(null);
+      setExpandedTrajectoryDetailLoading(false);
+      return;
+    }
+    const childEvent = trajectoryPages
+      .get(selectedSessionKey)
+      ?.get(expandedTrajectoryEvent.trajectory_key)
+      ?.events.find((event) => event.event_key === expandedTrajectoryEvent.event_key);
+    if (!expandedEventNeedsDetail(childEvent)) {
+      setExpandedTrajectoryDetailOwnerKey(null);
+      setExpandedTrajectoryDetailLoading(false);
+      return;
+    }
+
+    const cacheKey = `${selectedSessionKey}:${expandedTrajectoryEvent.event_key}`;
+    setExpandedTrajectoryDetailOwnerKey(cacheKey);
+    const cached = readCachedDetail(detailCache.current, cacheKey);
+    if (cached) {
+      setExpandedTrajectoryDetail(cached);
+      setExpandedTrajectoryDetailLoading(false);
+      return;
+    }
+
+    setExpandedTrajectoryDetailLoading(true);
+    void requestDetail(selectedSessionKey, expandedTrajectoryEvent.event_key)
+      .then((response) => {
+        if (expandedTrajectoryDetailRequest.current === requestId) {
+          setExpandedTrajectoryDetail(response);
+        }
+      })
+      .catch((error: unknown) => {
+        if (expandedTrajectoryDetailRequest.current === requestId) {
+          setExpandedTrajectoryDetailError(errorMessage(error));
+        }
+      })
+      .finally(() => {
+        if (expandedTrajectoryDetailRequest.current === requestId) {
+          setExpandedTrajectoryDetailLoading(false);
+        }
+      });
+  }, [
+    detailRevision,
+    expandedTrajectoryDetailAttempt,
+    expandedTrajectoryEvent,
+    requestDetail,
+    selectedSessionKey,
+    trajectoryPages,
+  ]);
+
+  useEffect(() => {
+    if (
+      expandedTrajectoryEvent
+      && expandedEventKey !== expandedTrajectoryEvent.trajectory_key
+    ) {
+      setExpandedTrajectoryEvent(null);
+    }
+  }, [expandedEventKey, expandedTrajectoryEvent]);
+
+  useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
       if (event.key !== "Escape") {
         return;
@@ -602,10 +895,23 @@ export function useViewerState() {
   );
   const eventsAreOwned = selectedSessionKey !== null && eventsOwnerKey === selectedSessionKey;
   const visibleEvents = eventsAreOwned ? events : [];
-  const selectedEvent = useMemo(
-    () => visibleEvents.find((event) => event.event_key === selectedEventKey) ?? null,
-    [selectedEventKey, visibleEvents],
-  );
+  const selectedEvent = useMemo(() => {
+    const timelineEvent = visibleEvents.find((event) => event.event_key === selectedEventKey) ?? null;
+    if (timelineEvent || !selectedSessionKey || !selectedEventKey) {
+      return timelineEvent;
+    }
+    const pages = trajectoryPages.get(selectedSessionKey);
+    if (!pages) {
+      return null;
+    }
+    for (const page of pages.values()) {
+      const trajectoryEvent = page.events.find((event) => event.event_key === selectedEventKey);
+      if (trajectoryEvent) {
+        return trajectoryEvent;
+      }
+    }
+    return null;
+  }, [selectedEventKey, selectedSessionKey, trajectoryPages, visibleEvents]);
   const detailTargetKey = selectedSessionKey && selectedEventKey
     ? `${selectedSessionKey}:${selectedEventKey}`
     : null;
@@ -620,6 +926,27 @@ export function useViewerState() {
     : null;
   const expandedDetailIsOwned = expandedDetailTargetKey !== null
     && expandedDetailOwnerKey === expandedDetailTargetKey;
+  const expandedTrajectoryChild = useMemo(() => {
+    if (
+      !selectedSessionKey
+      || !expandedTrajectoryEvent
+      || expandedEventKey !== expandedTrajectoryEvent.trajectory_key
+    ) {
+      return null;
+    }
+    return trajectoryPages
+      .get(selectedSessionKey)
+      ?.get(expandedTrajectoryEvent.trajectory_key)
+      ?.events.find((event) => event.event_key === expandedTrajectoryEvent.event_key)
+      ?? null;
+  }, [expandedEventKey, expandedTrajectoryEvent, selectedSessionKey, trajectoryPages]);
+  const expandedTrajectoryDetailTargetKey = selectedSessionKey
+    && expandedTrajectoryChild
+    && expandedEventNeedsDetail(expandedTrajectoryChild)
+    ? `${selectedSessionKey}:${expandedTrajectoryChild.event_key}`
+    : null;
+  const expandedTrajectoryDetailIsOwned = expandedTrajectoryDetailTargetKey !== null
+    && expandedTrajectoryDetailOwnerKey === expandedTrajectoryDetailTargetKey;
 
   const toggleProvider = useCallback((provider: ViewerProvider) => {
     sessionsRequest.current += 1;
@@ -652,6 +979,55 @@ export function useViewerState() {
   const toggleEventExpanded = useCallback((eventKey: string) => {
     setExpandedEventKey((current) => current === eventKey ? null : eventKey);
   }, []);
+
+  const toggleTrajectoryEventExpanded = useCallback((trajectoryKey: string, eventKey: string) => {
+    setExpandedTrajectoryEvent((current) => (
+      current?.trajectory_key === trajectoryKey && current.event_key === eventKey
+        ? null
+        : { trajectory_key: trajectoryKey, event_key: eventKey }
+    ));
+  }, []);
+
+  const retryExpandedTrajectoryDetail = useCallback((trajectoryKey: string, eventKey: string) => {
+    setExpandedTrajectoryEvent((current) => (
+      current?.trajectory_key === trajectoryKey && current.event_key === eventKey
+        ? current
+        : { trajectory_key: trajectoryKey, event_key: eventKey }
+    ));
+    setExpandedTrajectoryDetailAttempt((attempt) => attempt + 1);
+  }, []);
+
+  const loadOlderTrajectoryEvents = useCallback((trajectoryKey: string) => {
+    if (!selectedSessionKey) {
+      return;
+    }
+    const page = trajectoryPagesRef.current.get(selectedSessionKey)?.get(trajectoryKey);
+    const cursor = page?.previous_cursor ?? null;
+    if (cursor !== null) {
+      requestTrajectoryEventPage(selectedSessionKey, trajectoryKey, cursor, "older", false);
+    }
+  }, [requestTrajectoryEventPage, selectedSessionKey]);
+
+  const loadNewerTrajectoryEvents = useCallback((trajectoryKey: string) => {
+    if (!selectedSessionKey) {
+      return;
+    }
+    const page = trajectoryPagesRef.current.get(selectedSessionKey)?.get(trajectoryKey);
+    const cursor = page?.next_cursor ?? null;
+    if (cursor !== null) {
+      requestTrajectoryEventPage(selectedSessionKey, trajectoryKey, cursor, "newer", false);
+    }
+  }, [requestTrajectoryEventPage, selectedSessionKey]);
+
+  const retryTrajectoryEvents = useCallback((trajectoryKey: string) => {
+    if (!selectedSessionKey) {
+      return;
+    }
+    const page = trajectoryPagesRef.current.get(selectedSessionKey)?.get(trajectoryKey);
+    const direction = page?.error_direction ?? "initial";
+    const cursor = page?.error_cursor ?? null;
+    requestTrajectoryEventPage(selectedSessionKey, trajectoryKey, cursor, direction, true);
+  }, [requestTrajectoryEventPage, selectedSessionKey]);
 
   const toggleInspector = useCallback(() => {
     if (inspectorOpen) {
@@ -809,6 +1185,20 @@ export function useViewerState() {
     selectEvent,
     expandedEventKey: expandedEventIsVisible ? expandedEventKey : null,
     toggleEventExpanded,
+    trajectoryPages,
+    loadOlderTrajectoryEvents,
+    loadNewerTrajectoryEvents,
+    retryTrajectoryEvents,
+    expandedTrajectoryKey: expandedTrajectoryChild ? expandedTrajectoryEvent?.trajectory_key ?? null : null,
+    expandedTrajectoryEventKey: expandedTrajectoryChild ? expandedTrajectoryEvent?.event_key ?? null : null,
+    expandedTrajectoryDetail: expandedTrajectoryDetailIsOwned ? expandedTrajectoryDetail : null,
+    expandedTrajectoryDetailLoading: expandedTrajectoryDetailTargetKey !== null
+      && (!expandedTrajectoryDetailIsOwned || expandedTrajectoryDetailLoading),
+    expandedTrajectoryDetailError: expandedTrajectoryDetailIsOwned
+      ? expandedTrajectoryDetailError
+      : null,
+    toggleTrajectoryEventExpanded,
+    retryExpandedTrajectoryDetail,
     expandedDetail: expandedDetailIsOwned ? expandedDetail : null,
     expandedDetailLoading: expandedDetailTargetKey !== null
       && (!expandedDetailIsOwned || expandedDetailLoading),

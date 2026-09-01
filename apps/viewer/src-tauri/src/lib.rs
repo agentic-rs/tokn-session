@@ -14,6 +14,7 @@ pub fn run() {
       commands::sessions::list_session_children,
       commands::events::load_event_page,
       commands::events::load_event_detail,
+      commands::events::load_trajectory_event_page,
     ])
     .run(tauri::generate_context!())
     .expect("error while running tokn session viewer");

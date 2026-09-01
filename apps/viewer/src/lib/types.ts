@@ -23,7 +23,9 @@ export type EventType =
   | "usage"
   | "metadata"
   | "error"
-  | "unknown";
+  | "unknown"
+  /** A projected whole-turn timeline entry with lazily loaded source events. */
+  | "trajectory";
 
 export type EventPhase = "started" | "delta" | "updated" | "finished";
 export type MessageRole = "user" | "assistant" | "system" | "tool" | "unknown";
@@ -194,6 +196,24 @@ export interface AgentActivityCardSummary {
   target: SessionSummary | null;
 }
 
+/**
+ * Compact aggregate metadata for a projected whole-turn trajectory.
+ *
+ * `duration_ms` stays a decimal string because the backend may calculate a
+ * duration larger than JavaScript can represent exactly as a Number.
+ */
+export interface TrajectoryCardSummary {
+  event_count: number;
+  tool_count: number;
+  reasoning_count: number;
+  agent_activity_count: number;
+  error_count: number;
+  unknown_count: number;
+  started_at: string | null;
+  ended_at: string | null;
+  duration_ms: string | null;
+}
+
 export interface EventSummary {
   event_key: string;
   type: EventType | string;
@@ -208,6 +228,8 @@ export interface EventSummary {
   is_error: boolean | null;
   /** Optional while the viewer remains compatible with older backends. */
   agent_activity?: AgentActivityCardSummary | null;
+  /** Present only for a projected whole-turn timeline entry. */
+  trajectory?: TrajectoryCardSummary | null;
   tool: ToolCardSummary | null;
   usage: UsageCardSummary | null;
   reasoning: ReasoningCardSummary | null;
@@ -229,6 +251,41 @@ export interface EventPageResponse {
   previous_cursor: string | null;
   total_events: number;
   history_status: SessionHistoryStatus;
+}
+
+export interface LoadTrajectoryEventPageRequest {
+  session_key: string;
+  trajectory_key: string;
+  cursor?: string;
+  direction?: EventPageDirection;
+  limit?: number;
+}
+
+export interface TrajectoryEventPageResponse {
+  events: EventSummary[];
+  next_cursor: string | null;
+  previous_cursor: string | null;
+  total_events: number;
+}
+
+export type TrajectoryPageLoadDirection = "initial" | "older" | "newer";
+
+/**
+ * One locally cached, bounded source-event sequence for a whole-turn card.
+ * It is intentionally separate from the parent session's event page state.
+ */
+export interface TrajectoryEventPageState {
+  events: EventSummary[];
+  next_cursor: string | null;
+  previous_cursor: string | null;
+  total_events: number | null;
+  has_loaded: boolean;
+  is_loading: boolean;
+  is_loading_older: boolean;
+  is_loading_newer: boolean;
+  error: string | null;
+  error_direction: TrajectoryPageLoadDirection | null;
+  error_cursor: string | null;
 }
 
 export interface LoadEventDetailRequest {
