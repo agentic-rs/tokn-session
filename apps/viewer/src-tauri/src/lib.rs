@@ -3,24 +3,36 @@ mod model;
 mod repository;
 mod service;
 
-use std::time::Duration;
+use std::{
+  path::{Path, PathBuf},
+  time::Duration,
+};
 
 use service::ViewerService;
 use tauri::{Emitter, Manager};
 
 const INDEX_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
+fn session_index_path_for_home(home: &Path) -> PathBuf {
+  home.join(".tokn").join("sessions").join("index.sqlite")
+}
+
+fn session_index_path() -> Result<PathBuf, String> {
+  dirs::home_dir()
+    .map(|home| session_index_path_for_home(&home))
+    .ok_or_else(|| "could not resolve the user home directory for the session index".to_owned())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
     .setup(|app| {
-      let app_data_dir = app
-        .path()
-        .app_local_data_dir()
-        .expect("viewer app-local data directory should resolve");
-      std::fs::create_dir_all(&app_data_dir).expect("viewer app-local data directory should be creatable");
-      let service =
-        ViewerService::native(app_data_dir.join("session-index.sqlite3")).expect("viewer session index should open");
+      let index_path = session_index_path().expect("viewer session index path should resolve");
+      let index_directory = index_path
+        .parent()
+        .expect("viewer session index path should have a parent directory");
+      std::fs::create_dir_all(index_directory).expect("viewer session index directory should be creatable");
+      let service = ViewerService::native(index_path).expect("viewer session index should open");
       let refresh_service = service.clone();
       let app_handle = app.handle().clone();
       app.manage(service);
@@ -54,4 +66,19 @@ pub fn run() {
     ])
     .run(tauri::generate_context!())
     .expect("error while running tokn session viewer");
+}
+
+#[cfg(test)]
+mod tests {
+  use std::path::Path;
+
+  use super::session_index_path_for_home;
+
+  #[test]
+  fn session_index_uses_the_shared_tokn_sessions_directory() {
+    assert_eq!(
+      session_index_path_for_home(Path::new("/example/home")),
+      Path::new("/example/home/.tokn/sessions/index.sqlite"),
+    );
+  }
 }

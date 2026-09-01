@@ -328,7 +328,7 @@ responses bounded, including tool-card command and query fields, while expanded
 native event detail and inline tool output are fetched lazily and hidden Pi
 content stays redacted.
 
-The viewer owns an app-local SQLite `session-index.sqlite3`. It stores opaque
+The viewer owns a SQLite index at `~/.tokn/sessions/index.sqlite`. It stores opaque
 source checkpoints; source/session identity and paths; bounded sidebar
 metadata (title, preview, cwd, timestamps, parent, and agent labels); and
 opaque attention markers/revisions. It never stores normalized event records,

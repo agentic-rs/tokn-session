@@ -109,7 +109,8 @@ provider does not hide sessions from the others.
 
 Session discovery starts with provider headers or catalog rows and deliberately
 does not compute message or event counts. The first complete background scan
-then establishes an app-local SQLite sidebar index; later sidebar/tree queries
+then establishes a shared SQLite sidebar index at `~/.tokn/sessions/index.sqlite`;
+later sidebar/tree queries
 read that index. It retains opaque source checkpoints, session identity/paths,
 bounded title/preview/cwd/timestamp/relationship metadata, and unread
 revisions, but never event records, native payloads, reasoning, tool I/O, or
