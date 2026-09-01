@@ -86,6 +86,43 @@ ALTER TABLE sessions
     CHECK(notify_on_baseline IN (0, 1));
 "#;
 
+// `sessions` stays normalized through `sources`: a provider/source pair has
+// one authoritative identity, and duplicating it into every row would make
+// source replacement need to maintain a redundant invariant. The view is the
+// stable, convenient SQL read surface for diagnostics and future consumers
+// that need a session row with its provider alongside it.
+const MIGRATION_003: &str = r#"
+CREATE VIEW indexed_sessions AS
+SELECT
+  source.provider AS provider,
+  source.source_key AS source_key,
+  session.id AS id,
+  session.source_id AS source_id,
+  session.session_id AS session_id,
+  session.source_path AS source_path,
+  session.title AS title,
+  session.preview AS preview,
+  session.cwd AS cwd,
+  session.timestamp AS timestamp,
+  session.updated_at AS updated_at,
+  session.updated_at_ms AS updated_at_ms,
+  session.parent_session_id AS parent_session_id,
+  session.agent_path AS agent_path,
+  session.agent_nickname AS agent_nickname,
+  session.agent_role AS agent_role,
+  session.attention_marker AS attention_marker,
+  session.attention_baselined AS attention_baselined,
+  session.notify_on_baseline AS notify_on_baseline,
+  session.attention_revision AS attention_revision,
+  session.seen_attention_revision AS seen_attention_revision,
+  session.seen_at_ms AS seen_at_ms,
+  session.present AS present,
+  session.first_indexed_at_ms AS first_indexed_at_ms,
+  session.indexed_at_ms AS indexed_at_ms
+FROM sessions AS session
+INNER JOIN sources AS source ON source.id = session.source_id;
+"#;
+
 struct Migration {
   version: i64,
   sql: &'static str,
@@ -99,6 +136,10 @@ const MIGRATIONS: &[Migration] = &[
   Migration {
     version: 2,
     sql: MIGRATION_002,
+  },
+  Migration {
+    version: 3,
+    sql: MIGRATION_003,
   },
 ];
 
@@ -1472,6 +1513,7 @@ mod tests {
       vec![
         (1, migration_checksum(MIGRATION_001)),
         (2, migration_checksum(MIGRATION_002)),
+        (3, migration_checksum(MIGRATION_003)),
       ]
     );
   }
@@ -1527,6 +1569,69 @@ mod tests {
       .expect("migrated session should exist");
     assert!(indexed.attention_baselined);
     assert!(!indexed.notify_on_baseline);
+    drop(index);
+
+    let connection = Connection::open(&path).expect("migrated database should reopen");
+    let provider: String = connection
+      .query_row(
+        "SELECT provider FROM indexed_sessions WHERE session_id = 'a'",
+        [],
+        |row| row.get(0),
+      )
+      .expect("joined session view should expose migrated provider");
+    assert_eq!(provider, PROVIDER);
+  }
+
+  #[test]
+  fn indexed_sessions_view_exposes_provider_and_source_key() {
+    let directory = tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("session-index.sqlite3");
+    {
+      let index = SessionIndex::open(&path).expect("index should open");
+      index
+        .replace_source(SourceReplacement::baseline(
+          source_for("codex", "codex-source", "one", 10),
+          vec![session_for("codex", "codex-source", "codex-session", Some("message"))],
+        ))
+        .expect("Codex source should be indexed");
+      index
+        .replace_source(SourceReplacement::baseline(
+          source_for("pi", "pi-source", "one", 10),
+          vec![session_for("pi", "pi-source", "pi-session", Some("message"))],
+        ))
+        .expect("Pi source should be indexed");
+    }
+
+    let connection = Connection::open(&path).expect("index database should reopen");
+    let rows = connection
+      .prepare(
+        "SELECT provider, source_key, session_id
+         FROM indexed_sessions
+         WHERE present = 1
+         ORDER BY provider, session_id",
+      )
+      .expect("view query should prepare")
+      .query_map([], |row| {
+        Ok((
+          row.get::<_, String>(0)?,
+          row.get::<_, String>(1)?,
+          row.get::<_, String>(2)?,
+        ))
+      })
+      .expect("view query should run")
+      .collect::<rusqlite::Result<Vec<_>>>()
+      .expect("view rows should decode");
+    assert_eq!(
+      rows,
+      vec![
+        (
+          "codex".to_string(),
+          "codex-source".to_string(),
+          "codex-session".to_string()
+        ),
+        ("pi".to_string(), "pi-source".to_string(), "pi-session".to_string()),
+      ]
+    );
   }
 
   #[test]

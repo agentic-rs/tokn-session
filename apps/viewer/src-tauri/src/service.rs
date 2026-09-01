@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -110,21 +110,10 @@ struct SessionHeaderInventory {
   direct_attention: HashMap<SessionLocator, bool>,
 }
 
-#[derive(Eq, Ord, PartialEq, PartialOrd)]
-struct SessionCatalogIdentity {
-  source_path: String,
-  session_id: String,
-  parent_session_id: Option<String>,
-  agent_path: Option<String>,
-  agent_nickname: Option<String>,
-  agent_role: Option<String>,
-  title: Option<String>,
-  preview: Option<String>,
-  cwd: Option<String>,
-  timestamp: Option<String>,
-  updated_at: Option<String>,
-  updated_at_ms: Option<i64>,
-}
+/// Stable source/session membership observed during one header catalog pass.
+/// Presentation fields and source revision are intentionally absent: Codex can
+/// update those while a large discovery pass is still running.
+type SessionCatalogTopology = BTreeMap<String, BTreeSet<String>>;
 
 /// Result of one background reconciliation pass. It deliberately carries no
 /// session contents: the Tauri shell receives only a sidebar-refresh signal
@@ -144,12 +133,18 @@ pub(crate) struct IndexRefresh {
   /// frontend only needs the existing compact refresh payload.
   #[serde(skip)]
   pub has_pending_body_jobs: bool,
+  /// Internal scheduler hint for a catalog that changed structurally while it
+  /// was being observed. This is not a provider-read error; the previous
+  /// committed catalog remains safe to show.
+  #[serde(skip)]
+  pub retry_catalog_soon: bool,
 }
 
 #[derive(Default)]
 struct ProviderIndexRefresh {
   changed: bool,
   attention_session_keys: Vec<String>,
+  retry_catalog_soon: bool,
 }
 
 /// A source whose metadata catalog has committed but whose message body still
@@ -546,6 +541,7 @@ impl ViewerService {
       match self.refresh_provider_catalog(provider) {
         Ok(provider_refresh) => {
           refresh.changed |= provider_refresh.changed;
+          refresh.retry_catalog_soon |= provider_refresh.retry_catalog_soon;
           refresh
             .attention_session_keys
             .extend(provider_refresh.attention_session_keys);
@@ -647,11 +643,12 @@ impl ViewerService {
   }
 
   /// Builds one provider's complete header catalog without reading any message
-  /// bodies. A catalog sentinel becomes visible only after this entire pass
-  /// commits atomically, so sidebar queries never observe a partial provider.
+  /// bodies. A catalog sentinel becomes visible only after a stable complete
+  /// pass commits atomically, so a first-run sidebar never observes a partial
+  /// provider snapshot.
   fn refresh_provider_catalog(&self, provider: ViewerProvider) -> Result<ProviderIndexRefresh, String> {
     let headers = self.repository.list_session_headers(provider)?;
-    let catalog_identity = session_catalog_identity(&headers)?;
+    let catalog_topology = session_catalog_topology(provider, &headers)?;
     let catalog_key = index_catalog_source_key(provider);
     let provider_ready = self
       .session_index
@@ -779,7 +776,7 @@ impl ViewerService {
         continue;
       }
 
-      checked_sources.push((source_path.clone(), cursor.clone()));
+      checked_sources.push((source_key.source_key.clone(), source_path.clone(), cursor.clone()));
       replacements.push(
         SourceReplacement::new(SourceState::new(source_key, staged_cursor, indexed_at_ms), sessions)
           .with_source_cursor_precondition(source_cursor_precondition(previous)),
@@ -805,34 +802,73 @@ impl ViewerService {
       return Ok(ProviderIndexRefresh::default());
     }
 
-    // A second header pass keeps a source disappearing or appearing midway
-    // through the catalog scan from being tombstoned/committed as a coherent
-    // provider snapshot. It intentionally compares only source identity and
-    // hierarchy metadata, never prompt or assistant content.
+    // A second header pass proves source/session membership stayed stable while
+    // the catalog was built. Presentation metadata and file revisions are
+    // intentionally not part of this comparison: Codex updates both while a
+    // rollout is active, and that is ordinary provider activity rather than a
+    // read failure.
     let confirmed_headers = self.repository.list_session_headers(provider)?;
-    if session_catalog_identity(&confirmed_headers)? != catalog_identity {
-      return Err("session catalog changed while it was being indexed".to_string());
+    let confirmed_topology = session_catalog_topology(provider, &confirmed_headers)?;
+    let mut retry_catalog_soon = catalog_topology != confirmed_topology;
+
+    if retry_catalog_soon {
+      // Commit only source snapshots whose complete session membership appears
+      // in both passes. A newly created, removed, or moved source waits for a
+      // stable retry; cached rows remain visible and no provider error is
+      // shown. Tombstones are safe only when the source is absent in both
+      // inventories.
+      replacements.retain(|replacement| {
+        let source_key = &replacement.source.key.source_key;
+        if source_key == INDEX_CATALOG_SOURCE_KEY {
+          return false;
+        }
+        if current_source_keys.contains(source_key) {
+          return catalog_topology.get(source_key) == confirmed_topology.get(source_key);
+        }
+        !confirmed_topology.contains_key(source_key)
+      });
+      checked_sources
+        .retain(|(source_key, _, _)| catalog_topology.get(source_key) == confirmed_topology.get(source_key));
     }
-    for (source_path, cursor) in &checked_sources {
-      if source_cursor(provider, source_path)? != *cursor {
-        return Err("session source changed before the index could commit".to_string());
-      }
+
+    // Per-source cursor verification is deliberately granular. One active
+    // rollout should not prevent thousands of unrelated catalog rows from
+    // committing; its previous row remains until the next catalog observes a
+    // stable revision.
+    let changed_sources = checked_sources
+      .iter()
+      .map(|(source_key, source_path, cursor)| {
+        let confirmed_cursor = source_cursor(provider, source_path)?;
+        Ok((confirmed_cursor != *cursor).then_some(source_key.clone()))
+      })
+      .collect::<Result<Vec<_>, String>>()?
+      .into_iter()
+      .flatten()
+      .collect::<HashSet<_>>();
+    if !changed_sources.is_empty() {
+      retry_catalog_soon = true;
+      replacements.retain(|replacement| !changed_sources.contains(&replacement.source.key.source_key));
     }
 
     // The sentinel means a complete header catalog is available, not that every
     // source body has been read. It also makes an empty provider catalog
     // explicit, so a later first session is correctly identified as new.
-    if !provider_ready {
+    if !provider_ready && !retry_catalog_soon {
       replacements.push(
         SourceReplacement::new(SourceState::new(catalog_key, "headers.v2", indexed_at_ms), Vec::new())
           .with_source_cursor_precondition(SourceCursorPrecondition::missing()),
       );
     }
 
-    // All catalog sources for a provider, including its readiness sentinel,
-    // commit in one transaction. A cursor race on any source must leave the
-    // previous provider snapshot intact; otherwise the UI could see a partial
-    // session tree.
+    // Every safe source selected above commits in one transaction. The
+    // readiness sentinel is included only for a stable complete pass; a
+    // cursor race therefore cannot publish a partial first-run provider tree.
+    if replacements.is_empty() {
+      return Ok(ProviderIndexRefresh {
+        retry_catalog_soon,
+        ..Default::default()
+      });
+    }
     self
       .session_index
       .replace_sources(&replacements)
@@ -840,6 +876,7 @@ impl ViewerService {
     Ok(ProviderIndexRefresh {
       changed: true,
       attention_session_keys: Vec::new(),
+      retry_catalog_soon,
     })
   }
 
@@ -1073,6 +1110,7 @@ impl ViewerService {
       provider_refresh: ProviderIndexRefresh {
         changed: completion.was_applied(),
         attention_session_keys,
+        retry_catalog_soon: false,
       },
       next_source,
     })
@@ -1678,28 +1716,19 @@ fn session_body_priority(session: &IndexedSession) -> i64 {
     .unwrap_or(i64::MIN)
 }
 
-fn session_catalog_identity(headers: &[SessionHeader]) -> Result<Vec<SessionCatalogIdentity>, String> {
-  let mut identity = headers
-    .iter()
-    .map(|header| {
-      Ok(SessionCatalogIdentity {
-        source_path: index_path_string(&header.path)?,
-        session_id: header.id.clone(),
-        parent_session_id: header.parent_session_id.clone(),
-        agent_path: header.agent_path.clone(),
-        agent_nickname: header.agent_nickname.clone(),
-        agent_role: header.agent_role.clone(),
-        title: header.title.clone(),
-        preview: header.preview.clone(),
-        cwd: header.cwd.clone(),
-        timestamp: header.timestamp.clone(),
-        updated_at: header.updated_at.clone(),
-        updated_at_ms: header.updated_at_ms,
-      })
-    })
-    .collect::<Result<Vec<_>, String>>()?;
-  identity.sort();
-  Ok(identity)
+fn session_catalog_topology(
+  provider: ViewerProvider,
+  headers: &[SessionHeader],
+) -> Result<SessionCatalogTopology, String> {
+  let mut topology = SessionCatalogTopology::new();
+  for header in headers {
+    let source_key = index_source_key_for_path(provider, &header.path)?;
+    topology
+      .entry(source_key.source_key)
+      .or_default()
+      .insert(header.id.clone());
+  }
+  Ok(topology)
 }
 
 fn indexed_session_header(session: &IndexedSession) -> Result<SessionHeader, String> {
@@ -3934,6 +3963,63 @@ mod tests {
     }
   }
 
+  struct CatalogSequenceRepository {
+    codex_catalogs: Vec<Vec<SessionHeader>>,
+    codex_header_calls: AtomicUsize,
+    mutate_path_after_first_catalog: Option<PathBuf>,
+    remove_path_after_first_catalog: Option<PathBuf>,
+  }
+
+  impl ViewerRepository for CatalogSequenceRepository {
+    fn list_session_headers(&self, provider: ViewerProvider) -> Result<Vec<SessionHeader>, String> {
+      if provider != ViewerProvider::Codex {
+        return Ok(Vec::new());
+      }
+      let call = self.codex_header_calls.fetch_add(1, Ordering::SeqCst);
+      if call == 1
+        && let Some(path) = &self.mutate_path_after_first_catalog
+      {
+        std::fs::write(path, "fixture source changed during catalog confirmation")
+          .expect("fixture source mutation should succeed");
+      }
+      if call == 1
+        && let Some(path) = &self.remove_path_after_first_catalog
+      {
+        std::fs::remove_file(path).expect("fixture source removal should succeed");
+      }
+      self
+        .codex_catalogs
+        .get(call.min(self.codex_catalogs.len().saturating_sub(1)))
+        .cloned()
+        .ok_or_else(|| "catalog sequence requires at least one Codex listing".to_string())
+    }
+
+    fn hydrate_session_header(
+      &self,
+      _provider: ViewerProvider,
+      header: SessionHeader,
+    ) -> Result<SessionHeader, String> {
+      Ok(header)
+    }
+
+    fn load_session(&self, locator: &SessionLocator) -> Result<LoadedSession, String> {
+      let header = self
+        .codex_catalogs
+        .iter()
+        .flatten()
+        .find(|header| header.id == locator.session_id && header.path == locator.source_path)
+        .cloned()
+        .ok_or_else(|| "fixture session is not configured".to_string())?;
+      Ok(
+        IndexedLoadSpec {
+          header,
+          messages: vec![indexed_message(Role::User, MessageDelivery::Unspecified)],
+        }
+        .load(),
+      )
+    }
+  }
+
   fn indexing_repository(specs: Vec<IndexedLoadSpec>) -> Arc<IndexingRepository> {
     indexing_repository_for(ViewerProvider::Codex, specs)
   }
@@ -4102,6 +4188,160 @@ mod tests {
         .expect("index query should work")
         .expect("oldest catalog row should exist")
         .attention_baselined
+    );
+  }
+
+  #[test]
+  fn session_index_ignores_mutable_header_changes_between_catalog_passes() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("active.jsonl");
+    std::fs::write(&path, "fixture source").expect("fixture source should be written");
+    let before = indexed_header(path.clone(), "active", None);
+    let mut after = before.clone();
+    after.title = Some("Title assigned while indexing".to_string());
+    after.preview = Some("Preview assigned while indexing".to_string());
+    after.updated_at = Some("2026-09-01T00:00:01Z".to_string());
+    after.updated_at_ms = Some(1);
+    let repository = Arc::new(CatalogSequenceRepository {
+      codex_catalogs: vec![vec![before.clone()], vec![after]],
+      codex_header_calls: AtomicUsize::new(0),
+      mutate_path_after_first_catalog: None,
+      remove_path_after_first_catalog: None,
+    });
+    let index = Arc::new(SessionIndex::open_in_memory().expect("test index should open"));
+    let service = ViewerService::new_with_index(repository, Arc::clone(&index));
+
+    let refresh = service
+      .refresh_session_index()
+      .expect("catalog should tolerate metadata churn");
+    assert!(!refresh.retry_catalog_soon);
+    assert!(service.index_error_for(ViewerProvider::Codex).is_none());
+    let locator = locator_for_header(ViewerProvider::Codex, &before);
+    let stored = index
+      .session(&index_session_key(&locator).expect("index key should encode"))
+      .expect("index query should work")
+      .expect("stable session should be cataloged");
+    assert_eq!(stored.title.as_deref(), before.title.as_deref());
+    assert!(stored.attention_baselined);
+  }
+
+  #[test]
+  fn session_index_quietly_retries_when_catalog_membership_changes() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let first_path = directory.path().join("first.jsonl");
+    let second_path = directory.path().join("second.jsonl");
+    std::fs::write(&first_path, "first source").expect("first fixture source should be written");
+    std::fs::write(&second_path, "second source").expect("second fixture source should be written");
+    let first = indexed_header(first_path, "first", None);
+    let second = indexed_header(second_path, "second", None);
+    let repository = Arc::new(CatalogSequenceRepository {
+      codex_catalogs: vec![vec![first.clone()], vec![second.clone()]],
+      codex_header_calls: AtomicUsize::new(0),
+      mutate_path_after_first_catalog: None,
+      remove_path_after_first_catalog: None,
+    });
+    let index = Arc::new(SessionIndex::open_in_memory().expect("test index should open"));
+    let service = ViewerService::new_with_index(repository, Arc::clone(&index));
+
+    let unstable = service.refresh_session_index().expect("catalog race should stay quiet");
+    assert!(unstable.retry_catalog_soon);
+    assert!(service.index_error_for(ViewerProvider::Codex).is_none());
+    assert!(
+      index
+        .source_state(&index_catalog_source_key(ViewerProvider::Codex))
+        .expect("catalog state should query")
+        .is_none(),
+      "an unstable first catalog must not publish its readiness sentinel"
+    );
+    assert!(
+      index
+        .session(
+          &index_session_key(&locator_for_header(ViewerProvider::Codex, &first)).expect("first key should encode")
+        )
+        .expect("index query should work")
+        .is_none(),
+      "the disappearing source should wait for a stable catalog"
+    );
+
+    let stable = service
+      .refresh_session_index()
+      .expect("stable retry should catalog the replacement");
+    assert!(!stable.retry_catalog_soon);
+    assert!(service.index_error_for(ViewerProvider::Codex).is_none());
+    assert!(
+      index
+        .session(
+          &index_session_key(&locator_for_header(ViewerProvider::Codex, &second)).expect("second key should encode")
+        )
+        .expect("index query should work")
+        .is_some()
+    );
+  }
+
+  #[test]
+  fn session_index_defers_only_a_source_that_changes_during_cataloging() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("active.jsonl");
+    std::fs::write(&path, "before catalog confirmation").expect("fixture source should be written");
+    let header = indexed_header(path.clone(), "active", None);
+    let repository = Arc::new(CatalogSequenceRepository {
+      codex_catalogs: vec![vec![header.clone()]],
+      codex_header_calls: AtomicUsize::new(0),
+      mutate_path_after_first_catalog: Some(path),
+      remove_path_after_first_catalog: None,
+    });
+    let index = Arc::new(SessionIndex::open_in_memory().expect("test index should open"));
+    let service = ViewerService::new_with_index(repository, Arc::clone(&index));
+    let locator = locator_for_header(ViewerProvider::Codex, &header);
+
+    let unstable = service
+      .refresh_session_index()
+      .expect("active source should defer without an error");
+    assert!(unstable.retry_catalog_soon);
+    assert!(service.index_error_for(ViewerProvider::Codex).is_none());
+    assert!(
+      index
+        .session(&index_session_key(&locator).expect("index key should encode"))
+        .expect("index query should work")
+        .is_none(),
+      "only the source with a changed cursor should be deferred"
+    );
+
+    let stable = service
+      .refresh_session_index()
+      .expect("next stable catalog should recover");
+    assert!(!stable.retry_catalog_soon);
+    assert!(
+      index
+        .session(&index_session_key(&locator).expect("index key should encode"))
+        .expect("index query should work")
+        .is_some()
+    );
+  }
+
+  #[test]
+  fn session_index_reports_a_source_that_becomes_unreadable_during_cataloging() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("removed.jsonl");
+    std::fs::write(&path, "fixture source").expect("fixture source should be written");
+    let header = indexed_header(path.clone(), "removed", None);
+    let repository = Arc::new(CatalogSequenceRepository {
+      codex_catalogs: vec![vec![header]],
+      codex_header_calls: AtomicUsize::new(0),
+      mutate_path_after_first_catalog: None,
+      remove_path_after_first_catalog: Some(path),
+    });
+    let service = ViewerService::new_with_index(
+      repository,
+      Arc::new(SessionIndex::open_in_memory().expect("test index should open")),
+    );
+
+    service
+      .refresh_session_index()
+      .expect("provider failures should stay isolated from the refresh loop");
+    assert_eq!(
+      service.index_error_for(ViewerProvider::Codex).as_deref(),
+      Some("session source is unavailable while indexing")
     );
   }
 

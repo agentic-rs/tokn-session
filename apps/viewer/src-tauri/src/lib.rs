@@ -13,6 +13,8 @@ use tauri::{Emitter, Manager};
 
 const INDEX_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const INDEX_PENDING_BODY_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const INDEX_CATALOG_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_CONSECUTIVE_CATALOG_RETRIES: u8 = 2;
 
 fn session_index_path_for_home(home: &Path) -> PathBuf {
   home.join(".tokn").join("sessions").join("index.sqlite")
@@ -43,6 +45,7 @@ pub fn run() {
       // retains native header discovery until its compact catalog commits.
       tauri::async_runtime::spawn(async move {
         let mut next_catalog_refresh = Instant::now();
+        let mut consecutive_catalog_retries = 0_u8;
         loop {
           let catalog_due = Instant::now() >= next_catalog_refresh;
           let service = refresh_service.clone();
@@ -54,14 +57,25 @@ pub fn run() {
             }
           })
           .await;
-          // Start the ordinary catalog interval after its potentially slow
-          // blocking scan returns. Advancing this deadline before the scan can
-          // turn a large first catalog into a tight full-catalog loop.
-          if catalog_due {
-            next_catalog_refresh = Instant::now() + INDEX_REFRESH_INTERVAL;
-          }
           match result {
             Ok(Ok(refresh)) => {
+              // Start the ordinary catalog interval after its potentially slow
+              // blocking scan returns. A structurally changing inventory is a
+              // normal race, not a provider error, so make up to two quick
+              // retries before returning to the regular cadence. This avoids
+              // a long-lived active provider becoming a one-second full-scan
+              // loop.
+              if catalog_due {
+                let retry_soon =
+                  refresh.retry_catalog_soon && consecutive_catalog_retries < MAX_CONSECUTIVE_CATALOG_RETRIES;
+                if retry_soon {
+                  consecutive_catalog_retries += 1;
+                  next_catalog_refresh = Instant::now() + INDEX_CATALOG_RETRY_INTERVAL;
+                } else {
+                  consecutive_catalog_retries = 0;
+                  next_catalog_refresh = Instant::now() + INDEX_REFRESH_INTERVAL;
+                }
+              }
               let has_pending_body_jobs = refresh.has_pending_body_jobs;
               if refresh.changed {
                 let _ = app_handle.emit("session-index-changed", refresh);
@@ -76,10 +90,18 @@ pub fn run() {
             }
             Ok(Err(error)) => {
               eprintln!("viewer session index refresh failed: {error}");
+              if catalog_due {
+                consecutive_catalog_retries = 0;
+                next_catalog_refresh = Instant::now() + INDEX_REFRESH_INTERVAL;
+              }
               tokio::time::sleep(next_catalog_refresh.saturating_duration_since(Instant::now())).await;
             }
             Err(error) => {
               eprintln!("viewer session index refresh task failed: {error}");
+              if catalog_due {
+                consecutive_catalog_retries = 0;
+                next_catalog_refresh = Instant::now() + INDEX_REFRESH_INTERVAL;
+              }
               tokio::time::sleep(next_catalog_refresh.saturating_duration_since(Instant::now())).await;
             }
           }

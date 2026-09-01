@@ -90,12 +90,15 @@ Provider storage is resolved as follows:
 - DSH: `$DSH_HOME/sessions`, then the platform home directory's `.dsh/sessions`
   folder.
 
-The app first commits a complete provider-header catalog to its shared index at
+The app first commits a stable provider-header catalog to its shared index at
 `~/.tokn/sessions/index.sqlite`, so the sidebar can use the index without
 waiting to read every session body. It then backfills event-derived attention in
 bounded, newest-first batches. Header catalogs refresh every 10 seconds; while
 body work is pending, a body-only pass runs every second without rediscovering
-the whole provider catalog. A row has no dot until its body has finished
+the whole provider catalog. If active source membership changes during a
+catalog pass, the previous catalog remains visible and the app quietly retries;
+mutable titles, previews, and modification times do not become false
+provider-read errors. A row has no dot until its body has finished
 backfilling, except that a relocated row retains an already-unread dot while
 its new path is validated. Sessions first discovered after a provider catalog
 exists can become unread only after that body confirmation finds a new unhidden
@@ -133,12 +136,19 @@ cached by source revision, and overlapping requests share each session's
 in-flight scan. Codex can also
 read title metadata from its optional private `state_5.sqlite` in read-only
 mode; rows are correlated by both thread id and rollout path, and incompatible
-or unavailable private state fails softly. The selected session's normalized
+or unavailable private state fails softly. Known Codex subagents intentionally
+ignore title and preview fields inherited from their parent in that private
+state; their agent nickname, role, or path becomes the row label instead. The
+selected session's normalized
 event count arrives with its first event page. Root, direct-subagent, and event
 responses are listed in bounded pages. Direct-subagent pages resolve edges only
 within one provider, canonicalize duplicate provider IDs by newest provider
 timestamp (then path), and keep missing-parent or cyclic records visible rather
 than hiding them.
+
+The index keeps source identity normalized in `sources`. Its read-only
+`indexed_sessions` SQLite view joins `provider` and `source_key` onto every
+session row for diagnostics without duplicating those fields in storage.
 Conversational Markdown previews are capped before IPC,
 tool-card fields are also capped, and full event detail is loaded only when
 requested. Inline tool output keeps at most 64 KiB using a head-and-tail preview;
