@@ -1155,22 +1155,64 @@ fn base_timeline_entries(events: &[AgentEvent]) -> Vec<TimelineEntry> {
 /// messages instead belong to the surrounding work trajectory so expanding a
 /// turn reveals the ordinary assistant cards that led to its final reply. All
 /// other message roles remain visible boundaries because their delivery
-/// semantics are not reliable enough to fold safely.
+/// semantics are not reliable enough to fold safely. The grouping is
+/// directional: bookkeeping written after a final reply is never made to look
+/// like a second completed turn merely because it has a usage record.
 fn timeline_entries(events: &[AgentEvent]) -> Vec<TimelineEntry> {
   let base_entries = base_timeline_entries(events);
   let mut entries = Vec::with_capacity(base_entries.len());
   let mut pending = Vec::new();
+  // Codex writes a replaceable session token snapshot after a reply. Keep all
+  // post-final records as ordinary rows until a new prompt or a non-final
+  // assistant message proves that another turn has begun.
+  let mut after_final_reply = false;
 
   for entry in base_entries {
     if is_trajectory_boundary(&entry, events) {
       flush_trajectory_candidate(&mut entries, &mut pending, events);
+      update_after_final_reply(&entry, events, &mut after_final_reply);
+      entries.push(entry);
+    } else if after_final_reply && !starts_trajectory_after_final_reply(&entry, events) {
+      // Do not hold bookkeeping in `pending`: if later activity starts a real
+      // turn, these rows must remain chronologically outside that trajectory.
       entries.push(entry);
     } else {
+      after_final_reply = false;
       pending.push(entry);
     }
   }
   flush_trajectory_candidate(&mut entries, &mut pending, events);
   entries
+}
+
+fn update_after_final_reply(entry: &TimelineEntry, events: &[AgentEvent], after_final_reply: &mut bool) {
+  let TimelineEntry::Event { source_event_index } = entry else {
+    return;
+  };
+  let Some(AgentEvent::Message(message)) = events.get(*source_event_index) else {
+    return;
+  };
+
+  if message.role == Role::User {
+    *after_final_reply = false;
+  } else if is_final_assistant_message(message.role, message.delivery) {
+    *after_final_reply = true;
+  }
+}
+
+/// Returns whether a non-boundary row proves that the assistant has started a
+/// new turn after a final reply. Late tool, reasoning, lifecycle, error, and
+/// usage rows can be postamble from the completed turn, so only a non-final
+/// assistant message reopens the pending trajectory. Once it does, ordinary
+/// substantive-work rules apply to the remaining rows.
+fn starts_trajectory_after_final_reply(entry: &TimelineEntry, events: &[AgentEvent]) -> bool {
+  match entry {
+    TimelineEntry::Event { source_event_index } => matches!(
+      events.get(*source_event_index),
+      Some(AgentEvent::Message(message)) if is_non_final_assistant_message(message.role, message.delivery)
+    ),
+    TimelineEntry::ToolOperation { .. } | TimelineEntry::Trajectory { .. } => false,
+  }
 }
 
 fn flush_trajectory_candidate(
@@ -1227,12 +1269,9 @@ fn is_substantive_work_entry(entry: &TimelineEntry, events: &[AgentEvent]) -> bo
       // trace. Treat it as substantive so standalone commentary/delta runs
       // are consistently represented by the parent `Worked for …` item.
       Some(AgentEvent::Message(message)) => is_non_final_assistant_message(message.role, message.delivery),
+      Some(AgentEvent::Usage(usage)) => usage.kind != UsageKind::SessionSnapshot,
       Some(
-        AgentEvent::Reasoning(_)
-        | AgentEvent::AgentActivity(_)
-        | AgentEvent::Lifecycle(_)
-        | AgentEvent::Usage(_)
-        | AgentEvent::Error(_),
+        AgentEvent::Reasoning(_) | AgentEvent::AgentActivity(_) | AgentEvent::Lifecycle(_) | AgentEvent::Error(_),
       ) => true,
       _ => false,
     },
@@ -1242,6 +1281,10 @@ fn is_substantive_work_entry(entry: &TimelineEntry, events: &[AgentEvent]) -> bo
 
 fn is_non_final_assistant_message(role: Role, delivery: MessageDelivery) -> bool {
   role == Role::Assistant && delivery != MessageDelivery::Final
+}
+
+fn is_final_assistant_message(role: Role, delivery: MessageDelivery) -> bool {
+  role == Role::Assistant && delivery == MessageDelivery::Final
 }
 
 fn timeline_entry_anchor_source_event_index(entry: &TimelineEntry) -> Option<usize> {
@@ -2463,7 +2506,8 @@ mod tests {
   use tokn_session_core::{
     AgentActivity, ErrorEvent, LifecycleEvent, LifecycleScope, MessageDelivery, MessageEvent, MessageProvenance,
     MetadataEvent, MetadataKind, Phase, ProviderChanged, ReasoningEvent, SessionHistoryStatus, SessionRef,
-    SessionStarted, ToolCallEvent, ToolKind, ToolRecordKind, ToolTransport, UnknownEvent, UsageEvent, UsageKind,
+    SessionSettingsApplied, SessionStarted, ToolCallEvent, ToolKind, ToolRecordKind, ToolTransport, UnknownEvent,
+    UsageEvent, UsageKind,
   };
 
   use super::*;
@@ -3124,6 +3168,7 @@ mod tests {
         thinking_level: None,
         timestamp: None,
       }),
+      message_event_with_role("follow-up progress", Role::Assistant, MessageDelivery::Commentary),
       agent_activity("child", Some("/root/reviewer")),
     ];
 
@@ -3164,7 +3209,7 @@ mod tests {
     assert_eq!(trajectory.started_at.as_deref(), Some("2026-09-01T00:01:00Z"));
     assert_eq!(trajectory.ended_at.as_deref(), Some("2026-09-01T00:04:00Z"));
     assert_eq!(trajectory.duration_ms.as_deref(), Some("180000"));
-    assert_eq!(page.events[5].event_key, encode_trajectory_key(9));
+    assert_eq!(page.events[5].event_key, encode_trajectory_key(10));
   }
 
   #[test]
@@ -3289,9 +3334,252 @@ mod tests {
   }
 
   #[test]
+  fn post_final_session_bookkeeping_stays_flat_until_the_next_user_prompt() {
+    let events = vec![
+      message_event_with_role("First request", Role::User, MessageDelivery::Unspecified),
+      message_event_with_role("I am working", Role::Assistant, MessageDelivery::Commentary),
+      message_event("First answer"),
+      usage_event(UsageKind::SessionSnapshot, Provider::Codex),
+      settings_event(),
+      metadata_event("post-final context"),
+      message_event_with_role("Second request", Role::User, MessageDelivery::Unspecified),
+    ];
+    let directory = tempfile::tempdir().unwrap();
+    let session_key = key_for_cached_source(&directory, "fixture");
+    let service = service_with_session(loaded_session(events));
+    let first = service
+      .load_event_page(EventPageRequest {
+        session_key: session_key.clone(),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: Some(4),
+      })
+      .unwrap();
+
+    assert_eq!(first.total_events, 7);
+    assert_eq!(
+      first
+        .events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect::<Vec<_>>(),
+      ["message", "trajectory", "message", "usage"]
+    );
+    assert_eq!(first.events[1].event_key, encode_trajectory_key(1));
+    assert_eq!(first.events[3].event_key, encode_event_key(3));
+    assert!(first.events[3].trajectory.is_none());
+
+    let second = service
+      .load_event_page(EventPageRequest {
+        session_key,
+        cursor: first.next_cursor,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: Some(4),
+      })
+      .unwrap();
+    assert_eq!(
+      second
+        .events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect::<Vec<_>>(),
+      ["session_settings_applied", "metadata", "message"]
+    );
+    assert!(second.events.iter().all(|event| event.trajectory.is_none()));
+  }
+
+  #[test]
+  fn post_final_session_bookkeeping_stays_flat_at_end_of_session() {
+    let events = vec![
+      message_event_with_role("Request", Role::User, MessageDelivery::Unspecified),
+      message_event_with_role("I am working", Role::Assistant, MessageDelivery::Commentary),
+      message_event("Answer"),
+      usage_event(UsageKind::SessionSnapshot, Provider::Codex),
+      settings_event(),
+      metadata_event("post-final context"),
+    ];
+    let page = service_with_session(loaded_session(events))
+      .load_event_page(EventPageRequest {
+        session_key: key_for("fixture"),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+
+    assert_eq!(
+      page
+        .events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect::<Vec<_>>(),
+      [
+        "message",
+        "trajectory",
+        "message",
+        "usage",
+        "session_settings_applied",
+        "metadata"
+      ]
+    );
+    assert_eq!(
+      page
+        .events
+        .iter()
+        .filter(|event| event.event_type == "trajectory")
+        .count(),
+      1
+    );
+  }
+
+  #[test]
+  fn session_snapshot_alone_does_not_form_a_trajectory() {
+    let events = vec![
+      message_event_with_role("Request", Role::User, MessageDelivery::Unspecified),
+      usage_event(UsageKind::SessionSnapshot, Provider::Codex),
+    ];
+    let page = service_with_session(loaded_session(events))
+      .load_event_page(EventPageRequest {
+        session_key: key_for("fixture"),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+
+    assert_eq!(
+      page
+        .events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect::<Vec<_>>(),
+      ["message", "usage"]
+    );
+  }
+
+  #[test]
+  fn model_call_usage_is_flat_after_a_final_but_substantive_before_one() {
+    let pre_final = service_with_session(loaded_session(vec![
+      message_event_with_role("Request", Role::User, MessageDelivery::Unspecified),
+      usage_event(UsageKind::ModelCall, Provider::Codex),
+      message_event("Answer"),
+    ]))
+    .load_event_page(EventPageRequest {
+      session_key: key_for("fixture"),
+      cursor: None,
+      offset: None,
+      direction: PageDirection::Forward,
+      limit: None,
+    })
+    .unwrap();
+    assert_eq!(
+      pre_final
+        .events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect::<Vec<_>>(),
+      ["message", "trajectory", "message"]
+    );
+    assert_eq!(pre_final.events[1].trajectory.as_ref().unwrap().usage_count, 1);
+
+    let post_final = service_with_session(loaded_session(vec![
+      message_event("Answer"),
+      usage_event(UsageKind::ModelCall, Provider::Codex),
+    ]))
+    .load_event_page(EventPageRequest {
+      session_key: key_for("fixture"),
+      cursor: None,
+      offset: None,
+      direction: PageDirection::Forward,
+      limit: None,
+    })
+    .unwrap();
+    assert_eq!(
+      post_final
+        .events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect::<Vec<_>>(),
+      ["message", "usage"]
+    );
+  }
+
+  #[test]
+  fn genuine_progress_after_a_final_reply_forms_the_next_trajectory() {
+    let events = vec![
+      message_event("First answer"),
+      usage_event(UsageKind::SessionSnapshot, Provider::Codex),
+      message_event_with_role("I will continue", Role::Assistant, MessageDelivery::Commentary),
+      tool_call(
+        Provider::Codex,
+        "shell",
+        "follow-up-tool",
+        ToolKind::Shell,
+        None,
+        Phase::Finished,
+        None,
+      ),
+      message_event("Second answer"),
+    ];
+    let page = service_with_session(loaded_session(events))
+      .load_event_page(EventPageRequest {
+        session_key: key_for("fixture"),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+
+    assert_eq!(
+      page
+        .events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect::<Vec<_>>(),
+      ["message", "usage", "trajectory", "message"]
+    );
+    let trajectory = page.events[2].trajectory.as_ref().expect("follow-up work is folded");
+    assert_eq!(trajectory.event_count, 2);
+    assert_eq!(trajectory.tool_count, 1);
+    assert_eq!(page.events[2].event_key, encode_trajectory_key(3));
+  }
+
+  #[test]
+  fn active_work_after_a_user_prompt_still_folds_at_end_of_session() {
+    let events = vec![
+      message_event_with_role("Request", Role::User, MessageDelivery::Unspecified),
+      message_event_with_role("I am working", Role::Assistant, MessageDelivery::Commentary),
+    ];
+    let page = service_with_session(loaded_session(events))
+      .load_event_page(EventPageRequest {
+        session_key: key_for("fixture"),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+
+    assert_eq!(
+      page
+        .events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect::<Vec<_>>(),
+      ["message", "trajectory"]
+    );
+    assert_eq!(page.events[1].event_key, encode_trajectory_key(1));
+  }
+
+  #[test]
   fn top_level_trajectory_paging_uses_projected_cards_without_losing_messages() {
     let events = vec![
-      message_event("before"),
+      message_event_with_role("before", Role::User, MessageDelivery::Unspecified),
       with_timestamp(
         reasoning_event(Some("one"), None, None, None, None),
         "2026-09-01T00:01:00Z",
@@ -3301,6 +3589,7 @@ mod tests {
         "2026-09-01T00:02:00Z",
       ),
       message_event("between"),
+      message_event_with_role("follow-up progress", Role::Assistant, MessageDelivery::Commentary),
       with_timestamp(lifecycle_event(), "2026-09-01T00:03:00Z"),
       with_timestamp(
         AgentEvent::Unknown(UnknownEvent {
@@ -3356,7 +3645,7 @@ mod tests {
       ["message", "trajectory"]
     );
     assert_eq!(second.events[0].summary, "between");
-    assert_eq!(second.events[1].event_key, encode_trajectory_key(5));
+    assert_eq!(second.events[1].event_key, encode_trajectory_key(6));
 
     let third = service
       .load_event_page(EventPageRequest {
@@ -3453,6 +3742,7 @@ mod tests {
       reasoning_event(Some("missing"), None, None, None, None),
       with_timestamp(usage_event(UsageKind::ModelCall, Provider::Codex), "not-a-time"),
       message_event("boundary"),
+      message_event_with_role("follow-up progress", Role::Assistant, MessageDelivery::Commentary),
       with_timestamp(
         reasoning_event(Some("late first"), None, None, None, None),
         "2026-09-01T00:02:00Z",
@@ -4999,6 +5289,26 @@ mod tests {
       cache_write_tokens: None,
       reasoning_tokens: None,
       native: json!({}),
+      timestamp: None,
+    })
+  }
+
+  fn settings_event() -> AgentEvent {
+    AgentEvent::SessionSettingsApplied(SessionSettingsApplied {
+      provider: Provider::Codex,
+      session_id: Some("fixture".to_string()),
+      model_provider: None,
+      model_id: None,
+      service_tier: None,
+      cwd: None,
+      reasoning_effort: None,
+      reasoning_summary: None,
+      personality: None,
+      collaboration_mode: None,
+      approval_policy: None,
+      approvals_reviewer: None,
+      active_permission_profile_id: None,
+      native: None,
       timestamp: None,
     })
   }
