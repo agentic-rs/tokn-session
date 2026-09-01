@@ -3,6 +3,7 @@ import type { SessionSummary } from "./types";
 import {
   findKnownSession,
   knownSessionAncestors,
+  providerLabel,
   sessionDisplayTitle,
   shortSessionId,
 } from "./state";
@@ -33,6 +34,10 @@ function session(overrides: Partial<SessionSummary> = {}): SessionSummary {
 }
 
 describe("session identity", () => {
+  it("labels WorkBuddy sessions by their product name", () => {
+    expect(providerLabel("workbuddy")).toBe("WorkBuddy");
+  });
+
   it("prefers a native title over the first-message preview", () => {
     expect(sessionDisplayTitle(session({ title: "Named task", preview: "Raw prompt" })))
       .toBe("Named task");

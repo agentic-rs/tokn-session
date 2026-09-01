@@ -1,10 +1,10 @@
 # Tokn Sessions Viewer
 
 The viewer is a read-only Tauri desktop app for browsing historical Pi, Codex,
-OpenCode, ZCode, and DeepSeek Harness (DSH) sessions in one place. It shows root
-sessions in a searchable, provider-filterable sidebar, expands their known
-subagents on demand, and renders each selected normalized event stream as a
-conversation with inspectable technical events.
+OpenCode, ZCode, WorkBuddy, and DeepSeek Harness (DSH) sessions in one place. It
+shows root sessions in a searchable, provider-filterable sidebar, expands their
+known subagents on demand, and renders each selected normalized event stream as
+a conversation with inspectable technical events.
 It does not create sessions, append messages, or modify provider data.
 
 ## Development
@@ -89,6 +89,9 @@ Provider storage is resolved as follows:
   the upstream home-directory fallback is used.
 - ZCode: `$ZCODE_STORAGE_DIR/cli/db/db.sqlite`, then the platform home
   directory's `.zcode/cli/db/db.sqlite` path.
+- WorkBuddy: `$WORKBUDDY_CONFIG_DIR/workbuddy.db`, then
+  `$CODEBUDDY_CONFIG_DIR/workbuddy.db`, then the platform home directory's
+  `.workbuddy-ai/workbuddy.db` catalog and its `projects` histories.
 - DSH: `$DSH_HOME/sessions`, then the platform home directory's `.dsh/sessions`
   folder.
 

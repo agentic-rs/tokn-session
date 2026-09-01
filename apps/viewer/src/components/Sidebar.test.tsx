@@ -56,6 +56,14 @@ function renderSidebar(sessions: SessionSummary[]) {
 }
 
 describe("Sidebar session identity", () => {
+  it("offers WorkBuddy as a provider filter", () => {
+    renderSidebar([]);
+
+    const filter = screen.getByRole("button", { name: "WorkBuddy" });
+    expect(filter).toHaveAttribute("data-provider", "workbuddy");
+    expect(filter).toHaveAttribute("aria-pressed", "false");
+  });
+
   it("renders title fallbacks while keeping the full session id discoverable", () => {
     const titledId = "01991dce-7f6a-7000-8000-000000000001";
     const previewId = "abcdef01-2345-6789-abcd-ef0123456789";

@@ -79,7 +79,7 @@ struct TreeDiscoveryPlan {
 }
 
 fn tree_discovery_plan(source: Source, session_dir: Option<PathBuf>, session: &str) -> TreeDiscoveryPlan {
-  if matches!(source, Source::OpenCode | Source::ZCode) {
+  if matches!(source, Source::OpenCode | Source::WorkBuddy | Source::ZCode) {
     return TreeDiscoveryPlan {
       session_dir,
       supplemental_dir: None,

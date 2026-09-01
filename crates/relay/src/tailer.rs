@@ -68,6 +68,9 @@ impl SessionTailer {
     if roots.iter().any(|root| matches!(root.provider, Provider::ZCode)) {
       return Err("zcode relay watching is not implemented; use historical list/show".into());
     }
+    if roots.iter().any(|root| matches!(root.provider, Provider::WorkBuddy)) {
+      return Err("workbuddy relay watching is not implemented; use historical list/show".into());
+    }
     let (project_catalog, project_catalog_source, project_catalog_warning) = load_project_catalog(&roots);
     let project_catalog = Arc::new(RwLock::new(project_catalog));
     let mut tailer = Self {
@@ -705,7 +708,7 @@ impl SessionNormalizer {
     match provider {
       Provider::Codex => Self::Codex(CodexNormalizer::new()),
       Provider::Pi => Self::Pi(PiNormalizer::new()),
-      Provider::OpenCode | Provider::ZCode | Provider::Dsh => {
+      Provider::OpenCode | Provider::ZCode | Provider::WorkBuddy | Provider::Dsh => {
         unreachable!("provider is not supported by the JSONL tailer")
       }
     }
@@ -826,6 +829,7 @@ fn provider_name(provider: Provider) -> &'static str {
     Provider::Pi => "pi",
     Provider::OpenCode => "opencode",
     Provider::ZCode => "zcode",
+    Provider::WorkBuddy => "workbuddy",
     Provider::Dsh => "dsh",
   }
 }

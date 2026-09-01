@@ -313,13 +313,19 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn rejects_dsh_watching_until_a_live_reader_exists() {
-    let config = RelayConfig::new(vec![ProviderRoot::new(Provider::Dsh, "unused".into())]);
-    let error = SessionRelay::new(config)
-      .await
-      .err()
-      .expect("DSH relay must be rejected");
-    assert!(error.contains("dsh relay watching is not implemented"));
+  async fn rejects_historical_only_providers_until_live_readers_exist() {
+    for (provider, name) in [
+      (Provider::Dsh, "dsh"),
+      (Provider::ZCode, "zcode"),
+      (Provider::WorkBuddy, "workbuddy"),
+    ] {
+      let config = RelayConfig::new(vec![ProviderRoot::new(provider, "unused".into())]);
+      let error = SessionRelay::new(config)
+        .await
+        .err()
+        .expect("historical-only relay provider must be rejected");
+      assert!(error.contains(&format!("{name} relay watching is not implemented")));
+    }
   }
 
   #[tokio::test]

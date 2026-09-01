@@ -9,6 +9,8 @@ members = [
   "crates/opencode-protocol",
   "crates/opencode",
   "crates/zcode",
+  "crates/workbuddy-protocol",
+  "crates/workbuddy",
   "crates/dsh-protocol",
   "crates/dsh",
   "crates/session-index",
@@ -38,6 +40,7 @@ tokn-codex-protocol = { path = "crates/codex-protocol" }
 tokn-dsh-protocol = { path = "crates/dsh-protocol" }
 tokn-opencode-protocol = { path = "crates/opencode-protocol" }
 tokn-pi-protocol = { path = "crates/pi-protocol" }
+tokn-workbuddy-protocol = { path = "crates/workbuddy-protocol" }
 tokn-session-client = { path = "crates/client" }
 tokn-session-codex = { path = "crates/codex" }
 tokn-session-core = { path = "crates/core" }
@@ -45,6 +48,7 @@ tokn-session-dsh = { path = "crates/dsh" }
 tokn-session-opencode = { path = "crates/opencode" }
 tokn-session-pi = { path = "crates/pi" }
 tokn-session-zcode = { path = "crates/zcode" }
+tokn-session-workbuddy = { path = "crates/workbuddy" }
 tokn-session-relay = { path = "crates/relay" }
 tokn-session-render = { path = "crates/render" }
 tokn-session-index = { path = "crates/session-index" }
