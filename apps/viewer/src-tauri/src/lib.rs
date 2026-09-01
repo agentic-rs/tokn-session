@@ -5,13 +5,14 @@ mod service;
 
 use std::{
   path::{Path, PathBuf},
-  time::Duration,
+  time::{Duration, Instant},
 };
 
 use service::ViewerService;
 use tauri::{Emitter, Manager};
 
 const INDEX_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+const INDEX_PENDING_BODY_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 fn session_index_path_for_home(home: &Path) -> PathBuf {
   home.join(".tokn").join("sessions").join("index.sqlite")
@@ -39,19 +40,49 @@ pub fn run() {
 
       // Initial discovery is deliberately background-only: an established
       // sidebar remains responsive from its previous index, while a first run
-      // retains native header discovery until its baseline commits.
+      // retains native header discovery until its compact catalog commits.
       tauri::async_runtime::spawn(async move {
+        let mut next_catalog_refresh = Instant::now();
         loop {
+          let catalog_due = Instant::now() >= next_catalog_refresh;
           let service = refresh_service.clone();
-          match tauri::async_runtime::spawn_blocking(move || service.refresh_session_index()).await {
-            Ok(Ok(refresh)) if refresh.changed => {
-              let _ = app_handle.emit("session-index-changed", refresh);
+          let result = tauri::async_runtime::spawn_blocking(move || {
+            if catalog_due {
+              service.refresh_session_index()
+            } else {
+              service.refresh_pending_session_index()
             }
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => eprintln!("viewer session index refresh failed: {error}"),
-            Err(error) => eprintln!("viewer session index refresh task failed: {error}"),
+          })
+          .await;
+          // Start the ordinary catalog interval after its potentially slow
+          // blocking scan returns. Advancing this deadline before the scan can
+          // turn a large first catalog into a tight full-catalog loop.
+          if catalog_due {
+            next_catalog_refresh = Instant::now() + INDEX_REFRESH_INTERVAL;
           }
-          tokio::time::sleep(INDEX_REFRESH_INTERVAL).await;
+          match result {
+            Ok(Ok(refresh)) => {
+              let has_pending_body_jobs = refresh.has_pending_body_jobs;
+              if refresh.changed {
+                let _ = app_handle.emit("session-index-changed", refresh);
+              }
+              let until_catalog = next_catalog_refresh.saturating_duration_since(Instant::now());
+              let delay = if has_pending_body_jobs {
+                INDEX_PENDING_BODY_REFRESH_INTERVAL.min(until_catalog)
+              } else {
+                until_catalog
+              };
+              tokio::time::sleep(delay).await;
+            }
+            Ok(Err(error)) => {
+              eprintln!("viewer session index refresh failed: {error}");
+              tokio::time::sleep(next_catalog_refresh.saturating_duration_since(Instant::now())).await;
+            }
+            Err(error) => {
+              eprintln!("viewer session index refresh task failed: {error}");
+              tokio::time::sleep(next_catalog_refresh.saturating_duration_since(Instant::now())).await;
+            }
+          }
         }
       });
       Ok(())

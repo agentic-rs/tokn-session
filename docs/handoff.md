@@ -328,48 +328,56 @@ responses bounded, including tool-card command and query fields, while expanded
 native event detail and inline tool output are fetched lazily and hidden Pi
 content stays redacted.
 
-The viewer owns a SQLite index at `~/.tokn/sessions/index.sqlite`. It stores opaque
-source checkpoints; source/session identity and paths; bounded sidebar
+The viewer owns a SQLite index at `~/.tokn/sessions/index.sqlite`. It stores
+opaque source checkpoints; source/session identity and paths; bounded sidebar
 metadata (title, preview, cwd, timestamps, parent, and agent labels); and
 opaque attention markers/revisions. It never stores normalized event records,
 provider-native payloads, reasoning, tool input/output, or full message bodies.
 Title and preview are retained presentation text, and a preview can derive from
-a user prompt, so index-only does not mean zero textual metadata. Before a
-provider's first successful complete baseline, sidebar IPC keeps using
-`AgentClient::list_session_headers`, which reads file headers or OpenCode
-catalog rows without computing conversation counts. Afterwards, sidebar and
-tree rows read the durable index, with native headers as a fail-soft fallback.
-The viewer lazily hydrates visible untitled rows with a provider-specific
-history scan; prompt-text searches may hydrate additional candidates to
-determine whether they match. Hydrated metadata is cached by source revision,
-and per-session in-flight gates prevent overlapping searches from repeating the
-same scan. The selected session's normalized `total_events` arrives with its
-first event page. The existing CLI continues to use the counted
-`list_sessions` API.
+a user prompt, so index-only does not mean zero textual metadata. A successful
+complete header pass commits the provider catalog immediately, so sidebar and
+tree IPC read durable index rows without waiting for every session body. Native
+headers remain a fail-soft fallback. The viewer lazily hydrates visible untitled
+rows with a provider-specific history scan; prompt-text searches may hydrate
+additional candidates to determine whether they match. Hydrated metadata is
+cached by source revision, and per-session in-flight gates prevent overlapping
+searches from repeating the same scan. The selected session's normalized
+`total_events` arrives with its first event page. The existing CLI continues to
+use the counted `list_sessions` API.
 
-Background reconciliation runs every 10 seconds. A provider's first complete
-scan establishes its no-dot attention baseline. Later scans mark only new,
-unhidden User messages or Final Assistant messages; commentary/non-final
-assistant updates, tools, reasoning, and metadata never produce attention.
-The marker is an eligible-message count rather than content or IDs, so history
-reductions and same-count rewrites intentionally do not dot. Direct child
-attention aggregates onto collapsed canonical ancestors without making the
-parent itself unread. A newest event page acknowledges only the opaque revision
-it actually captured after React commits it; a concurrent later revision remains
-unread. A refresh reloads the current timeline only when that exact session is
-named as newly attentive, so unrelated indexing cannot disturb an expanded
-timeline.
+After cataloging, reconciliation backfills bodies and attention in bounded
+newest-first batches. The full header catalog stays on a 10-second cadence;
+while any row remains unbaselined, a one-second body-only pass advances the next
+batch without rediscovering the whole provider. A newly cataloged row never
+shows a dot before its body finishes, except a relocated row that retains an
+existing unread state while its new path is validated. The initial catalog
+establishes no unread attention; a session first discovered after that catalog
+can become unread only after its body confirms a new, unhidden User message or
+Final Assistant reply. Later body refreshes mark only those eligible message
+additions; commentary/non-final assistant updates, tools, reasoning, and
+metadata never produce attention. The marker is an eligible-message count
+rather than content or IDs, so history reductions and same-count rewrites
+intentionally do not dot. Direct child attention aggregates onto collapsed
+canonical ancestors without making the parent itself unread. A newest event
+page acknowledges only the opaque revision it actually captured after React
+commits it; a concurrent later revision remains unread. A refresh reloads the
+current timeline only when that exact session is named as newly attentive, so
+unrelated indexing cannot disturb an expanded timeline.
 
 An index cursor is an opaque source revision, not a byte offset or event-page
 cursor. File-backed sources use a metadata fingerprint; OpenCode uses its
 database and WAL, deliberately excluding its reader-writable SHM file. A
 header-only metadata change is written without replaying an unchanged session
-body, preserving its attention state. Replacements carry the previously
-observed cursor as an optimistic precondition. Each provider's staged source
-replacements commit in one transaction, so another viewer process cannot
-overwrite a newer source snapshot with a stale scan or leave a partial provider
-snapshot behind. A failed or racing scan retains the last good index rows and
-reports an isolated provider warning; warning changes refresh the sidebar too.
+body, preserving its attention state. The catalog pass and its later body pass
+both carry optimistic source-cursor preconditions: the body result must still
+match the catalog snapshot before it can commit. Catalog source replacements
+commit atomically, and these staged checks prevent concurrent viewers from
+overwriting a newer catalog or attention snapshot with stale work. A failed or
+racing scan retains the last good index rows and reports an isolated provider
+warning; warning changes refresh the sidebar too. When a session file moves
+between sources, a staged target preserves any existing unread state until its
+body validation succeeds, so a transient archive read failure cannot clear a
+dot.
 
 Session rows prefer a non-placeholder provider title, then the first meaningful
 user-prompt preview, then a child agent nickname, role, or path, and finally
@@ -702,6 +710,9 @@ OpenCode has the first live-output normalizer: `OpenCodeLiveNormalizer` parses `
 - The desktop viewer remains historical and read-only. Sidebar and a matching
   selected timeline refresh through polling, not provider live streams, native
   watchers, or authoritative incremental parsing.
+- Viewer session-file relocation is deliberately conservative. Repeated or
+  overlapping moves can make the retired source ambiguous, in which case the
+  later path is treated as a new row instead of transferring prior attention.
 
 ## Useful Smokes
 

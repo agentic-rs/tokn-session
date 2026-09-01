@@ -11,8 +11,8 @@ use tokn_session_core::{
   ToolCallEvent, ToolKind, ToolOperation, ToolOperationStatus, ToolSummary, UsageKind, assemble_tool_operations,
 };
 use tokn_session_index::{
-  AttentionMode, IndexedSession, SessionIndex, SessionKey as IndexedSessionKey, SessionMetadata,
-  SourceCursorPrecondition, SourceKey, SourceReplacement, SourceState,
+  IndexedSession, SessionIndex, SessionKey as IndexedSessionKey, SessionMetadata, SourceCursorPrecondition, SourceKey,
+  SourceReplacement, SourceState,
 };
 use tokn_session_render::render_event_summary;
 
@@ -45,6 +45,11 @@ const MAX_INDEXED_CWD_CHARS: usize = 4 * 1024;
 const MAX_INDEXED_TIMESTAMP_CHARS: usize = 256;
 const INDEX_CATALOG_SOURCE_KEY: &str = "catalog.v1";
 const INDEX_MISSING_SOURCE_CURSOR: &str = "missing.v1";
+const INDEX_PENDING_BODY_CURSOR_PREFIX: &str = "catalog.v3.";
+const INDEX_COMPLETED_BODY_CURSOR_PREFIX: &str = "body.v3.";
+const LEGACY_PENDING_BODY_CURSOR_PREFIX: &str = "catalog.v2.";
+const LEGACY_COMPLETED_BODY_CURSOR_PREFIX: &str = "body.v2.";
+const INDEX_BODY_SCAN_BATCH_SIZE: usize = 8;
 const TOOL_OUTPUT_TRUNCATION_MARKER: &str = "\n\u{2026} output truncated \u{2026}\n";
 
 #[derive(Clone)]
@@ -52,7 +57,11 @@ pub(crate) struct ViewerService {
   repository: Arc<dyn ViewerRepository>,
   session_index: Arc<SessionIndex>,
   index_refresh_gate: Arc<Mutex<()>>,
+  /// Header-discovery failures remain visible until a later full catalog
+  /// succeeds, even if a direct body retry happens to work in the meantime.
+  catalog_errors: Arc<Mutex<HashMap<ViewerProvider, String>>>,
   index_errors: Arc<Mutex<HashMap<ViewerProvider, String>>>,
+  failed_body_jobs: Arc<Mutex<HashMap<(SourceKey, String), FailedBodyJob>>>,
   session_header_cache: Arc<Mutex<HashMap<SessionLocator, CachedSessionHeader>>>,
   session_header_gates: Arc<Mutex<HashMap<SessionLocator, Arc<Mutex<()>>>>>,
   loaded_session_cache: Arc<Mutex<Option<CachedSession>>>,
@@ -131,6 +140,10 @@ pub(crate) struct IndexRefresh {
   /// metadata updates so an unrelated source scan cannot reset the timeline a
   /// user is reading.
   pub attention_session_keys: Vec<String>,
+  /// Internal scheduler hint. It deliberately stays out of Tauri events: the
+  /// frontend only needs the existing compact refresh payload.
+  #[serde(skip)]
+  pub has_pending_body_jobs: bool,
 }
 
 #[derive(Default)]
@@ -139,16 +152,39 @@ struct ProviderIndexRefresh {
   attention_session_keys: Vec<String>,
 }
 
-enum IndexedSourceMetadataRefresh {
-  /// The current header snapshot is already represented exactly by the
-  /// durable source row, so no SQLite write or body load is needed.
-  Unchanged,
-  /// Header-only metadata changed while the conversation source cursor did
-  /// not. Replacing these rows preserves their attention marker/revisions.
-  Replacement(Vec<SessionMetadata>),
-  /// A header was added/removed or a formerly missing row returned. Read the
-  /// source body so notification state is never guessed from headers alone.
-  RequiresBody,
+/// A source whose metadata catalog has committed but whose message body still
+/// needs to be inspected. Its staged cursor prevents two viewer processes from
+/// independently turning the same new message into two unread revisions.
+#[derive(Clone)]
+struct PendingBodyJob {
+  provider: ViewerProvider,
+  source: SourceState,
+  raw_cursor: String,
+  locator: SessionLocator,
+  priority: i64,
+  deprioritized: bool,
+}
+
+#[derive(Clone)]
+struct FailedBodyJob {
+  raw_cursor: String,
+  message: String,
+}
+
+struct BodyBackfillRefresh {
+  refresh: IndexRefresh,
+  errors: HashMap<ViewerProvider, String>,
+}
+
+enum BodyJobRefresh {
+  /// The job no longer matches the current catalog or provider source. A
+  /// subsequent catalog pass will create the next safe job.
+  Stale,
+  /// The source body committed successfully.
+  Updated {
+    provider_refresh: ProviderIndexRefresh,
+    next_source: SourceState,
+  },
 }
 
 struct SessionRelationIndex {
@@ -211,7 +247,9 @@ impl ViewerService {
       repository,
       session_index,
       index_refresh_gate: Arc::new(Mutex::new(())),
+      catalog_errors: Arc::new(Mutex::new(HashMap::new())),
       index_errors: Arc::new(Mutex::new(HashMap::new())),
+      failed_body_jobs: Arc::new(Mutex::new(HashMap::new())),
       session_header_cache: Arc::new(Mutex::new(HashMap::new())),
       session_header_gates: Arc::new(Mutex::new(HashMap::new())),
       loaded_session_cache: Arc::new(Mutex::new(None)),
@@ -427,8 +465,8 @@ impl ViewerService {
     Ok(ListSessionChildrenResponse { sessions, next_cursor })
   }
 
-  /// Reads headers from the durable index once this provider's complete first
-  /// baseline is committed. Until then, keep the current native header path so
+  /// Reads headers from the durable index once this provider's complete header
+  /// catalog is committed. Until then, keep the current native header path so
   /// opening the app never waits for a whole-history body scan.
   fn session_header_inventory(&self, provider: ViewerProvider) -> Result<SessionHeaderInventory, String> {
     let catalog_key = index_catalog_source_key(provider);
@@ -502,21 +540,102 @@ impl ViewerService {
       .lock()
       .map_err(|_| "session index refresh gate is poisoned".to_string())?;
     let mut refresh = IndexRefresh::default();
-    let mut errors = HashMap::new();
-
-    let mut attention_session_keys = HashSet::new();
+    let mut catalog_errors = HashMap::new();
+    let mut catalog_failures = HashSet::new();
     for provider in ViewerProvider::ALL {
-      match self.refresh_provider_index(provider) {
+      match self.refresh_provider_catalog(provider) {
         Ok(provider_refresh) => {
           refresh.changed |= provider_refresh.changed;
-          attention_session_keys.extend(provider_refresh.attention_session_keys);
+          refresh
+            .attention_session_keys
+            .extend(provider_refresh.attention_session_keys);
         }
         Err(message) => {
-          errors.insert(provider, message);
+          catalog_failures.insert(provider);
+          catalog_errors.insert(provider, message);
         }
       }
     }
 
+    let body_refresh = self.refresh_pending_body_jobs(&catalog_failures)?;
+    refresh.changed |= body_refresh.refresh.changed;
+    refresh
+      .attention_session_keys
+      .extend(body_refresh.refresh.attention_session_keys);
+    refresh.has_pending_body_jobs = body_refresh.refresh.has_pending_body_jobs;
+    refresh.attention_session_keys.sort();
+    refresh.attention_session_keys.dedup();
+    self.replace_catalog_errors(catalog_errors.clone());
+    Ok(self.finish_index_refresh(refresh, combined_index_errors(catalog_errors, body_refresh.errors)))
+  }
+
+  /// Advances only the bounded body queue from an already committed catalog.
+  /// The background scheduler calls this between normal catalog intervals so a
+  /// large provider is not rediscovered for every eight-session body batch.
+  pub(crate) fn refresh_pending_session_index(&self) -> Result<IndexRefresh, String> {
+    let _refresh_gate = self
+      .index_refresh_gate
+      .lock()
+      .map_err(|_| "session index refresh gate is poisoned".to_string())?;
+    let catalog_errors = self
+      .catalog_errors
+      .lock()
+      .map(|current_errors| current_errors.clone())
+      .unwrap_or_default();
+    let body_refresh = self.refresh_pending_body_jobs(&HashSet::new())?;
+    let mut refresh = body_refresh.refresh;
+    refresh.attention_session_keys.sort();
+    refresh.attention_session_keys.dedup();
+    Ok(self.finish_index_refresh(refresh, combined_index_errors(catalog_errors, body_refresh.errors)))
+  }
+
+  /// The catalog commits first, so even a large historical provider becomes
+  /// listable before its message bodies are inspected. Process a bounded,
+  /// global newest-first batch afterwards; a malformed rollout cannot starve
+  /// older pending sources and no one refresh can become a whole-history
+  /// parse again.
+  fn refresh_pending_body_jobs(&self, unavailable: &HashSet<ViewerProvider>) -> Result<BodyBackfillRefresh, String> {
+    let mut refresh = IndexRefresh::default();
+    let mut attention_session_keys = HashSet::new();
+    let mut pending_jobs = self.pending_body_jobs(unavailable)?;
+    let batch_len = pending_jobs.len().min(INDEX_BODY_SCAN_BATCH_SIZE);
+    for index in 0..batch_len {
+      let job = pending_jobs[index].clone();
+      match self.refresh_pending_body_job(&job) {
+        Ok(BodyJobRefresh::Stale) => self.clear_failed_body_job(&job),
+        Ok(BodyJobRefresh::Updated {
+          provider_refresh,
+          next_source,
+        }) => {
+          self.clear_failed_body_job(&job);
+          refresh.changed |= provider_refresh.changed;
+          attention_session_keys.extend(provider_refresh.attention_session_keys);
+          Self::retarget_pending_body_jobs(&mut pending_jobs[index + 1..], &job.source, next_source);
+        }
+        Err(message) => {
+          self.record_failed_body_job(&job, message);
+        }
+      }
+    }
+    // A catalog failure skips that provider for this full pass, but its prior
+    // staged work still keeps the one-second body scheduler alive. The next
+    // body-only pass can make progress without waiting for another catalog.
+    let remaining_jobs = self.pending_body_jobs(&HashSet::new())?;
+    refresh.has_pending_body_jobs = !remaining_jobs.is_empty();
+    refresh.attention_session_keys = attention_session_keys.into_iter().collect();
+    Ok(BodyBackfillRefresh {
+      refresh,
+      errors: self.body_errors_for_pending_jobs(&remaining_jobs),
+    })
+  }
+
+  fn replace_catalog_errors(&self, errors: HashMap<ViewerProvider, String>) {
+    if let Ok(mut current_errors) = self.catalog_errors.lock() {
+      *current_errors = errors;
+    }
+  }
+
+  fn finish_index_refresh(&self, mut refresh: IndexRefresh, errors: HashMap<ViewerProvider, String>) -> IndexRefresh {
     // A provider warning is part of the sidebar state too. Notify when it is
     // added, removed, or changes even if no session row happened to change;
     // otherwise a recovered source could leave a stale warning on screen.
@@ -524,15 +643,13 @@ impl ViewerService {
       refresh.changed |= *current_errors != errors;
       *current_errors = errors;
     }
-    refresh.attention_session_keys = attention_session_keys.into_iter().collect();
-    refresh.attention_session_keys.sort();
-    Ok(refresh)
+    refresh
   }
 
-  /// Performs all potentially fallible source reads before changing any source
-  /// inventory. If a changed session is mid-write or malformed, its last
-  /// successful index row remains present and no absent source is tombstoned.
-  fn refresh_provider_index(&self, provider: ViewerProvider) -> Result<ProviderIndexRefresh, String> {
+  /// Builds one provider's complete header catalog without reading any message
+  /// bodies. A catalog sentinel becomes visible only after this entire pass
+  /// commits atomically, so sidebar queries never observe a partial provider.
+  fn refresh_provider_catalog(&self, provider: ViewerProvider) -> Result<ProviderIndexRefresh, String> {
     let headers = self.repository.list_session_headers(provider)?;
     let catalog_identity = session_catalog_identity(&headers)?;
     let catalog_key = index_catalog_source_key(provider);
@@ -579,20 +696,15 @@ impl ViewerService {
       headers_by_source.entry(key).or_default().push(header);
     }
     let current_source_keys = paths_by_source.keys().cloned().collect::<HashSet<_>>();
-
-    let attention_mode = if provider_ready {
-      AttentionMode::TrackChanges
-    } else {
-      AttentionMode::Baseline
-    };
     let indexed_at_ms = current_time_ms();
     let mut replacements = Vec::new();
     let mut checked_sources = Vec::new();
-    let mut attention_session_keys = Vec::new();
 
     // File-backed sources each contain one session. OpenCode groups all rows
-    // under its database path, so a database/WAL checkpoint change rebuilds
-    // every row in that one source for correctness.
+    // under its database path, so one catalog source can contain many rows.
+    // This pass only stores bounded headers; its staged cursor records that a
+    // later body job must establish notification state for the observed source
+    // revision.
     for (source_key_string, source_headers) in headers_by_source {
       let source_path = paths_by_source
         .get(&source_key_string)
@@ -601,62 +713,77 @@ impl ViewerService {
       let previous = existing_by_key.get(&source_key_string).copied();
       let source_key = SourceKey::new(provider.as_str(), source_key_string);
       let source_headers = canonical_session_headers(source_headers);
-      if provider_ready && previous.is_some_and(|state| state.cursor == cursor) {
-        match indexed_source_metadata_refresh(&source_key, &source_headers, &existing_by_session_key)? {
-          IndexedSourceMetadataRefresh::Unchanged => continue,
-          IndexedSourceMetadataRefresh::Replacement(sessions) => {
-            replacements.push(SourceReplacement {
-              source: SourceState::new(source_key, cursor.clone(), indexed_at_ms),
-              sessions,
-              attention_mode,
-              source_cursor_precondition: source_cursor_precondition(previous),
-            });
-            checked_sources.push((source_path.clone(), cursor.clone()));
-            continue;
+      let source_changed = previous.and_then(|state| indexed_source_raw_cursor(&state.cursor)) != Some(cursor.as_str());
+      let source_has_pending_session = source_headers.iter().any(|header| {
+        let key = IndexedSessionKey::new(
+          source_key.provider.clone(),
+          source_key.source_key.clone(),
+          header.id.clone(),
+        );
+        existing_by_session_key
+          .get(&key)
+          .is_some_and(|session| !session.attention_baselined)
+      });
+      let source_has_new_session = source_headers.iter().any(|header| {
+        let key = IndexedSessionKey::new(
+          source_key.provider.clone(),
+          source_key.source_key.clone(),
+          header.id.clone(),
+        );
+        !existing_by_session_key.contains_key(&key)
+      });
+      let body_pending = source_changed || source_has_pending_session || source_has_new_session;
+      let staged_cursor = if body_pending {
+        previous
+          .filter(|state| !source_changed && pending_body_raw_cursor(&state.cursor) == Some(cursor.as_str()))
+          .map(|state| state.cursor.clone())
+          .unwrap_or_else(|| pending_body_cursor(&cursor))
+      } else {
+        completed_body_cursor(&cursor)
+      };
+
+      let sessions = source_headers
+        .iter()
+        .map(|header| {
+          let key = IndexedSessionKey::new(
+            source_key.provider.clone(),
+            source_key.source_key.clone(),
+            header.id.clone(),
+          );
+          let existing = existing_by_session_key.get(&key).copied();
+          let mut metadata =
+            catalog_session_metadata(&source_key, header.clone(), existing, provider_ready, source_changed)?;
+          // Codex commonly moves a completed rollout to the archive directory.
+          // The new path must not masquerade as a freshly-created conversation.
+          if existing.is_none()
+            && let Some(relocated) =
+              relocated_session_reference(&source_key, &metadata, &current_source_keys, &existing_by_session_id)
+          {
+            // A move replaces the old source inventory before the archive body
+            // can be read. Preserve an existing unread dot in the staged target
+            // so a transient archive read failure never makes it disappear.
+            // The later body completion compares against this retained marker
+            // and therefore does not create a duplicate revision for the move.
+            metadata.notify_on_baseline = false;
+            if relocated.has_unread() {
+              metadata.attention_marker = known_attention_marker(relocated);
+              metadata.has_new_attention = true;
+            }
           }
-          IndexedSourceMetadataRefresh::RequiresBody => {}
-        }
+          Ok(metadata)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+      let source_matches_catalog = indexed_source_matches_catalog(&source_key, &sessions, &existing_by_session_key);
+      let cursor_matches_catalog = previous.is_some_and(|state| state.cursor == staged_cursor);
+      if source_matches_catalog && cursor_matches_catalog {
+        continue;
       }
 
-      let mut sessions = Vec::with_capacity(source_headers.len());
-      for header in source_headers {
-        let locator = locator_for_header(provider, &header);
-        let loaded = self.repository.load_session(&locator)?;
-        if loaded.reference.id != locator.session_id {
-          return Err("session index source no longer matches its header".to_string());
-        }
-        let key = index_session_key(&locator)?;
-        let existing = self
-          .session_index
-          .session(&key)
-          .map_err(|error| format!("failed to read indexed session attention: {error}"))?;
-        let attention_marker = visible_attention_marker(&loaded.events);
-        let header = merge_loaded_session_header(header, &loaded);
-        let mut metadata = session_metadata_from_header(&source_key, header, attention_marker.clone(), false)?;
-        let relocated = existing
-          .is_none()
-          .then(|| relocated_session_reference(&source_key, &metadata, &current_source_keys, &existing_by_session_id))
-          .flatten();
-        let attention_reference = existing.as_ref().or(relocated);
-        let has_new_attention = relocated.is_some_and(IndexedSession::has_unread)
-          || has_new_visible_attention(attention_reference, attention_marker.as_deref());
-        if attention_mode == AttentionMode::TrackChanges && has_new_attention {
-          attention_session_keys.push(encode_session_key(&locator)?);
-        }
-        metadata.has_new_attention = has_new_attention;
-        sessions.push(metadata);
-      }
-      let confirmed_cursor = source_cursor(provider, source_path)?;
-      if confirmed_cursor != cursor {
-        return Err("session source changed while it was being indexed".to_string());
-      }
       checked_sources.push((source_path.clone(), cursor.clone()));
-      replacements.push(SourceReplacement {
-        source: SourceState::new(source_key, cursor, indexed_at_ms),
-        sessions,
-        attention_mode,
-        source_cursor_precondition: source_cursor_precondition(previous),
-      });
+      replacements.push(
+        SourceReplacement::new(SourceState::new(source_key, staged_cursor, indexed_at_ms), sessions)
+          .with_source_cursor_precondition(source_cursor_precondition(previous)),
+      );
     }
 
     for source in &existing_sources {
@@ -669,7 +796,7 @@ impl ViewerService {
       replacements.push(SourceReplacement {
         source: SourceState::new(source.key.clone(), INDEX_MISSING_SOURCE_CURSOR, indexed_at_ms),
         sessions: Vec::new(),
-        attention_mode,
+        attention_mode: Default::default(),
         source_cursor_precondition: SourceCursorPrecondition::existing(source.cursor.clone()),
       });
     }
@@ -679,7 +806,7 @@ impl ViewerService {
     }
 
     // A second header pass keeps a source disappearing or appearing midway
-    // through a body scan from being tombstoned/committed as a coherent
+    // through the catalog scan from being tombstoned/committed as a coherent
     // provider snapshot. It intentionally compares only source identity and
     // hierarchy metadata, never prompt or assistant content.
     let confirmed_headers = self.repository.list_session_headers(provider)?;
@@ -692,31 +819,262 @@ impl ViewerService {
       }
     }
 
-    // The sentinel commits only after every source body above has been read and
-    // indexed successfully. It also makes an empty provider baseline explicit,
-    // so a later first session is correctly treated as new attention.
+    // The sentinel means a complete header catalog is available, not that every
+    // source body has been read. It also makes an empty provider catalog
+    // explicit, so a later first session is correctly identified as new.
     if !provider_ready {
       replacements.push(
-        SourceReplacement::baseline(SourceState::new(catalog_key, "complete.v1", indexed_at_ms), Vec::new())
+        SourceReplacement::new(SourceState::new(catalog_key, "headers.v2", indexed_at_ms), Vec::new())
           .with_source_cursor_precondition(SourceCursorPrecondition::missing()),
       );
     }
 
-    // All sources for a provider, including its readiness sentinel, commit in
-    // one transaction. A cursor race on any source must leave the previous
-    // provider snapshot intact; otherwise a partial commit could be invisible
-    // to the UI when this refresh reports the provider error.
-    let summaries = self
+    // All catalog sources for a provider, including its readiness sentinel,
+    // commit in one transaction. A cursor race on any source must leave the
+    // previous provider snapshot intact; otherwise the UI could see a partial
+    // session tree.
+    self
       .session_index
       .replace_sources(&replacements)
       .map_err(|error| format!("failed to update the {provider:?} session index: {error}"))?;
-    let changed = summaries
-      .iter()
-      .any(|summary| summary.inserted != 0 || summary.updated != 0 || summary.tombstoned != 0);
-
     Ok(ProviderIndexRefresh {
-      changed,
-      attention_session_keys,
+      changed: true,
+      attention_session_keys: Vec::new(),
+    })
+  }
+
+  /// Returns the bounded global queue of cataloged sources whose bodies still
+  /// need inspection. All jobs are ordered by provider update time first, then
+  /// source-file modification time, so recent conversations become fully
+  /// actionable before old history.
+  fn pending_body_jobs(&self, unavailable: &HashSet<ViewerProvider>) -> Result<Vec<PendingBodyJob>, String> {
+    let sessions = self
+      .session_index
+      .list_all_sessions()
+      .map_err(|error| format!("failed to read indexed session metadata: {error}"))?;
+    let mut sessions_by_source = HashMap::<SourceKey, Vec<IndexedSession>>::new();
+    for session in sessions.into_iter().filter(|session| session.present) {
+      sessions_by_source
+        .entry(session.key.source_key())
+        .or_default()
+        .push(session);
+    }
+
+    let mut jobs = Vec::new();
+    let failed_jobs = self
+      .failed_body_jobs
+      .lock()
+      .map(|jobs| jobs.clone())
+      .unwrap_or_default();
+    for provider in ViewerProvider::ALL {
+      if unavailable.contains(&provider) {
+        continue;
+      }
+      let sources = self
+        .session_index
+        .list_sources(provider.as_str())
+        .map_err(|error| format!("failed to read indexed {provider:?} sources: {error}"))?;
+      for source in sources {
+        if source.key.source_key == INDEX_CATALOG_SOURCE_KEY || source.cursor == INDEX_MISSING_SOURCE_CURSOR {
+          continue;
+        }
+        let Some(raw_cursor) = pending_body_raw_cursor(&source.cursor).map(str::to_owned) else {
+          continue;
+        };
+        let Some(source_sessions) = sessions_by_source.remove(&source.key) else {
+          continue;
+        };
+        for session in source_sessions
+          .into_iter()
+          .filter(|session| !session.attention_baselined)
+        {
+          let priority = session_body_priority(&session);
+          let header = indexed_session_header(&session)?;
+          let locator = locator_for_header(provider, &header);
+          let deprioritized = failed_jobs
+            .get(&(source.key.clone(), locator.session_id.clone()))
+            .is_some_and(|failure| failure.raw_cursor == raw_cursor);
+          jobs.push(PendingBodyJob {
+            provider,
+            source: source.clone(),
+            raw_cursor: raw_cursor.clone(),
+            locator,
+            priority,
+            deprioritized,
+          });
+        }
+      }
+    }
+    jobs.sort_by(|left, right| {
+      left
+        .deprioritized
+        .cmp(&right.deprioritized)
+        .then_with(|| right.priority.cmp(&left.priority))
+        .then_with(|| left.provider.as_str().cmp(right.provider.as_str()))
+        .then_with(|| left.source.key.source_key.cmp(&right.source.key.source_key))
+        .then_with(|| left.locator.session_id.cmp(&right.locator.session_id))
+    });
+    Ok(jobs)
+  }
+
+  fn record_failed_body_job(&self, job: &PendingBodyJob, message: String) {
+    if let Ok(mut failed_jobs) = self.failed_body_jobs.lock() {
+      failed_jobs.insert(
+        (job.source.key.clone(), job.locator.session_id.clone()),
+        FailedBodyJob {
+          raw_cursor: job.raw_cursor.clone(),
+          message,
+        },
+      );
+    }
+  }
+
+  fn clear_failed_body_job(&self, job: &PendingBodyJob) {
+    if let Ok(mut failed_jobs) = self.failed_body_jobs.lock() {
+      let key = (job.source.key.clone(), job.locator.session_id.clone());
+      if failed_jobs
+        .get(&key)
+        .is_some_and(|failure| failure.raw_cursor == job.raw_cursor)
+      {
+        failed_jobs.remove(&key);
+      }
+    }
+  }
+
+  fn body_errors_for_pending_jobs(&self, jobs: &[PendingBodyJob]) -> HashMap<ViewerProvider, String> {
+    let Ok(failed_jobs) = self.failed_body_jobs.lock() else {
+      return HashMap::new();
+    };
+    let mut errors = HashMap::new();
+    for job in jobs {
+      let key = (job.source.key.clone(), job.locator.session_id.clone());
+      if let Some(failure) = failed_jobs
+        .get(&key)
+        .filter(|failure| failure.raw_cursor == job.raw_cursor)
+      {
+        errors.entry(job.provider).or_insert_with(|| failure.message.clone());
+      }
+    }
+    errors
+  }
+
+  /// A successful body completion advances the source cursor as an optimistic
+  /// concurrency generation. Retarget still-queued siblings so a shared
+  /// source (notably the OpenCode database) can use the rest of this bounded
+  /// batch instead of treating every sibling as stale.
+  fn retarget_pending_body_jobs(jobs: &mut [PendingBodyJob], previous_source: &SourceState, next_source: SourceState) {
+    let Some(next_raw_cursor) = pending_body_raw_cursor(&next_source.cursor) else {
+      return;
+    };
+    for job in jobs {
+      if job.source.key == previous_source.key
+        && job.source.cursor == previous_source.cursor
+        && job.raw_cursor == next_raw_cursor
+      {
+        job.source = next_source.clone();
+      }
+    }
+  }
+
+  /// Loads and commits one staged session body. Cataloging remains the only
+  /// source-inventory writer, so OpenCode's shared database source can backfill
+  /// its sessions independently without one job tombstoning its siblings.
+  fn refresh_pending_body_job(&self, job: &PendingBodyJob) -> Result<BodyJobRefresh, String> {
+    let current_source = self
+      .session_index
+      .source_state(&job.source.key)
+      .map_err(|error| format!("failed to read indexed body job source: {error}"))?;
+    if current_source.as_ref().map(|source| source.cursor.as_str()) != Some(job.source.cursor.as_str()) {
+      return Ok(BodyJobRefresh::Stale);
+    }
+    if source_cursor(job.provider, &job.locator.source_path)? != job.raw_cursor {
+      return Ok(BodyJobRefresh::Stale);
+    }
+
+    let existing_sessions = self
+      .session_index
+      .list_all_sessions()
+      .map_err(|error| format!("failed to read indexed body attention: {error}"))?;
+    let existing_by_session_key = existing_sessions
+      .iter()
+      .map(|session| (session.key.clone(), session))
+      .collect::<HashMap<_, _>>();
+    let existing_by_session_id = existing_sessions
+      .iter()
+      .filter(|session| session.key.provider == job.provider.as_str())
+      .fold(
+        HashMap::<String, Vec<&IndexedSession>>::new(),
+        |mut grouped, session| {
+          grouped.entry(session.key.session_id.clone()).or_default().push(session);
+          grouped
+        },
+      );
+    let key = index_session_key(&job.locator)?;
+    if key.source_key() != job.source.key {
+      return Err("session index body job has a mismatched source path".to_string());
+    }
+    let Some(existing) = existing_by_session_key.get(&key).copied() else {
+      return Ok(BodyJobRefresh::Stale);
+    };
+    if !existing.present || existing.attention_baselined {
+      return Ok(BodyJobRefresh::Stale);
+    }
+    let loaded = self.repository.load_session(&job.locator)?;
+    if loaded.reference.id != job.locator.session_id {
+      return Err("session index source no longer matches its header".to_string());
+    }
+    let attention_marker = visible_attention_marker(&loaded.events);
+    if source_cursor(job.provider, &job.locator.source_path)? != job.raw_cursor {
+      return Ok(BodyJobRefresh::Stale);
+    }
+
+    // Completion writes only attention fields. Use the committed catalog row
+    // for relocation identity, so this bounded body job never needs to walk
+    // the whole provider header catalog again or overwrite newer metadata.
+    let metadata = session_metadata_from_header(
+      &job.source.key,
+      indexed_session_header(existing)?,
+      attention_marker.clone(),
+      false,
+    )?;
+    let current_source_keys = existing_sessions
+      .iter()
+      .filter(|session| session.present && session.key.provider == job.provider.as_str())
+      .map(|session| session.key.source_key.clone())
+      .collect::<HashSet<_>>();
+    let relocated = relocated_session_reference(
+      &job.source.key,
+      &metadata,
+      &current_source_keys,
+      &existing_by_session_id,
+    );
+    let has_new_attention = body_has_new_attention(existing, relocated, attention_marker.as_deref());
+    let mut completion = tokn_session_index::SessionBaselineCompletionRequest::new(key, attention_marker);
+    completion.has_new_attention = has_new_attention;
+    let next_source = SourceState::new(
+      job.source.key.clone(),
+      advance_pending_body_cursor(&job.source.cursor)?,
+      current_time_ms(),
+    );
+    let completion = self
+      .session_index
+      .complete_session_baseline(&job.source, &next_source, completion)
+      .map_err(|error| format!("failed to update the {:?} session index: {error}", job.provider))?;
+    if completion == tokn_session_index::SessionBaselineCompletion::Stale {
+      return Ok(BodyJobRefresh::Stale);
+    }
+    let attention_session_keys = completion
+      .attention_changed()
+      .then(|| encode_session_key(&job.locator))
+      .transpose()?
+      .into_iter()
+      .collect();
+    Ok(BodyJobRefresh::Updated {
+      provider_refresh: ProviderIndexRefresh {
+        changed: completion.was_applied(),
+        attention_session_keys,
+      },
+      next_source,
     })
   }
 
@@ -1232,6 +1590,65 @@ fn source_cursor_precondition(previous: Option<&SourceState>) -> SourceCursorPre
     .unwrap_or_else(SourceCursorPrecondition::missing)
 }
 
+/// Returns the provider revision embedded in an index cursor. Pre-staging
+/// index versions stored the raw value directly and are treated as complete so
+/// they upgrade lazily on the next catalog pass.
+fn indexed_source_raw_cursor(cursor: &str) -> Option<&str> {
+  if cursor == INDEX_MISSING_SOURCE_CURSOR {
+    return None;
+  }
+  staged_body_cursor_parts(cursor, INDEX_PENDING_BODY_CURSOR_PREFIX)
+    .map(|(_, raw_cursor)| raw_cursor)
+    .or_else(|| staged_body_cursor_parts(cursor, INDEX_COMPLETED_BODY_CURSOR_PREFIX).map(|(_, raw_cursor)| raw_cursor))
+    .or_else(|| cursor.strip_prefix(LEGACY_PENDING_BODY_CURSOR_PREFIX))
+    .or_else(|| cursor.strip_prefix(LEGACY_COMPLETED_BODY_CURSOR_PREFIX))
+    .or(Some(cursor))
+}
+
+fn pending_body_raw_cursor(cursor: &str) -> Option<&str> {
+  staged_body_cursor_parts(cursor, INDEX_PENDING_BODY_CURSOR_PREFIX)
+    .map(|(_, raw_cursor)| raw_cursor)
+    .or_else(|| cursor.strip_prefix(LEGACY_PENDING_BODY_CURSOR_PREFIX))
+}
+
+fn pending_body_cursor(raw_cursor: &str) -> String {
+  format!("{INDEX_PENDING_BODY_CURSOR_PREFIX}0.{raw_cursor}")
+}
+
+fn completed_body_cursor(raw_cursor: &str) -> String {
+  format!("{INDEX_COMPLETED_BODY_CURSOR_PREFIX}0.{raw_cursor}")
+}
+
+/// Bumps the opaque staged cursor each time one session body finishes. The
+/// source-level compare-and-swap then prevents a stale catalog replacement or
+/// a second viewer from restoring the older pending attention state.
+fn advance_pending_body_cursor(cursor: &str) -> Result<String, String> {
+  let (generation, raw_cursor) = staged_body_cursor_parts(cursor, INDEX_PENDING_BODY_CURSOR_PREFIX)
+    .or_else(|| {
+      cursor
+        .strip_prefix(LEGACY_PENDING_BODY_CURSOR_PREFIX)
+        .map(|raw_cursor| (0, raw_cursor))
+    })
+    .ok_or_else(|| "session body job does not have a staged cursor".to_string())?;
+  let generation = generation
+    .checked_add(1)
+    .ok_or_else(|| "session body cursor generation overflowed".to_string())?;
+  Ok(format!("{INDEX_PENDING_BODY_CURSOR_PREFIX}{generation}.{raw_cursor}"))
+}
+
+fn staged_body_cursor_parts<'a>(cursor: &'a str, prefix: &str) -> Option<(u64, &'a str)> {
+  let remainder = cursor.strip_prefix(prefix)?;
+  let (generation, raw_cursor) = remainder.split_once('.')?;
+  (!raw_cursor.is_empty())
+    .then(|| {
+      generation
+        .parse::<u64>()
+        .ok()
+        .map(|generation| (generation, raw_cursor))
+    })
+    .flatten()
+}
+
 fn index_source_key_for_path(provider: ViewerProvider, path: &Path) -> Result<SourceKey, String> {
   let source_path = index_path_string(path)?;
   Ok(SourceKey::new(provider.as_str(), format!("path.v1.{source_path}")))
@@ -1252,6 +1669,13 @@ fn index_path_string(path: &Path) -> Result<String, String> {
     .filter(|value| !value.is_empty())
     .ok_or_else(|| "session path is not valid UTF-8".to_string())?;
   Ok(value.to_owned())
+}
+
+fn session_body_priority(session: &IndexedSession) -> i64 {
+  session
+    .updated_at_ms
+    .or_else(|| file_modified_at_ms(Path::new(&session.source_path)))
+    .unwrap_or(i64::MIN)
 }
 
 fn session_catalog_identity(headers: &[SessionHeader]) -> Result<Vec<SessionCatalogIdentity>, String> {
@@ -1298,21 +1722,6 @@ fn indexed_session_header(session: &IndexedSession) -> Result<SessionHeader, Str
   })
 }
 
-fn merge_loaded_session_header(mut header: SessionHeader, loaded: &LoadedSession) -> SessionHeader {
-  // Header discovery retains provider-native update ordering. A full load can
-  // fill user-facing metadata such as an OpenCode prompt preview, but must not
-  // overwrite the source path or turn an event-body scan into a second catalog.
-  header.parent_session_id = loaded.reference.parent_session_id.clone().or(header.parent_session_id);
-  header.agent_path = loaded.reference.agent_path.clone().or(header.agent_path);
-  header.agent_nickname = loaded.reference.agent_nickname.clone().or(header.agent_nickname);
-  header.agent_role = loaded.reference.agent_role.clone().or(header.agent_role);
-  header.title = loaded.reference.title.clone().or(header.title);
-  header.preview = loaded.reference.preview.clone().or(header.preview);
-  header.cwd = loaded.reference.cwd.clone().or(header.cwd);
-  header.timestamp = loaded.reference.timestamp.clone().or(header.timestamp);
-  header
-}
-
 fn session_metadata_from_header(
   source_key: &SourceKey,
   header: SessionHeader,
@@ -1345,51 +1754,70 @@ fn session_metadata_from_header(
   Ok(metadata)
 }
 
-/// Decides whether a source with an unchanged conversation cursor can update
-/// its compact sidebar fields without replaying its body. Header membership
-/// changes always require a body read because a new session may carry eligible
-/// visible conversation activity.
-fn indexed_source_metadata_refresh(
+/// Builds a compact catalog row while preserving the prior body-derived
+/// notification state. A changed source becomes pending again, but a brand-new
+/// row only requests notification after a completed provider catalog exists.
+fn catalog_session_metadata(
   source_key: &SourceKey,
-  headers: &[SessionHeader],
-  existing_by_session_key: &HashMap<IndexedSessionKey, &IndexedSession>,
-) -> Result<IndexedSourceMetadataRefresh, String> {
-  let mut current_session_keys = HashSet::with_capacity(headers.len());
-  let mut sessions = Vec::with_capacity(headers.len());
-  let mut changed = false;
-
-  for header in headers {
-    let key = IndexedSessionKey::new(
-      source_key.provider.clone(),
-      source_key.source_key.clone(),
-      header.id.clone(),
-    );
-    let Some(indexed) = existing_by_session_key.get(&key).copied() else {
-      return Ok(IndexedSourceMetadataRefresh::RequiresBody);
-    };
-    if !indexed.present {
-      return Ok(IndexedSourceMetadataRefresh::RequiresBody);
+  header: SessionHeader,
+  existing: Option<&IndexedSession>,
+  provider_ready: bool,
+  source_changed: bool,
+) -> Result<SessionMetadata, String> {
+  let attention_marker = existing.and_then(|indexed| {
+    if source_changed && indexed.attention_baselined {
+      known_attention_marker(indexed)
+    } else {
+      indexed.attention_marker.clone()
     }
-    let metadata = session_metadata_from_header(source_key, header.clone(), indexed.attention_marker.clone(), false)?;
-    changed |= !indexed_session_matches_metadata(indexed, &metadata);
-    current_session_keys.insert(key);
-    sessions.push(metadata);
+  });
+  let mut metadata = session_metadata_from_header(source_key, header, attention_marker, false)?;
+  match existing {
+    Some(indexed) if source_changed => {
+      metadata.attention_baselined = false;
+      // A pending row that was already new must remain eligible when its body
+      // eventually succeeds. A previously completed row instead compares its
+      // retained count on the later body pass.
+      metadata.notify_on_baseline = if indexed.attention_baselined {
+        false
+      } else {
+        indexed.notify_on_baseline
+      };
+    }
+    Some(indexed) => {
+      metadata.attention_baselined = indexed.attention_baselined;
+      metadata.notify_on_baseline = indexed.notify_on_baseline;
+    }
+    None => {
+      metadata.attention_baselined = false;
+      metadata.notify_on_baseline = provider_ready;
+    }
   }
+  Ok(metadata)
+}
 
-  let source_has_unlisted_present_session = existing_by_session_key.values().any(|indexed| {
+/// True only when the index already represents exactly this source's complete
+/// header inventory. Body-derived fields are compared too, so a deferred row
+/// remains eligible for a later body job even if its sidebar metadata itself
+/// has not changed.
+fn indexed_source_matches_catalog(
+  source_key: &SourceKey,
+  sessions: &[SessionMetadata],
+  existing_by_session_key: &HashMap<IndexedSessionKey, &IndexedSession>,
+) -> bool {
+  let current_session_keys = sessions
+    .iter()
+    .map(|session| session.key.clone())
+    .collect::<HashSet<_>>();
+  sessions.iter().all(|metadata| {
+    existing_by_session_key
+      .get(&metadata.key)
+      .is_some_and(|indexed| indexed.present && indexed_session_matches_metadata(indexed, metadata))
+  }) && !existing_by_session_key.values().any(|indexed| {
     indexed.present
       && indexed.key.provider == source_key.provider
       && indexed.key.source_key == source_key.source_key
       && !current_session_keys.contains(&indexed.key)
-  });
-  if source_has_unlisted_present_session {
-    return Ok(IndexedSourceMetadataRefresh::RequiresBody);
-  }
-
-  Ok(if changed {
-    IndexedSourceMetadataRefresh::Replacement(sessions)
-  } else {
-    IndexedSourceMetadataRefresh::Unchanged
   })
 }
 
@@ -1407,6 +1835,8 @@ fn indexed_session_matches_metadata(indexed: &IndexedSession, metadata: &Session
     && indexed.agent_nickname == metadata.agent_nickname
     && indexed.agent_role == metadata.agent_role
     && indexed.attention_marker == metadata.attention_marker
+    && indexed.attention_baselined == metadata.attention_baselined
+    && indexed.notify_on_baseline == metadata.notify_on_baseline
 }
 
 /// Finds one retired source row that can safely carry attention state across a
@@ -1447,7 +1877,9 @@ fn same_optional_identity(left: Option<&str>, right: Option<&str>) -> bool {
 /// The marker is deliberately only a count of eligible normalized message
 /// records. It stores neither message text nor message IDs/timestamps, while
 /// still allowing a source scan to distinguish a new visible conversation row
-/// from metadata-only or work-trajectory changes.
+/// from metadata-only or work-trajectory changes. A completed zero is stored
+/// explicitly, so a staged first-run row can remain distinguishable from a
+/// previously inspected session with no eligible messages.
 fn visible_attention_marker(events: &[AgentEvent]) -> Option<String> {
   let count = events
     .iter()
@@ -1461,7 +1893,43 @@ fn visible_attention_marker(events: &[AgentEvent]) -> Option<String> {
         )
     })
     .count();
-  (count != 0).then(|| format!("visible-message-count.v1.{count}"))
+  Some(attention_marker_for_count(count))
+}
+
+fn attention_marker_for_count(count: usize) -> String {
+  format!("visible-message-count.v1.{count}")
+}
+
+/// A historical version of the index used `NULL` for a completed zero count.
+/// Preserve that interpretation while turning a changed source back into a
+/// pending body job.
+fn known_attention_marker(indexed: &IndexedSession) -> Option<String> {
+  indexed
+    .attention_marker
+    .clone()
+    .or_else(|| indexed.attention_baselined.then(|| attention_marker_for_count(0)))
+}
+
+/// Decides whether a completed staged body should advance unread attention.
+/// New rows discovered after the first complete catalog defer their decision to
+/// this point; initial rows deliberately establish a quiet baseline instead.
+fn body_has_new_attention(existing: &IndexedSession, relocated: Option<&IndexedSession>, marker: Option<&str>) -> bool {
+  if let Some(relocated) = relocated {
+    if existing.attention_revision != 0 && existing.attention_marker == known_attention_marker(relocated) {
+      // Catalog transfer already retained the prior unread state before this
+      // archive body could load. Compare from that state rather than turning
+      // the same moved messages into a second unread revision.
+      return has_new_visible_attention(Some(existing), marker);
+    }
+    // A move can race the first quiet body pass. Reuse the retired row's own
+    // baseline policy so an initially discovered session remains quiet, while
+    // a later newly-created-but-pending row still becomes unread as intended.
+    return relocated.has_unread() || body_has_new_attention(relocated, None, marker);
+  }
+  if !existing.attention_baselined && existing.attention_marker.is_none() {
+    return existing.notify_on_baseline && attention_marker_count(marker).is_some_and(|count| count != 0);
+  }
+  has_new_visible_attention(Some(existing), marker)
 }
 
 fn has_new_visible_attention(existing: Option<&IndexedSession>, marker: Option<&str>) -> bool {
@@ -1475,6 +1943,7 @@ fn has_new_visible_attention(existing: Option<&IndexedSession>, marker: Option<&
   // alone is not a visible-message addition, so compare it just like a
   // continuously present source rather than treating it as a new session.
   match existing.attention_marker.as_deref() {
+    None if existing.attention_baselined => new_count != 0,
     None => true,
     Some(previous) => attention_marker_count(Some(previous)).is_some_and(|previous_count| new_count > previous_count),
   }
@@ -1560,6 +2029,16 @@ fn file_revision(path: &Path) -> Option<FileRevision> {
   })
 }
 
+fn file_modified_at_ms(path: &Path) -> Option<i64> {
+  let duration = std::fs::metadata(path)
+    .ok()?
+    .modified()
+    .ok()?
+    .duration_since(UNIX_EPOCH)
+    .ok()?;
+  i64::try_from(duration.as_millis()).ok()
+}
+
 fn selected_providers(requested: &[ViewerProvider]) -> Vec<ViewerProvider> {
   if requested.is_empty() {
     return ViewerProvider::ALL.to_vec();
@@ -1574,6 +2053,18 @@ fn record_source_error(errors: &mut Vec<SourceError>, provider: ViewerProvider, 
   if errors.iter().all(|error| error.provider != provider) {
     errors.push(SourceError { provider, message });
   }
+}
+
+/// Catalog failures take precedence because a direct historical body read can
+/// still succeed while current header discovery is unavailable. Body failures
+/// disappear as soon as no pending job still carries that source revision.
+fn combined_index_errors(
+  catalog_errors: HashMap<ViewerProvider, String>,
+  body_errors: HashMap<ViewerProvider, String>,
+) -> HashMap<ViewerProvider, String> {
+  let mut errors = body_errors;
+  errors.extend(catalog_errors);
+  errors
 }
 
 fn validate_session_header(provider: ViewerProvider, header: &SessionHeader) -> Result<(), String> {
@@ -3391,6 +3882,7 @@ mod tests {
     mutate_source_on_next_load: Mutex<Option<PathBuf>>,
     header_calls: AtomicUsize,
     load_calls: AtomicUsize,
+    load_order: Mutex<Vec<SessionLocator>>,
   }
 
   impl ViewerRepository for IndexingRepository {
@@ -3417,6 +3909,11 @@ mod tests {
 
     fn load_session(&self, locator: &SessionLocator) -> Result<LoadedSession, String> {
       self.load_calls.fetch_add(1, Ordering::SeqCst);
+      self
+        .load_order
+        .lock()
+        .expect("fixture load order lock should not be poisoned")
+        .push(locator.clone());
       if let Some(path) = self
         .mutate_source_on_next_load
         .lock()
@@ -3438,17 +3935,22 @@ mod tests {
   }
 
   fn indexing_repository(specs: Vec<IndexedLoadSpec>) -> Arc<IndexingRepository> {
+    indexing_repository_for(ViewerProvider::Codex, specs)
+  }
+
+  fn indexing_repository_for(provider: ViewerProvider, specs: Vec<IndexedLoadSpec>) -> Arc<IndexingRepository> {
     let headers = specs.iter().map(|spec| spec.header.clone()).collect::<Vec<_>>();
     let loads = specs
       .into_iter()
-      .map(|spec| (locator_for_header(ViewerProvider::Codex, &spec.header), Ok(spec)))
+      .map(|spec| (locator_for_header(provider, &spec.header), Ok(spec)))
       .collect();
     Arc::new(IndexingRepository {
-      listings: Mutex::new(HashMap::from([(ViewerProvider::Codex, headers)])),
+      listings: Mutex::new(HashMap::from([(provider, headers)])),
       loads: Mutex::new(loads),
       mutate_source_on_next_load: Mutex::new(None),
       header_calls: AtomicUsize::new(0),
       load_calls: AtomicUsize::new(0),
+      load_order: Mutex::new(Vec::new()),
     })
   }
 
@@ -3482,6 +3984,8 @@ mod tests {
       agent_nickname: None,
       agent_role: None,
       attention_marker: marker.map(str::to_owned),
+      attention_baselined: true,
+      notify_on_baseline: false,
       attention_revision: 0,
       seen_attention_revision: 0,
       seen_at_ms: None,
@@ -3502,6 +4006,254 @@ mod tests {
       Some("visible-message-count.v1.3")
     ));
     assert!(!has_new_visible_attention(Some(&tombstoned), None));
+  }
+
+  #[test]
+  fn session_index_catalogs_every_header_then_backfills_newest_bodies_in_batches() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let mut specs = Vec::new();
+    for index in 0..=INDEX_BODY_SCAN_BATCH_SIZE {
+      let id = format!("session-{index}");
+      let path = directory.path().join(format!("{id}.jsonl"));
+      std::fs::write(&path, format!("fixture {index}")).expect("fixture source should be written");
+      let mut header = indexed_header(path, &id, None);
+      header.updated_at = Some(format!("2026-09-01T00:00:{index:02}Z"));
+      header.updated_at_ms = Some(i64::try_from(index).expect("small fixture index should fit"));
+      specs.push(IndexedLoadSpec {
+        header,
+        messages: vec![indexed_message(Role::User, MessageDelivery::Unspecified)],
+      });
+    }
+    let repository = indexing_repository(specs);
+    let index = Arc::new(SessionIndex::open_in_memory().expect("test index should open"));
+    let service = ViewerService::new_with_index(repository.clone(), Arc::clone(&index));
+
+    let first_refresh = service
+      .refresh_session_index()
+      .expect("catalog and first batch should refresh");
+    assert!(first_refresh.changed);
+    assert!(first_refresh.has_pending_body_jobs);
+    assert_eq!(repository.load_calls.load(Ordering::SeqCst), INDEX_BODY_SCAN_BATCH_SIZE);
+    assert_eq!(
+      repository.header_calls.load(Ordering::SeqCst),
+      ViewerProvider::ALL.len() * 2,
+      "each body job should reuse the committed catalog row instead of rediscovering every provider header"
+    );
+    let first_loads = repository
+      .load_order
+      .lock()
+      .expect("fixture load order lock should not be poisoned")
+      .iter()
+      .map(|locator| locator.session_id.clone())
+      .collect::<Vec<_>>();
+    assert_eq!(
+      first_loads,
+      (1..=INDEX_BODY_SCAN_BATCH_SIZE)
+        .rev()
+        .map(|index| format!("session-{index}"))
+        .collect::<Vec<_>>(),
+      "newer provider update timestamps should receive body inspection first"
+    );
+
+    let cataloged = service
+      .list_sessions(ListSessionsRequest {
+        query: SessionQuery {
+          providers: vec![ViewerProvider::Codex],
+          search: None,
+        },
+        cursor: None,
+        offset: None,
+        limit: Some(100),
+      })
+      .expect("cataloged listing should work");
+    assert_eq!(cataloged.sessions.len(), INDEX_BODY_SCAN_BATCH_SIZE + 1);
+    assert!(cataloged.sessions.iter().all(|session| !session.has_unread));
+    let oldest_locator = SessionLocator {
+      version: 1,
+      provider: ViewerProvider::Codex,
+      session_id: "session-0".to_string(),
+      source_path: directory.path().join("session-0.jsonl"),
+    };
+    assert!(
+      !index
+        .session(&index_session_key(&oldest_locator).expect("index key should encode"))
+        .expect("index query should work")
+        .expect("oldest catalog row should exist")
+        .attention_baselined,
+      "the sidebar should expose the old row before its body is parsed"
+    );
+
+    let second_refresh = service
+      .refresh_pending_session_index()
+      .expect("second body-only batch should refresh");
+    assert!(!second_refresh.has_pending_body_jobs);
+    assert_eq!(
+      repository.load_calls.load(Ordering::SeqCst),
+      INDEX_BODY_SCAN_BATCH_SIZE + 1
+    );
+    assert_eq!(
+      repository.header_calls.load(Ordering::SeqCst),
+      ViewerProvider::ALL.len() * 2,
+      "a one-second body-only pass must not rediscover the catalog"
+    );
+    assert!(
+      index
+        .session(&index_session_key(&oldest_locator).expect("index key should encode"))
+        .expect("index query should work")
+        .expect("oldest catalog row should exist")
+        .attention_baselined
+    );
+  }
+
+  #[test]
+  fn session_index_backfills_a_shared_source_in_one_newest_first_batch() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let database_path = directory.path().join("opencode.db");
+    std::fs::write(&database_path, "fixture database").expect("fixture database should be written");
+    let mut specs = Vec::new();
+    for index in 0..=INDEX_BODY_SCAN_BATCH_SIZE {
+      let id = format!("shared-{index}");
+      let mut header = indexed_header(database_path.clone(), &id, None);
+      header.updated_at = Some(format!("2026-09-01T00:01:{index:02}Z"));
+      header.updated_at_ms = Some(i64::try_from(index).expect("small fixture index should fit"));
+      specs.push(IndexedLoadSpec {
+        header,
+        messages: vec![indexed_message(Role::User, MessageDelivery::Unspecified)],
+      });
+    }
+    let repository = indexing_repository_for(ViewerProvider::OpenCode, specs);
+    let index = Arc::new(SessionIndex::open_in_memory().expect("test index should open"));
+    let service = ViewerService::new_with_index(repository.clone(), Arc::clone(&index));
+
+    let first_refresh = service
+      .refresh_session_index()
+      .expect("catalog and first shared-source batch should refresh");
+    assert!(first_refresh.has_pending_body_jobs);
+    assert_eq!(repository.load_calls.load(Ordering::SeqCst), INDEX_BODY_SCAN_BATCH_SIZE);
+    let first_loads = repository
+      .load_order
+      .lock()
+      .expect("fixture load order lock should not be poisoned")
+      .iter()
+      .map(|locator| locator.session_id.clone())
+      .collect::<Vec<_>>();
+    assert_eq!(
+      first_loads,
+      (1..=INDEX_BODY_SCAN_BATCH_SIZE)
+        .rev()
+        .map(|index| format!("shared-{index}"))
+        .collect::<Vec<_>>(),
+      "the newest sessions in a shared source should use the entire bounded batch"
+    );
+
+    let source_key =
+      index_source_key_for_path(ViewerProvider::OpenCode, &database_path).expect("shared source key should encode");
+    let source = index
+      .source_state(&source_key)
+      .expect("source query should work")
+      .expect("shared source should be indexed");
+    assert!(
+      source.cursor.starts_with(&format!(
+        "{INDEX_PENDING_BODY_CURSOR_PREFIX}{INDEX_BODY_SCAN_BATCH_SIZE}."
+      )),
+      "each completed shared-source session should advance the staged generation"
+    );
+    let indexed = index
+      .list_present_sessions()
+      .expect("present sessions should list")
+      .into_iter()
+      .filter(|session| session.key.provider == ViewerProvider::OpenCode.as_str())
+      .collect::<Vec<_>>();
+    assert_eq!(indexed.len(), INDEX_BODY_SCAN_BATCH_SIZE + 1);
+    assert_eq!(
+      indexed.iter().filter(|session| session.attention_baselined).count(),
+      INDEX_BODY_SCAN_BATCH_SIZE,
+      "completing one shared-source session must not tombstone its siblings"
+    );
+
+    let second_refresh = service
+      .refresh_session_index()
+      .expect("remaining shared-source body should refresh");
+    assert!(!second_refresh.has_pending_body_jobs);
+    assert_eq!(
+      repository.load_calls.load(Ordering::SeqCst),
+      INDEX_BODY_SCAN_BATCH_SIZE + 1
+    );
+    assert!(
+      index
+        .list_present_sessions()
+        .expect("present sessions should list")
+        .into_iter()
+        .filter(|session| session.key.provider == ViewerProvider::OpenCode.as_str())
+        .all(|session| session.attention_baselined),
+      "the final sibling should complete without replacing the shared source inventory"
+    );
+  }
+
+  #[test]
+  fn session_index_defers_new_session_attention_until_its_body_completes() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let original_path = directory.path().join("original.jsonl");
+    std::fs::write(&original_path, "original session").expect("fixture source should be written");
+    let original = indexed_header(original_path, "original", None);
+    let repository = indexing_repository(vec![IndexedLoadSpec {
+      header: original,
+      messages: vec![indexed_message(Role::User, MessageDelivery::Unspecified)],
+    }]);
+    let index = Arc::new(SessionIndex::open_in_memory().expect("test index should open"));
+    let service = ViewerService::new_with_index(repository.clone(), Arc::clone(&index));
+    service
+      .refresh_session_index()
+      .expect("initial quiet baseline should refresh");
+
+    let new_path = directory.path().join("new.jsonl");
+    std::fs::write(&new_path, "new session").expect("fixture source should be written");
+    let mut new_header = indexed_header(new_path, "new", None);
+    new_header.updated_at_ms = Some(99);
+    let new_locator = locator_for_header(ViewerProvider::Codex, &new_header);
+    repository
+      .listings
+      .lock()
+      .expect("fixture listings lock should not be poisoned")
+      .insert(ViewerProvider::Codex, vec![new_header.clone()]);
+    repository
+      .loads
+      .lock()
+      .expect("fixture loads lock should not be poisoned")
+      .insert(
+        new_locator.clone(),
+        Ok(IndexedLoadSpec {
+          header: new_header,
+          messages: vec![
+            indexed_message(Role::User, MessageDelivery::Unspecified),
+            indexed_message(Role::Assistant, MessageDelivery::Final),
+          ],
+        }),
+      );
+
+    service
+      .refresh_provider_catalog(ViewerProvider::Codex)
+      .expect("new header catalog should refresh");
+    let pending = index
+      .session(&index_session_key(&new_locator).expect("index key should encode"))
+      .expect("index query should work")
+      .expect("new catalog row should exist");
+    assert!(!pending.attention_baselined);
+    assert!(pending.notify_on_baseline);
+    assert!(!pending.has_unread());
+
+    let completed = service.refresh_session_index().expect("new body should complete");
+    assert_eq!(
+      completed.attention_session_keys,
+      vec![encode_session_key(&new_locator).expect("session key should encode")]
+    );
+    assert!(
+      index
+        .session(&index_session_key(&new_locator).expect("index key should encode"))
+        .expect("index query should work")
+        .expect("new session should remain indexed")
+        .has_unread()
+    );
   }
 
   #[test]
@@ -3570,6 +4322,175 @@ mod tests {
       encode_session_key(&archived_locator).expect("session key should encode")
     );
     assert!(!sessions.sessions[0].has_unread);
+  }
+
+  #[test]
+  fn session_index_keeps_an_initial_quiet_baseline_when_its_file_moves_before_body_backfill() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let active_path = directory.path().join("active.jsonl");
+    std::fs::write(&active_path, "active session").expect("fixture source should be written");
+    let active_header = indexed_header(active_path.clone(), "moved-before-body", None);
+    let active_locator = locator_for_header(ViewerProvider::Codex, &active_header);
+    let repository = indexing_repository(vec![IndexedLoadSpec {
+      header: active_header.clone(),
+      messages: vec![
+        indexed_message(Role::User, MessageDelivery::Unspecified),
+        indexed_message(Role::Assistant, MessageDelivery::Final),
+      ],
+    }]);
+    let index = Arc::new(SessionIndex::open_in_memory().expect("test index should open"));
+    let service = ViewerService::new_with_index(repository.clone(), Arc::clone(&index));
+
+    service
+      .refresh_provider_catalog(ViewerProvider::Codex)
+      .expect("initial header catalog should refresh");
+    let initial = index
+      .session(&index_session_key(&active_locator).expect("index key should encode"))
+      .expect("index query should work")
+      .expect("initial catalog row should exist");
+    assert!(!initial.attention_baselined);
+    assert!(!initial.notify_on_baseline);
+
+    let archived_path = directory.path().join("archived.jsonl");
+    std::fs::rename(&active_path, &archived_path).expect("fixture source should move");
+    let mut archived_header = active_header;
+    archived_header.path = archived_path;
+    let archived_locator = locator_for_header(ViewerProvider::Codex, &archived_header);
+    repository
+      .listings
+      .lock()
+      .expect("fixture listings lock should not be poisoned")
+      .insert(ViewerProvider::Codex, vec![archived_header.clone()]);
+    let mut loads = repository
+      .loads
+      .lock()
+      .expect("fixture loads lock should not be poisoned");
+    loads.remove(&active_locator);
+    loads.insert(
+      archived_locator.clone(),
+      Ok(IndexedLoadSpec {
+        header: archived_header,
+        messages: vec![
+          indexed_message(Role::User, MessageDelivery::Unspecified),
+          indexed_message(Role::Assistant, MessageDelivery::Final),
+        ],
+      }),
+    );
+    drop(loads);
+
+    let refresh = service.refresh_session_index().expect("moved source should refresh");
+    assert!(refresh.attention_session_keys.is_empty());
+    let archived = index
+      .session(&index_session_key(&archived_locator).expect("index key should encode"))
+      .expect("index query should work")
+      .expect("archived row should exist");
+    assert!(archived.attention_baselined);
+    assert!(!archived.has_unread());
+  }
+
+  #[test]
+  fn session_index_preserves_unread_attention_when_a_moved_body_temporarily_fails() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let active_path = directory.path().join("active.jsonl");
+    std::fs::write(&active_path, "active session").expect("fixture source should be written");
+    let active_header = indexed_header(active_path.clone(), "moved-unread", None);
+    let active_locator = locator_for_header(ViewerProvider::Codex, &active_header);
+    let repository = indexing_repository(vec![IndexedLoadSpec {
+      header: active_header.clone(),
+      messages: vec![
+        indexed_message(Role::User, MessageDelivery::Unspecified),
+        indexed_message(Role::Assistant, MessageDelivery::Final),
+      ],
+    }]);
+    let index = Arc::new(SessionIndex::open_in_memory().expect("test index should open"));
+    let service = ViewerService::new_with_index(repository.clone(), Arc::clone(&index));
+    service
+      .refresh_session_index()
+      .expect("initial baseline should refresh");
+
+    std::fs::write(&active_path, "active session with a new final reply").expect("fixture source should change");
+    repository
+      .loads
+      .lock()
+      .expect("fixture loads lock should not be poisoned")
+      .insert(
+        active_locator.clone(),
+        Ok(IndexedLoadSpec {
+          header: active_header.clone(),
+          messages: vec![
+            indexed_message(Role::User, MessageDelivery::Unspecified),
+            indexed_message(Role::Assistant, MessageDelivery::Final),
+            indexed_message(Role::Assistant, MessageDelivery::Final),
+          ],
+        }),
+      );
+    service.refresh_session_index().expect("new attention should refresh");
+    assert!(
+      index
+        .session(&index_session_key(&active_locator).expect("index key should encode"))
+        .expect("index query should work")
+        .expect("active row should remain indexed")
+        .has_unread()
+    );
+
+    let archived_path = directory.path().join("archived.jsonl");
+    std::fs::rename(&active_path, &archived_path).expect("fixture source should move");
+    let mut archived_header = active_header;
+    archived_header.path = archived_path;
+    let archived_locator = locator_for_header(ViewerProvider::Codex, &archived_header);
+    repository
+      .listings
+      .lock()
+      .expect("fixture listings lock should not be poisoned")
+      .insert(ViewerProvider::Codex, vec![archived_header.clone()]);
+    let mut loads = repository
+      .loads
+      .lock()
+      .expect("fixture loads lock should not be poisoned");
+    loads.remove(&active_locator);
+    loads.insert(
+      archived_locator.clone(),
+      Err("fixture archive body is temporarily unavailable".to_string()),
+    );
+    drop(loads);
+
+    service
+      .refresh_session_index()
+      .expect("catalog should preserve the moved unread state despite the body failure");
+    let staged_archive = index
+      .session(&index_session_key(&archived_locator).expect("index key should encode"))
+      .expect("index query should work")
+      .expect("archived row should remain indexed");
+    assert!(!staged_archive.attention_baselined);
+    assert!(staged_archive.has_unread());
+    assert_eq!(staged_archive.attention_revision, 1);
+
+    repository
+      .loads
+      .lock()
+      .expect("fixture loads lock should not be poisoned")
+      .insert(
+        archived_locator.clone(),
+        Ok(IndexedLoadSpec {
+          header: archived_header,
+          messages: vec![
+            indexed_message(Role::User, MessageDelivery::Unspecified),
+            indexed_message(Role::Assistant, MessageDelivery::Final),
+            indexed_message(Role::Assistant, MessageDelivery::Final),
+          ],
+        }),
+      );
+    let retry = service
+      .refresh_pending_session_index()
+      .expect("archive body retry should refresh");
+    assert!(retry.attention_session_keys.is_empty());
+    let completed_archive = index
+      .session(&index_session_key(&archived_locator).expect("index key should encode"))
+      .expect("index query should work")
+      .expect("archived row should remain indexed");
+    assert!(completed_archive.attention_baselined);
+    assert!(completed_archive.has_unread());
+    assert_eq!(completed_archive.attention_revision, 1);
   }
 
   #[test]
@@ -3765,7 +4686,7 @@ mod tests {
         .refresh_session_index()
         .expect("refresh loop should isolate provider failure")
         .changed,
-      "the sidebar must refresh to show the newly recorded provider warning"
+      "the catalog update must remain visible while its body job is retried"
     );
 
     let stale = index
@@ -3773,8 +4694,9 @@ mod tests {
       .expect("indexed session should query")
       .expect("indexed session should remain present");
     assert_eq!(stale.attention_marker.as_deref(), Some("visible-message-count.v1.1"));
+    assert!(!stale.attention_baselined);
     assert!(!stale.has_unread());
-    assert!(service.index_error_for(ViewerProvider::Codex).is_some());
+    assert!(service.index_error_for(ViewerProvider::Codex).is_none());
 
     // The next stable pass can safely observe the final reply and mark it new.
     service.refresh_session_index().expect("stable retry should refresh");
@@ -3787,6 +4709,57 @@ mod tests {
       Some("visible-message-count.v1.2")
     );
     assert!(recovered.has_unread());
+  }
+
+  #[test]
+  fn session_index_clears_a_recovered_body_warning_without_waiting_for_the_next_catalog() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("retry.jsonl");
+    std::fs::write(&path, "baseline").expect("fixture source should be written");
+    let header = indexed_header(path.clone(), "retry", None);
+    let locator = locator_for_header(ViewerProvider::Codex, &header);
+    let repository = indexing_repository(vec![IndexedLoadSpec {
+      header: header.clone(),
+      messages: vec![indexed_message(Role::User, MessageDelivery::Unspecified)],
+    }]);
+    let service = ViewerService::new_with_index(
+      repository.clone(),
+      Arc::new(SessionIndex::open_in_memory().expect("test index should open")),
+    );
+    service.refresh_session_index().expect("baseline should refresh");
+
+    std::fs::write(&path, "body retry is required").expect("fixture source should change");
+    repository
+      .loads
+      .lock()
+      .expect("fixture loads lock should not be poisoned")
+      .insert(locator.clone(), Err("fixture body read failed".to_string()));
+    service
+      .refresh_session_index()
+      .expect("catalog should remain usable when a body fails");
+    assert_eq!(
+      service.index_error_for(ViewerProvider::Codex).as_deref(),
+      Some("fixture body read failed")
+    );
+
+    repository
+      .loads
+      .lock()
+      .expect("fixture loads lock should not be poisoned")
+      .insert(
+        locator,
+        Ok(IndexedLoadSpec {
+          header,
+          messages: vec![
+            indexed_message(Role::User, MessageDelivery::Unspecified),
+            indexed_message(Role::Assistant, MessageDelivery::Final),
+          ],
+        }),
+      );
+    service
+      .refresh_pending_session_index()
+      .expect("body-only retry should refresh");
+    assert!(service.index_error_for(ViewerProvider::Codex).is_none());
   }
 
   #[test]

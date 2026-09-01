@@ -73,15 +73,34 @@ CREATE INDEX sessions_by_attention
   ON sessions(present, attention_revision, seen_attention_revision);
 "#;
 
+// These fields distinguish a known-empty attention marker from a marker that
+// has not been established yet. Existing indexes were written only after a
+// complete body scan, so they migrate to the completed, non-notifying state.
+const MIGRATION_002: &str = r#"
+ALTER TABLE sessions
+  ADD COLUMN attention_baselined INTEGER NOT NULL DEFAULT 1
+    CHECK(attention_baselined IN (0, 1));
+
+ALTER TABLE sessions
+  ADD COLUMN notify_on_baseline INTEGER NOT NULL DEFAULT 0
+    CHECK(notify_on_baseline IN (0, 1));
+"#;
+
 struct Migration {
   version: i64,
   sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-  version: 1,
-  sql: MIGRATION_001,
-}];
+const MIGRATIONS: &[Migration] = &[
+  Migration {
+    version: 1,
+    sql: MIGRATION_001,
+  },
+  Migration {
+    version: 2,
+    sql: MIGRATION_002,
+  },
+];
 
 /// Errors returned by [`SessionIndex`].
 #[derive(Debug)]
@@ -270,10 +289,13 @@ impl SourceCursorPrecondition {
 /// The title and preview are copied exactly as supplied by the caller. The
 /// store does not sanitize, derive, or inspect either field. `attention_marker`
 /// must be an opaque token (for example, a message ID or fingerprint), never a
-/// message body. `has_new_attention` is the separate, caller-controlled signal
-/// that one or more new visible user messages or final assistant messages have
-/// been observed. Metadata changes, marker rewrites, and history reductions must
-/// leave it false.
+/// message body. `attention_baselined` records whether the caller has inspected
+/// the body enough to establish that marker; a missing marker is meaningful only
+/// when it is true. `notify_on_baseline` lets a caller defer the unread decision
+/// until that first body inspection. `has_new_attention` is the separate,
+/// caller-controlled signal that one or more new visible user messages or final
+/// assistant messages have been observed. Metadata changes, marker rewrites,
+/// and history reductions must leave it false.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionMetadata {
   pub key: SessionKey,
@@ -294,6 +316,11 @@ pub struct SessionMetadata {
   pub agent_nickname: Option<String>,
   pub agent_role: Option<String>,
   pub attention_marker: Option<String>,
+  /// Whether `attention_marker` reflects a completed body inspection.
+  pub attention_baselined: bool,
+  /// Whether the first completed body inspection should make eligible visible
+  /// conversation activity unread. This is only valid while not baselined.
+  pub notify_on_baseline: bool,
   /// Advances the unread revision only when the caller observed new eligible
   /// visible conversation activity. The index cannot infer this from metadata.
   pub has_new_attention: bool,
@@ -315,6 +342,8 @@ impl SessionMetadata {
       agent_nickname: None,
       agent_role: None,
       attention_marker: None,
+      attention_baselined: true,
+      notify_on_baseline: false,
       has_new_attention: false,
     }
   }
@@ -395,6 +424,11 @@ pub struct IndexedSession {
   pub agent_nickname: Option<String>,
   pub agent_role: Option<String>,
   pub attention_marker: Option<String>,
+  /// Whether `attention_marker` reflects a completed body inspection.
+  pub attention_baselined: bool,
+  /// Whether a first completed body inspection should surface eligible visible
+  /// conversation activity as unread.
+  pub notify_on_baseline: bool,
   pub attention_revision: i64,
   pub seen_attention_revision: i64,
   pub seen_at_ms: Option<i64>,
@@ -415,6 +449,59 @@ pub struct ReplaceSummary {
   pub tombstoned: usize,
   pub attention_changed: usize,
   pub baseline_established: bool,
+}
+
+/// Outcome of completing one cataloged session's attention baseline.
+///
+/// [`Self::Stale`] is expected when a later catalog replacement changed the
+/// source cursor, removed the session, or another worker already completed the
+/// pending baseline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionBaselineCompletion {
+  Applied {
+    /// Whether this completion advanced the unread attention revision.
+    attention_changed: bool,
+  },
+  Stale,
+}
+
+impl SessionBaselineCompletion {
+  pub const fn was_applied(self) -> bool {
+    matches!(self, Self::Applied { .. })
+  }
+
+  pub const fn attention_changed(self) -> bool {
+    matches!(
+      self,
+      Self::Applied {
+        attention_changed: true
+      }
+    )
+  }
+}
+
+/// Body-derived attention data used to complete one cataloged session baseline.
+///
+/// This intentionally excludes catalog-owned presentation and relationship
+/// metadata. A delayed body load must not overwrite a title, source path, or
+/// parent relationship that a same-cursor catalog pass has already refreshed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionBaselineCompletionRequest {
+  pub key: SessionKey,
+  /// Opaque body-derived marker, such as the newest eligible message ID.
+  pub attention_marker: Option<String>,
+  /// Whether the completed baseline should advance the unread revision.
+  pub has_new_attention: bool,
+}
+
+impl SessionBaselineCompletionRequest {
+  pub fn new(key: SessionKey, attention_marker: Option<String>) -> Self {
+    Self {
+      key,
+      attention_marker,
+      has_new_attention: false,
+    }
+  }
 }
 
 /// An app-owned SQLite session index.
@@ -545,6 +632,69 @@ impl SessionIndex {
       .collect::<Result<Vec<_>>>()?;
     transaction.commit()?;
     Ok(summaries)
+  }
+
+  /// Completes the pending attention baseline for exactly one cataloged
+  /// session, without replacing or tombstoning sibling sessions.
+  ///
+  /// `expected_source` must be the staged source state captured by the catalog
+  /// pass. `next_source` must have the same key and a new cursor. The completion
+  /// atomically advances to that cursor so a catalog replacement still guarded
+  /// by the staged cursor cannot regress the completed attention state. The
+  /// completion applies only while the staged cursor still matches and the
+  /// target session remains present with `attention_baselined == false`.
+  /// Callers provide only body-derived attention data; catalog-owned metadata
+  /// remains unchanged. A mismatched or already-completed row returns
+  /// [`SessionBaselineCompletion::Stale`] rather than overwriting newer data.
+  pub fn complete_session_baseline(
+    &self,
+    expected_source: &SourceState,
+    next_source: &SourceState,
+    request: SessionBaselineCompletionRequest,
+  ) -> Result<SessionBaselineCompletion> {
+    validate_session_baseline_completion(expected_source, next_source, &request)?;
+
+    let mut connection = self.connection()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let source_id = transaction
+      .query_row(
+        "SELECT id FROM sources WHERE provider = ?1 AND source_key = ?2 AND cursor = ?3",
+        params![
+          expected_source.key.provider,
+          expected_source.key.source_key,
+          expected_source.cursor,
+        ],
+        |row| row.get::<_, i64>(0),
+      )
+      .optional()?;
+    let Some(source_id) = source_id else {
+      return Ok(SessionBaselineCompletion::Stale);
+    };
+
+    let pending = pending_session_for_completion(&transaction, source_id, &request.key.session_id)?;
+    let Some(pending) = pending else {
+      return Ok(SessionBaselineCompletion::Stale);
+    };
+    if !pending.present || pending.attention_baselined {
+      return Ok(SessionBaselineCompletion::Stale);
+    }
+
+    let attention_changed = request.has_new_attention;
+    let attention_revision = if attention_changed {
+      next_attention_revision(pending.attention_revision)?
+    } else {
+      pending.attention_revision
+    };
+    complete_session_attention_baseline(
+      &transaction,
+      pending.id,
+      &request,
+      attention_revision,
+      pending.seen_attention_revision,
+    )?;
+    advance_source_state(&transaction, source_id, next_source)?;
+    transaction.commit()?;
+    Ok(SessionBaselineCompletion::Applied { attention_changed })
   }
 
   /// Returns one session, including tombstoned rows when present in the index.
@@ -732,6 +882,12 @@ fn validate_replacement(replacement: &SourceReplacement) -> Result<()> {
         session.key.session_id, replacement.source.key.provider, replacement.source.key.source_key
       )));
     }
+    if session.attention_baselined && session.notify_on_baseline {
+      return Err(SessionIndexError::InvalidReplacement(format!(
+        "session {} cannot notify on an already established attention baseline",
+        session.key.session_id
+      )));
+    }
     if !session_ids.insert(session.key.session_id.as_str()) {
       return Err(SessionIndexError::InvalidReplacement(format!(
         "source contains duplicate session id {}",
@@ -752,6 +908,35 @@ fn validate_replacements(replacements: &[SourceReplacement]) -> Result<()> {
         replacement.source.key.provider, replacement.source.key.source_key
       )));
     }
+  }
+  Ok(())
+}
+
+fn validate_session_baseline_completion(
+  expected_source: &SourceState,
+  next_source: &SourceState,
+  request: &SessionBaselineCompletionRequest,
+) -> Result<()> {
+  if request.key.provider != expected_source.key.provider || request.key.source_key != expected_source.key.source_key {
+    return Err(SessionIndexError::InvalidReplacement(format!(
+      "session {} does not belong to staged source {}/{}",
+      request.key.session_id, expected_source.key.provider, expected_source.key.source_key
+    )));
+  }
+  if next_source.key != expected_source.key {
+    return Err(SessionIndexError::InvalidReplacement(format!(
+      "next source {}/{} does not match staged source {}/{}",
+      next_source.key.provider,
+      next_source.key.source_key,
+      expected_source.key.provider,
+      expected_source.key.source_key
+    )));
+  }
+  if next_source.cursor == expected_source.cursor {
+    return Err(SessionIndexError::InvalidReplacement(format!(
+      "next source cursor for {}/{} must advance beyond the staged cursor",
+      expected_source.key.provider, expected_source.key.source_key
+    )));
   }
   Ok(())
 }
@@ -917,6 +1102,15 @@ struct ExistingSessionAttention {
   seen_attention_revision: i64,
 }
 
+#[derive(Debug)]
+struct PendingSessionCompletion {
+  id: i64,
+  attention_revision: i64,
+  seen_attention_revision: i64,
+  present: bool,
+  attention_baselined: bool,
+}
+
 fn existing_session_attention(
   transaction: &Transaction<'_>,
   source_id: i64,
@@ -940,6 +1134,68 @@ fn existing_session_attention(
     .map_err(Into::into)
 }
 
+fn pending_session_for_completion(
+  transaction: &Transaction<'_>,
+  source_id: i64,
+  session_id: &str,
+) -> Result<Option<PendingSessionCompletion>> {
+  transaction
+    .query_row(
+      "SELECT id, attention_revision, seen_attention_revision, present, attention_baselined
+       FROM sessions
+       WHERE source_id = ?1 AND session_id = ?2",
+      params![source_id, session_id],
+      |row| {
+        Ok(PendingSessionCompletion {
+          id: row.get(0)?,
+          attention_revision: row.get(1)?,
+          seen_attention_revision: row.get(2)?,
+          present: row.get(3)?,
+          attention_baselined: row.get(4)?,
+        })
+      },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn complete_session_attention_baseline(
+  transaction: &Transaction<'_>,
+  id: i64,
+  request: &SessionBaselineCompletionRequest,
+  attention_revision: i64,
+  seen_attention_revision: i64,
+) -> Result<()> {
+  transaction.execute(
+    "UPDATE sessions
+     SET attention_marker = ?2,
+         attention_baselined = 1,
+         notify_on_baseline = 0,
+         attention_revision = ?3,
+         seen_attention_revision = ?4
+     WHERE id = ?1",
+    params![
+      id,
+      request.attention_marker,
+      attention_revision,
+      seen_attention_revision,
+    ],
+  )?;
+  Ok(())
+}
+
+fn advance_source_state(transaction: &Transaction<'_>, source_id: i64, next_source: &SourceState) -> Result<()> {
+  transaction.execute(
+    "UPDATE sources
+     SET cursor = ?2,
+         scanned_at_ms = ?3,
+         updated_at_ms = ?3
+     WHERE id = ?1",
+    params![source_id, next_source.cursor, next_source.scanned_at_ms],
+  )?;
+  Ok(())
+}
+
 fn next_attention_revision(revision: i64) -> Result<i64> {
   revision
     .checked_add(1)
@@ -958,11 +1214,12 @@ fn insert_session(
     "INSERT INTO sessions(
        source_id, session_id, source_path, title, preview, cwd, timestamp,
        updated_at, updated_at_ms, parent_session_id, agent_path, agent_nickname,
-       agent_role, attention_marker, attention_revision, seen_attention_revision,
-       seen_at_ms, present, first_indexed_at_ms, indexed_at_ms
+       agent_role, attention_marker, attention_baselined, notify_on_baseline,
+       attention_revision, seen_attention_revision, seen_at_ms, present,
+       first_indexed_at_ms, indexed_at_ms
      ) VALUES(
        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-       NULL, 1, ?17, ?17
+       ?17, ?18, NULL, 1, ?19, ?19
      )",
     params![
       source_id,
@@ -979,6 +1236,8 @@ fn insert_session(
       session.agent_nickname,
       session.agent_role,
       session.attention_marker,
+      session.attention_baselined,
+      session.notify_on_baseline,
       attention_revision,
       seen_attention_revision,
       indexed_at_ms,
@@ -1009,10 +1268,12 @@ fn update_session(
          agent_nickname = ?11,
          agent_role = ?12,
          attention_marker = ?13,
-         attention_revision = ?14,
-         seen_attention_revision = ?15,
+         attention_baselined = ?14,
+         notify_on_baseline = ?15,
+         attention_revision = ?16,
+         seen_attention_revision = ?17,
          present = 1,
-         indexed_at_ms = ?16
+         indexed_at_ms = ?18
      WHERE id = ?1",
     params![
       id,
@@ -1028,6 +1289,8 @@ fn update_session(
       session.agent_nickname,
       session.agent_role,
       session.attention_marker,
+      session.attention_baselined,
+      session.notify_on_baseline,
       attention_revision,
       seen_attention_revision,
       indexed_at_ms,
@@ -1052,6 +1315,8 @@ const SESSION_COLUMNS: &str = "
   session.agent_nickname,
   session.agent_role,
   session.attention_marker,
+  session.attention_baselined,
+  session.notify_on_baseline,
   session.attention_revision,
   session.seen_attention_revision,
   session.seen_at_ms,
@@ -1095,7 +1360,7 @@ where
 }
 
 fn indexed_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedSession> {
-  let present: i64 = row.get(18)?;
+  let present: i64 = row.get(20)?;
   Ok(IndexedSession {
     key: SessionKey {
       provider: row.get(0)?,
@@ -1114,9 +1379,11 @@ fn indexed_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Indexed
     agent_nickname: row.get(12)?,
     agent_role: row.get(13)?,
     attention_marker: row.get(14)?,
-    attention_revision: row.get(15)?,
-    seen_attention_revision: row.get(16)?,
-    seen_at_ms: row.get(17)?,
+    attention_baselined: row.get(15)?,
+    notify_on_baseline: row.get(16)?,
+    attention_revision: row.get(17)?,
+    seen_attention_revision: row.get(18)?,
+    seen_at_ms: row.get(19)?,
     present: present != 0,
   })
 }
@@ -1171,6 +1438,20 @@ mod tests {
     SourceReplacement::baseline(source(cursor, scanned_at_ms), sessions)
   }
 
+  fn pending_session(id: &str, notify_on_baseline: bool) -> SessionMetadata {
+    let mut session = session(id, None);
+    session.attention_baselined = false;
+    session.notify_on_baseline = notify_on_baseline;
+    session
+  }
+
+  fn completion_request(id: &str, marker: Option<&str>, has_new_attention: bool) -> SessionBaselineCompletionRequest {
+    let mut request =
+      SessionBaselineCompletionRequest::new(SessionKey::new(PROVIDER, SOURCE_KEY, id), marker.map(str::to_owned));
+    request.has_new_attention = has_new_attention;
+    request
+  }
+
   #[test]
   fn creates_and_records_migrations() {
     let directory = tempdir().expect("temporary directory should exist");
@@ -1186,7 +1467,288 @@ mod tests {
       .expect("migration query should run")
       .collect::<rusqlite::Result<_>>()
       .expect("migration rows should decode");
-    assert_eq!(applied, vec![(1, migration_checksum(MIGRATION_001))]);
+    assert_eq!(
+      applied,
+      vec![
+        (1, migration_checksum(MIGRATION_001)),
+        (2, migration_checksum(MIGRATION_002)),
+      ]
+    );
+  }
+
+  #[test]
+  fn migration_preserves_existing_rows_as_completed_non_notifying_baselines() {
+    let directory = tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("session-index.sqlite3");
+    let connection = Connection::open(&path).expect("database should open");
+    connection
+      .pragma_update(None, "application_id", APPLICATION_ID)
+      .expect("database should become index-owned");
+    connection
+      .execute_batch(
+        "CREATE TABLE schema_migrations (
+           version INTEGER PRIMARY KEY,
+           checksum TEXT NOT NULL,
+           applied_at_ms INTEGER NOT NULL
+         );",
+      )
+      .expect("migration ledger should be created");
+    connection
+      .execute_batch(MIGRATION_001)
+      .expect("original schema should be created");
+    connection
+      .execute(
+        "INSERT INTO schema_migrations(version, checksum, applied_at_ms) VALUES(?1, ?2, ?3)",
+        params![1, migration_checksum(MIGRATION_001), 0],
+      )
+      .expect("first migration should be recorded");
+    connection
+      .execute(
+        "INSERT INTO sources(provider, source_key, cursor, scanned_at_ms, created_at_ms, updated_at_ms)
+         VALUES(?1, ?2, ?3, ?4, ?4, ?4)",
+        params![PROVIDER, SOURCE_KEY, "one", 10],
+      )
+      .expect("source should be inserted");
+    connection
+      .execute(
+        "INSERT INTO sessions(
+           source_id, session_id, source_path, attention_revision,
+           seen_attention_revision, present, first_indexed_at_ms, indexed_at_ms
+         ) VALUES(1, ?1, ?2, 0, 0, 1, 10, 10)",
+        params!["a", "/sessions/a.jsonl"],
+      )
+      .expect("old session should be inserted");
+    drop(connection);
+
+    let index = SessionIndex::open(&path).expect("original index should migrate");
+    let indexed = index
+      .session(&SessionKey::new(PROVIDER, SOURCE_KEY, "a"))
+      .expect("session query should work")
+      .expect("migrated session should exist");
+    assert!(indexed.attention_baselined);
+    assert!(!indexed.notify_on_baseline);
+  }
+
+  #[test]
+  fn persists_pending_attention_baseline_state() {
+    let directory = tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("session-index.sqlite3");
+    let mut pending = session("a", None);
+    assert!(pending.attention_baselined);
+    assert!(!pending.notify_on_baseline);
+    pending.attention_baselined = false;
+    pending.notify_on_baseline = true;
+
+    {
+      let index = SessionIndex::open(&path).expect("index should open");
+      index
+        .replace_source(replacement("one", 10, vec![pending]))
+        .expect("pending baseline should be stored");
+    }
+
+    let index = SessionIndex::open(&path).expect("index should reopen");
+    let key = SessionKey::new(PROVIDER, SOURCE_KEY, "a");
+    let stored_pending = index
+      .session(&key)
+      .expect("session query should work")
+      .expect("pending session should exist");
+    assert!(!stored_pending.attention_baselined);
+    assert!(stored_pending.notify_on_baseline);
+
+    let mut completed = session("a", Some("message-a"));
+    completed.attention_baselined = true;
+    completed.notify_on_baseline = false;
+    index
+      .replace_source(replacement("two", 20, vec![completed]))
+      .expect("completed baseline should be stored");
+    let stored_completed = index
+      .session(&key)
+      .expect("session query should work")
+      .expect("completed session should exist");
+    assert!(stored_completed.attention_baselined);
+    assert!(!stored_completed.notify_on_baseline);
+  }
+
+  #[test]
+  fn rejects_notify_on_an_already_established_baseline() {
+    let index = SessionIndex::open_in_memory().expect("index should open");
+    let mut invalid = session("a", None);
+    invalid.notify_on_baseline = true;
+
+    assert!(matches!(
+      index.replace_source(replacement("one", 10, vec![invalid])),
+      Err(SessionIndexError::InvalidReplacement(message))
+        if message.contains("already established attention baseline")
+    ));
+  }
+
+  #[test]
+  fn completing_one_pending_baseline_does_not_touch_siblings_or_increment_twice() {
+    let index = SessionIndex::open_in_memory().expect("index should open");
+    let staged_source = source("catalog-one", 10);
+    let completed_source = source("body-one", 11);
+    let mut cataloged = pending_session("a", true);
+    cataloged.title = Some("new catalog title".to_owned());
+    cataloged.source_path = "/catalog/a.jsonl".to_owned();
+    index
+      .replace_source(SourceReplacement::new(
+        staged_source.clone(),
+        vec![cataloged, pending_session("b", false)],
+      ))
+      .expect("catalog replacement should succeed");
+
+    let first = index
+      .complete_session_baseline(
+        &staged_source,
+        &completed_source,
+        completion_request("a", Some("message-a"), true),
+      )
+      .expect("first completion should run");
+    assert_eq!(
+      first,
+      SessionBaselineCompletion::Applied {
+        attention_changed: true
+      }
+    );
+    assert!(first.was_applied());
+    assert!(first.attention_changed());
+
+    let second = index
+      .complete_session_baseline(
+        &staged_source,
+        &source("body-two", 12),
+        completion_request("a", Some("message-b"), true),
+      )
+      .expect("second completion should run");
+    assert_eq!(second, SessionBaselineCompletion::Stale);
+    assert!(!second.was_applied());
+    assert!(!second.attention_changed());
+
+    let completed = index
+      .session(&SessionKey::new(PROVIDER, SOURCE_KEY, "a"))
+      .expect("session query should work")
+      .expect("completed session should exist");
+    assert!(completed.attention_baselined);
+    assert!(!completed.notify_on_baseline);
+    assert_eq!(completed.title.as_deref(), Some("new catalog title"));
+    assert_eq!(completed.source_path, "/catalog/a.jsonl");
+    assert_eq!(completed.attention_marker.as_deref(), Some("message-a"));
+    assert_eq!(completed.attention_revision, 1);
+    assert!(completed.has_unread());
+
+    let sibling = index
+      .session(&SessionKey::new(PROVIDER, SOURCE_KEY, "b"))
+      .expect("session query should work")
+      .expect("sibling session should remain indexed");
+    assert!(sibling.present);
+    assert!(!sibling.attention_baselined);
+    assert!(!sibling.has_unread());
+    assert_eq!(
+      index
+        .source_state(&staged_source.key)
+        .expect("source query should work"),
+      Some(completed_source)
+    );
+  }
+
+  #[test]
+  fn completing_a_pending_baseline_rejects_another_source_and_stale_cursor() {
+    let index = SessionIndex::open_in_memory().expect("index should open");
+    let staged_source = source("catalog-one", 10);
+    let completed_source = source("body-one", 11);
+    index
+      .replace_source(replacement("catalog-one", 10, vec![pending_session("a", true)]))
+      .expect("catalog replacement should succeed");
+
+    assert!(matches!(
+      index.complete_session_baseline(
+        &staged_source,
+        &staged_source,
+        completion_request("a", Some("message-a"), true),
+      ),
+      Err(SessionIndexError::InvalidReplacement(message)) if message.contains("must advance")
+    ));
+    assert!(matches!(
+      index.complete_session_baseline(
+        &staged_source,
+        &source_for(PROVIDER, "other-source", "body-one", 11),
+        completion_request("a", Some("message-a"), true),
+      ),
+      Err(SessionIndexError::InvalidReplacement(message)) if message.contains("does not match staged source")
+    ));
+
+    let wrong_source = SessionBaselineCompletionRequest::new(
+      SessionKey::new(PROVIDER, "other-source", "a"),
+      Some("message-a".to_owned()),
+    );
+    assert!(matches!(
+      index.complete_session_baseline(&staged_source, &completed_source, wrong_source),
+      Err(SessionIndexError::InvalidReplacement(message))
+        if message.contains("does not belong to staged source")
+    ));
+
+    let stale_source = source("catalog-two", 20);
+    assert_eq!(
+      index
+        .complete_session_baseline(
+          &stale_source,
+          &source("body-two", 21),
+          completion_request("a", Some("message-a"), true),
+        )
+        .expect("stale completion should not fail"),
+      SessionBaselineCompletion::Stale
+    );
+    let pending = index
+      .session(&SessionKey::new(PROVIDER, SOURCE_KEY, "a"))
+      .expect("session query should work")
+      .expect("pending session should remain indexed");
+    assert!(!pending.attention_baselined);
+    assert_eq!(pending.attention_revision, 0);
+  }
+
+  #[test]
+  fn baseline_completion_advancing_cursor_rejects_a_prepared_catalog_replacement() {
+    let directory = tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("session-index.sqlite3");
+    let first = SessionIndex::open(&path).expect("first index should open");
+    let second = SessionIndex::open(&path).expect("second index should open");
+    let staged_source = source("catalog-one", 10);
+    let completed_source = source("body-one", 11);
+    first
+      .replace_source(SourceReplacement::new(
+        staged_source.clone(),
+        vec![pending_session("a", true)],
+      ))
+      .expect("catalog replacement should succeed");
+
+    let prepared_catalog_replacement =
+      SourceReplacement::new(source("catalog-two", 20), vec![pending_session("a", true)])
+        .with_source_cursor_precondition(SourceCursorPrecondition::existing(staged_source.cursor.clone()));
+
+    assert_eq!(
+      first
+        .complete_session_baseline(
+          &staged_source,
+          &completed_source,
+          completion_request("a", Some("message-a"), true),
+        )
+        .expect("completion should succeed"),
+      SessionBaselineCompletion::Applied {
+        attention_changed: true
+      }
+    );
+
+    let error = second
+      .replace_source(prepared_catalog_replacement)
+      .expect_err("catalog replacement prepared at the old cursor must conflict");
+    assert!(matches!(
+      error,
+      SessionIndexError::SourceCursorConflict {
+        source: conflict_source,
+        expected: SourceCursorPrecondition::Exact(Some(expected)),
+        actual: Some(actual),
+      } if conflict_source == staged_source.key && expected == "catalog-one" && actual == "body-one"
+    ));
   }
 
   #[test]

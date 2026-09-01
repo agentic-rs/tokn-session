@@ -90,13 +90,19 @@ Provider storage is resolved as follows:
 - DSH: `$DSH_HOME/sessions`, then the platform home directory's `.dsh/sessions`
   folder.
 
-The app reconciles compact sidebar metadata in the background every 10 seconds.
-Its first complete scan creates a no-dot baseline; later scans show a dot only
-for new unhidden user messages or final assistant replies. A dot on a collapsed
-parent can represent unread activity in a known subagent. The currently open
-timeline refreshes only when that exact session gains such activity. This
-version remains historical and read-only: it has no composer and never mutates
-provider session files.
+The app first commits a complete provider-header catalog to its shared index at
+`~/.tokn/sessions/index.sqlite`, so the sidebar can use the index without
+waiting to read every session body. It then backfills event-derived attention in
+bounded, newest-first batches. Header catalogs refresh every 10 seconds; while
+body work is pending, a body-only pass runs every second without rediscovering
+the whole provider catalog. A row has no dot until its body has finished
+backfilling, except that a relocated row retains an already-unread dot while
+its new path is validated. Sessions first discovered after a provider catalog
+exists can become unread only after that body confirmation finds a new unhidden
+user message or final assistant reply. A dot on a collapsed parent can represent
+unread activity in a known subagent. The currently open timeline refreshes only
+when that exact session gains such activity. This version remains historical and
+read-only: it has no composer and never mutates provider session files.
 
 ## Architecture
 
@@ -108,17 +114,19 @@ cross the IPC boundary. Source errors remain isolated so one unavailable
 provider does not hide sessions from the others.
 
 Session discovery starts with provider headers or catalog rows and deliberately
-does not compute message or event counts. The first complete background scan
-then establishes a shared SQLite sidebar index at `~/.tokn/sessions/index.sqlite`;
-later sidebar/tree queries
-read that index. It retains opaque source checkpoints, session identity/paths,
-bounded title/preview/cwd/timestamp/relationship metadata, and unread
-revisions, but never event records, native payloads, reasoning, tool I/O, or
-full message bodies. Header-only metadata changes update the index without a
-body replay. Each provider's staged source replacements commit atomically, and
-optimistic source-cursor checks prevent another viewer process from replacing a
-newer source snapshot with an older scan. Visible
-untitled rows are then hydrated lazily with a
+does not compute message or event counts. A complete header catalog is committed
+promptly to the shared SQLite sidebar index at `~/.tokn/sessions/index.sqlite`;
+sidebar and tree queries use it immediately. The separate body pass backfills
+attention in bounded newest-first batches; the one-second pending worker reads
+only those selected bodies, while header discovery remains on the 10-second
+catalog cadence. The index retains opaque source checkpoints, session
+identity/paths, bounded title/preview/cwd/timestamp/relationship metadata, and
+unread revisions, but never event records, native payloads, reasoning, tool
+I/O, or full message bodies. Header-only metadata changes update the index
+without a body replay. Catalog and body replacements are staged with optimistic
+source-cursor checks: a body result must still match the catalog snapshot before
+it can replace it, preventing concurrent viewers from publishing stale metadata
+or attention. Visible untitled rows are then hydrated lazily with a
 provider-specific history scan, while a prompt-text search may hydrate
 additional candidates to determine whether they match. Hydrated headers are
 cached by source revision, and overlapping requests share each session's
