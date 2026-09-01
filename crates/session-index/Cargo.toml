@@ -1,0 +1,12 @@
+[package]
+name = "tokn-session-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"

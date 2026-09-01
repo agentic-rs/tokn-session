@@ -92,9 +92,22 @@ Provider storage is resolved as follows:
 - DSH: `$DSH_HOME/sessions`, then the platform home directory's `.dsh/sessions`
   folder.
 
-Restart the app to discover provider changes made after it opened. This first
-version is historical and read-only: it has no composer and never mutates the
-provider session files.
+The app first commits a stable provider-header catalog to its shared index at
+`~/.tokn/sessions/index.sqlite`, so the sidebar can use the index without
+waiting to read every session body. It then backfills event-derived attention in
+bounded, newest-first batches. Header catalogs refresh every 10 seconds; while
+body work is pending, a body-only pass runs every second without rediscovering
+the whole provider catalog. If active source membership changes during a
+catalog pass, the previous catalog remains visible and the app quietly retries;
+mutable titles, previews, and modification times do not become false
+provider-read errors. A row has no dot until its body has finished
+backfilling, except that a relocated row retains an already-unread dot while
+its new path is validated. Sessions first discovered after a provider catalog
+exists can become unread only after that body confirmation finds a new unhidden
+user message or final assistant reply. A dot on a collapsed parent can represent
+unread activity in a known subagent. The currently open timeline refreshes only
+when that exact session gains such activity. This version remains historical and
+read-only: it has no composer and never mutates provider session files.
 
 ## Architecture
 
@@ -106,20 +119,38 @@ cross the IPC boundary. Source errors remain isolated so one unavailable
 provider does not hide sessions from the others.
 
 Session discovery starts with provider headers or catalog rows and deliberately
-does not compute message or event counts. Indexed native titles are returned in
-that cheap pass. Visible untitled rows are then hydrated lazily with a
+does not compute message or event counts. A complete header catalog is committed
+promptly to the shared SQLite sidebar index at `~/.tokn/sessions/index.sqlite`;
+sidebar and tree queries use it immediately. The separate body pass backfills
+attention in bounded newest-first batches; the one-second pending worker reads
+only those selected bodies, while header discovery remains on the 10-second
+catalog cadence. The index retains opaque source checkpoints, session
+identity/paths, bounded title/preview/cwd/timestamp/relationship metadata, and
+unread revisions, but never event records, native payloads, reasoning, tool
+I/O, or full message bodies. Header-only metadata changes update the index
+without a body replay. Catalog and body replacements are staged with optimistic
+source-cursor checks: a body result must still match the catalog snapshot before
+it can replace it, preventing concurrent viewers from publishing stale metadata
+or attention. Visible untitled rows are then hydrated lazily with a
 provider-specific history scan, while a prompt-text search may hydrate
 additional candidates to determine whether they match. Hydrated headers are
 cached by source revision, and overlapping requests share each session's
 in-flight scan. Codex can also
 read title metadata from its optional private `state_5.sqlite` in read-only
 mode; rows are correlated by both thread id and rollout path, and incompatible
-or unavailable private state fails softly. The selected session's normalized
+or unavailable private state fails softly. Known Codex subagents intentionally
+ignore title and preview fields inherited from their parent in that private
+state; their agent nickname, role, or path becomes the row label instead. The
+selected session's normalized
 event count arrives with its first event page. Root, direct-subagent, and event
 responses are listed in bounded pages. Direct-subagent pages resolve edges only
 within one provider, canonicalize duplicate provider IDs by newest provider
 timestamp (then path), and keep missing-parent or cyclic records visible rather
 than hiding them.
+
+The index keeps source identity normalized in `sources`. Its read-only
+`indexed_sessions` SQLite view joins `provider` and `source_key` onto every
+session row for diagnostics without duplicating those fields in storage.
 Conversational Markdown previews are capped before IPC,
 tool-card fields are also capped, and full event detail is loaded only when
 requested. Inline tool output keeps at most 64 KiB using a head-and-tail preview;
@@ -127,9 +158,11 @@ the full normalized and native inspector representations retain their separate
 512 KiB limits. The backend keeps at most one normalized session snapshot and
 reuses it across page and inspector requests while the source revision is
 unchanged; OpenCode and ZCode revision checks include their SQLite WAL
-sidecars. The current provider readers may still load an entire selected session before
-producing an event page, so paging does not yet bound parser memory for very
-large histories.
+sidecars.
+The independent durable index checkpoint uses the database and WAL but excludes
+the reader-writable SHM file. The current provider readers may still load an
+entire selected session before producing an event page, so paging does not yet
+bound parser memory for very large histories.
 Trajectory items are a viewer presentation projection over that normalized
 timeline: user prompts, final assistant replies, their terminal bookkeeping,
 and hidden-event boundaries remain outside the item, while intermediate

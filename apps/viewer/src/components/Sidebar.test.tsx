@@ -25,6 +25,7 @@ function session(overrides: Partial<SessionSummary> = {}): SessionSummary {
     message_count: null,
     event_count: null,
     history_status: null,
+    has_unread: false,
     ...overrides,
   };
 }
@@ -201,5 +202,91 @@ describe("Sidebar session identity", () => {
     expect(childRow).toHaveTextContent("/root/researcher");
     fireEvent.click(childRow);
     expect(onSessionSelect).toHaveBeenCalledWith(child.session_key);
+  });
+});
+
+describe("Sidebar unread activity", () => {
+  it("renders an accessible indicator for a directly unread session", () => {
+    const unread = session({
+      session_key: "codex:unread",
+      session_id: "unread-0000",
+      title: "Needs attention",
+      has_unread: true,
+    });
+
+    renderSidebar([unread]);
+
+    const row = screen.getByRole("button", {
+      name: "Needs attention, Codex session unread-0000, unread updates",
+    });
+    const dot = within(row).getByRole("img", { name: "Unread updates" });
+
+    expect(row).toHaveAttribute("data-unread", "true");
+    expect(dot).toHaveClass("session-row__unread-dot");
+    expect(dot).toHaveAttribute("data-unread-source", "direct");
+  });
+
+  it("renders unread indicators on a parent and its loaded unread subagent", () => {
+    const parent = session({
+      session_key: "codex:parent",
+      session_id: "parent-0000",
+      title: "Root task",
+      child_count: 1,
+      has_unread_descendant: true,
+    });
+    const child = session({
+      session_key: "codex:child",
+      session_id: "child-0000",
+      parent_session_id: parent.session_id,
+      is_subagent: true,
+      agent_nickname: "Hubble",
+      has_unread: true,
+    });
+
+    render(
+      <Sidebar
+        enabled_providers={new Set(["codex"])}
+        error={null}
+        has_more={false}
+        is_loading={false}
+        is_loading_more={false}
+        on_children_load={vi.fn()}
+        on_children_load_more={vi.fn()}
+        on_children_retry={vi.fn()}
+        on_load_more={vi.fn()}
+        on_provider_toggle={vi.fn()}
+        on_retry={vi.fn()}
+        on_search_change={vi.fn()}
+        on_session_select={vi.fn()}
+        search=""
+        session_children={new Map([[
+          parent.session_key,
+          {
+            sessions: [child],
+            next_cursor: null,
+            is_loading: false,
+            is_loading_more: false,
+            error: null,
+          },
+        ]])}
+        selected_session_key={null}
+        sessions={[parent]}
+        source_errors={[]}
+      />,
+    );
+
+    const parentRow = screen.getByRole("button", {
+      name: "Root task, Codex session parent-0000, unread updates in a subagent",
+    });
+    expect(within(parentRow).getByRole("img", { name: "Unread updates in a subagent" }))
+      .toHaveAttribute("data-unread-source", "descendant");
+
+    fireEvent.click(screen.getByRole("button", { name: "Show 1 subagent for Root task" }));
+
+    const childRow = screen.getByRole("button", {
+      name: "subagent Hubble, Codex session child-0000, unread updates",
+    });
+    expect(within(childRow).getByRole("img", { name: "Unread updates" }))
+      .toHaveAttribute("data-unread-source", "direct");
   });
 });

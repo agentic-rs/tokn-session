@@ -323,6 +323,15 @@ fn read_state_metadata(
 }
 
 fn apply_indexed_metadata_to_reference(reference: &mut SessionRef, metadata: &IndexedSessionMetadata) {
+  // Codex Desktop currently carries a parent thread's title, preview, and
+  // first user message into rows it creates for subagents. Those fields do not
+  // identify the child's work and make a session tree look like duplicated
+  // root conversations. The rollout header already gives us an explicit
+  // parent relationship and agent identity, so keep child presentation empty
+  // and let consumers use that identity instead.
+  if reference.parent_session_id.is_some() {
+    return;
+  }
   let state_matches = metadata
     .rollout_path
     .as_deref()
@@ -882,7 +891,7 @@ mod tests {
       Some("Latest name")
     );
 
-    let mut matching_reference = session_reference("matched", matched_rollout);
+    let mut matching_reference = session_reference("matched", matched_rollout.clone());
     apply_indexed_metadata_to_reference(&mut matching_reference, matched);
     assert_eq!(matching_reference.title.as_deref(), Some("Explicit   name"));
     assert_eq!(matching_reference.preview.as_deref(), Some("first\nrequest"));
@@ -891,6 +900,15 @@ mod tests {
     apply_indexed_metadata_to_reference(&mut duplicate_reference, matched);
     assert_eq!(duplicate_reference.title, None);
     assert_eq!(duplicate_reference.preview, None);
+
+    let mut child_reference = session_reference("matched", directory.path().join("child.jsonl"));
+    child_reference.parent_session_id = Some("root".to_string());
+    child_reference.agent_nickname = Some("Hubble".to_string());
+    child_reference.path = matched_rollout;
+    apply_indexed_metadata_to_reference(&mut child_reference, matched);
+    assert_eq!(child_reference.title, None);
+    assert_eq!(child_reference.preview, None);
+    assert_eq!(child_reference.agent_nickname.as_deref(), Some("Hubble"));
   }
 
   #[test]

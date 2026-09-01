@@ -11,6 +11,7 @@ members = [
   "crates/zcode",
   "crates/dsh-protocol",
   "crates/dsh",
+  "crates/session-index",
   "crates/client",
   "crates/render",
   "crates/cli",
@@ -46,4 +47,5 @@ tokn-session-pi = { path = "crates/pi" }
 tokn-session-zcode = { path = "crates/zcode" }
 tokn-session-relay = { path = "crates/relay" }
 tokn-session-render = { path = "crates/render" }
+tokn-session-index = { path = "crates/session-index" }
 zeromq = "0.6.0"

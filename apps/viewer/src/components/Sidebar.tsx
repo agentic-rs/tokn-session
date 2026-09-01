@@ -76,6 +76,10 @@ function SessionBranch({
   const relationship = depth > 0 ? subagentDetail(session) : null;
   const title = sessionDisplayTitle(session);
   const sessionDescription = depth > 0 ? `subagent ${title}` : title;
+  const hasUnread = session.has_unread || session.has_unread_descendant === true;
+  const unreadLabel = session.has_unread
+    ? "Unread updates"
+    : "Unread updates in a subagent";
 
   useEffect(() => {
     if (hasChildren && isExpanded && !childrenState) {
@@ -101,16 +105,25 @@ function SessionBranch({
         )}
         <button
           aria-current={session.session_key === selected_session_key ? "page" : undefined}
-          aria-label={`${sessionDescription}, ${providerLabel(session.provider)} session ${session.session_id}`}
+          aria-label={`${sessionDescription}, ${providerLabel(session.provider)} session ${session.session_id}${hasUnread ? `, ${unreadLabel.toLowerCase()}` : ""}`}
           className="session-row"
           data-selected={session.session_key === selected_session_key}
           data-subagent={depth > 0}
+          data-unread={hasUnread || undefined}
           onClick={() => on_session_select(session.session_key)}
           title={`${title}\n${session.session_id}`}
           type="button"
         >
           <span className="provider-avatar" data-provider={session.provider}>
             {providerLabel(session.provider).slice(0, 1)}
+            {hasUnread ? (
+              <span
+                aria-label={unreadLabel}
+                className="session-row__unread-dot"
+                data-unread-source={session.has_unread ? "direct" : "descendant"}
+                role="img"
+              />
+            ) : null}
           </span>
           <span className="session-row__body">
             <span className="session-row__title">{title}</span>

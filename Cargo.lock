@@ -4145,6 +4145,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokn-session-index"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "tempfile",
+]
+
+[[package]]
 name = "tokn-session-opencode"
 version = "0.1.0"
 dependencies = [
@@ -4198,13 +4206,16 @@ name = "tokn-session-viewer"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "dirs",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tempfile",
+ "tokio",
  "tokn-session-client",
  "tokn-session-core",
+ "tokn-session-index",
  "tokn-session-render",
 ]
 

@@ -328,16 +328,67 @@ output or depend on Relay. The frontend receives source-neutral snake-case
 DTOs with opaque, source-aware session keys. Session and event pages keep IPC
 responses bounded, including tool-card command and query fields, while expanded
 native event detail and inline tool output are fetched lazily and hidden Pi
-content stays redacted. Sidebar discovery uses
-`AgentClient::list_session_headers`, which reads file headers or OpenCode
-catalog rows without computing conversation counts. Indexed native titles are
-available during that cheap pass. The viewer lazily hydrates visible untitled
+content stays redacted.
+
+The viewer owns a SQLite index at `~/.tokn/sessions/index.sqlite`. It stores
+opaque source checkpoints; source/session identity and paths; bounded sidebar
+metadata (title, preview, cwd, timestamps, parent, and agent labels); and
+opaque attention markers/revisions. It never stores normalized event records,
+provider-native payloads, reasoning, tool input/output, or full message bodies.
+Title and preview are retained presentation text, and a preview can derive from
+a user prompt, so index-only does not mean zero textual metadata. A successful
+stable header pass commits the provider catalog immediately, so sidebar and
+tree IPC read durable index rows without waiting for every session body. Native
+headers remain a fail-soft fallback. The viewer lazily hydrates visible untitled
 rows with a provider-specific history scan; prompt-text searches may hydrate
 additional candidates to determine whether they match. Hydrated metadata is
 cached by source revision, and per-session in-flight gates prevent overlapping
 searches from repeating the same scan. The selected session's normalized
 `total_events` arrives with its first event page. The existing CLI continues to
 use the counted `list_sessions` API.
+
+`sources` remains the normalized owner of `provider` and `source_key`.
+`indexed_sessions` is a read-only SQLite view that joins those fields onto every
+session row for diagnostics and future read-only consumers.
+
+After cataloging, reconciliation backfills bodies and attention in bounded
+newest-first batches. The full header catalog stays on a 10-second cadence;
+while any row remains unbaselined, a one-second body-only pass advances the next
+batch without rediscovering the whole provider. A membership or source-revision
+race during a catalog pass keeps the prior rows visible and makes up to two
+one-second full-catalog retries before returning to the normal cadence; mutable
+title, preview, and modification-time changes are intentionally not catalog
+races. A newly cataloged row never
+shows a dot before its body finishes, except a relocated row that retains an
+existing unread state while its new path is validated. The initial catalog
+establishes no unread attention; a session first discovered after that catalog
+can become unread only after its body confirms a new, unhidden User message or
+Final Assistant reply. Later body refreshes mark only those eligible message
+additions; commentary/non-final assistant updates, tools, reasoning, and
+metadata never produce attention. The marker is an eligible-message count
+rather than content or IDs, so history reductions and same-count rewrites
+intentionally do not dot. Direct child attention aggregates onto collapsed
+canonical ancestors without making the parent itself unread. A newest event
+page acknowledges only the opaque revision it actually captured after React
+commits it; a concurrent later revision remains unread. A refresh reloads the
+current timeline only when that exact session is named as newly attentive, so
+unrelated indexing cannot disturb an expanded timeline.
+
+An index cursor is an opaque source revision, not a byte offset or event-page
+cursor. File-backed sources use a metadata fingerprint; OpenCode uses its
+database and WAL, deliberately excluding its reader-writable SHM file. A
+header-only metadata change is written without replaying an unchanged session
+body, preserving its attention state. The catalog pass and its later body pass
+both carry optimistic source-cursor preconditions: the body result must still
+match the catalog snapshot before it can commit. Catalog source replacements
+commit atomically, and these staged checks prevent concurrent viewers from
+overwriting a newer catalog or attention snapshot with stale work. A failed or
+racing scan retains the last good index rows; actual provider read failures
+report an isolated warning, while ordinary catalog races retry quietly. Warning
+changes refresh the sidebar too. When a session file moves
+between sources, a staged target preserves any existing unread state until its
+body validation succeeds, so a transient archive read failure cannot clear a
+dot.
 
 Session rows prefer a non-placeholder provider title, then the first meaningful
 user-prompt preview, then a child agent nickname, role, or path, and finally
@@ -352,8 +403,10 @@ Event paging currently bounds the data sent across IPC, not all source-reader
 memory: a provider parser may still load the full selected session before
 producing a page. A one-entry normalized-session cache avoids reparsing between
 page and inspector requests and invalidates on source revision changes,
-including OpenCode's SQLite WAL/SHM sidecars. Live filesystem invalidation and
-authoritative incremental parsing are follow-up work. Each normalized and
+including OpenCode's SQLite WAL/SHM sidecars. This cache is separate from the
+durable sidebar index checkpoint, which tracks OpenCode's database/WAL only.
+Periodic sidebar reconciliation exists; native filesystem invalidation and
+authoritative incremental parsing remain follow-up work. Each normalized and
 provider-native inspector representation is capped at 512 KiB before IPC;
 oversized values are replaced by structured JSON truncation metadata. A full,
 uncapped export path is not implemented yet.
@@ -432,6 +485,13 @@ bounded rollout scan as fallbacks. Its state location follows `config.toml`
 session title column, filters strict generated `New session` and `Child session`
 placeholders, and lazily queries the first user text or subtask when needed.
 ZCode uses the same title behavior.
+
+Codex Desktop can copy a root thread's state-db title, preview, and first user
+message into each subagent row. The Codex adapter intentionally ignores those
+private-state presentation fields for sessions with `parent_thread_id`; the
+viewer then labels the child from its nickname, role, or agent path. A selected
+child can still hydrate an owned post-boundary preview without writing that
+body-derived text into the durable index.
 
 Relationship metadata still includes optional `parent_session_id`,
 `agent_path`, `agent_nickname`, and `agent_role`. Codex takes owning identity
@@ -685,8 +745,12 @@ OpenCode has the first live-output normalizer: `OpenCodeLiveNormalizer` parses `
   delivery acknowledgement; subscribers that are disconnected can miss events.
 - The terminal pet cannot distinguish every runtime state authoritatively until
   provider task lifecycle and interaction events are represented in `AgentEvent`.
-- The desktop viewer is historical and read-only. It does not yet refresh when
-  provider storage changes while the app is open.
+- The desktop viewer remains historical and read-only. Sidebar and a matching
+  selected timeline refresh through polling, not provider live streams, native
+  watchers, or authoritative incremental parsing.
+- Viewer session-file relocation is deliberately conservative. Repeated or
+  overlapping moves can make the retired source ambiguous, in which case the
+  later path is treated as a new row instead of transferring prior attention.
 
 ## Useful Smokes
 
@@ -720,7 +784,7 @@ cd apps/viewer && pnpm tauri dev
 - Decide whether live stream consumption should live in `client` as callbacks/iterators or in the CLI command path.
 - Extend provider fixture coverage with OpenCode SQLite normalization.
 - Add CLI golden tests for tiny fixture-backed `list` and `show` outputs.
-- Add live storage invalidation and incremental source paging to the desktop
+- Add native storage invalidation and incremental source paging to the desktop
   viewer after the historical read-only surface stabilizes.
 - Map Codex lifecycle next and teach terminal pet to use authoritative lifecycle
   instead of heuristics. Pi live boundaries require a bridge feature; do not

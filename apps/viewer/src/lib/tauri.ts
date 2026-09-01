@@ -1,5 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AcknowledgeSessionAttentionRequest,
+  AcknowledgeSessionAttentionResponse,
   EventPageResponse,
   ListSessionChildrenRequest,
   ListSessionChildrenResponse,
@@ -9,6 +12,7 @@ import type {
   EventDetail,
   LoadEventPageRequest,
   LoadTrajectoryEventPageRequest,
+  SessionIndexChangedEvent,
   TrajectoryEventPageResponse,
 } from "./types";
 
@@ -34,4 +38,25 @@ export function loadTrajectoryEventPage(
 
 export function loadEventDetail(request: LoadEventDetailRequest): Promise<EventDetail> {
   return invoke<EventDetail>("load_event_detail", { request });
+}
+
+/**
+ * Advances the local seen cursor only through the attention revision that was
+ * included in an event page the UI actually accepted.
+ */
+export function acknowledgeSessionAttention(
+  request: AcknowledgeSessionAttentionRequest,
+): Promise<AcknowledgeSessionAttentionResponse> {
+  return invoke<AcknowledgeSessionAttentionResponse>("acknowledge_session_attention", { request });
+}
+
+/**
+ * The backend emits this after committing a background index refresh. Keeping
+ * the subscription here makes the React state hook testable without exposing
+ * Tauri event details throughout the UI.
+ */
+export function listenForSessionIndexChanges(
+  handler: (change: SessionIndexChangedEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<SessionIndexChangedEvent>("session-index-changed", (event) => handler(event.payload));
 }
