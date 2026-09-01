@@ -65,6 +65,9 @@ impl SessionTailer {
     if roots.iter().any(|root| matches!(root.provider, Provider::Dsh)) {
       return Err("dsh relay watching is not implemented; use historical list/show".into());
     }
+    if roots.iter().any(|root| matches!(root.provider, Provider::ZCode)) {
+      return Err("zcode relay watching is not implemented; use historical list/show".into());
+    }
     let (project_catalog, project_catalog_source, project_catalog_warning) = load_project_catalog(&roots);
     let project_catalog = Arc::new(RwLock::new(project_catalog));
     let mut tailer = Self {
@@ -702,7 +705,9 @@ impl SessionNormalizer {
     match provider {
       Provider::Codex => Self::Codex(CodexNormalizer::new()),
       Provider::Pi => Self::Pi(PiNormalizer::new()),
-      Provider::OpenCode | Provider::Dsh => unreachable!("provider is not supported by the JSONL tailer"),
+      Provider::OpenCode | Provider::ZCode | Provider::Dsh => {
+        unreachable!("provider is not supported by the JSONL tailer")
+      }
     }
   }
 
@@ -820,6 +825,7 @@ fn provider_name(provider: Provider) -> &'static str {
     Provider::Codex => "codex",
     Provider::Pi => "pi",
     Provider::OpenCode => "opencode",
+    Provider::ZCode => "zcode",
     Provider::Dsh => "dsh",
   }
 }

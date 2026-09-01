@@ -63,8 +63,11 @@ pub(crate) fn append_session(request: AppendSessionRequest) -> Result<(), String
 }
 
 fn run_print_session(request: PrintSessionRequest) -> Result<(), String> {
-  if request.source == Source::Dsh {
-    return Err("dsh currently supports historical list/show/browse only; create/append are not implemented".into());
+  if matches!(request.source, Source::Dsh | Source::ZCode) {
+    return Err(format!(
+      "{} currently supports historical list/show/browse only; create/append are not implemented",
+      request.source.as_str()
+    ));
   }
   let executor = request
     .executor
@@ -101,6 +104,7 @@ fn print_args(source: Source, action: &PrintAction) -> Result<Vec<String>, Strin
     Source::Pi => pi_print_args(action),
     Source::Codex => codex_print_args(action),
     Source::OpenCode => opencode_print_args(action),
+    Source::ZCode => return Err("zcode create/append are not implemented".into()),
   })
 }
 
@@ -262,7 +266,7 @@ fn split_command_line(input: &str) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
-  use super::{PrintAction, print_argv, split_command_line};
+  use super::{PrintAction, print_args, print_argv, split_command_line};
   use crate::Source;
 
   #[test]
@@ -372,5 +376,18 @@ mod tests {
     .unwrap();
 
     assert_eq!(args, vec!["custom-agent", "--message", "create a todo app"]);
+  }
+
+  #[test]
+  fn zcode_print_mode_is_explicitly_unsupported() {
+    let error = print_args(
+      Source::ZCode,
+      &PrintAction::Create {
+        prompt: "create a todo app".to_string(),
+      },
+    )
+    .expect_err("zcode is historical-only");
+
+    assert_eq!(error, "zcode create/append are not implemented");
   }
 }

@@ -7,6 +7,7 @@ use tokn_session_core::{LoadedSession, LoadedSessionTree, SessionHeader, Session
 use tokn_session_dsh::DshSessionSource;
 use tokn_session_opencode::OpenCodeSessionSource;
 use tokn_session_pi::PiSessionSource;
+use tokn_session_zcode::ZCodeSessionSource;
 
 use crate::Source;
 
@@ -15,6 +16,7 @@ pub(crate) enum SessionSourceClient {
   Codex(CodexSessionSource),
   OpenCode(OpenCodeSessionSource),
   Pi(PiSessionSource),
+  ZCode(ZCodeSessionSource),
 }
 
 impl SessionSourceClient {
@@ -24,6 +26,7 @@ impl SessionSourceClient {
       Self::Codex(source) => file_headers(source.list_session_relations()?),
       Self::OpenCode(source) => source.list_session_headers()?,
       Self::Pi(source) => file_headers(source.list_session_relations()?),
+      Self::ZCode(source) => source.list_session_headers()?,
     };
     headers.sort_by(|left, right| {
       right
@@ -42,6 +45,7 @@ impl SessionSourceClient {
       Self::Codex(source) => source.list_sessions(),
       Self::OpenCode(source) => source.list_sessions(),
       Self::Pi(source) => source.list_sessions(),
+      Self::ZCode(source) => source.list_sessions(),
     }
   }
 
@@ -51,6 +55,7 @@ impl SessionSourceClient {
       Self::Codex(source) => source.hydrate_session_header(header),
       Self::OpenCode(source) => source.hydrate_session_header(header),
       Self::Pi(source) => source.hydrate_session_header(header),
+      Self::ZCode(source) => source.hydrate_session_header(header),
     }
   }
 
@@ -60,6 +65,7 @@ impl SessionSourceClient {
       Self::Codex(source) => source.list_session_relations(),
       Self::OpenCode(source) => source.list_session_relations(),
       Self::Pi(source) => source.list_session_relations(),
+      Self::ZCode(source) => source.list_session_relations(),
     }
   }
 
@@ -69,6 +75,7 @@ impl SessionSourceClient {
       Self::Codex(source) => source.load_session(session),
       Self::OpenCode(source) => source.load_session(session),
       Self::Pi(source) => source.load_session(session),
+      Self::ZCode(source) => source.load_session(session),
     }
   }
 
@@ -80,6 +87,9 @@ impl SessionSourceClient {
         Err("opencode sessions are stored in sqlite; pass a session id and use --session-dir for the database".into())
       }
       Self::Pi(source) => source.load_session_path(path),
+      Self::ZCode(_) => {
+        Err("zcode sessions are stored in sqlite; pass a session id and use --session-dir for the database".into())
+      }
     }
   }
 
@@ -136,6 +146,7 @@ impl SessionSourceClient {
       Self::Codex(source) => source.load_session_path(&reference.path),
       Self::OpenCode(source) => source.load_session_exact(&reference.id),
       Self::Pi(source) => source.load_session_path(&reference.path),
+      Self::ZCode(source) => source.load_session_exact(&reference.id),
     }
   }
 }
@@ -178,5 +189,6 @@ pub(crate) fn session_source(source: Source, session_dir: Option<PathBuf>) -> Re
     Source::Pi => Ok(SessionSourceClient::Pi(PiSessionSource::new(session_dir))),
     Source::Codex => Ok(SessionSourceClient::Codex(CodexSessionSource::new(session_dir))),
     Source::OpenCode => Ok(SessionSourceClient::OpenCode(OpenCodeSessionSource::new(session_dir))),
+    Source::ZCode => Ok(SessionSourceClient::ZCode(ZCodeSessionSource::new(session_dir))),
   }
 }

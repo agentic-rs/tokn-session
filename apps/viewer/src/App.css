@@ -24,6 +24,7 @@
   --codex: #4e806a;
   --pi: #8067c7;
   --opencode: #437ca3;
+  --zcode: #8a6b2f;
   --dsh: #b46d36;
   --reasoning: #8067c7;
   --usage: #967229;
@@ -52,6 +53,7 @@
     --codex: #68a389;
     --pi: #9c89dd;
     --opencode: #68a0c8;
+    --zcode: #c59b4d;
     --dsh: #d28a51;
     --reasoning: #9c89dd;
     --usage: #d1a65d;
@@ -328,6 +330,11 @@ button:disabled {
   color: var(--opencode);
 }
 
+[data-provider="zcode"] .provider-dot,
+.provider-filter[data-provider="zcode"] .provider-dot {
+  color: var(--zcode);
+}
+
 [data-provider="dsh"] .provider-dot,
 .provider-filter[data-provider="dsh"] .provider-dot {
   color: var(--dsh);
@@ -584,6 +591,10 @@ button:disabled {
   background: var(--opencode);
 }
 
+.provider-avatar[data-provider="zcode"] {
+  background: var(--zcode);
+}
+
 .provider-avatar[data-provider="dsh"] {
   background: var(--dsh);
 }
@@ -792,6 +803,10 @@ button:disabled {
 
 .provider-badge[data-provider="opencode"] {
   color: var(--opencode);
+}
+
+.provider-badge[data-provider="zcode"] {
+  color: var(--zcode);
 }
 
 .provider-badge[data-provider="dsh"] {

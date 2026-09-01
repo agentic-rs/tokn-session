@@ -4,6 +4,7 @@ pub enum Source {
   Pi,
   Codex,
   OpenCode,
+  ZCode,
 }
 
 impl Source {
@@ -13,6 +14,7 @@ impl Source {
       Self::Pi => "pi",
       Self::Codex => "codex",
       Self::OpenCode => "opencode",
+      Self::ZCode => "zcode",
     }
   }
 }

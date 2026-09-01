@@ -70,7 +70,7 @@ impl SessionContext {
     match self.provider {
       Provider::Codex => self.update_codex(value),
       Provider::Pi => self.update_pi(value),
-      Provider::OpenCode | Provider::Dsh => {}
+      Provider::OpenCode | Provider::ZCode | Provider::Dsh => {}
     }
   }
 

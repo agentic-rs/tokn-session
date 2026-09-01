@@ -1,13 +1,14 @@
-use crate::row::{OpenCodeMessageRow, OpenCodePartRow, OpenCodeSessionRow};
+use crate::row::{OpenCodeMessageRow, OpenCodePartRow, OpenCodeSessionEntryRow, OpenCodeSessionRow};
 use serde_json::{Value, json};
 use tokn_opencode_protocol::v1::{MessageItem, PartItem, TokenUsage, ToolState, ToolStateItem};
 use tokn_session_core::{
-  AgentEvent, ErrorEvent, MessageDelivery, MessageEvent, Phase, Provider, ProviderChanged, ReasoningEvent, Role,
-  SessionStarted, ToolCallEvent, ToolRecordKind, ToolTransport, UnknownEvent, UsageEvent, UsageKind,
-  tool_kind_for_optional_name, tool_summary_for_io,
+  AgentEvent, ErrorEvent, MessageDelivery, MessageEvent, MessageProvenance, MetadataEvent, MetadataKind, Phase,
+  Provider, ProviderChanged, ReasoningEvent, Role, SessionStarted, ToolCallEvent, ToolRecordKind, ToolTransport,
+  UnknownEvent, UsageEvent, UsageKind, tool_kind_for_optional_name, tool_summary_for_io,
 };
 
 pub struct OpenCodeNormalizer {
+  provider: Provider,
   session_id: String,
   current_provider: Option<String>,
   current_model: Option<String>,
@@ -15,7 +16,12 @@ pub struct OpenCodeNormalizer {
 
 impl OpenCodeNormalizer {
   pub fn new(session_id: String) -> Self {
+    Self::with_provider(session_id, Provider::OpenCode)
+  }
+
+  pub(crate) fn with_provider(session_id: String, provider: Provider) -> Self {
     Self {
+      provider,
       session_id,
       current_provider: None,
       current_model: None,
@@ -24,7 +30,7 @@ impl OpenCodeNormalizer {
 
   pub fn normalize_session(&mut self, row: &OpenCodeSessionRow) -> Vec<AgentEvent> {
     let mut events = vec![AgentEvent::SessionStarted(SessionStarted {
-      provider: Provider::OpenCode,
+      provider: self.provider,
       session_id: row.id.clone(),
       cwd: row.directory.clone(),
       timestamp: timestamp(row.time_created),
@@ -36,7 +42,7 @@ impl OpenCodeNormalizer {
       self.current_provider = model.provider_id.clone();
       self.current_model = model.id.clone();
       events.push(AgentEvent::ProviderChanged(ProviderChanged {
-        provider: Provider::OpenCode,
+        provider: self.provider,
         session_id: Some(row.id.clone()),
         native_id: None,
         native_parent_id: None,
@@ -60,15 +66,16 @@ impl OpenCodeNormalizer {
     let (message, native) = data.into_parts();
     let mut events = self.normalize_model(&message, &native, time_created);
     let parent_id = string_field(&native, "parentID");
+    let provenance = message_provenance(self.provider, &native);
 
     match message {
       MessageItem::User(_) => {
-        events.extend(self.text_message(id, parent_id, Role::User, time_created, parts));
+        events.extend(self.text_message(id, parent_id, Role::User, provenance, time_created, parts));
       }
       MessageItem::Assistant(message) => {
         if let Some(error) = message.error {
           events.push(AgentEvent::Error(ErrorEvent {
-            provider: Provider::OpenCode,
+            provider: self.provider,
             session_id: Some(self.session_id.clone()),
             message: error_message(error),
             timestamp: timestamp(time_created),
@@ -80,21 +87,22 @@ impl OpenCodeNormalizer {
           time_created,
           message.tokens.as_ref(),
           &native,
+          provenance,
           true,
           parts,
         ));
       }
       MessageItem::Unknown(item) if item.native_type.as_deref() == Some("system") => {
-        events.extend(self.text_message(id, parent_id, Role::System, time_created, parts));
+        events.extend(self.text_message(id, parent_id, Role::System, provenance, time_created, parts));
       }
       MessageItem::Unknown(item) if item.native_type.as_deref() == Some("user") => {
-        events.extend(self.text_message(id, parent_id, Role::User, time_created, parts));
+        events.extend(self.text_message(id, parent_id, Role::User, provenance, time_created, parts));
         events.push(self.unknown_message(item, time_created));
       }
       MessageItem::Unknown(item) if item.native_type.as_deref() == Some("assistant") => {
         if let Some(error) = item.native.get("error").filter(|error| !error.is_null()).cloned() {
           events.push(AgentEvent::Error(ErrorEvent {
-            provider: Provider::OpenCode,
+            provider: self.provider,
             session_id: Some(self.session_id.clone()),
             message: error_message(error),
             timestamp: timestamp(time_created),
@@ -107,6 +115,7 @@ impl OpenCodeNormalizer {
           time_created,
           recovered_tokens.as_ref(),
           &native,
+          provenance,
           false,
           parts,
         ));
@@ -120,8 +129,86 @@ impl OpenCodeNormalizer {
     events
   }
 
+  pub(crate) fn normalize_session_entry(&mut self, row: OpenCodeSessionEntryRow) -> AgentEvent {
+    let OpenCodeSessionEntryRow {
+      id,
+      native_type,
+      time_created,
+      data,
+    } = row;
+    let native = json!({
+      "id": id,
+      "type": native_type,
+      "data": data,
+    });
+
+    match native_type.as_str() {
+      "runtime/model_selection" => {
+        let provider_id = string_field(&data, "providerId");
+        let model_id = string_field(&data, "modelId");
+        let thinking_level = string_field(&data, "thoughtLevel");
+        if provider_id.is_none() && model_id.is_none() {
+          return unknown_event(
+            self.provider,
+            Some(self.session_id.clone()),
+            Some(native_type),
+            Some(native),
+            timestamp(time_created),
+          );
+        }
+        self.current_provider.clone_from(&provider_id);
+        self.current_model.clone_from(&model_id);
+        AgentEvent::ProviderChanged(ProviderChanged {
+          provider: self.provider,
+          session_id: Some(self.session_id.clone()),
+          native_id: Some(id),
+          native_parent_id: None,
+          model_provider: provider_id,
+          model_id,
+          thinking_level,
+          timestamp: timestamp(time_created),
+        })
+      }
+      "runtime/bash_shell_selection" => AgentEvent::Metadata(MetadataEvent {
+        provider: self.provider,
+        session_id: Some(self.session_id.clone()),
+        kind: MetadataKind::Configuration,
+        native_type,
+        summary: "bash shell selection".to_string(),
+        native,
+        timestamp: timestamp(time_created),
+      }),
+      "runtime/workspace_checkpoint" => AgentEvent::Metadata(MetadataEvent {
+        provider: self.provider,
+        session_id: Some(self.session_id.clone()),
+        kind: MetadataKind::Context,
+        native_type,
+        summary: "workspace checkpoint".to_string(),
+        native,
+        timestamp: timestamp(time_created),
+      }),
+      "runtime/user_input_auto_resolution" => AgentEvent::Metadata(MetadataEvent {
+        provider: self.provider,
+        session_id: Some(self.session_id.clone()),
+        kind: MetadataKind::Diagnostic,
+        native_type,
+        summary: "user input auto-resolution".to_string(),
+        native,
+        timestamp: timestamp(time_created),
+      }),
+      _ => unknown_event(
+        self.provider,
+        Some(self.session_id.clone()),
+        Some(native_type),
+        Some(native),
+        timestamp(time_created),
+      ),
+    }
+  }
+
   fn unknown_message(&self, item: tokn_opencode_protocol::UnknownItem, time_created: Option<i64>) -> AgentEvent {
     unknown_event(
+      self.provider,
       Some(self.session_id.clone()),
       item
         .native_type
@@ -138,6 +225,7 @@ impl OpenCodeNormalizer {
     message_id: String,
     parent_id: Option<String>,
     role: Role,
+    provenance: Option<MessageProvenance>,
     time_created: Option<i64>,
     parts: Vec<OpenCodePartRow>,
   ) -> Vec<AgentEvent> {
@@ -148,6 +236,7 @@ impl OpenCodeNormalizer {
       match item {
         PartItem::Text(part) => texts.push(part.text),
         item => unknowns.push(unknown_event(
+          self.provider,
           Some(self.session_id.clone()),
           Some(format!("part.{}", item.native_type().unwrap_or("unknown"))),
           Some(native),
@@ -160,8 +249,8 @@ impl OpenCodeNormalizer {
     let mut events = Vec::with_capacity(unknowns.len() + 1);
     if !text.is_empty() {
       events.push(AgentEvent::Message(MessageEvent {
-        provenance: None,
-        provider: Provider::OpenCode,
+        provenance,
+        provider: self.provider,
         session_id: Some(self.session_id.clone()),
         message_id: Some(message_id),
         parent_id,
@@ -196,7 +285,7 @@ impl OpenCodeNormalizer {
     self.current_provider = provider_id.clone();
     self.current_model = model_id.clone();
     vec![AgentEvent::ProviderChanged(ProviderChanged {
-      provider: Provider::OpenCode,
+      provider: self.provider,
       session_id: Some(self.session_id.clone()),
       native_id: None,
       native_parent_id: None,
@@ -211,6 +300,7 @@ impl OpenCodeNormalizer {
     &self,
     message_id: &str,
     parent_id: &Option<String>,
+    provenance: &Option<MessageProvenance>,
     part: OpenCodePartRow,
   ) -> Vec<AgentEvent> {
     let OpenCodePartRow {
@@ -223,8 +313,8 @@ impl OpenCodeNormalizer {
 
     match item {
       PartItem::Text(part) => vec![AgentEvent::Message(MessageEvent {
-        provenance: None,
-        provider: Provider::OpenCode,
+        provenance: provenance.clone(),
+        provider: self.provider,
         session_id: Some(self.session_id.clone()),
         message_id: Some(message_id.to_string()),
         parent_id: parent_id.clone(),
@@ -234,21 +324,30 @@ impl OpenCodeNormalizer {
         text: part.text,
         timestamp: timestamp(time_created),
       })],
-      PartItem::Reasoning(part) => vec![AgentEvent::Reasoning(ReasoningEvent {
-        provenance: None,
-        provider: Provider::OpenCode,
-        session_id: Some(self.session_id.clone()),
-        message_id: Some(message_id.to_string()),
-        parent_id: parent_id.clone(),
-        phase: Phase::Finished,
-        text: Some(part.text),
-        summary: None,
-        redacted: None,
-        encrypted_content: None,
-        signature: None,
-        timestamp: timestamp(time_created),
-      })],
+      PartItem::Reasoning(part) => {
+        let signature = part
+          .metadata
+          .as_ref()
+          .and_then(|metadata| metadata.pointer("/anthropic/signature"))
+          .and_then(Value::as_str)
+          .map(str::to_string);
+        vec![AgentEvent::Reasoning(ReasoningEvent {
+          provenance: provenance.clone(),
+          provider: self.provider,
+          session_id: Some(self.session_id.clone()),
+          message_id: Some(message_id.to_string()),
+          parent_id: parent_id.clone(),
+          phase: Phase::Finished,
+          text: Some(part.text),
+          summary: None,
+          redacted: None,
+          encrypted_content: None,
+          signature,
+          timestamp: timestamp(time_created),
+        })]
+      }
       PartItem::Tool(part) => vec![tool_event(
+        self.provider,
         self.session_id.clone(),
         message_id.to_string(),
         parent_id.clone(),
@@ -259,6 +358,7 @@ impl OpenCodeNormalizer {
       )],
       PartItem::StepStart(_) | PartItem::StepFinish(_) => Vec::new(),
       _ => vec![unknown_event(
+        self.provider,
         Some(self.session_id.clone()),
         Some(format!("part.{}", native_type.as_deref().unwrap_or("unknown"))),
         Some(native),
@@ -278,13 +378,15 @@ impl OpenCodeNormalizer {
     message_time_created: Option<i64>,
     message_tokens: Option<&TokenUsage>,
     message_native: &Value,
+    provenance: Option<MessageProvenance>,
     report_invalid_message_usage: bool,
     parts: Vec<OpenCodePartRow>,
   ) -> Vec<AgentEvent> {
     let mut malformed_usage = Vec::new();
     let fallback_usage = message_tokens.and_then(|tokens| {
       let native = usage_native(message_native);
-      match usage_event(
+      match usage_event_for_provider(
+        self.provider,
         Some(self.session_id.clone()),
         Some(message_id.to_string()),
         None,
@@ -297,6 +399,7 @@ impl OpenCodeNormalizer {
         None => {
           if report_invalid_message_usage {
             malformed_usage.push(unknown_event(
+              self.provider,
               Some(self.session_id.clone()),
               Some("usage".to_string()),
               Some(native),
@@ -322,7 +425,8 @@ impl OpenCodeNormalizer {
       };
 
       let native = usage_native(part.data.native());
-      match usage_event(
+      match usage_event_for_provider(
+        self.provider,
         Some(self.session_id.clone()),
         Some(message_id.to_string()),
         Some(part.id.clone()),
@@ -333,6 +437,7 @@ impl OpenCodeNormalizer {
       ) {
         Some(event) => latest_step_usage = Some(event),
         None if report_invalid_step_usage => malformed_usage.push(unknown_event(
+          self.provider,
           Some(self.session_id.clone()),
           Some("usage".to_string()),
           Some(native),
@@ -344,7 +449,7 @@ impl OpenCodeNormalizer {
 
     let mut events = Vec::new();
     for part in parts {
-      events.extend(self.normalize_assistant_part(message_id, parent_id, part));
+      events.extend(self.normalize_assistant_part(message_id, parent_id, &provenance, part));
     }
     events.extend(malformed_usage);
     if let Some(usage) = latest_step_usage.or(fallback_usage) {
@@ -366,6 +471,28 @@ pub(crate) fn usage_event(
   native: Value,
   timestamp: Option<String>,
 ) -> Option<AgentEvent> {
+  usage_event_for_provider(
+    Provider::OpenCode,
+    session_id,
+    message_id,
+    step_id,
+    record_id,
+    tokens,
+    native,
+    timestamp,
+  )
+}
+
+fn usage_event_for_provider(
+  provider: Provider,
+  session_id: Option<String>,
+  message_id: Option<String>,
+  step_id: Option<String>,
+  record_id: Option<String>,
+  tokens: &TokenUsage,
+  native: Value,
+  timestamp: Option<String>,
+) -> Option<AgentEvent> {
   let input = token_counter(tokens.input)?;
   let output = token_counter(tokens.output)?;
   let cache_read = optional_token_counter(tokens.cache.as_ref().and_then(|cache| cache.read))?;
@@ -378,7 +505,7 @@ pub(crate) fn usage_event(
 
   Some(AgentEvent::Usage(UsageEvent {
     kind: UsageKind::ModelCall,
-    provider: Provider::OpenCode,
+    provider,
     session_id,
     turn_id: None,
     step_id,
@@ -424,6 +551,7 @@ fn optional_token_counter(value: Option<f64>) -> Option<Option<u64>> {
 }
 
 pub(crate) fn tool_event(
+  provider: Provider,
   session_id: String,
   message_id: String,
   parent_id: Option<String>,
@@ -477,7 +605,7 @@ pub(crate) fn tool_event(
   };
 
   AgentEvent::ToolCall(ToolCallEvent {
-    provider: Provider::OpenCode,
+    provider,
     session_id: Some(session_id),
     turn_id: None,
     message_id: Some(message_id),
@@ -549,18 +677,47 @@ fn model_from_native(value: &Value) -> (Option<String>, Option<String>) {
   (direct_provider.or(nested_provider), direct_model.or(nested_model))
 }
 
+fn message_provenance(provider: Provider, native: &Value) -> Option<MessageProvenance> {
+  if !matches!(provider, Provider::ZCode) {
+    return None;
+  }
+
+  let semantics = native.get("semantics");
+  let transcript_visibility = semantics
+    .and_then(|value| value.get("transcriptVisibility"))
+    .and_then(Value::as_str);
+  let ui_visibility = semantics
+    .and_then(|value| value.get("uiVisibility"))
+    .and_then(Value::as_str);
+  let display = (transcript_visibility == Some("hidden") || ui_visibility == Some("hidden")).then_some(false);
+  let source = semantics
+    .and_then(|value| value.get("source"))
+    .or_else(|| native.get("source"))
+    .cloned()
+    .unwrap_or_else(|| Value::String("zcode".to_string()));
+
+  Some(MessageProvenance {
+    source,
+    display,
+    native: semantics.cloned(),
+    surface_op: None,
+    source_event_seqs: None,
+  })
+}
+
 fn string_field(value: &Value, field: &str) -> Option<String> {
   value.get(field).and_then(Value::as_str).map(str::to_string)
 }
 
 fn unknown_event(
+  provider: Provider,
   session_id: Option<String>,
   native_type: Option<String>,
   native: Option<Value>,
   timestamp: Option<String>,
 ) -> AgentEvent {
   AgentEvent::Unknown(UnknownEvent {
-    provider: Provider::OpenCode,
+    provider,
     session_id,
     native_type,
     native,

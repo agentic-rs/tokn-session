@@ -22,7 +22,7 @@ impl ViewerRepository for NativeRepository {
 
   fn load_session(&self, locator: &SessionLocator) -> Result<LoadedSession, String> {
     match locator.provider {
-      ViewerProvider::OpenCode => AgentClient::load_session(
+      ViewerProvider::OpenCode | ViewerProvider::ZCode => AgentClient::load_session(
         locator.provider.source(),
         Some(locator.source_path.clone()),
         &locator.session_id,

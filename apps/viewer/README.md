@@ -1,7 +1,7 @@
 # Tokn Sessions Viewer
 
 The viewer is a read-only Tauri desktop app for browsing historical Pi, Codex,
-OpenCode, and DeepSeek Harness (DSH) sessions in one place. It shows root
+OpenCode, ZCode, and DeepSeek Harness (DSH) sessions in one place. It shows root
 sessions in a searchable, provider-filterable sidebar, expands their known
 subagents on demand, and renders each selected normalized event stream as a
 conversation with inspectable technical events.
@@ -87,6 +87,8 @@ Provider storage is resolved as follows:
 - OpenCode: `$OPENCODE_DB`, including paths relative to
   `$XDG_DATA_HOME/opencode`; otherwise `$XDG_DATA_HOME/opencode/opencode.db` or
   the upstream home-directory fallback is used.
+- ZCode: `$ZCODE_STORAGE_DIR/cli/db/db.sqlite`, then the platform home
+  directory's `.zcode/cli/db/db.sqlite` path.
 - DSH: `$DSH_HOME/sessions`, then the platform home directory's `.dsh/sessions`
   folder.
 
@@ -124,8 +126,8 @@ requested. Inline tool output keeps at most 64 KiB using a head-and-tail preview
 the full normalized and native inspector representations retain their separate
 512 KiB limits. The backend keeps at most one normalized session snapshot and
 reuses it across page and inspector requests while the source revision is
-unchanged; OpenCode revision checks include its SQLite WAL and SHM sidecars. The
-current provider readers may still load an entire selected session before
+unchanged; OpenCode and ZCode revision checks include their SQLite WAL
+sidecars. The current provider readers may still load an entire selected session before
 producing an event page, so paging does not yet bound parser memory for very
 large histories.
 Trajectory items are a viewer presentation projection over that normalized

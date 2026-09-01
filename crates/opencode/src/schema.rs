@@ -4,6 +4,7 @@ use rusqlite::Connection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OpenCodeCapabilities {
+  pub(crate) has_session_entry: bool,
   pub(crate) has_session_agent: bool,
   pub(crate) has_session_model: bool,
   pub(crate) has_session_title: bool,
@@ -15,6 +16,7 @@ impl OpenCodeCapabilities {
     let session = table_columns(connection, "session")?;
     let message = table_columns(connection, "message")?;
     let part = table_columns(connection, "part")?;
+    let session_entry = table_columns(connection, "session_entry")?;
 
     let mut missing = Vec::new();
     require_columns(
@@ -23,6 +25,14 @@ impl OpenCodeCapabilities {
       &session,
       &["id", "parent_id", "directory", "time_created", "time_updated"],
     );
+    if !session_entry.is_empty() {
+      require_columns(
+        &mut missing,
+        "session_entry",
+        &session_entry,
+        &["id", "session_id", "type", "time_created", "data"],
+      );
+    }
     require_columns(
       &mut missing,
       "message",
@@ -37,12 +47,13 @@ impl OpenCodeCapabilities {
     );
     if !missing.is_empty() {
       return Err(format!(
-        "unsupported opencode database schema: missing {}",
+        "unsupported session database schema: missing {}",
         missing.join(", ")
       ));
     }
 
     Ok(Self {
+      has_session_entry: !session_entry.is_empty(),
       has_session_agent: session.contains("agent"),
       has_session_model: session.contains("model"),
       has_session_title: session.contains("title"),
@@ -73,17 +84,18 @@ fn table_columns(connection: &Connection, table: &str) -> Result<BTreeSet<String
     "session" => "pragma table_info(session)",
     "message" => "pragma table_info(message)",
     "part" => "pragma table_info(part)",
-    _ => return Err(format!("unsupported opencode schema table `{table}`")),
+    "session_entry" => "pragma table_info(session_entry)",
+    _ => return Err(format!("unsupported session schema table `{table}`")),
   };
   let mut statement = connection
     .prepare(pragma)
-    .map_err(|err| format!("failed to inspect opencode `{table}` schema: {err}"))?;
+    .map_err(|err| format!("failed to inspect session `{table}` schema: {err}"))?;
   let rows = statement
     .query_map([], |row| row.get::<_, String>(1))
-    .map_err(|err| format!("failed to read opencode `{table}` schema: {err}"))?;
+    .map_err(|err| format!("failed to read session `{table}` schema: {err}"))?;
 
   rows
-    .map(|row| row.map_err(|err| format!("failed to read opencode `{table}` schema: {err}")))
+    .map(|row| row.map_err(|err| format!("failed to read session `{table}` schema: {err}")))
     .collect()
 }
 
@@ -138,6 +150,7 @@ mod tests {
     base_schema(&connection);
 
     let capabilities = OpenCodeCapabilities::detect(&connection).expect("base schema should be supported");
+    assert!(!capabilities.has_session_entry);
     assert!(!capabilities.has_session_agent);
     assert!(!capabilities.has_session_model);
     assert!(!capabilities.has_session_title);
@@ -162,6 +175,20 @@ mod tests {
     assert!(capabilities.session_projection().contains(", model,"));
     assert!(capabilities.session_projection().contains(", title,"));
     assert!(capabilities.session_catalog_projection().contains(", title,"));
+
+    connection
+      .execute_batch(
+        "create table session_entry (
+           id text primary key,
+           session_id text not null,
+           type text not null,
+           time_created integer not null,
+           data text not null
+         );",
+      )
+      .expect("session entry table should be created");
+    let capabilities = OpenCodeCapabilities::detect(&connection).expect("runtime entries should be supported");
+    assert!(capabilities.has_session_entry);
   }
 
   #[test]

@@ -311,6 +311,7 @@ fn parse_source(value: &str) -> Result<Source, String> {
     "pi" => Ok(Source::Pi),
     "codex" => Ok(Source::Codex),
     "opencode" => Ok(Source::OpenCode),
+    "zcode" => Ok(Source::ZCode),
     "dsh" => Ok(Source::Dsh),
     _ => Err(format!("unknown source `{value}`")),
   }
@@ -350,10 +351,10 @@ fn reject_show_scope(command: &str, scope: Option<ShowScope>) -> Result<(), Stri
 
 fn help() -> String {
   "usage:
-  tokn-session list [--source pi|codex|opencode|dsh] [--session-dir <dir>]
-  tokn-session list [--source pi|codex|opencode|dsh] [--limit <n>]
-  tokn-session show [--source pi|codex|opencode|dsh] [--format pretty|jsonl] [--scope self|tree] [--session-dir <dir>] <session-id-or-path>
-  tokn-session browse [--source pi|codex|opencode|dsh] [--session-dir <dir>] [session-id-or-path]
+  tokn-session list [--source pi|codex|opencode|zcode|dsh] [--session-dir <dir>]
+  tokn-session list [--source pi|codex|opencode|zcode|dsh] [--limit <n>]
+  tokn-session show [--source pi|codex|opencode|zcode|dsh] [--format pretty|jsonl] [--scope self|tree] [--session-dir <dir>] <session-id-or-path>
+  tokn-session browse [--source pi|codex|opencode|zcode|dsh] [--session-dir <dir>] [session-id-or-path]
   tokn-session create [--source pi|codex|opencode] [--executor <command>] [--cwd <dir>] <prompt>
   tokn-session append [--source pi|codex|opencode] [--executor <command>] [--cwd <dir>] (--continue|--session <id>) <prompt>"
     .to_string()
@@ -437,5 +438,19 @@ mod tests {
       .expect_err("list scope should be rejected");
 
     assert_eq!(error, "--scope is only valid for show, not list");
+  }
+
+  #[test]
+  fn list_accepts_zcode_as_a_historical_source() {
+    let cli =
+      parse(vec!["list".to_string(), "--source".to_string(), "zcode".to_string()]).expect("zcode list should parse");
+
+    assert!(matches!(
+      cli.command,
+      Command::List {
+        source: Source::ZCode,
+        ..
+      }
+    ));
   }
 }
