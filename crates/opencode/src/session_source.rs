@@ -1,6 +1,9 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+mod cache;
+pub use cache::{CachedSessionRecords, OpenCodeSessionCache};
+
 use crate::normalize::OpenCodeNormalizer;
 use crate::row::{OpenCodeMessageRow, OpenCodePartRow, OpenCodeSessionEntryRow, OpenCodeSessionRow};
 use crate::schema::OpenCodeCapabilities;
@@ -168,6 +171,17 @@ impl OpenCodeSessionSource {
     include_native: bool,
   ) -> Result<LoadedSessionRecords, String> {
     self.load_records_from_database(self.database_path()?, session_id, include_native)
+  }
+
+  /// Reconcile source rows in one read transaction, reusing decoded records
+  /// and normalization checkpoints when their inputs have not changed.
+  pub fn load_session_records_cached_exact(
+    &self,
+    session_id: &str,
+    include_native: bool,
+    cache: &mut OpenCodeSessionCache,
+  ) -> Result<CachedSessionRecords, String> {
+    cache.load(self, self.database_path()?, session_id, include_native)
   }
 
   fn load_records_from_database(

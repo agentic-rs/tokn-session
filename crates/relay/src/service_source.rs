@@ -7,10 +7,13 @@ use std::{
   time::SystemTime,
 };
 
-use tokn_session_core::Provider;
-use tokn_session_opencode::OpenCodeSessionSource;
+use tokn_session_core::{NormalizedRecord, Provider};
+use tokn_session_opencode::{OpenCodeSessionCache, OpenCodeSessionSource};
 
 use crate::{RecordOperation, RelayRecord, SessionContext, service_protocol::CatalogEntry, tailer::FileState};
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Clone)]
 pub(crate) struct Snapshot {
@@ -37,6 +40,8 @@ fn generation() -> String {
 pub(crate) struct SessionReader {
   file: Option<FileState>,
   database: Option<OpenCodeSessionSource>,
+  database_cache: OpenCodeSessionCache,
+  database_records: Vec<Arc<NormalizedRecord>>,
   native: bool,
   root: PathBuf,
   bytes: usize,
@@ -59,6 +64,8 @@ impl SessionReader {
       },
       database: matches!(entry.provider, Provider::OpenCode)
         .then(|| OpenCodeSessionSource::new(Some(entry.header.path.clone()))),
+      database_cache: OpenCodeSessionCache::with_max_source_bytes(crate::service_protocol::MAX_SNAPSHOT_BYTES),
+      database_records: Vec::new(),
       native,
       root,
       bytes: 0,
@@ -88,6 +95,9 @@ impl SessionReader {
     if version == self.version && self.snapshot.error.is_none() {
       return Ok(false);
     }
+    if self.database.is_some() {
+      return self.poll_database(version);
+    }
     let (records, reset) = if let Some(file) = &mut self.file {
       // Same-length rewrites need a fresh reader; truncation/replacement is
       // also detected inside FileState before its next append read.
@@ -101,21 +111,6 @@ impl SessionReader {
         return Err(update.warnings.join("; "));
       }
       (update.records, reset || same_length_edit)
-    } else if let Some(database) = &self.database {
-      let loaded = database.load_session_records_exact(&self.snapshot.entry.header.id, self.native)?;
-      let context = SessionContext::from_session_ref(&loaded.reference);
-      let records = loaded
-        .records
-        .into_iter()
-        .map(|record| RelayRecord {
-          path: path.clone(),
-          topic: format!("opencode.{}", context.session_id),
-          session: context.clone(),
-          operation: RecordOperation::Upsert,
-          record,
-        })
-        .collect();
-      (records, true)
     } else {
       return Err("Provider does not support snapshot/follow".into());
     };
@@ -145,6 +140,69 @@ impl SessionReader {
     self.bytes = bytes;
     self.snapshot.revision += 1;
     self.snapshot.error = None;
+    Ok(true)
+  }
+
+  fn poll_database(&mut self, version: Vec<Option<FileVersion>>) -> Result<bool, String> {
+    let loaded = self.database.as_ref().unwrap().load_session_records_cached_exact(
+      &self.snapshot.entry.header.id,
+      self.native,
+      &mut self.database_cache,
+    )?;
+    let mut prefix = 0;
+    for (old, new) in self.database_records.iter().zip(&loaded.records) {
+      // Unchanged rows retain their allocation. Changed raw JSON can still
+      // produce identical output (e.g. unknown fields with native disabled).
+      if !Arc::ptr_eq(old, new)
+        && serde_json::to_value(old.as_ref()).map_err(|e| e.to_string())?
+          != serde_json::to_value(new.as_ref()).map_err(|e| e.to_string())?
+      {
+        break;
+      }
+      prefix += 1;
+    }
+    #[cfg(unix)]
+    let replaced = self.version.first().and_then(Option::as_ref).map(|v| v.identity)
+      != version.first().and_then(Option::as_ref).map(|v| v.identity);
+    #[cfg(not(unix))]
+    let replaced = false;
+    let reset = replaced || prefix < self.database_records.len();
+    let header_changed = loaded.header != self.snapshot.entry.header;
+    let changed =
+      reset || loaded.records.len() != self.database_records.len() || header_changed || self.snapshot.error.is_some();
+    if !changed {
+      self.database_records = loaded.records;
+      self.version = version;
+      return Ok(false);
+    }
+    let context = SessionContext::from_session_ref(&loaded.reference);
+    let mut records = Vec::new();
+    let mut bytes = if reset { 0 } else { self.bytes };
+    for record in loaded.records.iter().skip(if reset { 0 } else { prefix }) {
+      let record = RelayRecord {
+        path: loaded.reference.path.clone(),
+        topic: format!("opencode.{}", context.session_id),
+        session: context.clone(),
+        operation: RecordOperation::Upsert,
+        record: record.as_ref().clone(),
+      };
+      bytes = bytes.saturating_add(serde_json::to_vec(&record).map_err(|e| e.to_string())?.len());
+      if bytes > crate::service_protocol::MAX_SNAPSHOT_BYTES {
+        return Err("Relay session exceeds the snapshot memory limit".into());
+      }
+      records.push(Arc::new(record));
+    }
+    if reset {
+      self.snapshot.generation = generation();
+      self.snapshot.records.clear();
+    }
+    self.snapshot.records.extend(records);
+    self.snapshot.entry.header = loaded.header;
+    self.snapshot.revision += 1;
+    self.snapshot.error = None;
+    self.database_records = loaded.records;
+    self.bytes = bytes;
+    self.version = version;
     Ok(true)
   }
 }

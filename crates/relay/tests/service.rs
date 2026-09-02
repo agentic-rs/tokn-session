@@ -181,6 +181,57 @@ async fn opencode_changes_and_deletions_replace_the_snapshot() {
 }
 
 #[tokio::test]
+async fn opencode_subscribers_append_and_receive_metadata_without_replacing_history() {
+  for native in [false, true] {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("opencode.db");
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch(r#"
+      pragma journal_mode = wal;
+      create table session (id text primary key, parent_id text, directory text, title text, time_created integer, time_updated integer);
+      create table message (id text primary key, session_id text, time_created integer, data text);
+      create table part (id text primary key, message_id text, session_id text, time_created integer, data text);
+      insert into session values ('ses_1', null, '/tmp', null, 1, 1);
+      insert into message values ('msg_1', 'ses_1', 1, '{"role":"user"}');
+      insert into part values ('part_1', 'msg_1', 'ses_1', 1, '{"type":"text","text":"hello"}');
+    "#).unwrap();
+    let server = server(&path, Provider::OpenCode, native).await;
+    let key = load_catalog(&server.endpoint).await.unwrap().entries.remove(0).key;
+    let mut first = RelaySubscription::connect(&server.endpoint, &key).await.unwrap();
+    let initial = snapshot(&mut first).await;
+    let mut second = RelaySubscription::connect(&server.endpoint, &key).await.unwrap();
+    assert_eq!(snapshot(&mut second).await.generation, initial.generation);
+    db.execute_batch(
+      r#"
+      begin;
+      insert into message values ('msg_2', 'ses_1', 2, '{"role":"user"}');
+      insert into part values ('part_2', 'msg_2', 'ses_1', 2, '{"type":"text","text":"world"}');
+    "#,
+    )
+    .unwrap();
+    if !native {
+      db.execute_batch("update session set time_updated = 2;").unwrap();
+    }
+    db.execute_batch("commit;").unwrap();
+    let update = snapshot(&mut first).await;
+    assert_eq!(update.generation, initial.generation);
+    assert_eq!(messages(&update), ["hello", "world"]);
+    assert_eq!(messages(&snapshot(&mut second).await), ["hello", "world"]);
+    if !native {
+      db.execute_batch("update session set title = 'New title';").unwrap();
+      let metadata = snapshot(&mut first).await;
+      assert_eq!(metadata.generation, initial.generation);
+      assert_eq!(metadata.loaded.reference.title.as_deref(), Some("New title"));
+      assert_eq!(messages(&metadata), ["hello", "world"]);
+    }
+    let mut reconnect = RelaySubscription::connect(&server.endpoint, &key).await.unwrap();
+    let current = snapshot(&mut reconnect).await;
+    assert_eq!(current.generation, initial.generation);
+    assert_eq!(messages(&current), ["hello", "world"]);
+  }
+}
+
+#[tokio::test]
 async fn framing_rejects_oversized_lengths_before_allocating_payloads() {
   let (mut writer, mut reader) = tokio::io::duplex(8);
   writer.write_u32(MAX_FRAME_BYTES as u32 + 1).await.unwrap();
