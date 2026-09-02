@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type {
   AgentActivityCardSummary,
   EventDetail,
@@ -256,12 +256,25 @@ function trajectoryFacts(trajectory: TrajectoryCardSummary): string {
   return facts.join(" · ");
 }
 
-function trajectoryHeading(event: EventSummary): TechnicalCardHeading {
+function useTrajectoryHeading(event: EventSummary): TechnicalCardHeading {
   const trajectory = event.trajectory;
-  const duration = formatTrajectoryDuration(trajectory?.duration_ms ?? null);
+  const working = trajectory?.status === "working";
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    if (!working) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [working, trajectory?.started_at]);
+  const timestamp = trajectory?.started_at;
+  const start = timestamp ? (/^\d+$/.test(timestamp) ? Number(timestamp) : Date.parse(timestamp)) : NaN;
+  const duration = formatTrajectoryDuration(working && Number.isFinite(start)
+    ? String(Math.max(0, now - start))
+    : trajectory?.duration_ms ?? null);
+  const verb = working ? "Working" : trajectory?.status === "unknown" ? "Work" : "Worked";
   return {
     action: "Turn",
-    primary: duration ? `Worked for ${duration}` : "Worked",
+    primary: duration ? `${verb} for ${duration}` : verb,
     secondary: trajectory ? trajectoryFacts(trajectory) : event.summary || null,
     monospace: false,
   };
@@ -467,7 +480,7 @@ function TrajectorySection({
   expanded_child_detail_loading: boolean;
   expanded_child_event_key: string | null;
 }) {
-  const heading = trajectoryHeading(event);
+  const heading = useTrajectoryHeading(event);
   const regionId = `${button_id}-details`;
   const labelId = `${button_id}-label`;
   const isLoadingPage = page?.is_loading_older || page?.is_loading_newer;
@@ -508,7 +521,7 @@ function TrajectorySection({
           id={regionId}
           role="region"
         >
-          {!page || page.is_loading || (!page.has_loaded && !page.error) ? (
+          {!page || (page.events.length === 0 && (page.is_loading || (!page.has_loaded && !page.error))) ? (
             <div className="trajectory-section__state" role="status">
               <span className="inline-spinner" aria-hidden="true" />
               Loading turn events…

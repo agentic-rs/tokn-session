@@ -185,6 +185,7 @@ export interface ListSessionChildrenResponse {
  * belongs to an unrelated provider or source.
  */
 export interface SessionIndexChangedEvent {
+  updated_session_keys?: string[];
   changed: boolean;
   attention_session_keys: string[];
 }
@@ -287,6 +288,7 @@ export interface AgentActivityCardSummary {
  * duration larger than JavaScript can represent exactly as a Number.
  */
 export interface TrajectoryCardSummary {
+  status?: "working" | "complete" | "unknown";
   event_count: number;
   tool_count: number;
   reasoning_count: number;

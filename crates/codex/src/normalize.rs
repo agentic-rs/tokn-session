@@ -1,5 +1,6 @@
 mod code_mode;
 mod item_lifecycle;
+mod turn_lifecycle;
 
 use std::collections::{HashMap, VecDeque};
 
@@ -742,7 +743,9 @@ fn normalize_event_message(
 ) -> Vec<AgentEvent> {
   let payload = item.native;
   match item.event_type.as_deref() {
-    Some("task_started" | "turn_started" | "task_complete" | "turn_complete") => Vec::new(),
+    Some(kind @ ("task_started" | "turn_started" | "task_complete" | "turn_complete")) => {
+      vec![turn_lifecycle::normalize(session_id, &payload, kind, timestamp)]
+    }
     Some("user_message") => string_field(&payload, "message")
       .map(|text| {
         vec![message_event(
@@ -788,7 +791,16 @@ fn normalize_event_message(
     Some("patch_apply_end") => normalize_patch_end(session_id, &payload, timestamp),
     Some("view_image_tool_call") => normalize_view_image(session_id, &payload, timestamp),
     Some("error" | "warning" | "guardian_warning" | "stream_error") => normalize_error(session_id, &payload, timestamp),
-    Some("turn_aborted") => normalize_turn_aborted(session_id, &payload, timestamp),
+    Some("turn_aborted") => {
+      let mut events = normalize_turn_aborted(session_id.clone(), &payload, timestamp.clone());
+      events.push(turn_lifecycle::normalize(
+        session_id,
+        &payload,
+        "turn_aborted",
+        timestamp,
+      ));
+      events
+    }
     Some("thread_settings_applied") => {
       vec![session_settings_applied_event(session_id, &payload, timestamp)]
     }
