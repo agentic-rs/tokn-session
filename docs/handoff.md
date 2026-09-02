@@ -286,7 +286,9 @@ establish a nonnegative observed span; it does not derive time from session file
 metadata. Expanding a trajectory lazily loads its contained normal event cards
 through a separately bounded page, preserving per-event inspection and verified
 direct-child delegation navigation. A trajectory is a viewer projection, not a
-provider-authoritative turn.
+provider-authoritative turn. Its identity uses the earliest normalized source
+event in the folded run, so it remains expandable when more work or a matching
+tool result is appended after the outer timeline loads.
 
 Visible user and assistant messages, expanded reasoning, and readable inspector
 content render GitHub-flavored Markdown. Raw HTML is disabled, images become

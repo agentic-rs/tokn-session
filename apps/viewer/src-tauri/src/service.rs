@@ -591,9 +591,10 @@ enum TimelineEntry {
 
 #[derive(Clone, Debug)]
 struct Trajectory {
-  /// The final base-timeline source position, used only in the opaque
-  /// `trajectory.v1.*` key. It intentionally does not alias an event key.
-  anchor_source_event_index: usize,
+  /// The first base-timeline source position, used only in the opaque
+  /// `trajectory.v1.*` key. Unlike the run's final position, this remains
+  /// stable while an active trajectory gains appended events.
+  start_source_event_index: usize,
   entries: Vec<TimelineEntry>,
 }
 
@@ -2381,7 +2382,7 @@ impl ViewerService {
 
   /// Returns the ordinary normalized rows represented by one synthetic
   /// trajectory. The opaque trajectory key pins the request to the run's
-  /// final source position, while a trajectory-specific cursor prevents a
+  /// first source position, while a trajectory-specific cursor prevents a
   /// cursor from one item being replayed against another.
   pub fn load_trajectory_event_page(
     &self,
@@ -2389,12 +2390,12 @@ impl ViewerService {
   ) -> Result<TrajectoryEventPage, String> {
     let limit = bounded_limit(request.limit)?;
     let locator = decode_session_key(&request.session_key)?;
-    let anchor_source_event_index = decode_trajectory_key(&request.trajectory_key)?;
+    let start_source_event_index = decode_trajectory_key(&request.trajectory_key)?;
     let loaded = self.load_verified(&locator)?;
-    let trajectory = trajectory_for_anchor(&loaded.events, anchor_source_event_index)
+    let trajectory = trajectory_for_start(&loaded.events, start_source_event_index)
       .ok_or_else(|| "trajectory key is outside the session".to_string())?;
     let total_events = trajectory.entries.len();
-    let requested = requested_trajectory_offset(request.cursor.as_deref(), request.offset, anchor_source_event_index)?;
+    let requested = requested_trajectory_offset(request.cursor.as_deref(), request.offset, start_source_event_index)?;
     let boundary = requested.unwrap_or(match request.direction {
       PageDirection::Forward => 0,
       PageDirection::Backward => total_events,
@@ -2413,8 +2414,8 @@ impl ViewerService {
 
     Ok(TrajectoryEventPage {
       events,
-      next_cursor: (end < total_events).then(|| encode_trajectory_event_cursor(anchor_source_event_index, end)),
-      previous_cursor: (start > 0).then(|| encode_trajectory_event_cursor(anchor_source_event_index, start)),
+      next_cursor: (end < total_events).then(|| encode_trajectory_event_cursor(start_source_event_index, end)),
+      previous_cursor: (start > 0).then(|| encode_trajectory_event_cursor(start_source_event_index, start)),
       total_events,
     })
   }
@@ -2423,8 +2424,8 @@ impl ViewerService {
     let locator = decode_session_key(&request.session_key)?;
     let loaded = self.load_verified(&locator)?;
     if request.event_key.starts_with("trajectory.v1.") {
-      let anchor_source_event_index = decode_trajectory_key(&request.event_key)?;
-      let trajectory = trajectory_for_anchor(&loaded.events, anchor_source_event_index)
+      let start_source_event_index = decode_trajectory_key(&request.event_key)?;
+      let trajectory = trajectory_for_start(&loaded.events, start_source_event_index)
         .ok_or_else(|| "trajectory key is outside the session".to_string())?;
       return trajectory_detail(request.event_key, &trajectory, &loaded.events);
     }
@@ -2675,7 +2676,7 @@ fn trajectory_detail(event_key: String, trajectory: &Trajectory, events: &[Agent
   let normalized = bounded_detail_value(
     json!({
       "type": "trajectory",
-      "anchor_event_key": encode_event_key(trajectory.anchor_source_event_index),
+      "anchor_event_key": encode_event_key(trajectory.start_source_event_index),
       "summary": card,
       "source_event_count": source_event_count,
       "source_records": normalized_records,
@@ -3702,7 +3703,7 @@ fn flush_trajectory_candidate(
     return;
   }
 
-  let Some(anchor_source_event_index) = pending.last().and_then(timeline_entry_anchor_source_event_index) else {
+  let Some(start_source_event_index) = pending.iter().filter_map(timeline_entry_start_source_event_index).min() else {
     // Every base timeline row should originate from at least one source
     // record. If that invariant is violated, retaining flat rows is safer
     // than inventing a synthetic key with no detail target.
@@ -3711,7 +3712,7 @@ fn flush_trajectory_candidate(
   };
   output.push(TimelineEntry::Trajectory {
     trajectory: Trajectory {
-      anchor_source_event_index,
+      start_source_event_index,
       entries: std::mem::take(pending),
     },
   });
@@ -3761,17 +3762,11 @@ fn is_final_assistant_message(role: Role, delivery: MessageDelivery) -> bool {
   role == Role::Assistant && delivery == MessageDelivery::Final
 }
 
-fn timeline_entry_anchor_source_event_index(entry: &TimelineEntry) -> Option<usize> {
+fn timeline_entry_start_source_event_index(entry: &TimelineEntry) -> Option<usize> {
   match entry {
     TimelineEntry::Event { source_event_index } => Some(*source_event_index),
-    TimelineEntry::ToolOperation {
-      source_event_index,
-      operation,
-    } => operation
-      .timeline_source_event_index()
-      .or_else(|| operation.source_event_indices.last().copied())
-      .or(Some(*source_event_index)),
-    TimelineEntry::Trajectory { trajectory } => Some(trajectory.anchor_source_event_index),
+    TimelineEntry::ToolOperation { source_event_index, .. } => Some(*source_event_index),
+    TimelineEntry::Trajectory { trajectory } => Some(trajectory.start_source_event_index),
   }
 }
 
@@ -3788,9 +3783,9 @@ fn base_timeline_entry_for_source(events: &[AgentEvent], source_event_index: usi
   })
 }
 
-fn trajectory_for_anchor(events: &[AgentEvent], anchor_source_event_index: usize) -> Option<Trajectory> {
+fn trajectory_for_start(events: &[AgentEvent], start_source_event_index: usize) -> Option<Trajectory> {
   timeline_entries(events).into_iter().find_map(|entry| match entry {
-    TimelineEntry::Trajectory { trajectory } if trajectory.anchor_source_event_index == anchor_source_event_index => {
+    TimelineEntry::Trajectory { trajectory } if trajectory.start_source_event_index == start_source_event_index => {
       Some(trajectory)
     }
     TimelineEntry::Event { .. } | TimelineEntry::ToolOperation { .. } | TimelineEntry::Trajectory { .. } => None,
@@ -3841,7 +3836,7 @@ fn trajectory_event_summary(trajectory: &Trajectory, events: &[AgentEvent]) -> E
   let summary = trajectory_summary(&card);
 
   EventSummary {
-    event_key: encode_trajectory_key(trajectory.anchor_source_event_index),
+    event_key: encode_trajectory_key(trajectory.start_source_event_index),
     event_type: "trajectory".to_string(),
     provider,
     timestamp: card.ended_at.clone(),
@@ -4009,13 +4004,13 @@ fn timeline_entry_source_event_indices(entry: &TimelineEntry) -> Vec<usize> {
 fn requested_trajectory_offset(
   cursor: Option<&str>,
   offset: Option<usize>,
-  anchor_source_event_index: usize,
+  start_source_event_index: usize,
 ) -> Result<Option<usize>, String> {
   match (cursor, offset) {
     (Some(_), Some(_)) => Err("cursor and offset cannot be used together".to_string()),
     (Some(cursor), None) => {
       let (cursor_anchor, offset) = decode_trajectory_event_cursor(cursor)?;
-      if cursor_anchor != anchor_source_event_index {
+      if cursor_anchor != start_source_event_index {
         return Err("trajectory cursor does not match the requested trajectory".to_string());
       }
       Ok(Some(offset))
@@ -4973,7 +4968,7 @@ fn truncate_with_flag(value: String, max_chars: usize) -> (String, bool) {
 
 #[cfg(test)]
 mod tests {
-  use std::collections::{BTreeMap, BTreeSet, HashMap};
+  use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
   use std::path::PathBuf;
   use std::sync::Mutex;
   use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5006,6 +5001,25 @@ mod tests {
         .expect("fixture lock should not be poisoned")
         .take()
         .ok_or_else(|| "fixture session already loaded".to_string())
+    }
+  }
+
+  struct SequenceRepository {
+    loaded: Mutex<VecDeque<LoadedSession>>,
+  }
+
+  impl ViewerRepository for SequenceRepository {
+    fn list_session_headers(&self, _provider: ViewerProvider) -> Result<Vec<SessionHeader>, String> {
+      Ok(Vec::new())
+    }
+
+    fn load_session(&self, _locator: &SessionLocator) -> Result<LoadedSession, String> {
+      self
+        .loaded
+        .lock()
+        .expect("fixture lock should not be poisoned")
+        .pop_front()
+        .ok_or_else(|| "fixture session sequence is exhausted".to_string())
     }
   }
 
@@ -8174,7 +8188,7 @@ mod tests {
       ]
     );
     let trajectory = page.events[1].trajectory.as_ref().expect("work run is collapsed");
-    assert_eq!(page.events[1].event_key, encode_trajectory_key(5));
+    assert_eq!(page.events[1].event_key, encode_trajectory_key(1));
     assert!(decode_event_key(&page.events[1].event_key).is_err());
     assert_eq!(trajectory.event_count, 5);
     assert_eq!(trajectory.source_event_count, 5);
@@ -8185,7 +8199,7 @@ mod tests {
     assert_eq!(trajectory.started_at.as_deref(), Some("2026-09-01T00:01:00Z"));
     assert_eq!(trajectory.ended_at.as_deref(), Some("2026-09-01T00:04:00Z"));
     assert_eq!(trajectory.duration_ms.as_deref(), Some("180000"));
-    assert_eq!(page.events[5].event_key, encode_trajectory_key(10));
+    assert_eq!(page.events[5].event_key, encode_trajectory_key(9));
   }
 
   #[test]
@@ -8522,7 +8536,7 @@ mod tests {
     let trajectory = page.events[2].trajectory.as_ref().expect("follow-up work is folded");
     assert_eq!(trajectory.event_count, 2);
     assert_eq!(trajectory.tool_count, 1);
-    assert_eq!(page.events[2].event_key, encode_trajectory_key(3));
+    assert_eq!(page.events[2].event_key, encode_trajectory_key(2));
   }
 
   #[test]
@@ -8601,7 +8615,7 @@ mod tests {
         .collect::<Vec<_>>(),
       ["message", "trajectory"]
     );
-    assert_eq!(first.events[1].event_key, encode_trajectory_key(2));
+    assert_eq!(first.events[1].event_key, encode_trajectory_key(1));
 
     let second = service
       .load_event_page(EventPageRequest {
@@ -8621,7 +8635,7 @@ mod tests {
       ["message", "trajectory"]
     );
     assert_eq!(second.events[0].summary, "between");
-    assert_eq!(second.events[1].event_key, encode_trajectory_key(6));
+    assert_eq!(second.events[1].event_key, encode_trajectory_key(4));
 
     let third = service
       .load_event_page(EventPageRequest {
@@ -8792,7 +8806,7 @@ mod tests {
       })
       .unwrap();
     let trajectory_key = page.events[0].event_key.clone();
-    assert_eq!(trajectory_key, encode_trajectory_key(1));
+    assert_eq!(trajectory_key, encode_trajectory_key(0));
 
     let outer = service
       .load_event_detail(LoadEventDetailRequest {
@@ -8855,7 +8869,7 @@ mod tests {
     let directory = tempfile::tempdir().unwrap();
     let session_key = key_for_cached_source(&directory, "fixture");
     let service = service_with_session(loaded_session(events));
-    let trajectory_key = encode_trajectory_key(2);
+    let trajectory_key = encode_trajectory_key(0);
 
     let first = service
       .load_trajectory_event_page(LoadTrajectoryEventPageRequest {
@@ -8909,6 +8923,62 @@ mod tests {
       wrong_cursor,
       "trajectory cursor does not match the requested trajectory"
     );
+  }
+
+  #[test]
+  fn trajectory_key_remains_resolvable_when_an_active_tool_finishes() {
+    let invocation = || {
+      tool_call(
+        Provider::Codex,
+        "exec_command",
+        "call-1",
+        ToolKind::Shell,
+        None,
+        Phase::Started,
+        None,
+      )
+    };
+    let commentary = || message_event_with_role("still working", Role::Assistant, MessageDelivery::Commentary);
+    let result = tool_call(
+      Provider::Codex,
+      "exec_command",
+      "call-1",
+      ToolKind::Shell,
+      None,
+      Phase::Finished,
+      Some(json!({"stdout": "done"})),
+    );
+    let before = loaded_session(vec![invocation(), commentary()]);
+    let after = loaded_session(vec![invocation(), commentary(), result]);
+    let service = ViewerService::new(Arc::new(SequenceRepository {
+      loaded: Mutex::new(VecDeque::from([before, after])),
+    }));
+    let session_key = key_for("fixture");
+
+    let outer = service
+      .load_event_page(EventPageRequest {
+        session_key: session_key.clone(),
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+    let trajectory_key = outer.events[0].event_key.clone();
+    assert_eq!(trajectory_key, encode_trajectory_key(0));
+
+    let inner = service
+      .load_trajectory_event_page(LoadTrajectoryEventPageRequest {
+        session_key,
+        trajectory_key,
+        cursor: None,
+        offset: None,
+        direction: PageDirection::Forward,
+        limit: None,
+      })
+      .unwrap();
+    assert_eq!(inner.total_events, 2);
+    assert!(inner.events.iter().any(|event| event.event_type == "tool_call"));
   }
 
   #[test]
@@ -9346,7 +9416,7 @@ mod tests {
       ),
     ];
 
-    let trajectory = trajectory_for_anchor(&events, 2).expect("terminal tool operation is a trajectory");
+    let trajectory = trajectory_for_start(&events, 0).expect("terminal tool operation is a trajectory");
     let operation_entry = trajectory
       .entries
       .iter()
