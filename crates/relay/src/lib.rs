@@ -2,6 +2,10 @@ mod context;
 mod project;
 mod publisher;
 mod relay;
+pub mod service_client;
+pub mod service_protocol;
+pub mod service_server;
+mod service_source;
 mod tailer;
 
 pub use context::{ProjectContext, SessionContext};

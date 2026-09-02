@@ -128,7 +128,7 @@ button:disabled {
 
 .viewer-app {
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   width: 100%;
   height: 100%;
   overflow: hidden;
@@ -2724,3 +2724,12 @@ button:disabled {
     animation-iteration-count: 1 !important;
   }
 }
+/* Connection settings remain outside the timeline so errors never replace it. */
+.relay-connection { padding: 6px 14px; border-bottom: 1px solid var(--border); font-size: 12px; }
+.relay-connection summary { cursor: pointer; }
+.relay-settings { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding-top: 8px; }
+.relay-settings input { min-width: 180px; flex: 1; padding: 6px 8px; color: var(--text); background: var(--surface); border: 1px solid var(--border-strong); border-radius: 4px; }
+.relay-settings button { padding: 6px 10px; color: var(--text); background: var(--surface-raised); border: 1px solid var(--border-strong); border-radius: 4px; }
+.relay-settings button:hover:not(:disabled) { background: var(--surface-hover); }
+.relay-settings button:disabled { opacity: 0.5; }
+.relay-settings p { width: 100%; margin: 2px 0; }

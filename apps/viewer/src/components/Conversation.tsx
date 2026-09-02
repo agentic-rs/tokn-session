@@ -19,6 +19,9 @@ import { EventCard } from "./EventCard";
 import { LoadingRows, StateView } from "./StateView";
 
 interface ConversationProps {
+  pending_live_activity?: boolean;
+  on_show_live_activity?: () => void;
+  on_follow_change?: (following: boolean) => void;
   session: SessionSummary | null;
   events: EventSummary[];
   selected_event_key: string | null;
@@ -59,6 +62,9 @@ interface ConversationProps {
 }
 
 export function Conversation({
+  pending_live_activity = false,
+  on_show_live_activity,
+  on_follow_change,
   session,
   events,
   selected_event_key,
@@ -101,6 +107,7 @@ export function Conversation({
   const priorScrollHeight = useRef<number | null>(null);
   const observedSessionKey = useRef<string | null>(null);
   const didInitialScroll = useRef(false);
+  const followingBottom = useRef(true);
 
   useLayoutEffect(() => {
     const timeline = timelineRef.current;
@@ -112,6 +119,7 @@ export function Conversation({
       observedSessionKey.current = sessionKey;
       didInitialScroll.current = false;
       priorScrollHeight.current = null;
+      followingBottom.current = true;
     }
     if (sessionKey && initial_page_loaded && !didInitialScroll.current) {
       timeline.scrollTop = timeline.scrollHeight;
@@ -121,10 +129,14 @@ export function Conversation({
     if (!is_loading_older && priorScrollHeight.current !== null) {
       timeline.scrollTop += timeline.scrollHeight - priorScrollHeight.current;
       priorScrollHeight.current = null;
+    } else if (followingBottom.current && !is_loading_older) {
+      timeline.scrollTop = timeline.scrollHeight;
     }
   }, [events, initial_page_loaded, is_loading_older, session?.session_key]);
 
   function loadOlder() {
+    followingBottom.current = false;
+    on_follow_change?.(false);
     priorScrollHeight.current = timelineRef.current?.scrollHeight ?? null;
     on_load_older();
   }
@@ -200,7 +212,19 @@ export function Conversation({
         </button>
       </header>
 
-      <div className="conversation__timeline" ref={timelineRef}>
+      {pending_live_activity ? (
+        <button className="page-button" type="button" onClick={() => {
+          followingBottom.current = true;
+          on_follow_change?.(true);
+          on_show_live_activity?.();
+        }}>New activity · Jump to latest</button>
+      ) : null}
+      <div className="conversation__timeline" ref={timelineRef} onScroll={() => {
+        const timeline = timelineRef.current;
+        if (!timeline) return;
+        followingBottom.current = timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 48;
+        on_follow_change?.(followingBottom.current);
+      }}>
         {!session ? (
           <StateView
             message="Choose a session from the sidebar to inspect its normalized conversation."

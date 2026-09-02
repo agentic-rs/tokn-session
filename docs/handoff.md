@@ -33,6 +33,24 @@ The old `tokn-session sessions list/show` shape is intentionally unsupported.
 
 ## Session Relay
 
+The viewer can now connect to an independently started
+`tokn-session-relay serve --bind tcp://127.0.0.1:5557 [--native]`. This is a
+versioned local TCP snapshot/follow endpoint, separate from the unchanged
+stdout/ZeroMQ modes below. Metadata catalogs are shared, bodies load on demand,
+and concurrent clients reuse one JSONL normalizer per session. Appends decode
+only new complete lines; replacement/truncation triggers an atomic new
+generation. OpenCode currently resnapshots followed sessions on DB/WAL changes.
+See [Relay service](relay.md#local-snapshotfollow-service) for framing and limits.
+
+Viewer Relay settings persist in app config `relay.json`. Covered providers
+skip local body reads/indexing; timeline, trajectories and Inspector share
+received snapshots. Disconnect/reconnect retains last-good data, switching
+endpoints clears it, and paused timelines pin their displayed snapshot until
+the user chooses New activity. Append refreshes preserve expansion keys;
+generation resets invalidate them. Native remains optional and bounded in
+Inspector. Next gaps: incremental OpenCode follow and durable Relay unread
+tracking (local unread indexing is currently bypassed for these sessions).
+
 `tokn-session-relay` follows active Codex and Pi JSONL session trees plus the
 OpenCode SQLite database. It requires an output subcommand:
 
@@ -113,7 +131,8 @@ changed sessions on the normal path; when message/part timestamps cannot prove
 which session changed, it performs one correctness fallback over the current
 sessions. New sessions use the replay window, while changed message records
 republish their whole normalized batch. JSONL updates decode each appended
-complete line once; viewer reload behavior is not changed by this migration.
+complete line once. The viewer uses the snapshot service above when configured;
+the publication modes retain their existing best-effort behavior.
 The database is opened read-only with WAL visibility and an immutable fallback;
 the relay never runs provider migrations.
 
@@ -839,14 +858,14 @@ OpenCode has the first live-output normalizer: `OpenCodeLiveNormalizer` parses `
 - Codex and Pi have normalization fixtures. OpenCode now has wire-format
   fixtures plus adapter/source regression tests; full SQLite-backed CLI golden
   tests are still missing.
-- The relay uses ZeroMQ `PUB/SUB`, which intentionally has no persistence or
+- Relay's ZeroMQ `PUB/SUB` mode intentionally has no persistence or
   delivery acknowledgement; subscribers that are disconnected can miss events.
 - The terminal pet cannot distinguish every runtime state authoritatively until
   provider task lifecycle and interaction events are represented in `AgentEvent`.
-- The desktop viewer remains historical and read-only. Codex and Pi sidebar
-  metadata use native watcher-driven catalog invalidation, but the viewer has
-  no provider live stream or authoritative incremental event parser; selected
-  timelines still refresh from the durable index and historical source reads.
+- The desktop viewer remains read-only. Without a Relay connection, selected
+  timelines refresh from the durable index and historical source reads. Relay
+  snapshot/follow supports Codex, Pi and OpenCode; it is not an agent-control
+  transport, and its unread tracking is not persisted yet.
 - Viewer session-file relocation is deliberately conservative. Repeated or
   overlapping moves can make the retired source ambiguous, in which case the
   later path is treated as a new row instead of transferring prior attention.

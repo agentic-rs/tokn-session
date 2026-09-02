@@ -1,5 +1,6 @@
 mod commands;
 mod model;
+mod relay;
 mod repository;
 mod service;
 mod watcher;
@@ -216,6 +217,42 @@ pub fn run() {
         .expect("viewer session index path should have a parent directory");
       std::fs::create_dir_all(index_directory).expect("viewer session index directory should be creatable");
       let service = ViewerService::native(index_path).expect("viewer session index should open");
+      let relay = service.relay.clone();
+      let mut relay_changes = relay.changes.subscribe();
+      let relay_handle = app.handle().clone();
+      tauri::async_runtime::spawn(async move {
+        loop {
+          match relay_changes.recv().await {
+            Ok(change) => {
+              let _ = relay_handle.emit("relay-changed", change);
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+              let _ = relay_handle.emit(
+                "relay-changed",
+                crate::relay::RelayChange {
+                  session_key: None,
+                  reset: true,
+                },
+              );
+            }
+            Err(_) => break,
+          }
+          let _ = relay_handle.emit("relay-status", relay.status());
+        }
+      });
+      match app
+        .path()
+        .app_config_dir()
+        .map_err(|e| e.to_string())
+        .and_then(|path| crate::relay::read_settings(&path.join("relay.json")))
+      {
+        Ok(settings) => {
+          if let Err(error) = service.relay.configure(settings) {
+            eprintln!("Relay settings: {error}");
+          }
+        }
+        Err(error) => eprintln!("Relay settings: {error}"),
+      }
       let (retry_sender, mut retry_receiver) = tokio::sync::mpsc::unbounded_channel();
       service.set_session_index_retry_sender(retry_sender);
       // Register before the first catalog so a rollout append during initial
@@ -502,6 +539,8 @@ pub fn run() {
       commands::events::acknowledge_session_attention,
       commands::indexing::get_session_index_progress,
       commands::indexing::retry_session_index,
+      commands::relay::get_relay_status,
+      commands::relay::configure_relay,
     ])
     .run(tauri::generate_context!())
     .expect("error while running tokn session viewer");

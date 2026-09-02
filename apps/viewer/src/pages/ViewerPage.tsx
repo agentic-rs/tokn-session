@@ -1,4 +1,5 @@
 import { Conversation } from "../components/Conversation";
+import { RelayConnection } from "../components/RelayConnection";
 import { Inspector } from "../components/Inspector";
 import { Sidebar } from "../components/Sidebar";
 import { StatusBar } from "../components/StatusBar";
@@ -9,6 +10,7 @@ export function ViewerPage() {
 
   return (
     <div className="viewer-app">
+      <RelayConnection />
       <div className="viewer-shell" data-inspector-open={viewer.inspectorOpen}>
         <div className="sidebar-shell" data-mobile-open={viewer.mobileSidebarOpen}>
           <Sidebar
@@ -44,6 +46,9 @@ export function ViewerPage() {
         ) : null}
 
         <Conversation
+          pending_live_activity={viewer.pendingLiveActivity}
+          on_show_live_activity={viewer.showLiveActivity}
+          on_follow_change={viewer.setFollowingLive}
           error={viewer.eventsError}
           events={viewer.events}
           expanded_detail={viewer.expandedDetail}

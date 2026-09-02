@@ -6,6 +6,7 @@ import {
   listSessions,
   listenForSessionIndexChanges,
   listenForSessionIndexProgress,
+  listenForRelayChanges,
   loadEventDetail,
   loadEventPage,
   loadTrajectoryEventPage,
@@ -181,6 +182,10 @@ export function useViewerState() {
   const [historyStatus, setHistoryStatus] = useState<SessionHistoryStatus | null>(null);
   const [eventsAttempt, setEventsAttempt] = useState(0);
   const eventsRequest = useRef(0);
+  const followingLive = useRef(true);
+  const pendingLiveReset = useRef(false);
+  const liveRefresh = useRef(false);
+  const [pendingLiveActivity, setPendingLiveActivity] = useState(false);
   const [acceptedInitialEventPage, setAcceptedInitialEventPage] = useState<
     AcceptedInitialEventPage | null
   >(null);
@@ -436,19 +441,55 @@ export function useViewerState() {
     [],
   );
 
-  const clearTrajectoryPages = useCallback(() => {
+  const clearTrajectoryPages = useCallback((preserveExpansion = false) => {
     trajectoryPageGeneration.current += 1;
     trajectoryPageRequests.current.clear();
     const next = new Map<string, Map<string, TrajectoryEventPageState>>();
     trajectoryPagesRef.current = next;
     setTrajectoryPages(next);
     expandedTrajectoryDetailRequest.current += 1;
-    setExpandedTrajectoryEvent(null);
+    if (!preserveExpansion) setExpandedTrajectoryEvent(null);
     setExpandedTrajectoryDetailOwnerKey(null);
     setExpandedTrajectoryDetail(null);
     setExpandedTrajectoryDetailLoading(false);
     setExpandedTrajectoryDetailError(null);
   }, []);
+
+  const showLiveActivity = useCallback(() => {
+    followingLive.current = true;
+    liveRefresh.current = true;
+    setPendingLiveActivity(false);
+    setEventsAttempt((attempt) => attempt + 1);
+  }, []);
+
+  const setFollowingLive = useCallback((following: boolean) => {
+    followingLive.current = following;
+  }, []);
+
+  useEffect(() => {
+    followingLive.current = true;
+    pendingLiveReset.current = false;
+    setPendingLiveActivity(false);
+  }, [selectedSessionKey]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listenForRelayChanges((change) => {
+      if (disposed) return;
+      setSessionsAttempt((attempt) => attempt + 1);
+      if (!selectedSessionKeyRef.current) return;
+      if (change.session_key === null && !change.reset) return;
+      if (change.session_key !== null && change.session_key !== selectedSessionKeyRef.current) return;
+      pendingLiveReset.current ||= change.reset;
+      if (followingLive.current) showLiveActivity();
+      else setPendingLiveActivity(true);
+    }).then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    }).catch((error: unknown) => setEventsError(errorMessage(error)));
+    return () => { disposed = true; unlisten?.(); };
+  }, [showLiveActivity]);
 
   const requestTrajectoryEventPage = useCallback(
     (
@@ -856,8 +897,16 @@ export function useViewerState() {
     // or selected-session change invalidates any response that has not yet
     // reached a committed React render.
     setAcceptedInitialEventPage(null);
-    clearTrajectoryPages();
     const ownsSession = eventsOwnerKeyRef.current === selectedSessionKey;
+    const isLiveRefresh = liveRefresh.current && ownsSession;
+    liveRefresh.current = false;
+    const reset = pendingLiveReset.current;
+    pendingLiveReset.current = false;
+    clearTrajectoryPages(isLiveRefresh && !reset);
+    if (reset) {
+      setExpandedEventKey(null);
+      applyEventSelection(null, false);
+    }
     if (!ownsSession) {
       eventsOwnerKeyRef.current = selectedSessionKey;
       setEventsOwnerKey(selectedSessionKey);
@@ -1497,6 +1546,9 @@ export function useViewerState() {
     totalEvents: eventsAreOwned ? totalEvents : null,
     historyStatus: eventsAreOwned ? historyStatus : null,
     retryEvents: () => setEventsAttempt((attempt) => attempt + 1),
+    pendingLiveActivity,
+    showLiveActivity,
+    setFollowingLive,
     loadOlderEvents,
     loadNewerEvents,
     inspectorOpen,

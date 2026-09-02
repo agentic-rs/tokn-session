@@ -8,6 +8,7 @@ import {
   listSessions,
   listenForSessionIndexChanges,
   listenForSessionIndexProgress,
+  listenForRelayChanges,
   loadEventDetail,
   loadEventPage,
   loadTrajectoryEventPage,
@@ -20,10 +21,12 @@ import type {
   SessionIndexProgress,
   SessionSummary,
   TrajectoryEventPageResponse,
+  RelayChange,
 } from "./types";
 import { useViewerState } from "./useViewerState";
 
 vi.mock("./tauri", () => ({
+  listenForRelayChanges: vi.fn(() => Promise.resolve(vi.fn())),
   acknowledgeSessionAttention: vi.fn(() => Promise.resolve({ changed: false })),
   getSessionIndexProgress: vi.fn(() => new Promise(() => undefined)),
   listSessionChildren: vi.fn(() => new Promise(() => undefined)),
@@ -37,6 +40,7 @@ vi.mock("./tauri", () => ({
 }));
 
 beforeEach(() => {
+  vi.mocked(listenForRelayChanges).mockReset().mockResolvedValue(vi.fn());
   vi.mocked(acknowledgeSessionAttention).mockReset().mockResolvedValue({ changed: false });
   vi.mocked(getSessionIndexProgress).mockReset().mockImplementation(() => new Promise(() => undefined));
   vi.mocked(listSessionChildren).mockReset().mockImplementation(() => new Promise(() => undefined));
@@ -300,6 +304,53 @@ function ViewerPageCommitProbe() {
     </>
   );
 }
+
+describe("useViewerState Relay updates", () => {
+  it("preserves expansion while following and defers updates when reading older events", async () => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => {
+      emit = handler;
+      return Promise.resolve(vi.fn());
+    });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    vi.mocked(loadEventPage).mockResolvedValue(toolEventPage());
+    vi.mocked(loadEventDetail).mockResolvedValue(toolDetail("done"));
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.events).toHaveLength(1));
+    act(() => result.current.toggleEventExpanded("event.v1.1"));
+    act(() => emit?.({ session_key: "live", reset: false }));
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(2));
+    expect(result.current.expandedEventKey).toBe("event.v1.1");
+    act(() => result.current.setFollowingLive(false));
+    act(() => emit?.({ session_key: "live", reset: false }));
+    expect(result.current.pendingLiveActivity).toBe(true);
+    expect(loadEventPage).toHaveBeenCalledTimes(2);
+    act(() => result.current.showLiveActivity());
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(3));
+    expect(result.current.pendingLiveActivity).toBe(false);
+    expect(result.current.expandedEventKey).toBe("event.v1.1");
+    act(() => emit?.({ session_key: "live", reset: true }));
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(4));
+    expect(result.current.expandedEventKey).toBeNull();
+  });
+
+  it("ignores unrelated session bodies and unregisters its listener", async () => {
+    const stop = vi.fn();
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(stop); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    vi.mocked(loadEventPage).mockResolvedValue(toolEventPage());
+    const { result, unmount } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.events).toHaveLength(1));
+    act(() => emit?.({ session_key: "another", reset: true }));
+    act(() => emit?.({ session_key: null, reset: false }));
+    expect(loadEventPage).toHaveBeenCalledOnce();
+    unmount();
+    expect(stop).toHaveBeenCalledOnce();
+  });
+});
 
 describe("useViewerState session-index signalling", () => {
   it("keeps the initial catalog metadata-only until the user chooses a session", async () => {

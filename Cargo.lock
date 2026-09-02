@@ -4107,6 +4107,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
@@ -4245,6 +4246,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokn-session-client",
  "tokn-session-codex",
  "tokn-session-core",
  "tokn-session-opencode",
@@ -4275,9 +4277,11 @@ dependencies = [
  "tauri-build",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tokn-session-client",
  "tokn-session-core",
  "tokn-session-index",
+ "tokn-session-relay",
  "tokn-session-render",
 ]
 

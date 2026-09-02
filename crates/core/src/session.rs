@@ -1,9 +1,10 @@
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::agent_event::AgentEvent;
 
 /// Metadata used to discover a session without reading its conversation body.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionHeader {
   pub id: String,
   pub parent_session_id: Option<String>,
@@ -26,7 +27,7 @@ pub struct SessionHeader {
   pub updated_at_ms: Option<i64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionRef {
   pub id: String,
   pub parent_session_id: Option<String>,
@@ -41,20 +42,20 @@ pub struct SessionRef {
   pub message_count: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadedSession {
   pub reference: SessionRef,
   pub events: Vec<AgentEvent>,
   pub history_status: SessionHistoryStatus,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadedSessionTree {
   pub session: LoadedSession,
   pub children: Vec<LoadedSessionTree>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SessionHistoryStatus {
   Complete,
   FilteredSubagent,

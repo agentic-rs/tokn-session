@@ -36,8 +36,16 @@ async fn run(args: Args) -> Result<(), String> {
     new_file_replay: args.new_file_replay,
     include_native: args.include_native,
   };
+  if let Command::Serve { endpoint } = &args.command {
+    eprintln!("serving local Relay snapshots on {endpoint}");
+    return tokio::select! {
+      result = tokn_session_relay::service_server::serve(endpoint, config) => result,
+      _ = tokio::signal::ctrl_c() => Ok(()),
+    };
+  }
   let mut relay = SessionRelay::new(config).await?;
   let mut output = match args.command {
+    Command::Serve { .. } => unreachable!(),
     Command::ZeroMq { endpoint } => {
       let publisher = ZmqPublisher::bind(&endpoint).await?;
       eprintln!("following Codex/Pi/OpenCode session events via ZeroMQ on {endpoint}");
@@ -394,6 +402,7 @@ const ANSI_DIM: &str = "\x1b[2m";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
+  Serve { endpoint: String },
   ZeroMq { endpoint: String },
   Stdout { format: StdoutFormat, color: bool },
 }
@@ -444,6 +453,7 @@ enum ArgsParse {
 
 #[derive(Clone, Copy)]
 enum Help {
+  Serve,
   Root,
   ZeroMq,
   Stdout,
@@ -452,7 +462,7 @@ enum Help {
 impl Args {
   fn parse(mut args: impl Iterator<Item = String>) -> Result<ArgsParse, String> {
     let Some(command) = args.next() else {
-      return Err("missing subcommand; expected `zeromq` or `stdout`".to_string());
+      return Err("missing subcommand; expected `serve`, `zeromq` or `stdout`".to_string());
     };
     if matches!(command.as_str(), "-h" | "--help") {
       return Ok(ArgsParse::Help(Help::Root));
@@ -460,6 +470,9 @@ impl Args {
 
     let mut parsed = Self {
       command: match command.as_str() {
+        "serve" => Command::Serve {
+          endpoint: tokn_session_relay::service_protocol::DEFAULT_SERVICE_ENDPOINT.into(),
+        },
         "zeromq" => Command::ZeroMq {
           endpoint: DEFAULT_ENDPOINT.to_string(),
         },
@@ -467,12 +480,20 @@ impl Args {
           format: StdoutFormat::Summary,
           color: false,
         },
-        _ => return Err(format!("unknown subcommand `{command}`; expected `zeromq` or `stdout`")),
+        _ => {
+          return Err(format!(
+            "unknown subcommand `{command}`; expected `serve`, `zeromq` or `stdout`"
+          ));
+        }
       },
       codex_dir: None,
       pi_dir: None,
       opencode_dir: None,
-      poll_interval: DEFAULT_POLL_INTERVAL,
+      poll_interval: if command == "serve" {
+        Duration::from_millis(500)
+      } else {
+        DEFAULT_POLL_INTERVAL
+      },
       new_file_replay: NewFileReplay::Messages(DEFAULT_REPLAY_MESSAGES),
       include_native: false,
     };
@@ -482,16 +503,22 @@ impl Args {
       match arg.as_str() {
         "--native" => parsed.include_native = true,
         "--bind" => match &mut parsed.command {
-          Command::ZeroMq { endpoint } => *endpoint = next_value(&mut args, "--bind")?,
-          Command::Stdout { .. } => return Err("`--bind` is only valid for the `zeromq` subcommand".to_string()),
+          Command::ZeroMq { endpoint } | Command::Serve { endpoint } => *endpoint = next_value(&mut args, "--bind")?,
+          Command::Stdout { .. } => {
+            return Err("`--bind` is only valid for the `serve` or `zeromq` subcommand".to_string());
+          }
         },
         "--format" => match &mut parsed.command {
           Command::Stdout { format, .. } => *format = StdoutFormat::parse(&next_value(&mut args, "--format")?)?,
-          Command::ZeroMq { .. } => return Err("`--format` is only valid for the `stdout` subcommand".to_string()),
+          Command::ZeroMq { .. } | Command::Serve { .. } => {
+            return Err("`--format` is only valid for the `stdout` subcommand".to_string());
+          }
         },
         "--color" => match &mut parsed.command {
           Command::Stdout { color, .. } => *color = true,
-          Command::ZeroMq { .. } => return Err("`--color` is only valid for the `stdout` subcommand".to_string()),
+          Command::ZeroMq { .. } | Command::Serve { .. } => {
+            return Err("`--color` is only valid for the `stdout` subcommand".to_string());
+          }
         },
         "--codex-dir" => parsed.codex_dir = Some(PathBuf::from(next_value(&mut args, "--codex-dir")?)),
         "--pi-dir" => parsed.pi_dir = Some(PathBuf::from(next_value(&mut args, "--pi-dir")?)),
@@ -512,6 +539,7 @@ impl Args {
         }
         "-h" | "--help" => {
           let help = match parsed.command {
+            Command::Serve { .. } => Help::Serve,
             Command::ZeroMq { .. } => Help::ZeroMq,
             Command::Stdout { .. } => Help::Stdout,
           };
@@ -519,6 +547,9 @@ impl Args {
         }
         _ => return Err(format!("unknown argument `{arg}`; use --help for usage")),
       }
+    }
+    if matches!(parsed.command, Command::Serve { .. }) && replay_option_seen {
+      return Err("`serve` always snapshots complete sessions; replay options apply to stdout/zeromq only".into());
     }
     Ok(ArgsParse::Run(parsed))
   }
@@ -584,6 +615,9 @@ fn resolve_root(explicit: &Option<PathBuf>, home: Option<&Path>, relative: &str)
 
 fn print_help(help: Help) {
   match help {
+    Help::Serve => println!(
+      "Local snapshot-and-follow service (version 1).\n\nUsage:\n  tokn-session-relay serve [options]\n\nOptions:\n  --bind <endpoint>       Numeric loopback TCP endpoint (default: tcp://127.0.0.1:5557)\n  --native                Include native records\n  --codex-dir <path>       Codex session root\n  --pi-dir <path>          Pi session root\n  --opencode-dir <path>    OpenCode directory or database\n  --poll-interval <time>   Active-session polling interval (default: 500ms)\n\nHistory is loaded on demand. Replay-window flags do not apply to serve."
+    ),
     Help::Root => println!(
       "\
 Follow Codex and Pi session files plus OpenCode's SQLite database, and emit normalized events.
@@ -592,6 +626,7 @@ Usage:
   tokn-session-relay <subcommand> [options]
 
 Subcommands:
+  serve   Serve on-demand snapshots and live updates to local viewers
   zeromq  Publish two-frame ZeroMQ messages
   stdout  Write formatted AgentEvent output to stdout
 
@@ -651,6 +686,27 @@ mod tests {
   use tokn_session_relay::{NewFileReplay, ProjectContext, RelayEvent, SessionContext};
 
   use super::{Args, ArgsParse, Command, StdoutFormat, write_jsonl_event, write_stdout_event};
+
+  #[test]
+  fn parses_independent_snapshot_service() {
+    let ArgsParse::Run(args) = Args::parse(
+      ["serve", "--native", "--bind", "tcp://127.0.0.1:9557"]
+        .into_iter()
+        .map(str::to_string),
+    )
+    .unwrap() else {
+      panic!("expected run");
+    };
+    assert_eq!(
+      args.command,
+      Command::Serve {
+        endpoint: "tcp://127.0.0.1:9557".into()
+      }
+    );
+    assert_eq!(args.poll_interval, Duration::from_millis(500));
+    assert!(args.include_native);
+    assert!(Args::parse(["serve", "--replay-all"].into_iter().map(str::to_string)).is_err());
+  }
 
   #[test]
   fn parses_zeromq_subcommand_and_shared_options() {

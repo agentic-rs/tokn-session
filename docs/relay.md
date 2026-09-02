@@ -50,14 +50,81 @@ The reader shares its grouped normalization with historical OpenCode/ZCode
 loading; historical APIs still flatten to the existing `LoadedSession` shape.
 Relay provider support remains Codex, Pi and OpenCode.
 
-This is a best-effort live feed, not a durable replication protocol: no ack,
+The stdout/ZeroMQ output is a best-effort live feed, not a durable replication protocol: no ack,
 resume cursor, or complete history on startup. JSONL offsets are not stable
 across file truncation/replacement; whole-session deletion and database/file
-replacement do not emit a complete set of tombstones. A future viewer store
-must establish a snapshot/resync boundary before treating it as authoritative.
+replacement do not emit a complete set of tombstones. Viewers should use the
+separate snapshot/follow service below instead of treating PUB as authoritative.
 JSONL updates only decode appended complete lines. OpenCode still reloads
 changed sessions (and can perform its existing correctness fallback); this
-change does not add incremental SQLite parsing or remove viewer reloads.
+wire migration does not add incremental SQLite parsing.
+
+## Local snapshot/follow service
+
+Start a separately configured service for the viewer:
+
+```sh
+tokn-session-relay serve --bind tcp://127.0.0.1:5557 --native
+```
+
+`--native` is optional. The usual `--codex-dir`, `--pi-dir`, and
+`--opencode-dir` source overrides apply. `--poll-interval` defaults to 500ms
+for active sessions; the shared metadata catalog is cached for two seconds.
+`serve` always supplies complete history and rejects replay-window flags.
+It does not start a PUB socket: pets can continue using an independently
+configured `zeromq` process on port 5556, without changing their wire format.
+
+This endpoint is **length-prefixed JSON over TCP, not ZeroMQ**. Each frame is
+a big-endian u32 byte length followed by UTF-8 JSON. Version 1 requests are
+`{"version":1,"action":"catalog"}` or
+`{"version":1,"action":"follow","session_key":"<catalog key>"}`.
+The server answers `hello` with its version, providers and native capability.
+Catalog responses contain `header` frames followed by `catalog_end`, including
+discovery warnings. Follow requests accept only keys from the discovered
+catalog, never arbitrary paths.
+
+A follow connection receives `begin`, zero or more `record` frames, then
+`commit`. Begin and commit carry matching generation and decimal-string
+revision values; begin also carries the session header and `reset` flag.
+The first transaction has `reset: true`. Subsequent JSONL transactions append
+new records in the same generation. File replacement, truncation and detected
+same-length rewrites start a fresh generation and replace the entire snapshot.
+OpenCode DB/WAL changes currently reload the followed session and send a fresh
+replacement generation, including deletions. Unrelated DB writes can trigger
+this conservative reload; incremental SQLite updates remain future work.
+
+Session bodies are loaded on demand. Concurrent subscribers share one reader
+and normalizer per session; complete appended JSONL lines decode only once.
+An idle session is released after its last subscriber leaves. Source errors,
+invalid frames and interrupted transactions never commit partial data.
+Slow clients are disconnected and reconnect to a complete snapshot; there is
+no durable event journal or resume-after-restart cursor. Heartbeats are sent
+every two seconds. Coalesced notifications include every intervening append.
+
+Limits: numeric loopback addresses only (no remote authentication), 64 client
+connections, 16 active sessions, 8 MiB per wire frame, 128 MiB serialized
+records per snapshot and 128 MiB per JSONL source. These are payload limits,
+not exact process-RAM caps; decoded objects and snapshots add overhead. Large
+sessions fail explicitly rather than silently returning partial history.
+Any local process can connect; `--native` may expose sensitive provider data.
+
+### Viewer connection
+
+The viewer's Relay panel saves endpoint and enabled state in its application
+config `relay.json`. It never launches or terminates Relay. Catalog polling
+updates the sidebar; up to eight recently opened sessions share received
+snapshots between timeline, trajectories and Inspector. Covered providers
+bypass local body indexing/reading. Uncovered providers retain local history.
+An enabled connection reconnects automatically and keeps the last committed
+data through failures. Explicit Disconnect also retains cached sessions until
+restart; switching endpoints clears them to avoid mixing independent sources.
+
+The displayed snapshot stays pinned while reading older events. Live updates
+follow only at the bottom; otherwise “New activity” lets the user jump to the
+latest page. Append refreshes preserve expansion keys, while a replacement
+generation clears them. Optional native records are available in bounded
+Inspector details, excluding records containing redacted reasoning. Local
+durable unread/seen indexing is not applied to Relay-backed sessions yet.
 
 ## Consumer migration
 

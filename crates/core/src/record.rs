@@ -1,11 +1,11 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{AgentEvent, LoadedSession, SessionHistoryStatus, SessionRef};
 
 /// One source record and its ordered normalization output. IDs are scoped to
 /// the source path and session. A record can normalize to no events.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NormalizedRecord {
   pub record_id: String,
   #[serde(skip_serializing_if = "Option::is_none")]
