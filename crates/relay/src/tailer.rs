@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokn_session_codex::{event::CodexLine, normalize::CodexNormalizer};
 use tokn_session_core::{AgentEvent, LoadedSessionRecords, NormalizedRecord, Provider};
@@ -40,7 +40,7 @@ pub struct RelayEvent {
 
 /// Wire envelope. Upserts replace the entire event batch for this record ID;
 /// removals invalidate an observed SQLite record and carry an empty batch.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RelayRecord {
   pub path: PathBuf,
   pub topic: String,
@@ -50,7 +50,7 @@ pub struct RelayRecord {
   pub record: NormalizedRecord,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordOperation {
   Upsert,
@@ -555,7 +555,7 @@ fn relay_records_from_loaded(
   records
 }
 
-struct FileState {
+pub(crate) struct FileState {
   path: PathBuf,
   provider: Provider,
   identity: FileIdentity,
@@ -569,6 +569,23 @@ struct FileState {
 }
 
 impl FileState {
+  /// Service readers start at zero and keep this exact normalizer for follow.
+  pub(crate) fn for_snapshot(
+    path: PathBuf,
+    provider: Provider,
+    include_native: bool,
+    root: &Path,
+  ) -> Result<Self, String> {
+    let (catalog, _, _) = load_project_catalog(&[ProviderRoot::new(provider, root.to_path_buf())]);
+    let mut state = Self::open(path, provider, Arc::new(RwLock::new(catalog)))?;
+    state.include_native = include_native;
+    Ok(state)
+  }
+
+  pub(crate) fn follow_snapshot(&mut self) -> Result<(TailUpdate, bool), String> {
+    self.read_appended(true)
+  }
+
   fn open(path: PathBuf, provider: Provider, project_catalog: SharedProjectCatalog) -> Result<Self, String> {
     let metadata = std::fs::metadata(&path).map_err(|err| format!("failed to inspect {}: {err}", path.display()))?;
     let context = SessionContext::from_path(provider, &path);

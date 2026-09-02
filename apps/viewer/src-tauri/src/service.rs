@@ -57,6 +57,7 @@ const TOOL_OUTPUT_TRUNCATION_MARKER: &str = "\n\u{2026} output truncated \u{2026
 
 #[derive(Clone)]
 pub(crate) struct ViewerService {
+  pub(crate) relay: Arc<crate::relay::ViewerRelay>,
   repository: Arc<dyn ViewerRepository>,
   session_index: Arc<SessionIndex>,
   index_refresh_gate: Arc<Mutex<()>>,
@@ -626,6 +627,7 @@ impl ViewerService {
     // the durable catalog again.
     let observed_index_data_version = session_index.data_version().ok();
     let service = Self {
+      relay: crate::relay::ViewerRelay::new(),
       repository,
       session_index,
       index_refresh_gate: Arc::new(Mutex::new(())),
@@ -838,12 +840,23 @@ impl ViewerService {
     self
       .session_index
       .staged_session_baseline_source_counts(&[INDEX_PENDING_BODY_CURSOR_PREFIX, LEGACY_PENDING_BODY_CURSOR_PREFIX])
+      .map(|counts| {
+        counts
+          .into_iter()
+          .filter(|count| {
+            !ViewerProvider::ALL
+              .into_iter()
+              .any(|provider| provider.as_str() == count.provider && self.relay.covers(provider))
+          })
+          .collect()
+      })
       .map_err(|error| format!("failed to read staged session-index progress: {error}"))
   }
 
   fn pending_catalog_providers(&self) -> Result<Vec<ViewerProvider>, String> {
     ViewerProvider::ALL
       .into_iter()
+      .filter(|provider| !self.relay.covers(*provider))
       .map(|provider| {
         self
           .session_index
@@ -1127,6 +1140,12 @@ impl ViewerService {
   /// A missing sentinel is an ordinary cold-start state, not permission to
   /// synchronously inspect provider storage on an IPC request.
   fn indexed_session_inventory(&self, provider: ViewerProvider) -> Result<Option<SessionHeaderInventory>, String> {
+    if self.relay.covers(provider) {
+      return Ok(self.relay.has_catalog().then(|| SessionHeaderInventory {
+        headers: self.relay.headers(provider),
+        direct_attention: HashMap::new(),
+      }));
+    }
     let catalog = self
       .session_index
       .source_state(&index_catalog_source_key(provider))
@@ -1160,6 +1179,19 @@ impl ViewerService {
   /// header APIs, so the first viewer screen remains fast and deterministic
   /// even while a provider catalog is still pending.
   fn indexed_session_inventories(&self, providers: &[ViewerProvider]) -> Result<IndexedSessionInventories, String> {
+    if providers.iter().any(|provider| self.relay.covers(*provider)) {
+      let local: Vec<_> = providers.iter().copied().filter(|p| !self.relay.covers(*p)).collect();
+      let mut result = self.indexed_session_inventories(&local)?;
+      for provider in providers.iter().copied().filter(|p| self.relay.covers(*p)) {
+        match self.indexed_session_inventory(provider)? {
+          Some(inventory) => {
+            result.by_provider.insert(provider, inventory);
+          }
+          None => result.pending_providers.push(provider),
+        }
+      }
+      return Ok(result);
+    }
     let mut committed_providers = HashSet::new();
     let mut pending_providers = Vec::new();
     for &provider in providers {
@@ -1219,10 +1251,16 @@ impl ViewerService {
   }
 
   fn index_error_for(&self, provider: ViewerProvider) -> Option<String> {
+    if self.relay.covers(provider) {
+      return self.relay.status().error;
+    }
     self.index_errors.lock().ok()?.get(&provider).cloned()
   }
 
   fn attention_revision_for_locator(&self, locator: &SessionLocator) -> Option<String> {
+    if self.relay.covers(locator.provider) {
+      return None;
+    }
     let catalog_key = index_catalog_source_key(locator.provider);
     if self.session_index.source_state(&catalog_key).ok().flatten().is_none() {
       return None;
@@ -1368,6 +1406,10 @@ impl ViewerService {
     let mut unavailable = HashSet::new();
     let providers = ordered_providers(providers);
     for provider in providers.iter().copied() {
+      if self.relay.covers(provider) {
+        self.finish_catalog_provider(provider, false, true);
+        continue;
+      }
       self.set_catalog_active_provider(provider);
       match self.refresh_provider_catalog(provider) {
         Ok(provider_refresh) => {
@@ -1807,6 +1849,9 @@ impl ViewerService {
     provider: ViewerProvider,
     paths: &BTreeSet<PathBuf>,
   ) -> Result<ProviderIndexRefresh, String> {
+    if self.relay.covers(provider) {
+      return Ok(ProviderIndexRefresh::default());
+    }
     if !matches!(provider, ViewerProvider::Codex | ViewerProvider::Pi) {
       return Ok(ProviderIndexRefresh {
         retry_catalog_soon: true,
@@ -2105,7 +2150,7 @@ impl ViewerService {
       .map(|jobs| jobs.clone())
       .unwrap_or_default();
     for provider in ViewerProvider::ALL {
-      if unavailable.contains(&provider) {
+      if unavailable.contains(&provider) || self.relay.covers(provider) {
         continue;
       }
       let sources = self
@@ -2329,7 +2374,11 @@ impl ViewerService {
     // only add attention beyond this revision, which a page acknowledgement
     // will deliberately leave unread.
     let attention_revision = self.attention_revision_for_locator(&locator);
-    let loaded = self.load_verified(&locator)?;
+    let loaded = if self.relay.covers(locator.provider) && request.cursor.is_none() && request.offset.is_none() {
+      self.relay.advance(&locator)?
+    } else {
+      self.load_verified(&locator)?
+    };
     let timeline = timeline_entries(&loaded.events);
     let total_events = timeline.len();
     let requested = requested_offset(request.cursor.as_deref(), request.offset, decode_event_cursor)?;
@@ -2427,7 +2476,13 @@ impl ViewerService {
       let start_source_event_index = decode_trajectory_key(&request.event_key)?;
       let trajectory = trajectory_for_start(&loaded.events, start_source_event_index)
         .ok_or_else(|| "trajectory key is outside the session".to_string())?;
-      return trajectory_detail(request.event_key, &trajectory, &loaded.events);
+      let mut detail = trajectory_detail(request.event_key, &trajectory, &loaded.events)?;
+      if let Some(native) =
+        self.relay_native_detail(&locator, &loaded, &trajectory_source_event_indices(&trajectory))?
+      {
+        detail.native = Some(native);
+      }
+      return Ok(detail);
     }
 
     let source_event_index = decode_event_key(&request.event_key)?;
@@ -2437,22 +2492,77 @@ impl ViewerService {
     match entry {
       TimelineEntry::Event { source_event_index } => {
         let event = &loaded.events[source_event_index];
-        event_detail(
+        let mut detail = event_detail(
           encode_event_key(source_event_index),
           event,
           &loaded.events,
           source_event_index,
-        )
+        )?;
+        if self.relay.covers(locator.provider)
+          && !matches!(event, AgentEvent::Reasoning(reasoning) if reasoning.redacted == Some(true))
+        {
+          if let Some(native) = self.relay.native(&locator, source_event_index, &loaded) {
+            detail.native = Some(bounded_detail_value(native, "native")?);
+          }
+        }
+        Ok(detail)
       }
       TimelineEntry::ToolOperation {
         source_event_index,
         operation,
-      } => tool_operation_detail(encode_event_key(source_event_index), &operation, &loaded.events),
+      } => {
+        let mut detail = tool_operation_detail(encode_event_key(source_event_index), &operation, &loaded.events)?;
+        if let Some(native) = self.relay_native_detail(&locator, &loaded, &operation.source_event_indices)? {
+          detail.native = Some(native);
+        }
+        Ok(detail)
+      }
       TimelineEntry::Trajectory { .. } => unreachable!("base timeline never contains trajectories"),
     }
   }
 
+  fn relay_native_detail(
+    &self,
+    locator: &SessionLocator,
+    loaded: &Arc<LoadedSession>,
+    indices: &[usize],
+  ) -> Result<Option<Value>, String> {
+    if !self.relay.covers(locator.provider) {
+      return Ok(None);
+    }
+    let mut records = Vec::new();
+    let mut bytes: usize = 0;
+    let mut truncated = indices.len() > MAX_TRAJECTORY_DETAIL_SOURCE_RECORDS;
+    for &index in indices.iter().take(MAX_TRAJECTORY_DETAIL_SOURCE_RECORDS) {
+      let Some(native) = self.relay.native(locator, index, loaded) else {
+        continue;
+      };
+      let record = bounded_detail_value_with_limit(
+        json!({ "event_key": encode_event_key(index), "native": native }),
+        "relay_native_record",
+        MAX_TRAJECTORY_DETAIL_SOURCE_RECORD_BYTES,
+      )?;
+      bytes = bytes.saturating_add(serialized_value_size(&record, "relay native record")?);
+      if bytes > trajectory_detail_record_budget() {
+        truncated = true;
+        break;
+      }
+      records.push(record);
+    }
+    if records.is_empty() {
+      return Ok(None);
+    }
+    bounded_detail_value(
+      json!({ "source_event_count": indices.len(), "source_records": records, "truncated": truncated }),
+      "relay_native_records",
+    )
+    .map(Some)
+  }
+
   fn load_verified(&self, locator: &SessionLocator) -> Result<Arc<LoadedSession>, String> {
+    if self.relay.covers(locator.provider) {
+      return self.relay.load(locator);
+    }
     let revision_before = source_revision(locator);
     if let Some(revision) = revision_before.as_ref() {
       let cache = self
@@ -10088,6 +10198,47 @@ mod tests {
       })
       .unwrap();
     assert_eq!(loads.load(Ordering::SeqCst), 2);
+  }
+
+  #[tokio::test]
+  async fn relay_covered_provider_never_falls_back_to_the_repository() {
+    let loads = Arc::new(AtomicUsize::new(0));
+    let service = ViewerService::new(Arc::new(CountingRepository { loads: loads.clone() }));
+    service
+      .relay
+      .configure(crate::relay::RelaySettings {
+        endpoint: "tcp://127.0.0.1:1".into(),
+        enabled: true,
+      })
+      .unwrap();
+    let locator = SessionLocator {
+      version: 1,
+      provider: ViewerProvider::Codex,
+      session_id: "fixture".into(),
+      source_path: "/missing/session.jsonl".into(),
+    };
+    assert!(service.load_verified(&locator).is_err());
+    assert_eq!(loads.load(Ordering::SeqCst), 0);
+    assert!(
+      service
+        .indexed_session_inventory(ViewerProvider::Codex)
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+      service
+        .pending_body_jobs(&HashSet::new())
+        .unwrap()
+        .iter()
+        .all(|job| job.provider != ViewerProvider::Codex)
+    );
+    service
+      .relay
+      .configure(crate::relay::RelaySettings {
+        endpoint: "tcp://127.0.0.1:1".into(),
+        enabled: false,
+      })
+      .unwrap();
   }
 
   #[test]

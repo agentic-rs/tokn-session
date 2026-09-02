@@ -1,12 +1,12 @@
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokn_session_core::{Provider, SessionRef};
 
 use crate::project::ProjectCatalog;
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ProjectContext {
   pub id: Option<String>,
@@ -20,7 +20,7 @@ pub struct ProjectContext {
   pub commit_hash: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionContext {
   pub provider: Provider,
   pub session_id: String,

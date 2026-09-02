@@ -1,7 +1,7 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
   SessionStarted(SessionStarted),
@@ -35,7 +35,7 @@ impl AgentEvent {
   }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct SessionStarted {
   pub provider: Provider,
   pub session_id: String,
@@ -43,7 +43,7 @@ pub struct SessionStarted {
   pub timestamp: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct ProviderChanged {
   pub provider: Provider,
   pub session_id: Option<String>,
@@ -55,7 +55,7 @@ pub struct ProviderChanged {
   pub timestamp: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct SessionSettingsApplied {
   pub provider: Provider,
   pub session_id: Option<String>,
@@ -74,7 +74,7 @@ pub struct SessionSettingsApplied {
   pub timestamp: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct MessageEvent {
   #[serde(skip_serializing_if = "Option::is_none")]
   pub provenance: Option<MessageProvenance>,
@@ -89,7 +89,7 @@ pub struct MessageEvent {
   pub timestamp: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct ReasoningEvent {
   #[serde(skip_serializing_if = "Option::is_none")]
   pub provenance: Option<MessageProvenance>,
@@ -110,7 +110,7 @@ pub struct ReasoningEvent {
   pub timestamp: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct GoalUpdated {
   pub provider: Provider,
   pub session_id: Option<String>,
@@ -119,7 +119,7 @@ pub struct GoalUpdated {
   pub timestamp: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct AgentActivity {
   pub provider: Provider,
   pub session_id: Option<String>,
@@ -134,7 +134,7 @@ pub struct AgentActivity {
   pub timestamp: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolCallEvent {
   pub provider: Provider,
   pub session_id: Option<String>,
@@ -181,7 +181,7 @@ impl ToolCallEvent {
   }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct ErrorEvent {
   pub provider: Provider,
   pub session_id: Option<String>,
@@ -190,7 +190,7 @@ pub struct ErrorEvent {
 }
 
 /// Provider-native attribution and surface edits, not extra conversation text.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MessageProvenance {
   pub source: Value,
   /// Explicit provider visibility; absent means visible. JSONL retains content.
@@ -204,7 +204,7 @@ pub struct MessageProvenance {
   pub source_event_seqs: Option<Vec<u64>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct LifecycleEvent {
   pub provider: Provider,
   pub session_id: Option<String>,
@@ -218,14 +218,14 @@ pub struct LifecycleEvent {
   pub timestamp: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleScope {
   Turn,
   Step,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleOutcome {
   Completed,
@@ -237,7 +237,7 @@ pub enum LifecycleOutcome {
 }
 
 /// Accounting scope is explicit: session snapshots replace rather than add.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageKind {
   ModelCall,
@@ -245,7 +245,7 @@ pub enum UsageKind {
   SessionSnapshot,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct UsageEvent {
   pub kind: UsageKind,
   pub provider: Provider,
@@ -271,7 +271,7 @@ pub struct UsageEvent {
 
 /// Recognized non-conversation records. Unknown is reserved for unsupported or
 /// malformed shapes; metadata must only be emitted after shape validation.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct MetadataEvent {
   pub provider: Provider,
   pub session_id: Option<String>,
@@ -282,7 +282,7 @@ pub struct MetadataEvent {
   pub timestamp: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MetadataKind {
   Session,
@@ -293,7 +293,7 @@ pub enum MetadataKind {
   Stream,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct UnknownEvent {
   pub provider: Provider,
   pub session_id: Option<String>,
@@ -302,7 +302,7 @@ pub struct UnknownEvent {
   pub timestamp: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
   Dsh,
@@ -316,7 +316,7 @@ pub enum Provider {
   WorkBuddy,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum Role {
@@ -327,7 +327,7 @@ pub enum Role {
   Unknown,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageDelivery {
   Commentary,
@@ -335,7 +335,7 @@ pub enum MessageDelivery {
   Unspecified,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum Phase {
@@ -350,7 +350,7 @@ pub enum Phase {
 /// Providers may persist an invocation and its result separately. Keeping the
 /// role explicit lets live consumers update one operation without pretending
 /// that an invocation record already contains its later result.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolRecordKind {
   #[default]
@@ -363,7 +363,7 @@ pub enum ToolRecordKind {
 }
 
 /// How a provider transported a semantic tool operation.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolTransport {
   /// The provider recorded the semantic tool call directly.
@@ -374,7 +374,7 @@ pub enum ToolTransport {
   Proxy,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolKind {
   /// A code cell, script, or similar execution wrapper.
@@ -391,7 +391,7 @@ pub enum ToolKind {
   Unknown,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolSummary {
   CodeExecution {
@@ -431,7 +431,7 @@ pub enum ToolSummary {
   },
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalAction {
   Send,

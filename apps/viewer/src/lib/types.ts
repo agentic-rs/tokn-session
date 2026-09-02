@@ -189,6 +189,15 @@ export interface SessionIndexChangedEvent {
   attention_session_keys: string[];
 }
 
+export interface RelaySettings { endpoint: string; enabled: boolean; }
+export interface RelayStatus {
+  settings: RelaySettings;
+  phase: "disconnected" | "connecting" | "live" | "reconnecting";
+  native: boolean;
+  error: string | null;
+}
+export interface RelayChange { session_key: string | null; reset: boolean; }
+
 /**
  * One in-memory operational snapshot for the durable session index.
  *

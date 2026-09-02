@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  RelaySettings, RelayStatus, RelayChange,
   AcknowledgeSessionAttentionRequest,
   AcknowledgeSessionAttentionResponse,
   EventPageResponse,
@@ -16,6 +17,19 @@ import type {
   SessionIndexProgress,
   TrajectoryEventPageResponse,
 } from "./types";
+
+export function getRelayStatus(): Promise<RelayStatus> {
+  return invoke<RelayStatus>("get_relay_status");
+}
+export function configureRelay(settings: RelaySettings): Promise<RelayStatus> {
+  return invoke<RelayStatus>("configure_relay", { settings });
+}
+export function listenForRelayStatus(handler: (status: RelayStatus) => void): Promise<UnlistenFn> {
+  return listen<RelayStatus>("relay-status", (event) => handler(event.payload));
+}
+export function listenForRelayChanges(handler: (change: RelayChange) => void): Promise<UnlistenFn> {
+  return listen<RelayChange>("relay-changed", (event) => handler(event.payload));
+}
 
 export function listSessions(request: ListSessionsRequest): Promise<ListSessionsResponse> {
   return invoke<ListSessionsResponse>("list_sessions", { request });
