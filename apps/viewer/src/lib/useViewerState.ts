@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   acknowledgeSessionAttention,
+  getSessionIndexProgress,
   listSessionChildren,
   listSessions,
   listenForSessionIndexChanges,
+  listenForSessionIndexProgress,
   loadEventDetail,
   loadEventPage,
   loadTrajectoryEventPage,
+  retrySessionIndex as requestSessionIndexRetry,
 } from "./tauri";
 import {
   EVENT_PAGE_SIZE,
@@ -25,6 +28,7 @@ import {
   type EventSummary,
   type SessionChildrenState,
   type SessionHistoryStatus,
+  type SessionIndexProgress,
   type SessionSummary,
   type SourceError,
   type TrajectoryEventPageState,
@@ -43,6 +47,18 @@ function useDebouncedValue<T>(value: T, delayMs: number): T {
 
 const DETAIL_CACHE_LIMIT = 50;
 const TRAJECTORY_EVENT_PAGE_SIZE = 40;
+
+function compareDecimalRevisions(left: string, right: string): number {
+  const normalizedLeft = left.replace(/^0+(?=\d)/, "");
+  const normalizedRight = right.replace(/^0+(?=\d)/, "");
+  if (normalizedLeft.length !== normalizedRight.length) {
+    return normalizedLeft.length < normalizedRight.length ? -1 : 1;
+  }
+  if (normalizedLeft === normalizedRight) {
+    return 0;
+  }
+  return normalizedLeft < normalizedRight ? -1 : 1;
+}
 
 function readCachedDetail(cache: Map<string, EventDetail>, key: string): EventDetail | null {
   const detail = cache.get(key) ?? null;
@@ -142,6 +158,12 @@ export function useViewerState() {
   const sessionsRequest = useRef(0);
   const previousSessionQueryKey = useRef<string | null>(null);
   const [sessionIndexListenerReady, setSessionIndexListenerReady] = useState(false);
+  const [sessionIndexProgress, setSessionIndexProgress] = useState<SessionIndexProgress | null>(null);
+  const [sessionIndexProgressLoading, setSessionIndexProgressLoading] = useState(true);
+  const [sessionIndexProgressError, setSessionIndexProgressError] = useState<string | null>(null);
+  const [sessionIndexRetrying, setSessionIndexRetrying] = useState(false);
+  const sessionIndexProgressRevision = useRef<string | null>(null);
+  const sessionIndexRetryInFlight = useRef(false);
 
   const [events, setEvents] = useState<EventSummary[]>([]);
   const [eventsOwnerKey, setEventsOwnerKey] = useState<string | null>(null);
@@ -206,6 +228,89 @@ export function useViewerState() {
   );
   const [expandedTrajectoryDetailAttempt, setExpandedTrajectoryDetailAttempt] = useState(0);
   const expandedTrajectoryDetailRequest = useRef(0);
+
+  const applySessionIndexProgress = useCallback(
+    (next: SessionIndexProgress, source: "event" | "snapshot" | "retry") => {
+      const currentRevision = sessionIndexProgressRevision.current;
+      if (currentRevision !== null) {
+        const comparison = compareDecimalRevisions(next.revision, currentRevision);
+        // The event listener is established before the first snapshot. If an
+        // event arrives while that snapshot is still loading, retain the
+        // event at the same or newer revision rather than regressing to the
+        // snapshot that was captured earlier.
+        if (comparison < 0 || (comparison === 0 && source === "snapshot")) {
+          return false;
+        }
+      }
+      sessionIndexProgressRevision.current = next.revision;
+      setSessionIndexProgress(next);
+      setSessionIndexProgressError(null);
+      return true;
+    },
+    [],
+  );
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    async function subscribeThenReadSnapshot() {
+      try {
+        unlisten = await listenForSessionIndexProgress((progress) => {
+          if (!disposed) {
+            applySessionIndexProgress(progress, "event");
+          }
+        });
+      } catch {
+        // The static Vite preview and browser-based component tests do not
+        // have Tauri's event bridge. The command snapshot below can still
+        // populate this surface when a caller provides one.
+      }
+
+      if (disposed) {
+        unlisten?.();
+        return;
+      }
+
+      try {
+        const progress = await getSessionIndexProgress();
+        if (!disposed) {
+          applySessionIndexProgress(progress, "snapshot");
+        }
+      } catch (error: unknown) {
+        if (!disposed) {
+          setSessionIndexProgressError(errorMessage(error));
+        }
+      } finally {
+        if (!disposed) {
+          setSessionIndexProgressLoading(false);
+        }
+      }
+    }
+
+    void subscribeThenReadSnapshot();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [applySessionIndexProgress]);
+
+  const retrySessionIndex = useCallback(async () => {
+    if (sessionIndexRetryInFlight.current) {
+      return;
+    }
+    sessionIndexRetryInFlight.current = true;
+    setSessionIndexRetrying(true);
+    try {
+      const progress = await requestSessionIndexRetry();
+      applySessionIndexProgress(progress, "retry");
+    } catch (error: unknown) {
+      setSessionIndexProgressError(errorMessage(error));
+    } finally {
+      sessionIndexRetryInFlight.current = false;
+      setSessionIndexRetrying(false);
+    }
+  }, [applySessionIndexProgress]);
 
   useEffect(() => {
     let disposed = false;
@@ -1322,6 +1427,13 @@ export function useViewerState() {
       });
   }, [invalidateEventDetails, newerCursor, newerLoading, selectedSessionKey]);
 
+  const retrySessions = useCallback(() => {
+    // Preserve the old immediate SQLite reread so a previously committed
+    // catalog remains visible, while also waking the actual provider indexer.
+    setSessionsAttempt((attempt) => attempt + 1);
+    void retrySessionIndex();
+  }, [retrySessionIndex]);
+
   return {
     search,
     setSearch: changeSearch,
@@ -1342,8 +1454,13 @@ export function useViewerState() {
     sourceErrors,
     pendingProviders,
     sessionsCursor,
-    retrySessions: () => setSessionsAttempt((attempt) => attempt + 1),
+    retrySessions,
     loadMoreSessions,
+    sessionIndexProgress,
+    sessionIndexProgressLoading,
+    sessionIndexProgressError,
+    sessionIndexRetrying,
+    retrySessionIndex,
     events: visibleEvents,
     eventsOwnerKey: eventsAreOwned ? eventsOwnerKey : null,
     initialPageLoaded: initialPageSessionKey === selectedSessionKey && eventsAreOwned,

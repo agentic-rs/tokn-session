@@ -24,5 +24,15 @@ tokn-session-core.workspace = true
 tokn-session-index.workspace = true
 tokn-session-render.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# The workspace watcher intentionally keeps Notify 8/Kqueue for the relay.
+# The viewer needs FSEvents instead: recursive Kqueue watches hold one vnode
+# descriptor for every historical rollout file. A separate major-version
+# package isolates that backend choice without changing the relay.
+notify_fsevent = { package = "notify", version = "7.0.0" }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+notify.workspace = true
+
 [dev-dependencies]
 tempfile = "3"

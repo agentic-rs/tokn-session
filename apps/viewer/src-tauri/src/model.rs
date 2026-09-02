@@ -11,7 +11,7 @@ pub const MAX_PAGE_LIMIT: usize = 200;
 const MAX_SESSION_KEY_BYTES: usize = 64 * 1024;
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ViewerProvider {
   Codex,
@@ -108,6 +108,152 @@ pub struct ListSessionChildrenResponse {
 pub struct SourceError {
   pub provider: ViewerProvider,
   pub message: String,
+}
+
+/// A cheap, in-memory snapshot of the background session-index worker.
+///
+/// This intentionally contains counts and provider identities only. Detailed
+/// error text remains part of the existing index-backed sidebar response, so
+/// a status-bar poll or progress event never leaks provider paths or causes a
+/// provider read.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionIndexProgress {
+  /// A monotonic decimal string. Keeping this as text avoids JavaScript's
+  /// integer precision boundary and lets the frontend discard stale events.
+  pub revision: String,
+  pub is_refreshing: bool,
+  pub activity: IndexActivity,
+  pub catalog: CatalogIndexProgress,
+  pub body: BodyIndexProgress,
+  /// A scheduler-level failure category. Provider-specific readable failures
+  /// remain in the existing sidebar source errors instead of this live status
+  /// payload.
+  pub worker_error: Option<IndexWorkerError>,
+  /// Epoch milliseconds for a scheduler-selected retry, when known. `None`
+  /// also represents an immediately queued manual retry.
+  pub retry_at_ms: Option<i64>,
+}
+
+impl SessionIndexProgress {
+  pub(crate) fn initial(body_batch_size: usize) -> Self {
+    Self {
+      revision: "0".to_owned(),
+      is_refreshing: false,
+      activity: IndexActivity::Idle,
+      catalog: CatalogIndexProgress {
+        // Startup always establishes a complete durable catalog before the
+        // scheduler can use targeted change checks.
+        scope: CatalogRefreshScope::Full,
+        active_provider: None,
+        processed_providers: 0,
+        total_providers: ViewerProvider::ALL.len(),
+        // Before the first durable catalog pass, every provider is pending.
+        pending_providers: ViewerProvider::ALL.to_vec(),
+        error_providers: Vec::new(),
+      },
+      body: BodyIndexProgress {
+        active_provider: None,
+        pending_jobs: 0,
+        failed_jobs: 0,
+        completed_in_run: 0,
+        stale_in_run: 0,
+        batch_size: body_batch_size,
+        providers: ViewerProvider::ALL
+          .into_iter()
+          .map(|provider| ProviderBody {
+            provider,
+            total_jobs: 0,
+            completed_jobs: 0,
+            pending_jobs: 0,
+            failed_jobs: 0,
+          })
+          .collect(),
+      },
+      worker_error: None,
+      retry_at_ms: None,
+    }
+  }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexActivity {
+  Idle,
+  Catalog,
+  Body,
+  WaitingToRetry,
+}
+
+/// A sanitized failure from the scheduler task itself rather than a single
+/// provider catalog/body job. It intentionally carries no platform error text
+/// or path information across the Tauri boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexWorkerError {
+  RefreshFailed,
+  TaskFailed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CatalogIndexProgress {
+  /// Whether this is a complete provider discovery pass or a targeted
+  /// follow-up for known changed session files. The UI uses this to describe
+  /// a normal lightweight refresh without implying a full rescan.
+  pub scope: CatalogRefreshScope,
+  pub active_provider: Option<ViewerProvider>,
+  pub processed_providers: usize,
+  pub total_providers: usize,
+  /// Providers without a committed durable catalog sentinel.
+  pub pending_providers: Vec<ViewerProvider>,
+  /// Providers whose most recent catalog attempt failed. Detail text stays in
+  /// `ListSessionsResponse.source_errors`.
+  pub error_providers: Vec<ViewerProvider>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogRefreshScope {
+  Full,
+  Targeted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct BodyIndexProgress {
+  /// At most one provider is actively loading a body job because the index
+  /// scheduler has a single bounded global queue. Providers with pending jobs
+  /// other than this one are queued, not concurrently loading.
+  pub active_provider: Option<ViewerProvider>,
+  /// Pending work after the latest observed queue reconciliation. Failed jobs
+  /// remain pending and are counted again in `failed_jobs`.
+  pub pending_jobs: usize,
+  pub failed_jobs: usize,
+  pub completed_in_run: usize,
+  pub stale_in_run: usize,
+  pub batch_size: usize,
+  pub providers: Vec<ProviderBody>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ProviderBody {
+  pub provider: ViewerProvider,
+  /// Work in the current catalog baseline. A catalog change that stages body
+  /// work establishes a new baseline; body-only passes retain it and can grow
+  /// it if new staged work appears.
+  pub total_jobs: usize,
+  /// Jobs durably handled since the current catalog baseline. This is derived
+  /// from the staged source cursor, so another process's completion survives a
+  /// restart and an exhausted durable queue reaches `total_jobs / total_jobs`.
+  pub completed_jobs: usize,
+  /// Remaining queued or retryable work. A nonzero count does not imply this
+  /// provider is active; compare `BodyIndexProgress.active_provider`.
+  pub pending_jobs: usize,
+  /// Failed jobs are still pending and are therefore a subset of
+  /// `pending_jobs`.
+  pub failed_jobs: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -604,6 +750,27 @@ mod tests {
         provider
       );
     }
+  }
+
+  #[test]
+  fn index_progress_uses_the_snake_case_status_center_contract() {
+    let progress = SessionIndexProgress::initial(8);
+    let value = serde_json::to_value(progress).expect("progress should serialize");
+
+    assert_eq!(value["revision"], "0");
+    assert_eq!(value["is_refreshing"], false);
+    assert_eq!(value["activity"], "idle");
+    assert_eq!(value["catalog"]["scope"], "full");
+    assert_eq!(serde_json::to_value(CatalogRefreshScope::Targeted).unwrap(), "targeted");
+    assert_eq!(value["catalog"]["total_providers"], ViewerProvider::ALL.len());
+    assert_eq!(value["catalog"]["pending_providers"][0], "codex");
+    assert_eq!(value["body"]["batch_size"], 8);
+    assert_eq!(value["body"]["providers"][0]["provider"], "codex");
+    assert_eq!(value["body"]["providers"][0]["total_jobs"], 0);
+    assert_eq!(value["body"]["providers"][0]["completed_jobs"], 0);
+    assert_eq!(value["body"]["providers"][0]["pending_jobs"], 0);
+    assert_eq!(value["worker_error"], serde_json::Value::Null);
+    assert!(value.get("isRefreshing").is_none());
   }
 
   #[test]

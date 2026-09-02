@@ -3,17 +3,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { eventButtonId } from "./state";
 import {
   acknowledgeSessionAttention,
+  getSessionIndexProgress,
   listSessionChildren,
   listSessions,
   listenForSessionIndexChanges,
+  listenForSessionIndexProgress,
   loadEventDetail,
   loadEventPage,
   loadTrajectoryEventPage,
+  retrySessionIndex,
 } from "./tauri";
 import type {
   EventDetail,
   EventPageResponse,
   SessionIndexChangedEvent,
+  SessionIndexProgress,
   SessionSummary,
   TrajectoryEventPageResponse,
 } from "./types";
@@ -21,24 +25,30 @@ import { useViewerState } from "./useViewerState";
 
 vi.mock("./tauri", () => ({
   acknowledgeSessionAttention: vi.fn(() => Promise.resolve({ changed: false })),
+  getSessionIndexProgress: vi.fn(() => new Promise(() => undefined)),
   listSessionChildren: vi.fn(() => new Promise(() => undefined)),
   listSessions: vi.fn(() => new Promise(() => undefined)),
   listenForSessionIndexChanges: vi.fn(() => Promise.resolve(vi.fn())),
+  listenForSessionIndexProgress: vi.fn(() => Promise.resolve(vi.fn())),
   loadEventDetail: vi.fn(() => new Promise(() => undefined)),
   loadEventPage: vi.fn(() => new Promise(() => undefined)),
   loadTrajectoryEventPage: vi.fn(() => new Promise(() => undefined)),
+  retrySessionIndex: vi.fn(() => new Promise(() => undefined)),
 }));
 
 beforeEach(() => {
   vi.mocked(acknowledgeSessionAttention).mockReset().mockResolvedValue({ changed: false });
+  vi.mocked(getSessionIndexProgress).mockReset().mockImplementation(() => new Promise(() => undefined));
   vi.mocked(listSessionChildren).mockReset().mockImplementation(() => new Promise(() => undefined));
   vi.mocked(listSessions).mockReset().mockImplementation(() => new Promise(() => undefined));
   vi.mocked(listenForSessionIndexChanges).mockReset().mockResolvedValue(vi.fn());
+  vi.mocked(listenForSessionIndexProgress).mockReset().mockResolvedValue(vi.fn());
   vi.mocked(loadEventPage).mockReset().mockImplementation(() => new Promise(() => undefined));
   vi.mocked(loadEventDetail).mockReset().mockImplementation(() => new Promise(() => undefined));
   vi.mocked(loadTrajectoryEventPage).mockReset().mockImplementation(
     () => new Promise(() => undefined),
   );
+  vi.mocked(retrySessionIndex).mockReset().mockImplementation(() => new Promise(() => undefined));
 });
 
 afterEach(() => {
@@ -85,6 +95,34 @@ function session(sessionKey: string): SessionSummary {
     event_count: 1,
     history_status: "complete",
     has_unread: false,
+  };
+}
+
+function indexProgress(overrides: Partial<SessionIndexProgress> = {}): SessionIndexProgress {
+  return {
+    revision: "1",
+    is_refreshing: false,
+    activity: "idle",
+    catalog: {
+      scope: "full",
+      active_provider: null,
+      processed_providers: 6,
+      total_providers: 6,
+      pending_providers: [],
+      error_providers: [],
+    },
+    body: {
+      active_provider: null,
+      pending_jobs: 0,
+      failed_jobs: 0,
+      completed_in_run: 0,
+      stale_in_run: 0,
+      batch_size: 1,
+      providers: [],
+    },
+    worker_error: null,
+    retry_at_ms: null,
+    ...overrides,
   };
 }
 
@@ -308,6 +346,87 @@ describe("useViewerState session-index signalling", () => {
       await subscription.promise;
     });
     await waitFor(() => expect(listSessions).toHaveBeenCalledOnce());
+  });
+
+  it("subscribes to index progress before its snapshot and ignores an older snapshot", async () => {
+    const snapshot = deferred<SessionIndexProgress>();
+    let progressHandler: ((progress: SessionIndexProgress) => void) | undefined;
+    vi.mocked(listenForSessionIndexProgress).mockImplementation((handler) => {
+      progressHandler = handler;
+      return Promise.resolve(vi.fn());
+    });
+    vi.mocked(getSessionIndexProgress).mockReturnValue(snapshot.promise);
+
+    const { result } = renderHook(() => useViewerState());
+
+    await waitFor(() => expect(listenForSessionIndexProgress).toHaveBeenCalledOnce());
+    await waitFor(() => expect(getSessionIndexProgress).toHaveBeenCalledOnce());
+    expect(
+      vi.mocked(listenForSessionIndexProgress).mock.invocationCallOrder[0],
+    ).toBeLessThan(vi.mocked(getSessionIndexProgress).mock.invocationCallOrder[0]!);
+
+    act(() => progressHandler?.(indexProgress({ revision: "12", activity: "body", is_refreshing: true })));
+    await waitFor(() => expect(result.current.sessionIndexProgress?.revision).toBe("12"));
+
+    await act(async () => {
+      snapshot.resolve(indexProgress({ revision: "11" }));
+      await snapshot.promise;
+    });
+
+    expect(result.current.sessionIndexProgress?.revision).toBe("12");
+    expect(result.current.sessionIndexProgress?.activity).toBe("body");
+  });
+
+  it("uses the retry command for both the status action and sidebar retry", async () => {
+    const waiting = indexProgress({
+      revision: "2",
+      activity: "waiting_to_retry",
+      body: {
+        ...indexProgress().body,
+        pending_jobs: 4,
+      },
+    });
+    vi.mocked(getSessionIndexProgress).mockResolvedValue(indexProgress());
+    vi.mocked(retrySessionIndex).mockResolvedValue(waiting);
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [],
+      next_cursor: null,
+      source_errors: [],
+      pending_providers: [],
+    });
+    const { result } = renderHook(() => useViewerState());
+
+    await waitFor(() => expect(result.current.sessionIndexProgress?.revision).toBe("1"));
+    await waitFor(() => expect(listSessions).toHaveBeenCalledOnce());
+    await act(async () => {
+      await result.current.retrySessionIndex();
+    });
+    expect(retrySessionIndex).toHaveBeenCalledOnce();
+    expect(result.current.sessionIndexProgress?.revision).toBe("2");
+
+    act(() => result.current.retrySessions());
+    await waitFor(() => expect(retrySessionIndex).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(listSessions).toHaveBeenCalledTimes(2));
+  });
+
+  it("keeps a retry command failure alongside the last-known index snapshot", async () => {
+    vi.mocked(getSessionIndexProgress).mockResolvedValue(indexProgress());
+    vi.mocked(retrySessionIndex).mockRejectedValue(new Error("Session index scheduler is unavailable."));
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [],
+      next_cursor: null,
+      source_errors: [],
+      pending_providers: [],
+    });
+    const { result } = renderHook(() => useViewerState());
+
+    await waitFor(() => expect(result.current.sessionIndexProgress?.revision).toBe("1"));
+    await act(async () => {
+      await result.current.retrySessionIndex();
+    });
+
+    expect(result.current.sessionIndexProgress?.revision).toBe("1");
+    expect(result.current.sessionIndexProgressError).toBe("Session index scheduler is unavailable.");
   });
 
   it("acknowledges only after React commits an accepted initial event page", async () => {

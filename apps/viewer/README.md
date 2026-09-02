@@ -102,11 +102,15 @@ The app commits a stable provider-header catalog to its shared index at
 search, and subagent-tree requests. Provider reads at startup belong to the
 background cataloger, not those UI requests. It then backfills event-derived
 attention and any body-derived title/preview metadata in bounded, newest-first
-batches. Header catalogs refresh every 10 seconds; while body work is pending,
-a body-only pass runs every second without rediscovering the whole provider
-catalog. If active source membership changes during a catalog pass, the
-previous catalog remains visible and the app quietly retries; mutable titles,
-previews, and modification times do not become false provider-read errors. A
+batches. Codex and Pi JSONL rollouts update from native filesystem
+notifications; ordinary writes inspect only the changed source. OpenCode,
+ZCode, WorkBuddy, and DSH retain a ten-second provider-local catalog cadence,
+while an all-provider catalog runs only at startup, on recovery, on explicit
+Retry, and as a five-minute safety sweep. While body work is pending, a
+body-only pass runs every second without rediscovering a provider catalog. If
+active source membership changes during a catalog pass, the previous catalog
+remains visible and the app quietly retries; mutable titles, previews, and
+modification times do not become false provider-read errors. A
 row has no dot until its body has finished
 backfilling, except that a relocated row retains an already-unread dot while
 its new path is validated. Sessions first discovered after a provider catalog
@@ -133,7 +137,8 @@ index-only. Before a provider's complete-catalog sentinel exists, its rows are
 reported as indexing rather than read directly from that provider. The separate
 body pass backfills attention and missing title/preview metadata in bounded
 newest-first batches; the one-second pending worker reads only those selected
-bodies, while header discovery remains on the 10-second catalog cadence. The
+bodies. The all-provider catalog is a recovery safety sweep, while unwatched
+providers are discovered on their independent ten-second cadence. The
 index retains opaque source checkpoints, session identity/paths, bounded
 title/preview/cwd/timestamp/relationship metadata, and unread revisions, but
 never event records, native payloads, reasoning, tool I/O, or full message

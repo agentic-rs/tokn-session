@@ -42,6 +42,32 @@ impl SessionSourceClient {
     Ok(headers)
   }
 
+  pub(crate) fn file_session_roots(&self) -> Result<Vec<PathBuf>, String> {
+    match self {
+      Self::Codex(source) => source.session_roots(),
+      Self::Pi(source) => source.session_roots(),
+      Self::Dsh(_) => Err(path_targeting_unsupported("dsh")),
+      Self::OpenCode(_) => Err(path_targeting_unsupported("opencode")),
+      Self::WorkBuddy(_) => Err(path_targeting_unsupported("workbuddy")),
+      Self::ZCode(_) => Err(path_targeting_unsupported("zcode")),
+    }
+  }
+
+  pub(crate) fn session_header_at_path(&self, path: &Path) -> Result<SessionHeader, String> {
+    let reference = match self {
+      // A watcher can receive one notification per appended rollout record.
+      // Keep its Codex read confined to the JSONL header; the complete catalog
+      // pass owns private Desktop state and legacy-index presentation metadata.
+      Self::Codex(source) => source.session_relation_at_path_for_incremental_catalog(path),
+      Self::Pi(source) => source.session_relation_at_path(path),
+      Self::Dsh(_) => Err(path_targeting_unsupported("dsh")),
+      Self::OpenCode(_) => Err(path_targeting_unsupported("opencode")),
+      Self::WorkBuddy(_) => Err(path_targeting_unsupported("workbuddy")),
+      Self::ZCode(_) => Err(path_targeting_unsupported("zcode")),
+    }?;
+    Ok(file_header(reference))
+  }
+
   pub(crate) fn list_sessions(&self) -> Result<Vec<SessionRef>, String> {
     match self {
       Self::Dsh(source) => source.list_sessions(),
@@ -176,6 +202,10 @@ impl SessionSourceClient {
 
 fn file_headers(references: Vec<SessionRef>) -> Vec<SessionHeader> {
   references.into_iter().map(file_header).collect()
+}
+
+fn path_targeting_unsupported(source: &str) -> String {
+  format!("{source} does not support path-targeted session cataloging")
 }
 
 fn file_header(reference: SessionRef) -> SessionHeader {

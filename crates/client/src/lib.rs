@@ -22,6 +22,31 @@ impl AgentClient {
     session_source::session_source(source, session_dir)?.list_session_headers()
   }
 
+  /// Returns the effective session-file roots for a provider that supports
+  /// path-targeted cataloging.
+  ///
+  /// The returned paths are the provider's own resolved discovery roots, so
+  /// callers do not need to duplicate environment-variable or platform-home
+  /// handling when registering filesystem watchers.
+  pub fn file_session_roots(source: Source, session_dir: Option<PathBuf>) -> Result<Vec<PathBuf>, String> {
+    session_source::session_source(source, session_dir)?.file_session_roots()
+  }
+
+  /// Reads one file-backed session header at a known path.
+  ///
+  /// This avoids enumerating a provider's whole catalog and does not inspect
+  /// the conversation body. It is currently available for Codex and Pi,
+  /// whose persisted histories are one session per JSONL file. Codex reads
+  /// only the rollout header here; its optional Desktop state and legacy-index
+  /// presentation metadata is refreshed by complete catalog discovery.
+  pub fn session_header_at_path(
+    source: Source,
+    session_dir: Option<PathBuf>,
+    path: &Path,
+  ) -> Result<SessionHeader, String> {
+    session_source::session_source(source, session_dir)?.session_header_at_path(path)
+  }
+
   /// Resolves presentation metadata that requires inspecting one session body.
   ///
   /// Call this only for visible or search-relevant headers. Bulk discovery is
@@ -150,6 +175,63 @@ mod tests {
       headers[0].updated_at.as_deref(),
       Some(expected_updated_at_ms.to_string().as_str())
     );
+
+    let header = AgentClient::session_header_at_path(Source::Codex, Some(directory.path().to_path_buf()), &path)
+      .expect("targeted header should stop before the invalid conversation body");
+    assert_eq!(header.id, "header-only");
+    assert_eq!(header.path, path);
+    assert_eq!(header.cwd.as_deref(), Some("/tmp/project"));
+    assert_eq!(header.timestamp.as_deref(), Some("2026-08-31T00:00:00Z"));
+    assert_eq!(header.updated_at_ms, Some(expected_updated_at_ms));
+  }
+
+  #[test]
+  fn exposes_effective_file_roots_for_targeted_file_providers() {
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    let root = directory.path().to_path_buf();
+
+    assert_eq!(
+      AgentClient::file_session_roots(Source::Codex, Some(root.clone()))
+        .expect("Codex should expose its explicit root"),
+      vec![root.clone()]
+    );
+    assert_eq!(
+      AgentClient::file_session_roots(Source::Pi, Some(root.clone())).expect("Pi should expose its explicit root"),
+      vec![root]
+    );
+  }
+
+  #[test]
+  fn targeted_pi_header_stops_before_an_invalid_conversation_body() {
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("pi-targeted.jsonl");
+    std::fs::write(
+      &path,
+      concat!(
+        r#"{"type":"session","id":"pi-targeted","cwd":"/tmp/pi-project","timestamp":"2026-09-02T00:00:00Z"}"#,
+        "\n",
+        "{invalid conversation record\n",
+      ),
+    )
+    .expect("Pi fixture should be written");
+
+    let header = AgentClient::session_header_at_path(Source::Pi, Some(directory.path().to_path_buf()), &path)
+      .expect("targeted Pi header should stop before the invalid conversation body");
+
+    assert_eq!(header.id, "pi-targeted");
+    assert_eq!(header.path, path);
+    assert_eq!(header.cwd.as_deref(), Some("/tmp/pi-project"));
+    assert_eq!(header.timestamp.as_deref(), Some("2026-09-02T00:00:00Z"));
+    assert!(header.updated_at_ms.is_some());
+  }
+
+  #[test]
+  fn rejects_path_targeting_for_catalog_backed_providers() {
+    let error = AgentClient::file_session_roots(Source::OpenCode, None)
+      .expect_err("OpenCode sessions are not one-file-per-session catalogs");
+
+    assert!(error.contains("opencode"));
+    assert!(error.contains("path-targeted"));
   }
 
   #[test]

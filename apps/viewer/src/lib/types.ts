@@ -189,6 +189,64 @@ export interface SessionIndexChangedEvent {
   attention_session_keys: string[];
 }
 
+/**
+ * One in-memory operational snapshot for the durable session index.
+ *
+ * `revision` is a decimal string because it originates from an in-memory,
+ * monotonic progress-store counter and must not lose precision in the browser. It protects
+ * an event that arrives while the initial command snapshot is still in flight
+ * from being replaced by that older snapshot.
+ */
+export type SessionIndexActivity = "idle" | "catalog" | "body" | "waiting_to_retry";
+/** Whether a catalog activity is complete discovery or a targeted change check. */
+export type SessionIndexCatalogScope = "full" | "targeted";
+/** Sanitized scheduler-wide failure categories; no provider path or raw error crosses IPC. */
+export type SessionIndexWorkerError = "refresh_failed" | "task_failed";
+
+export interface SessionIndexCatalogProgress {
+  /**
+   * Older hot-reloaded backends omit this field; treat that conservatively as
+   * a complete discovery pass in the UI.
+   */
+  scope?: SessionIndexCatalogScope;
+  active_provider: ViewerProvider | null;
+  processed_providers: number;
+  total_providers: number;
+  pending_providers: ViewerProvider[];
+  error_providers: ViewerProvider[];
+}
+
+export interface SessionIndexBodyProviderProgress {
+  provider: ViewerProvider;
+  pending_jobs: number;
+  failed_jobs: number;
+  /** Completed detail loads in the provider's current catalog baseline. */
+  completed_jobs: number;
+  /** Total detail loads in the provider's current catalog baseline. */
+  total_jobs: number;
+}
+
+export interface SessionIndexBodyProgress {
+  active_provider: ViewerProvider | null;
+  pending_jobs: number;
+  failed_jobs: number;
+  completed_in_run: number;
+  stale_in_run: number;
+  batch_size: number;
+  providers: SessionIndexBodyProviderProgress[];
+}
+
+export interface SessionIndexProgress {
+  revision: string;
+  is_refreshing: boolean;
+  activity: SessionIndexActivity;
+  catalog: SessionIndexCatalogProgress;
+  body: SessionIndexBodyProgress;
+  worker_error: SessionIndexWorkerError | null;
+  /** Unix milliseconds for a scheduled retry, or null when no retry is queued. */
+  retry_at_ms: number | null;
+}
+
 /** Local sidebar state for one lazily loaded direct-child page sequence. */
 export interface SessionChildrenState {
   sessions: SessionSummary[];

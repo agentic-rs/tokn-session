@@ -13,6 +13,7 @@ import type {
   LoadEventPageRequest,
   LoadTrajectoryEventPageRequest,
   SessionIndexChangedEvent,
+  SessionIndexProgress,
   TrajectoryEventPageResponse,
 } from "./types";
 
@@ -59,4 +60,31 @@ export function listenForSessionIndexChanges(
   handler: (change: SessionIndexChangedEvent) => void,
 ): Promise<UnlistenFn> {
   return listen<SessionIndexChangedEvent>("session-index-changed", (event) => handler(event.payload));
+}
+
+/**
+ * Reads the lightweight in-memory operational state for the background index
+ * scheduler. It never reads a provider session body.
+ */
+export function getSessionIndexProgress(): Promise<SessionIndexProgress> {
+  return invoke<SessionIndexProgress>("get_session_index_progress");
+}
+
+/**
+ * Requests an immediate scheduler wake and returns the progress state after it
+ * was queued. A later event can still supersede this response.
+ */
+export function retrySessionIndex(): Promise<SessionIndexProgress> {
+  return invoke<SessionIndexProgress>("retry_session_index");
+}
+
+/**
+ * This subscription is deliberately separate from the sidebar change signal:
+ * it reports scheduler progress even when no durable catalog transaction has
+ * happened yet.
+ */
+export function listenForSessionIndexProgress(
+  handler: (progress: SessionIndexProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<SessionIndexProgress>("session-index-progress", (event) => handler(event.payload));
 }
