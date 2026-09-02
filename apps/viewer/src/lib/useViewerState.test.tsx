@@ -24,6 +24,9 @@ import type {
   RelayChange,
 } from "./types";
 import { useViewerState } from "./useViewerState";
+import { ViewerPage } from "../pages/ViewerPage";
+
+vi.mock("../components/RelayConnection", () => ({ RelayConnection: () => null }));
 
 vi.mock("./tauri", () => ({
   listenForRelayChanges: vi.fn(() => Promise.resolve(vi.fn())),
@@ -306,7 +309,107 @@ function ViewerPageCommitProbe() {
 }
 
 describe("useViewerState Relay updates", () => {
-  it("preserves expansion while following and defers updates when reading older events", async () => {
+  it("renders the session page working, updates a visible tool while scrolled up, then collapses finished work", async () => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const active = trajectoryEventPage();
+    active.events[0].trajectory!.status = "working";
+    vi.mocked(loadEventPage).mockResolvedValue(active);
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValue(trajectoryChildPage());
+    const { container } = render(<ViewerPage />);
+    fireEvent.click(await screen.findByRole("button", { name: /session live/ }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /^Working for/ })).toHaveAttribute("aria-expanded", "true"));
+    expect(await screen.findByText("cargo test")).toBeInTheDocument();
+    const timeline = container.querySelector<HTMLElement>(".conversation__timeline")!;
+    Object.defineProperties(timeline, { scrollHeight: { configurable: true, value: 1000 }, clientHeight: { configurable: true, value: 300 } });
+    timeline.scrollTop = 120;
+    fireEvent.scroll(timeline);
+    const updated = trajectoryChildPage();
+    updated.events[0].tool!.command = "cargo check";
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValue(updated);
+    act(() => emit?.({ session_key: "live", reset: false }));
+    expect(await screen.findByText("cargo check")).toBeInTheDocument();
+    expect(timeline.scrollTop).toBe(120);
+    const finished = trajectoryEventPage();
+    finished.events[0].trajectory!.status = "complete";
+    vi.mocked(loadEventPage).mockResolvedValue(finished);
+    act(() => emit?.({ session_key: "live", reset: false }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Worked for 1h" })).toHaveAttribute("aria-expanded", "false"));
+    expect(screen.queryByText("cargo check")).not.toBeInTheDocument();
+  });
+
+  it("auto-expands active work, refreshes its children, respects manual collapse and closes on completion", async () => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const active = trajectoryEventPage();
+    active.events[0].trajectory!.status = "working";
+    vi.mocked(loadEventPage).mockResolvedValue(active);
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValue(trajectoryChildPage());
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    const key = active.events[0].event_key;
+    await waitFor(() => expect(result.current.expandedEventKey).toBe(key));
+    await waitFor(() => expect(loadTrajectoryEventPage).toHaveBeenCalledOnce());
+    expect(vi.mocked(loadTrajectoryEventPage).mock.calls[0][0].direction).toBe("backward");
+    const children = trajectoryChildPage();
+    children.events[0].summary = "new progress";
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValue(children);
+    act(() => emit?.({ session_key: "live", reset: false }));
+    await waitFor(() => expect(result.current.trajectoryPages.get("live")?.get(key)?.events[0].summary).toBe("new progress"));
+    act(() => result.current.toggleEventExpanded(key));
+    act(() => emit?.({ session_key: "live", reset: false }));
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(3));
+    expect(result.current.expandedEventKey).toBeNull();
+    act(() => result.current.toggleEventExpanded(key));
+    const finished = trajectoryEventPage();
+    finished.events[0].trajectory!.status = "complete";
+    vi.mocked(loadEventPage).mockResolvedValue(finished);
+    act(() => emit?.({ session_key: "live", reset: false }));
+    await waitFor(() => expect(result.current.events[0].trajectory?.status).toBe("complete"));
+    expect(result.current.expandedEventKey).toBeNull();
+    act(() => result.current.toggleEventExpanded(key));
+    expect(result.current.expandedEventKey).toBe(key);
+  });
+
+  it("coalesces events during a pending refresh and still applies the newest batch", async () => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    vi.mocked(loadEventPage).mockResolvedValue(toolEventPage());
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.events).toHaveLength(1));
+    const pending = deferred<EventPageResponse>();
+    vi.mocked(loadEventPage).mockReturnValueOnce(pending.promise);
+    act(() => emit?.({ session_key: "live", reset: false }));
+    act(() => { emit?.({ session_key: "live", reset: false }); emit?.({ session_key: "live", reset: false }); });
+    expect(loadEventPage).toHaveBeenCalledTimes(2);
+    const latest = toolEventPage();
+    latest.events[0].summary = "latest";
+    vi.mocked(loadEventPage).mockResolvedValue(latest);
+    await act(async () => pending.resolve(toolEventPage()));
+    await waitFor(() => expect(result.current.events[0].summary).toBe("latest"));
+    expect(loadEventPage).toHaveBeenCalledTimes(3);
+  });
+
+  it("refreshes local progress without requiring an unread attention event", async () => {
+    let emit: ((change: SessionIndexChangedEvent) => void) | undefined;
+    vi.mocked(listenForSessionIndexChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("local")], next_cursor: null, source_errors: [], pending_providers: [] });
+    vi.mocked(loadEventPage).mockResolvedValue(toolEventPage());
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "local");
+    await waitFor(() => expect(result.current.events).toHaveLength(1));
+    const next = toolEventPage();
+    next.events[0].summary = "running progress";
+    vi.mocked(loadEventPage).mockResolvedValue(next);
+    act(() => emit?.({ changed: true, attention_session_keys: [], updated_session_keys: ["local"] }));
+    await waitFor(() => expect(result.current.events[0].summary).toBe("running progress"));
+  });
+
+  it("preserves expansion and updates items even when reading older events", async () => {
     let emit: ((change: RelayChange) => void) | undefined;
     vi.mocked(listenForRelayChanges).mockImplementation((handler) => {
       emit = handler;
@@ -325,13 +428,13 @@ describe("useViewerState Relay updates", () => {
     act(() => result.current.setFollowingLive(false));
     act(() => emit?.({ session_key: "live", reset: false }));
     expect(result.current.pendingLiveActivity).toBe(true);
-    expect(loadEventPage).toHaveBeenCalledTimes(2);
-    act(() => result.current.showLiveActivity());
     await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(3));
+    act(() => result.current.showLiveActivity());
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(4));
     expect(result.current.pendingLiveActivity).toBe(false);
     expect(result.current.expandedEventKey).toBe("event.v1.1");
     act(() => emit?.({ session_key: "live", reset: true }));
-    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(4));
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(5));
     expect(result.current.expandedEventKey).toBeNull();
   });
 

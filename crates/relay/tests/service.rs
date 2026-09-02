@@ -232,6 +232,32 @@ async fn opencode_subscribers_append_and_receive_metadata_without_replacing_hist
 }
 
 #[tokio::test]
+async fn codex_turn_boundaries_reach_follow_clients_without_a_final_message() {
+  let root = TempDir::new().unwrap();
+  let path = root.path().join("rollout-turn.jsonl");
+  std::fs::write(&path, concat!(
+    "{\"type\":\"session_meta\",\"payload\":{\"id\":\"turn-session\"}}\n",
+    "{\"type\":\"event_msg\",\"timestamp\":\"2026-09-03T00:00:00Z\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t1\"}}\n"
+  )).unwrap();
+  let server = server(root.path(), Provider::Codex, true).await;
+  let key = load_catalog(&server.endpoint).await.unwrap().entries.remove(0).key;
+  let mut client = RelaySubscription::connect(&server.endpoint, &key).await.unwrap();
+  let initial = snapshot(&mut client).await;
+  assert!(initial.loaded.events.iter().any(
+    |e| matches!(e, AgentEvent::Lifecycle(l) if l.turn_id == "t1" && l.phase == tokn_session_core::Phase::Started)
+  ));
+  append(
+    &path,
+    "{\"type\":\"event_msg\",\"timestamp\":\"2026-09-03T00:00:03Z\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t1\"}}\n",
+  );
+  let finished = snapshot(&mut client).await;
+  assert_eq!(initial.generation, finished.generation);
+  assert!(
+    matches!(finished.loaded.events.last(), Some(AgentEvent::Lifecycle(l)) if l.phase == tokn_session_core::Phase::Finished)
+  );
+}
+
+#[tokio::test]
 async fn framing_rejects_oversized_lengths_before_allocating_payloads() {
   let (mut writer, mut reader) = tokio::io::duplex(8);
   writer.write_u32(MAX_FRAME_BYTES as u32 + 1).await.unwrap();

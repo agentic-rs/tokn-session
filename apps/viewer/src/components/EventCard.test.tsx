@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   EventDetail,
@@ -356,6 +356,36 @@ describe("EventCard subagent activity", () => {
 });
 
 describe("EventCard whole-turn trajectories", () => {
+  it("shows a ticking working duration and stops the timer when unmounted", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-31T00:00:02Z"));
+      const { unmount } = renderCard(event({ type: "trajectory", trajectory: trajectory({ status: "working" }) }));
+      expect(screen.getByRole("button", { name: "Working for 2s" })).toBeInTheDocument();
+      act(() => vi.advanceTimersByTime(1000));
+      expect(screen.getByRole("button", { name: "Working for 3s" })).toBeInTheDocument();
+      unmount();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not claim unknown historical work is currently running", () => {
+    renderCard(event({ type: "trajectory", trajectory: trajectory({ status: "unknown" }) }));
+    expect(screen.getByRole("button", { name: "Work for 1h" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Working/ })).not.toBeInTheDocument();
+  });
+
+  it("keeps existing child items visible during a live refresh", () => {
+    renderCard(event({ type: "trajectory", trajectory: trajectory({ status: "working" }) }), {
+      is_expanded: true,
+      trajectory_page: trajectoryPage({ is_loading: true, has_loaded: false, events: [event({ summary: "Still visible" })] }),
+    });
+    expect(screen.getByText("Still visible")).toBeInTheDocument();
+    expect(screen.queryByText("Loading turn events…")).not.toBeInTheDocument();
+  });
+
   const trajectoryEvent = event({
     event_key: "trajectory.v1.turn-1",
     type: "trajectory",

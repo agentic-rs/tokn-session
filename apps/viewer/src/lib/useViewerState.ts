@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { refreshEventWindow, refreshTrajectoryWindow } from "./liveEvents";
 import {
   acknowledgeSessionAttention,
   getSessionIndexProgress,
@@ -185,6 +186,10 @@ export function useViewerState() {
   const followingLive = useRef(true);
   const pendingLiveReset = useRef(false);
   const liveRefresh = useRef(false);
+  const eventRefreshInFlight = useRef(false);
+  const liveUpdateQueued = useRef(false);
+  const eventsRef = useRef<EventSummary[]>([]);
+  eventsRef.current = events;
   const [pendingLiveActivity, setPendingLiveActivity] = useState(false);
   const [acceptedInitialEventPage, setAcceptedInitialEventPage] = useState<
     AcceptedInitialEventPage | null
@@ -214,6 +219,7 @@ export function useViewerState() {
   const detailGeneration = useRef(0);
   const [detailRevision, setDetailRevision] = useState(0);
   const [expandedEventKey, setExpandedEventKey] = useState<string | null>(null);
+  const workingTrajectory = useRef<string | null>(null);
   const [expandedDetail, setExpandedDetail] = useState<EventDetail | null>(null);
   const [expandedDetailOwnerKey, setExpandedDetailOwnerKey] = useState<string | null>(null);
   const [expandedDetailLoading, setExpandedDetailLoading] = useState(false);
@@ -324,13 +330,17 @@ export function useViewerState() {
     void listenForSessionIndexChanges((change) => {
       setSessionsAttempt((attempt) => attempt + 1);
       const selectedSessionKey = selectedSessionKeyRef.current;
-      if (selectedSessionKey && change.attention_session_keys.includes(selectedSessionKey)) {
-        // A committed index change can contain a new final reply for the
-        // session already on screen. Reload only that newest page, so an
-        // unrelated provider/source cannot reset a timeline the user is
-        // reading. Its revision is still acknowledged only after React
-        // commits the matching response.
-        setEventsAttempt((attempt) => attempt + 1);
+      if (selectedSessionKey && (
+        change.updated_session_keys?.includes(selectedSessionKey)
+        || change.attention_session_keys.includes(selectedSessionKey)
+      )) {
+        // Body refresh is separate from unread attention: a tool/lifecycle
+        // update must reach the selected page without creating a dot.
+        // Older backends still send only attention_session_keys.
+        liveRefresh.current = true;
+        setPendingLiveActivity(!followingLive.current);
+        if (eventRefreshInFlight.current) liveUpdateQueued.current = true;
+        else setEventsAttempt((attempt) => attempt + 1);
       }
     })
       .then((stop) => {
@@ -441,14 +451,14 @@ export function useViewerState() {
     [],
   );
 
-  const clearTrajectoryPages = useCallback((preserveExpansion = false) => {
+  const clearTrajectoryPages = useCallback(() => {
     trajectoryPageGeneration.current += 1;
     trajectoryPageRequests.current.clear();
     const next = new Map<string, Map<string, TrajectoryEventPageState>>();
     trajectoryPagesRef.current = next;
     setTrajectoryPages(next);
     expandedTrajectoryDetailRequest.current += 1;
-    if (!preserveExpansion) setExpandedTrajectoryEvent(null);
+    setExpandedTrajectoryEvent(null);
     setExpandedTrajectoryDetailOwnerKey(null);
     setExpandedTrajectoryDetail(null);
     setExpandedTrajectoryDetailLoading(false);
@@ -468,6 +478,8 @@ export function useViewerState() {
 
   useEffect(() => {
     followingLive.current = true;
+    workingTrajectory.current = null;
+    liveUpdateQueued.current = false;
     pendingLiveReset.current = false;
     setPendingLiveActivity(false);
   }, [selectedSessionKey]);
@@ -477,19 +489,33 @@ export function useViewerState() {
     let unlisten: (() => void) | undefined;
     void listenForRelayChanges((change) => {
       if (disposed) return;
-      setSessionsAttempt((attempt) => attempt + 1);
+      if (change.session_key === null) setSessionsAttempt((attempt) => attempt + 1);
       if (!selectedSessionKeyRef.current) return;
       if (change.session_key === null && !change.reset) return;
       if (change.session_key !== null && change.session_key !== selectedSessionKeyRef.current) return;
       pendingLiveReset.current ||= change.reset;
-      if (followingLive.current) showLiveActivity();
-      else setPendingLiveActivity(true);
+      // Follow controls scrolling, not whether already displayed items update.
+      // Keep tool/progress cards live while the reader is higher in the page.
+      liveRefresh.current = true;
+      setPendingLiveActivity(!followingLive.current);
+      if (eventRefreshInFlight.current) liveUpdateQueued.current = true;
+      else setEventsAttempt((attempt) => attempt + 1);
     }).then((stop) => {
       if (disposed) stop();
       else unlisten = stop;
     }).catch((error: unknown) => setEventsError(errorMessage(error)));
     return () => { disposed = true; unlisten?.(); };
   }, [showLiveActivity]);
+
+  useEffect(() => {
+    if (eventsOwnerKey !== selectedSessionKey) return;
+    const active = [...events].reverse().find((event) => event.trajectory?.status === "working")?.event_key ?? null;
+    const previous = workingTrajectory.current;
+    if (active !== previous) {
+      workingTrajectory.current = active;
+      setExpandedEventKey((current) => active ?? (current === previous ? null : current));
+    }
+  }, [events, eventsOwnerKey, selectedSessionKey]);
 
   const requestTrajectoryEventPage = useCallback(
     (
@@ -533,13 +559,18 @@ export function useViewerState() {
         };
       });
 
-      void loadTrajectoryEventPage({
+      const working = eventsRef.current.find((event) => event.event_key === trajectoryKey)?.trajectory?.status === "working";
+      const request = {
         session_key: sessionKey,
         trajectory_key: trajectoryKey,
         cursor: cursor ?? undefined,
-        direction: direction === "older" ? "backward" : "forward",
+        direction: direction === "older" || (direction === "initial" && working) ? "backward" as const : "forward" as const,
         limit: TRAJECTORY_EVENT_PAGE_SIZE,
-      })
+      };
+      const response = direction === "initial"
+        ? refreshTrajectoryWindow(request, current?.events ?? [], loadTrajectoryEventPage, () => trajectoryPageGeneration.current === generation && trajectoryPageRequests.current.get(requestKey) === requestId)
+        : loadTrajectoryEventPage(request);
+      void response
         .then((response) => {
           if (
             trajectoryPageGeneration.current !== generation
@@ -902,8 +933,13 @@ export function useViewerState() {
     liveRefresh.current = false;
     const reset = pendingLiveReset.current;
     pendingLiveReset.current = false;
-    clearTrajectoryPages(isLiveRefresh && !reset);
+    if (!isLiveRefresh || reset) clearTrajectoryPages();
+    else {
+      trajectoryPageGeneration.current += 1;
+      trajectoryPageRequests.current.clear();
+    }
     if (reset) {
+      workingTrajectory.current = null;
       setExpandedEventKey(null);
       applyEventSelection(null, false);
     }
@@ -914,30 +950,52 @@ export function useViewerState() {
       setInitialPageSessionKey(null);
       applyEventSelection(null, false);
     }
-    setOlderCursor(null);
-    setNewerCursor(null);
+    if (!isLiveRefresh) {
+      setOlderCursor(null);
+      setNewerCursor(null);
+    }
     setOlderLoading(false);
     setNewerLoading(false);
-    setTotalEvents(null);
-    setHistoryStatus(null);
+    if (!isLiveRefresh) {
+      setTotalEvents(null);
+      setHistoryStatus(null);
+    }
     setEventsError(null);
 
     if (!selectedSessionKey) {
+      eventRefreshInFlight.current = false;
       setEventsLoading(false);
       return;
     }
 
     setEventsLoading(true);
-    void loadEventPage({
+    eventRefreshInFlight.current = true;
+    const page = isLiveRefresh
+      ? refreshEventWindow(selectedSessionKey, eventsRef.current, EVENT_PAGE_SIZE, loadEventPage, () => eventsRequest.current === requestId, reset)
+      : loadEventPage({
       session_key: selectedSessionKey,
       direction: "backward",
       limit: EVENT_PAGE_SIZE,
-    })
+    });
+    void page
       .then((response) => {
         if (eventsRequest.current !== requestId) {
           return;
         }
         invalidateEventDetails();
+        if (isLiveRefresh && !reset) {
+          // Invalidate in-flight child reads, but retain their displayed rows
+          // until a fresh bounded child page arrives (no loading flicker).
+          trajectoryPageGeneration.current += 1;
+          trajectoryPageRequests.current.clear();
+          const retained = new Map(trajectoryPagesRef.current);
+          const pages = retained.get(selectedSessionKey);
+          if (pages) retained.set(selectedSessionKey, new Map([...pages].map(([key, value]) => [key, {
+            ...value, has_loaded: false, is_loading: false, is_loading_older: false, is_loading_newer: false,
+          }])));
+          trajectoryPagesRef.current = retained;
+          setTrajectoryPages(retained);
+        }
         setEvents(response.events);
         setOlderCursor(response.previous_cursor);
         setNewerCursor(response.next_cursor);
@@ -963,7 +1021,13 @@ export function useViewerState() {
       })
       .finally(() => {
         if (eventsRequest.current === requestId) {
+          eventRefreshInFlight.current = false;
           setEventsLoading(false);
+          if (liveUpdateQueued.current) {
+            liveUpdateQueued.current = false;
+            liveRefresh.current = true;
+            setEventsAttempt((attempt) => attempt + 1);
+          }
         }
       });
   }, [
@@ -1127,7 +1191,7 @@ export function useViewerState() {
       "initial",
       false,
     );
-  }, [events, expandedEventKey, requestTrajectoryEventPage, selectedSessionKey]);
+  }, [detailRevision, events, expandedEventKey, requestTrajectoryEventPage, selectedSessionKey]);
 
   useEffect(() => {
     const requestId = ++expandedTrajectoryDetailRequest.current;

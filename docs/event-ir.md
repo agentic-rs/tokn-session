@@ -96,10 +96,13 @@ a session's source for otherwise unattributed messages.
 
 ## Adoption
 
-DSH produces lifecycle, usage, metadata, and provenance. Pi, Codex, and
+DSH produces lifecycle, usage, metadata, and provenance. Codex preserves
+task/turn start, completion, and abort as turn-scoped lifecycle with native
+turn IDs; missing IDs remain unknown rather than fabricated. Abort retains its
+existing error event as well. Pi, Codex, and
 OpenCode all normalize usage; Pi and Codex also adopt metadata, and Pi supplies
 extension provenance.
 Terminal Pet ignores usage, metadata, and hidden content for activity/focus and
-lease handling. Codex lifecycle mapping and authoritative Pet runtime state are
-next; Pi historical logs do not contain the live agent/turn boundaries, so
+lease handling. Authoritative Pet runtime state remains follow-up work;
+Pi historical logs do not contain the live agent/turn boundaries, so
 those require a separate bridge feature. DSH relay/input remain separate work.

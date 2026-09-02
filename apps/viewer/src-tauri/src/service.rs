@@ -31,6 +31,8 @@ use crate::model::{
 };
 use crate::repository::{NativeRepository, ViewerRepository};
 
+mod trajectory_state;
+
 const MAX_DETAIL_VALUE_BYTES: usize = 512 * 1024;
 const MAX_MESSAGE_SUMMARY_CHARS: usize = 16 * 1024;
 const MAX_SESSION_PREVIEW_CHARS: usize = 240;
@@ -355,6 +357,9 @@ pub(crate) struct IndexRefresh {
   /// metadata updates so an unrelated source scan cannot reset the timeline a
   /// user is reading.
   pub attention_session_keys: Vec<String>,
+  /// Successfully refreshed bodies, including progress/tool/lifecycle changes
+  /// that do not produce unread attention. Never inferred from catalog mtime.
+  pub updated_session_keys: Vec<String>,
   /// Internal scheduler hint. It deliberately stays out of Tauri events: the
   /// frontend only needs the existing compact refresh payload.
   #[serde(skip)]
@@ -1291,6 +1296,9 @@ impl ViewerService {
       let mut refresh = catalog_refresh.refresh;
       refresh.changed |= body_refresh.refresh.changed;
       refresh
+        .updated_session_keys
+        .extend(body_refresh.refresh.updated_session_keys);
+      refresh
         .attention_session_keys
         .extend(body_refresh.refresh.attention_session_keys);
       refresh.has_pending_body_jobs = body_refresh.refresh.has_pending_body_jobs;
@@ -1474,6 +1482,8 @@ impl ViewerService {
           self.clear_failed_body_job(&job);
           self.record_body_progress_completion(&job);
           refresh.changed |= provider_refresh.changed;
+          refresh.updated_session_keys.push(encode_session_key(&job.locator)?);
+          refresh.changed = true;
           attention_session_keys.extend(provider_refresh.attention_session_keys);
           Self::retarget_pending_body_jobs(&mut pending_jobs[index + 1..], &job.source, next_source);
         }
@@ -3753,6 +3763,19 @@ fn timeline_entries(events: &[AgentEvent]) -> Vec<TimelineEntry> {
   let mut after_final_reply = false;
 
   for entry in base_entries {
+    // Providers can write turn-start before the user prompt. Keep that marker
+    // with the work below the prompt instead of making a separate empty turn.
+    if matches!(&entry, TimelineEntry::Event { source_event_index } if matches!(&events[*source_event_index], AgentEvent::Message(m) if m.role == Role::User))
+      && !pending.is_empty()
+      && pending.iter().all(|e| trajectory_state::is_turn_start(e, events))
+    {
+      after_final_reply = false;
+      entries.push(entry);
+      continue;
+    }
+    if trajectory_state::is_turn_start(&entry, events) && !pending.is_empty() {
+      flush_trajectory_candidate(&mut entries, &mut pending, events);
+    }
     if is_trajectory_boundary(&entry, events) {
       flush_trajectory_candidate(&mut entries, &mut pending, events);
       update_after_final_reply(&entry, events, &mut after_final_reply);
@@ -3791,6 +3814,9 @@ fn update_after_final_reply(entry: &TimelineEntry, events: &[AgentEvent], after_
 /// assistant message reopens the pending trajectory. Once it does, ordinary
 /// substantive-work rules apply to the remaining rows.
 fn starts_trajectory_after_final_reply(entry: &TimelineEntry, events: &[AgentEvent]) -> bool {
+  if trajectory_state::is_turn_start(entry, events) {
+    return true;
+  }
   match entry {
     TimelineEntry::Event { source_event_index } => matches!(
       events.get(*source_event_index),
@@ -4053,6 +4079,15 @@ fn trajectory_card_summary(trajectory: &Trajectory, events: &[AgentEvent]) -> Tr
     }
   }
 
+  let status = trajectory_state::status(trajectory, events);
+  if status == "complete"
+    && let Some(timestamp) = trajectory_state::completion_timestamp(trajectory, events)
+    && let Some(time) = parse_updated_at_ms(Some(timestamp))
+    && last_timestamp.as_ref().is_some_and(|(_, last)| time >= *last)
+  {
+    last_timestamp =
+      normalize_one_line_text(timestamp, MAX_TRAJECTORY_TIMESTAMP_CHARS).map(|timestamp| (timestamp, time));
+  }
   let started_at = first_timestamp.as_ref().map(|(timestamp, _)| timestamp.clone());
   let ended_at = last_timestamp.as_ref().map(|(timestamp, _)| timestamp.clone());
   let duration_ms = first_timestamp
@@ -4060,6 +4095,7 @@ fn trajectory_card_summary(trajectory: &Trajectory, events: &[AgentEvent]) -> Tr
     .and_then(|((_, start), (_, end))| (end >= start).then_some((end - start).to_string()));
 
   TrajectoryCardSummary {
+    status,
     event_count: trajectory.entries.len(),
     source_event_count: trajectory_source_event_indices(trajectory).len(),
     reasoning_count,
@@ -6757,6 +6793,10 @@ mod tests {
     let baseline_refresh = service.refresh_session_index().expect("baseline should refresh");
     assert!(baseline_refresh.changed);
     assert!(baseline_refresh.attention_session_keys.is_empty());
+    assert_eq!(
+      baseline_refresh.updated_session_keys,
+      vec![encode_session_key(&locator).unwrap()]
+    );
     let calls_after_baseline = repository.header_calls.load(Ordering::SeqCst);
     let baseline = service
       .list_sessions(request.clone())
@@ -10430,7 +10470,7 @@ mod tests {
     assert!(serde_json::to_vec(&detail).unwrap().len() < 4 * 1024);
   }
 
-  fn service_with_session(session: LoadedSession) -> ViewerService {
+  pub(super) fn service_with_session(session: LoadedSession) -> ViewerService {
     ViewerService::new(Arc::new(FakeRepository {
       listings: HashMap::new(),
       loaded: Mutex::new(Some(session)),
@@ -10462,7 +10502,7 @@ mod tests {
     message_event_with_role(text, Role::Assistant, MessageDelivery::Final)
   }
 
-  fn message_event_with_role(text: &str, role: Role, delivery: MessageDelivery) -> AgentEvent {
+  pub(super) fn message_event_with_role(text: &str, role: Role, delivery: MessageDelivery) -> AgentEvent {
     AgentEvent::Message(MessageEvent {
       provenance: None,
       provider: Provider::Codex,
@@ -10659,7 +10699,7 @@ mod tests {
     })])
   }
 
-  fn loaded_session(events: Vec<AgentEvent>) -> LoadedSession {
+  pub(super) fn loaded_session(events: Vec<AgentEvent>) -> LoadedSession {
     loaded_session_for("fixture", events)
   }
 
@@ -10687,7 +10727,7 @@ mod tests {
     })
   }
 
-  fn key_for(session_id: &str) -> String {
+  pub(super) fn key_for(session_id: &str) -> String {
     encode_session_key(&SessionLocator {
       version: 1,
       provider: ViewerProvider::Codex,

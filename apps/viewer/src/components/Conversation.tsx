@@ -108,6 +108,18 @@ export function Conversation({
   const observedSessionKey = useRef<string | null>(null);
   const didInitialScroll = useRef(false);
   const followingBottom = useRef(true);
+  const scrollAnchor = useRef<{ key: string; top: number } | null>(null);
+
+  function captureAnchor() {
+    const timeline = timelineRef.current;
+    if (!timeline) return;
+    const top = timeline.getBoundingClientRect().top;
+    const item = [...timeline.querySelectorAll<HTMLElement>("[data-event-key]")]
+      .find((element) => element.getBoundingClientRect().bottom > top);
+    scrollAnchor.current = item
+      ? { key: item.dataset.eventKey!, top: item.getBoundingClientRect().top - top }
+      : null;
+  }
 
   useLayoutEffect(() => {
     const timeline = timelineRef.current;
@@ -120,10 +132,12 @@ export function Conversation({
       didInitialScroll.current = false;
       priorScrollHeight.current = null;
       followingBottom.current = true;
+      scrollAnchor.current = null;
     }
     if (sessionKey && initial_page_loaded && !didInitialScroll.current) {
       timeline.scrollTop = timeline.scrollHeight;
       didInitialScroll.current = true;
+      captureAnchor();
       return;
     }
     if (!is_loading_older && priorScrollHeight.current !== null) {
@@ -131,8 +145,26 @@ export function Conversation({
       priorScrollHeight.current = null;
     } else if (followingBottom.current && !is_loading_older) {
       timeline.scrollTop = timeline.scrollHeight;
+    } else if (scrollAnchor.current && !is_loading_older) {
+      const anchor = scrollAnchor.current;
+      const item = [...timeline.querySelectorAll<HTMLElement>("[data-event-key]")]
+        .find((element) => element.dataset.eventKey === anchor.key);
+      if (item) timeline.scrollTop += item.getBoundingClientRect().top - timeline.getBoundingClientRect().top - anchor.top;
     }
-  }, [events, initial_page_loaded, is_loading_older, session?.session_key]);
+    captureAnchor();
+  }, [events, initial_page_loaded, is_loading_older, session?.session_key, trajectory_pages, expanded_event_key]);
+
+  useLayoutEffect(() => {
+    const timeline = timelineRef.current;
+    const content = timeline?.querySelector(".timeline");
+    if (!timeline || !content || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (followingBottom.current && !is_loading_older) timeline.scrollTop = timeline.scrollHeight;
+      captureAnchor();
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [initial_page_loaded, session?.session_key, is_loading_older]);
 
   function loadOlder() {
     followingBottom.current = false;
@@ -224,6 +256,7 @@ export function Conversation({
         if (!timeline) return;
         followingBottom.current = timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 48;
         on_follow_change?.(followingBottom.current);
+        captureAnchor();
       }}>
         {!session ? (
           <StateView
@@ -288,6 +321,7 @@ export function Conversation({
             )}
 
             {events.map((event) => (
+              <div data-event-key={event.event_key} key={`${session.session_key}:${event.event_key}`}>
               <EventCard
                 button_id={eventButtonId(event.event_key)}
                 event={event}
@@ -332,6 +366,7 @@ export function Conversation({
                   ? trajectory_expanded_event_key
                   : null}
               />
+              </div>
             ))}
 
             {has_newer ? (

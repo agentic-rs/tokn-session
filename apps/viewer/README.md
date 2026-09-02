@@ -54,16 +54,25 @@ debugging representations.
 
 User prompts and final assistant replies remain in the outer conversation.
 Contiguous stretches of intermediate assistant progress and non-message work
-are initially folded into a compact **Worked** timeline item, keeping the
+are grouped into a compact work trajectory item, keeping the
 surrounding conversation easy to scan. A non-final assistant message itself is
 enough to make a stretch fold; metadata-only stretches remain flat. Terminal
 bookkeeping after a final reply remains as ordinary chronological rows instead
 of creating a second **Worked** item. It shows
-**Worked for …** only when its provider event timestamps establish an observed
-duration; the viewer never infers a duration from a session file's modification
-time. Expanding it fetches its contained event rows in bounded pages and shows
+**Working for …** with a ticking elapsed time when a provider turn-start is
+observed, auto-expanding to show the newest work. Completion collapses it to
+**Worked for …**; it can be reopened manually. Providers without reliable turn
+signals show neutral **Work** until a final reply or turn boundary closes the
+run. Durations use provider timestamps, never file modification time.
+Expanding it fetches its contained event rows in bounded pages and shows
 them as their normal event cards. Each row remains independently inspectable,
 and a recorded delegation can still open its verified direct child session.
+
+Relay batches refresh existing timeline and expanded child items without
+discarding loaded history. Scrolling follows new work only at the bottom;
+reading older rows preserves the scroll anchor. Local indexing also refreshes
+the selected session after successful body updates, including progress that
+does not qualify for unread attention.
 
 Known shell, file, search, web, and task tools use compact semantic headers.
 Expanding a tool fetches its output lazily, including the matching result when a

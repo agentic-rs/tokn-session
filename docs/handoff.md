@@ -50,8 +50,9 @@ See [Relay service](relay.md#local-snapshotfollow-service) for framing and limit
 Viewer Relay settings persist in app config `relay.json`. Covered providers
 skip local body reads/indexing; timeline, trajectories and Inspector share
 received snapshots. Disconnect/reconnect retains last-good data, switching
-endpoints clears it, and paused timelines pin their displayed snapshot until
-the user chooses New activity. Append refreshes preserve expansion keys;
+endpoints clears it. Live updates refresh loaded timeline/trajectory items even
+when scrolled up, retaining the reading position; New activity jumps to latest.
+Refreshes are coalesced and page through one pinned snapshot. Append refreshes preserve expansion keys;
 generation resets invalidate them. Native remains optional and bounded in
 Inspector. Next gap: durable Relay unread tracking (local unread indexing is
 currently bypassed for these sessions). The v1 append/reset contract still
@@ -244,7 +245,7 @@ roster-only.
 
 States currently derive from normalized messages, reasoning, tool calls,
 errors, goals, and preserved input-request events. Codex task start/complete
-lifecycle records are still dropped by the normalizer, so the reducer uses
+and abort records now normalize into turn lifecycle, but the reducer still uses
 leases and a short ready debounce instead of claiming authoritative runtime
 status. The recent-Ready roster is explicitly an observed-run heuristic, not an
 authoritative completion log. It includes only work seen while the pet is
@@ -311,12 +312,15 @@ reported without preventing the other providers from loading.
 The conversation keeps user prompts and final assistant replies visible. A
 contiguous stretch of intermediate assistant progress and non-message activity
 with substantive work (including a non-final assistant message) is represented
-by a collapsed `Worked` trajectory item; metadata-only stretches remain flat.
+by a work trajectory item; metadata-only stretches remain flat.
 Terminal bookkeeping written after a final reply also remains chronological,
 inspectable flat rows rather than creating a second `Worked` item.
-It says `Worked for …` only when the first and last provider event timestamps
-establish a nonnegative observed span; it does not derive time from session file
-metadata. Expanding a trajectory lazily loads its contained normal event cards
+Observed turn starts show `Working for …` with a ticking elapsed time and
+auto-expand the trajectory. A final reply/turn closure changes it to `Worked`
+and auto-collapses once; manual reopening remains available. Without reliable
+turn signals the label is neutral `Work`, not a claim of runtime activity.
+Duration uses provider timestamps, never session-file metadata.
+Expanding a trajectory lazily loads its contained normal event cards
 through a separately bounded page, preserving per-event inspection and verified
 direct-child delegation navigation. A trajectory is a viewer projection, not a
 provider-authoritative turn. Its identity uses the earliest normalized source
@@ -461,9 +465,10 @@ rather than content or IDs, so history reductions and same-count rewrites
 intentionally do not dot. Direct child attention aggregates onto collapsed
 canonical ancestors without making the parent itself unread. A newest event
 page acknowledges only the opaque revision it actually captured after React
-commits it; a concurrent later revision remains unread. A refresh reloads the
-current timeline only when that exact session is named as newly attentive, so
-unrelated indexing cannot disturb an expanded timeline.
+commits it; a concurrent later revision remains unread. Successful body
+refreshes separately name `updated_session_keys`, letting the selected timeline
+refresh tool/progress/lifecycle changes without creating unread attention.
+Unrelated indexing does not reload the conversation.
 
 An index cursor is an opaque source revision, not a byte offset or event-page
 cursor. File-backed sources use a metadata fingerprint; OpenCode uses its
@@ -690,7 +695,7 @@ All providers use the accounting contract in `docs/event-ir.md`. Usage
 distinguishes model calls, operation totals, and replaceable session snapshots.
 OpenCode emits one model-call usage event per historical assistant turn: the
 last valid `step-finish` tokens win, with assistant-message tokens as fallback.
-DSH still owns lifecycle adoption. Compact human output labels the usage scope;
+DSH and Codex expose turn lifecycle (DSH also exposes steps). Compact human output labels the usage scope;
 expanded browser rows and JSONL preserve native details except explicitly
 hidden Pi content, which is available only in JSONL. Terminal Pet ignores
 accounting/metadata/hidden content for activity and lease handling.
@@ -913,7 +918,7 @@ cd apps/viewer && pnpm tauri dev
 - Add CLI golden tests for tiny fixture-backed `list` and `show` outputs.
 - Extend native storage invalidation beyond Codex/Pi and add incremental source
   paging to the desktop viewer after the historical read-only surface stabilizes.
-- Map Codex lifecycle next and teach terminal pet to use authoritative lifecycle
+- Teach terminal pet to use the preserved Codex turn lifecycle
   instead of heuristics. Pi live boundaries require a bridge feature; do not
   infer them from historical assistant/tool records. OpenCode input-request
   events remain a follow-up.

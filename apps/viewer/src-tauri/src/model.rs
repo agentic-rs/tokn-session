@@ -392,6 +392,8 @@ pub struct EventSummary {
 /// loses precision when a provider reports a large interval.
 #[derive(Debug, Serialize)]
 pub struct TrajectoryCardSummary {
+  /// Observed turn state; unknown is not evidence of a running process.
+  pub status: &'static str,
   pub event_count: usize,
   pub source_event_count: usize,
   pub reasoning_count: usize,

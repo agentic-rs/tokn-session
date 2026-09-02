@@ -127,9 +127,11 @@ An enabled connection reconnects automatically and keeps the last committed
 data through failures. Explicit Disconnect also retains cached sessions until
 restart; switching endpoints clears them to avoid mixing independent sources.
 
-The displayed snapshot stays pinned while reading older events. Live updates
-follow only at the bottom; otherwise “New activity” lets the user jump to the
-latest page. Append refreshes preserve expansion keys, while a replacement
+Live updates refresh the loaded event window and expanded trajectory items,
+including while reading older events. Scrolling follows only at the bottom;
+otherwise the reading position is preserved and “New activity” jumps to the
+latest page. Each refresh uses one pinned snapshot for its bounded pages.
+Append refreshes preserve expansion keys, while a replacement
 generation clears them. Optional native records are available in bounded
 Inspector details, excluding records containing redacted reasoning. Local
 durable unread/seen indexing is not applied to Relay-backed sessions yet.
