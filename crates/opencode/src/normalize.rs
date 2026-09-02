@@ -7,6 +7,7 @@ use tokn_session_core::{
   UnknownEvent, UsageEvent, UsageKind, tool_kind_for_optional_name, tool_summary_for_io,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenCodeNormalizer {
   provider: Provider,
   session_id: String,

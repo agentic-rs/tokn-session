@@ -39,7 +39,12 @@ versioned local TCP snapshot/follow endpoint, separate from the unchanged
 stdout/ZeroMQ modes below. Metadata catalogs are shared, bodies load on demand,
 and concurrent clients reuse one JSONL normalizer per session. Appends decode
 only new complete lines; replacement/truncation triggers an atomic new
-generation. OpenCode currently resnapshots followed sessions on DB/WAL changes.
+generation. OpenCode reconciles consistent raw row snapshots on DB/WAL changes,
+reusing unchanged decoded records and normalization checkpoints. Unrelated
+writes/checkpoints are silent; appended suffixes preserve the generation.
+Existing record edits/deletions/reordering reset safely, including native-only
+changes when native is enabled. Raw SQL rows are still scanned (timestamps are
+not reliable change tokens); historical and stdout/ZeroMQ loading are unchanged.
 See [Relay service](relay.md#local-snapshotfollow-service) for framing and limits.
 
 Viewer Relay settings persist in app config `relay.json`. Covered providers
@@ -48,8 +53,10 @@ received snapshots. Disconnect/reconnect retains last-good data, switching
 endpoints clears it, and paused timelines pin their displayed snapshot until
 the user chooses New activity. Append refreshes preserve expansion keys;
 generation resets invalidate them. Native remains optional and bounded in
-Inspector. Next gaps: incremental OpenCode follow and durable Relay unread
-tracking (local unread indexing is currently bypassed for these sessions).
+Inspector. Next gap: durable Relay unread tracking (local unread indexing is
+currently bypassed for these sessions). The v1 append/reset contract still
+requires replacement generations for mutable OpenCode records; avoiding those
+resets would need a record-update protocol and stable viewer event identities.
 
 `tokn-session-relay` follows active Codex and Pi JSONL session trees plus the
 OpenCode SQLite database. It requires an output subcommand:

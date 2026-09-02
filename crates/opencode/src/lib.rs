@@ -5,4 +5,4 @@ mod schema;
 mod session_source;
 
 pub use live::OpenCodeLiveNormalizer;
-pub use session_source::OpenCodeSessionSource;
+pub use session_source::{CachedSessionRecords, OpenCodeSessionCache, OpenCodeSessionSource};

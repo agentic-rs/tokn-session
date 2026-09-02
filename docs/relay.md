@@ -89,9 +89,16 @@ revision values; begin also carries the session header and `reset` flag.
 The first transaction has `reset: true`. Subsequent JSONL transactions append
 new records in the same generation. File replacement, truncation and detected
 same-length rewrites start a fresh generation and replace the entire snapshot.
-OpenCode DB/WAL changes currently reload the followed session and send a fresh
-replacement generation, including deletions. Unrelated DB writes can trigger
-this conservative reload; incremental SQLite updates remain future work.
+OpenCode DB/WAL changes reconcile raw rows in one read transaction. Unchanged
+message records reuse decoded data and normalization checkpoints; changes to
+model state recompute dependent records until the state converges. SQLite rows
+are still scanned because timestamps/counts cannot reliably identify edits.
+Unrelated writes and WAL checkpoints publish nothing when the session is
+unchanged. A true appended suffix stays in the same generation; edits,
+deletions, reordering or database replacement reset the snapshot. Header-only
+changes can commit without record frames. With `--native`, changes to existing
+native data (including session update timestamps) also require a reset under
+the v1 append/reset protocol. This does not change stdout/ZeroMQ loading.
 
 Session bodies are loaded on demand. Concurrent subscribers share one reader
 and normalizer per session; complete appended JSONL lines decode only once.
@@ -103,7 +110,8 @@ every two seconds. Coalesced notifications include every intervening append.
 
 Limits: numeric loopback addresses only (no remote authentication), 64 client
 connections, 16 active sessions, 8 MiB per wire frame, 128 MiB serialized
-records per snapshot and 128 MiB per JSONL source. These are payload limits,
+records per snapshot, 128 MiB per JSONL source and 128 MiB of raw OpenCode
+session-row payloads per cached reader. These are payload limits,
 not exact process-RAM caps; decoded objects and snapshots add overhead. Large
 sessions fail explicitly rather than silently returning partial history.
 Any local process can connect; `--native` may expose sensitive provider data.
