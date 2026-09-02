@@ -5,6 +5,11 @@ conversations into Discord. It consumes the normalized JSONL emitted by
 `tokn-session-relay`, creates one public thread per root session, and publishes
 only user messages and final assistant messages.
 
+JSONL uses the [Relay record format](../../docs/relay.md), with an `events`
+array and optional sibling `native`. The shared reader dispatches each batch
+in order, preserves session context, and ignores native-only records. Legacy
+single-`event` wire envelopes are no longer accepted.
+
 Commentary, reasoning, tool activity, and child sessions are not published.
 The app uses Discord's REST API, so it requires no privileged gateway intents.
 

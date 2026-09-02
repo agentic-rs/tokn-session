@@ -12,7 +12,7 @@ import { TerminalKeyDecoder, type PetKeyAction } from "./keys";
 import { loadPetArt, selectPose } from "./art";
 import { consumeJsonl, JsonlDecoder } from "./jsonl";
 import { focusSnapshot, moveFocusTopic, type FocusDirection } from "./navigation";
-import { parseRelayEvent, type RelayEvent } from "./protocol";
+import { parseRelayRecord, RelayActivityDispatcher, type RelayEvent, type RelayRecord } from "./protocol";
 import { renderScreen, type RenderMeta } from "./renderer";
 import {
   TerminalInputEditor,
@@ -62,7 +62,7 @@ if (options.mode === "snapshot") {
 
 async function runInteractive(runOptions: Options): Promise<void> {
   const store = new PetStore();
-  const decoder = new JsonlDecoder(parseRelayEvent);
+  const decoder = new JsonlDecoder(parseRelayRecord);
   const surface = new TerminalSurface();
   const imageProtocol = resolveImageProtocol(runOptions.protocol);
   const imageController = new PetImageController(art, imageProtocol);
@@ -305,6 +305,15 @@ async function runInteractive(runOptions: Options): Promise<void> {
     }
   };
 
+  const activity = new RelayActivityDispatcher();
+  const onRecord = (record: RelayRecord): Promise<void> => activity.dispatch(record, (event) => {
+    if (!stopped) {
+      sessionInput.observe(event);
+      store.ingest(event);
+      render();
+    }
+  }, sourceAbort.signal);
+
   let rawMode = false;
   try {
     surface.enter();
@@ -326,13 +335,7 @@ async function runInteractive(runOptions: Options): Promise<void> {
       void consumeJsonl(
         Bun.stdin.stream(),
         decoder,
-        (event) => {
-          if (!stopped) {
-            sessionInput.observe(event);
-            store.ingest(event);
-            render();
-          }
-        },
+        onRecord,
         sourceAbort.signal
       )
         .then(() => stop(0))
@@ -345,13 +348,7 @@ async function runInteractive(runOptions: Options): Promise<void> {
         void consumeJsonl(
           child.stream,
           decoder,
-          (event) => {
-            if (!stopped) {
-              sessionInput.observe(event);
-              store.ingest(event);
-              render();
-            }
-          },
+          onRecord,
           sourceAbort.signal
         )
           .catch((error: unknown) => stop(1, errorMessage(error)));

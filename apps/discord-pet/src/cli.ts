@@ -57,7 +57,7 @@ Usage:
 
 Options:
   --config <path>     Config file (default: ~/.tokn/pet/discord.yaml)
-  --stdin             Read RelayEvent JSONL from stdin
+  --stdin             Read RelayRecord JSONL from stdin
   --relay-bin <path>  Spawn an installed tokn-session-relay binary
   --codex-dir <path>  Override the Codex session root
   --pi-dir <path>     Override the Pi session root

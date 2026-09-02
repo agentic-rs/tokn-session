@@ -33,6 +33,8 @@ pub struct RelayConfig {
   pub poll_interval: Duration,
   /// History emitted for a newly discovered or replaced session file.
   pub new_file_replay: NewFileReplay,
+  /// Include provider-native records in the wire envelope (off by default).
+  pub include_native: bool,
 }
 
 impl RelayConfig {
@@ -41,6 +43,7 @@ impl RelayConfig {
       roots,
       poll_interval: DEFAULT_POLL_INTERVAL,
       new_file_replay: NewFileReplay::Messages(DEFAULT_REPLAY_MESSAGES),
+      include_native: false,
     }
   }
 }
@@ -61,7 +64,8 @@ impl SessionRelay {
       return Err("relay poll interval must be greater than zero".to_string());
     }
 
-    let tailer = SessionTailer::prepare(config.roots, config.new_file_replay)?;
+    let mut tailer = SessionTailer::prepare(config.roots, config.new_file_replay)?;
+    tailer.set_include_native(config.include_native);
     let (wake_tx, wake_rx) = mpsc::unbounded_channel();
     let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
       let result = result
@@ -127,7 +131,7 @@ impl SessionRelay {
     let mut update = match scan {
       Ok(update) => update,
       Err(err) => TailUpdate {
-        events: Vec::new(),
+        records: Vec::new(),
         warnings: vec![err],
       },
     };
@@ -340,7 +344,7 @@ mod tests {
     let mut config = RelayConfig::new(vec![ProviderRoot::new(Provider::Pi, fixture.path().to_path_buf())]);
     config.poll_interval = Duration::from_millis(10);
     let mut relay = SessionRelay::new(config).await.unwrap();
-    assert!(relay.next_update().await.unwrap().events.is_empty());
+    assert!(relay.next_update().await.unwrap().records.is_empty());
 
     let mut file = OpenOptions::new().append(true).open(path).unwrap();
     file
@@ -351,15 +355,15 @@ mod tests {
     let update = tokio::time::timeout(Duration::from_secs(2), async {
       loop {
         let update = relay.next_update().await.unwrap();
-        if !update.events.is_empty() {
+        if !update.records.is_empty() {
           break update;
         }
       }
     })
     .await
     .expect("relay timed out");
-    assert_eq!(update.events.len(), 1);
-    let AgentEvent::Message(message) = &update.events[0].event else {
+    assert_eq!(update.records.len(), 1);
+    let AgentEvent::Message(message) = &update.records[0].record.events[0] else {
       panic!("expected message");
     };
     assert_eq!(message.text, "hello");
@@ -372,7 +376,7 @@ mod tests {
     let mut config = RelayConfig::new(vec![ProviderRoot::new(Provider::Pi, root.clone())]);
     config.poll_interval = Duration::from_millis(10);
     let mut relay = SessionRelay::new(config).await.unwrap();
-    assert!(relay.next_update().await.unwrap().events.is_empty());
+    assert!(relay.next_update().await.unwrap().records.is_empty());
 
     std::fs::create_dir(&root).unwrap();
     std::fs::write(
@@ -387,15 +391,15 @@ mod tests {
     let update = tokio::time::timeout(Duration::from_secs(2), async {
       loop {
         let update = relay.next_update().await.unwrap();
-        if !update.events.is_empty() {
+        if !update.records.is_empty() {
           break update;
         }
       }
     })
     .await
     .expect("relay timed out");
-    assert_eq!(update.events.len(), 2);
-    assert!(update.events.iter().all(|event| event.topic == "pi.new-session"));
+    assert_eq!(update.records.len(), 2);
+    assert!(update.records.iter().all(|event| event.topic == "pi.new-session"));
   }
 
   #[tokio::test]
@@ -439,7 +443,7 @@ mod tests {
     let mut config = RelayConfig::new(vec![ProviderRoot::new(Provider::OpenCode, database.clone())]);
     config.poll_interval = Duration::from_millis(10);
     let mut relay = SessionRelay::new(config).await.unwrap();
-    assert!(relay.next_update().await.unwrap().events.is_empty());
+    assert!(relay.next_update().await.unwrap().records.is_empty());
 
     let connection = Connection::open(&database).unwrap();
     insert_session(&connection, "ses_1", 1, 2);
@@ -458,9 +462,13 @@ mod tests {
     assert!(
       first
         .iter()
-        .any(|event| matches!(event.event, AgentEvent::SessionStarted(_)))
+        .any(|event| matches!(event.record.events[0], AgentEvent::SessionStarted(_)))
     );
-    assert!(first.iter().any(|event| matches!(event.event, AgentEvent::Message(_))));
+    assert!(
+      first
+        .iter()
+        .any(|event| matches!(event.record.events[0], AgentEvent::Message(_)))
+    );
 
     insert_message(
       &connection,
@@ -479,7 +487,7 @@ mod tests {
     );
     let second = wait_for_events(&mut relay).await;
     assert_eq!(second.len(), 1);
-    let AgentEvent::Message(message) = &second[0].event else {
+    let AgentEvent::Message(message) = &second[0].record.events[0] else {
       panic!("expected assistant message");
     };
     assert_eq!(message.text, "world");
@@ -492,18 +500,18 @@ mod tests {
       .unwrap();
     let third = wait_for_events(&mut relay).await;
     assert_eq!(third.len(), 1);
-    let AgentEvent::Message(message) = &third[0].event else {
+    let AgentEvent::Message(message) = &third[0].record.events[0] else {
       panic!("expected updated assistant message");
     };
     assert_eq!(message.text, "updated");
   }
 
-  async fn wait_for_events(relay: &mut SessionRelay) -> Vec<crate::RelayEvent> {
+  async fn wait_for_events(relay: &mut SessionRelay) -> Vec<crate::RelayRecord> {
     tokio::time::timeout(Duration::from_secs(2), async {
       loop {
         let update = relay.next_update().await.unwrap();
-        if !update.events.is_empty() {
-          break update.events;
+        if !update.records.is_empty() {
+          break update.records;
         }
       }
     })

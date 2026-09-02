@@ -1,7 +1,8 @@
+use serde::Serialize;
 use serde_json::Value;
 use tokn_opencode_protocol::v1::{MessageData, PartData, SessionModel};
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct OpenCodeSessionRow {
   pub id: String,
   pub parent_id: Option<String>,
@@ -12,7 +13,7 @@ pub struct OpenCodeSessionRow {
   pub time_updated: Option<i64>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct OpenCodeMessageRow {
   pub id: String,
   pub time_created: Option<i64>,
@@ -20,14 +21,14 @@ pub struct OpenCodeMessageRow {
   pub parts: Vec<OpenCodePartRow>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct OpenCodePartRow {
   pub id: String,
   pub time_created: Option<i64>,
   pub data: PartData,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct OpenCodeSessionEntryRow {
   pub id: String,
   pub native_type: String,

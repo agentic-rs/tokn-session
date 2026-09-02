@@ -1,15 +1,17 @@
 import { describe, expect, test } from "bun:test";
 
 import { JsonlDecoder } from "../src/jsonl";
-import { parseRelayEvent } from "../src/protocol";
+import { parseRelayRecord } from "../src/protocol";
 
 describe("Relay JSONL", () => {
   test("buffers partial records", () => {
-    const decoder = new JsonlDecoder(parseRelayEvent);
+    const decoder = new JsonlDecoder(parseRelayRecord);
     const line = JSON.stringify({
       topic: "codex.1",
       session: { session_id: "1" },
-      event: { type: "message" }
+      record_id: "jsonl:0",
+      operation: "upsert",
+      events: [{ type: "message" }]
     });
 
     expect(decoder.push(new TextEncoder().encode(line.slice(0, 10)))).toEqual([]);
@@ -18,14 +20,14 @@ describe("Relay JSONL", () => {
   });
 
   test("counts invalid records without stopping", () => {
-    const decoder = new JsonlDecoder(parseRelayEvent);
+    const decoder = new JsonlDecoder(parseRelayRecord);
     decoder.push(new TextEncoder().encode("{}\nnot-json\n"));
 
     expect(decoder.stats.malformed_lines).toBe(2);
   });
 
   test("preserves the session path and cwd for terminal input", () => {
-    const parsed = parseRelayEvent({
+    const parsed = parseRelayRecord({
       path: "/tmp/pi/session.jsonl",
       topic: "pi.session-1",
       session: {
@@ -33,7 +35,9 @@ describe("Relay JSONL", () => {
         session_id: "session-1",
         cwd: "/tmp/project"
       },
-      event: { type: "message" }
+      record_id: "jsonl:0",
+      operation: "upsert",
+      events: [{ type: "message" }]
     });
 
     expect(parsed).toMatchObject({

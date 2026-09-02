@@ -4,6 +4,11 @@
 owns one Relay event stream, evaluates declarative fan-out rules, and forwards
 matching `RelayEvent`s into bounded per-worker queues.
 
+The wire stream uses [Relay records](../../docs/relay.md): each record has an
+`events` array. The shared adapter dispatches it in order with backpressure;
+rules and workers still receive one internal `RelayEvent` at a time. Native
+data is optional and ignored. Update custom `--stdin` producers to this format.
+
 Downstreams are async worker objects in the same Bun runtime, not subprocesses.
 The supervisor currently supports:
 
