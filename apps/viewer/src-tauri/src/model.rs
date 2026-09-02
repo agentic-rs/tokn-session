@@ -581,10 +581,10 @@ pub(crate) fn decode_event_key(key: &str) -> Result<usize, String> {
 }
 
 /// A synthetic trajectory identity is intentionally distinct from the stable
-/// source-event identity. Its numeric payload is the final source position of
-/// the collapsed run, not an `event.v1.*` alias.
-pub(crate) fn encode_trajectory_key(anchor: usize) -> String {
-  format!("trajectory.v1.{anchor:x}")
+/// source-event identity. Its numeric payload is the first source position of
+/// the collapsed run, which remains stable when more work is appended.
+pub(crate) fn encode_trajectory_key(start: usize) -> String {
+  format!("trajectory.v1.{start:x}")
 }
 
 pub(crate) fn decode_trajectory_key(key: &str) -> Result<usize, String> {
