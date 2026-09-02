@@ -46,7 +46,7 @@ Both modes watch `~/.codex/sessions`, `~/.pi/agent/sessions`, and
 their session header before following from the snapshotted EOF, while existing
 OpenCode sessions are snapshotted without replay. `--codex-dir`, `--pi-dir`,
 `--opencode-dir` (a data directory or database path), `--poll-interval`,
-`--replay=<count>`, and `--replay-all` are shared options.
+`--replay=<count>`, `--replay-all`, and `--native` are shared options.
 
 Native filesystem watching is registered between the initial file snapshot and
 the EOF-seeding pass, so appends during startup remain visible. The periodic
@@ -69,17 +69,23 @@ Human-readable formats include the event timestamp, Codex Desktop project name
 when available, abbreviated session id, and message id/parent when available.
 Pretty output also prints the full session context before the first event
 observed for each session. `--color` adds ANSI color to human output. JSON
-remains colorless `RelayEvent` JSONL even when `--color` is present. Every
-format flushes after each event, and diagnostics remain on stderr.
+remains colorless `RelayRecord` JSONL even when `--color` is present. JSON
+flushes after each record, human output after each event; diagnostics stay on stderr.
 
 `zeromq` binds `tcp://127.0.0.1:5556` by default. Each publication is a two-frame
 ZeroMQ message:
 
 1. `codex.<session_id>`, `pi.<session_id>`, or `opencode.<session_id>` topic
-2. serialized `RelayEvent` JSON
+2. serialized `RelayRecord` JSON
 
-`RelayEvent` wraps the normalized `AgentEvent` with the source path, topic, and
-`SessionContext`. Context includes session id, optional parent/title, cwd and
+`RelayRecord` wraps zero or more ordered `AgentEvent`s in `events`, with a
+source-scoped `record_id`, `operation`, optional sibling `native` (opt-in),
+source path, topic, and `SessionContext`. This replaces the single `event`
+wire field; all bundled pets migrate together via `apps/shared/relay.ts`.
+JSONL lines stay atomic; OpenCode messages plus parts are replacement snapshots
+keyed by message ID, with removals for deleted messages in observed sessions.
+See [Relay records](relay.md) for the contract and snapshot/resync limitations.
+Context includes session id, optional parent/title, cwd and
 start time, optional agent path/nickname/role, plus a project object. That
 object carries the distinct `project_name`, `folder_name`, and
 `repository_name` fields as well as the existing folder path, repository URL,
@@ -105,15 +111,16 @@ and combines native filesystem notifications with a periodic rescan. OpenCode
 session summaries are cached, so a database notification reloads only new or
 changed sessions on the normal path; when message/part timestamps cannot prove
 which session changed, it performs one correctness fallback over the current
-sessions. New sessions use the replay window, while changed or newly appended
-message/part events are emitted once.
+sessions. New sessions use the replay window, while changed message records
+republish their whole normalized batch. JSONL updates decode each appended
+complete line once; viewer reload behavior is not changed by this migration.
 The database is opened read-only with WAL visibility and an immutable fallback;
 the relay never runs provider migrations.
 
 The reusable relay loop lives in the library as `SessionRelay`. `RelayConfig`
-controls provider roots, new-file replay, and the periodic recovery interval.
+controls provider roots, native inclusion, new-file replay, and the periodic recovery interval.
 Library consumers call `next_update().await`; notification and scan failures
-that can be retried are returned as warnings in `TailUpdate`.
+that can be retried are returned as warnings alongside `TailUpdate.records`.
 
 ## Discord Pet
 

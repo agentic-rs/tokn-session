@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use tokn_session_core::Provider;
 use tokn_session_relay::{
-  DEFAULT_POLL_INTERVAL, DEFAULT_REPLAY_MESSAGES, NewFileReplay, ProviderRoot, RelayConfig, RelayEvent, SessionRelay,
-  TailUpdate, ZmqPublisher,
+  DEFAULT_POLL_INTERVAL, DEFAULT_REPLAY_MESSAGES, NewFileReplay, ProviderRoot, RelayConfig, RelayEvent, RelayRecord,
+  SessionRelay, TailUpdate, ZmqPublisher,
 };
 use tokn_session_render::{render_event_pretty, render_event_summary};
 
@@ -34,6 +34,7 @@ async fn run(args: Args) -> Result<(), String> {
     roots: args.roots()?,
     poll_interval: args.poll_interval,
     new_file_replay: args.new_file_replay,
+    include_native: args.include_native,
   };
   let mut relay = SessionRelay::new(config).await?;
   let mut output = match args.command {
@@ -82,18 +83,15 @@ impl Output {
     for warning in update.warnings {
       eprintln!("warning: {warning}");
     }
-    for event in update.events {
+    for record in update.records {
       let result = match self {
-        Self::ZeroMq(publisher) => publisher.publish(&event).await,
+        Self::ZeroMq(publisher) => publisher.publish(&record).await,
         Self::Stdout {
           writer,
           format,
           color,
           seen_sessions,
-        } => {
-          let show_context = *format == StdoutFormat::Pretty && seen_sessions.insert(event.topic.clone());
-          write_stdout_event(writer, &event, *format, *color, show_context)
-        }
+        } => write_stdout_record(writer, record, *format, *color, seen_sessions),
       };
       if let Err(err) = result {
         eprintln!("warning: {err}");
@@ -102,12 +100,29 @@ impl Output {
   }
 }
 
-fn write_jsonl_event(writer: &mut impl Write, event: &RelayEvent) -> Result<(), String> {
+fn write_jsonl_event(writer: &mut impl Write, event: &RelayRecord) -> Result<(), String> {
   serde_json::to_writer(&mut *writer, event).map_err(|err| format!("failed to serialize relay event: {err}"))?;
   writer
     .write_all(b"\n")
     .and_then(|_| writer.flush())
     .map_err(|err| format!("failed to write relay event: {err}"))
+}
+
+fn write_stdout_record(
+  writer: &mut impl Write,
+  record: RelayRecord,
+  format: StdoutFormat,
+  color: bool,
+  seen_sessions: &mut HashSet<String>,
+) -> Result<(), String> {
+  if format == StdoutFormat::Json {
+    return write_jsonl_event(writer, &record);
+  }
+  for event in record.into_events() {
+    let show_context = format == StdoutFormat::Pretty && seen_sessions.insert(event.topic.clone());
+    write_stdout_event(writer, &event, format, color, show_context)?;
+  }
+  Ok(())
 }
 
 fn write_stdout_event(
@@ -117,10 +132,6 @@ fn write_stdout_event(
   color: bool,
   show_context: bool,
 ) -> Result<(), String> {
-  if format == StdoutFormat::Json {
-    return write_jsonl_event(writer, event);
-  }
-
   let rendered = match format {
     StdoutFormat::Pretty => {
       let pretty = render_event_pretty(&event.event);
@@ -423,6 +434,7 @@ struct Args {
   opencode_dir: Option<PathBuf>,
   poll_interval: Duration,
   new_file_replay: NewFileReplay,
+  include_native: bool,
 }
 
 enum ArgsParse {
@@ -462,11 +474,13 @@ impl Args {
       opencode_dir: None,
       poll_interval: DEFAULT_POLL_INTERVAL,
       new_file_replay: NewFileReplay::Messages(DEFAULT_REPLAY_MESSAGES),
+      include_native: false,
     };
     let mut replay_option_seen = false;
 
     while let Some(arg) = args.next() {
       match arg.as_str() {
+        "--native" => parsed.include_native = true,
         "--bind" => match &mut parsed.command {
           Command::ZeroMq { endpoint } => *endpoint = next_value(&mut args, "--bind")?,
           Command::Stdout { .. } => return Err("`--bind` is only valid for the `zeromq` subcommand".to_string()),
@@ -598,11 +612,12 @@ Options:
   --poll-interval <duration>  Fallback rescan interval, such as 250ms, 2s, or 1m (default: 30s)
   --replay=<count>            Messages replayed for a newly discovered file (default: 3)
   --replay-all                Replay all records for a newly discovered file
+  --native                    Include native data in JSON/ZeroMQ records
   -h, --help                  Show this help
 
 Messages use two frames:
-  1. topic: codex.<session_id> or pi.<session_id>
-  2. JSON: RelayEvent envelope with session context and normalized AgentEvent"
+  1. topic: codex.<session_id>, pi.<session_id>, or opencode.<session_id>
+  2. JSON: RelayRecord envelope with session context, events array, and optional native"
     ),
     Help::Stdout => println!(
       "\
@@ -620,6 +635,7 @@ Options:
   --poll-interval <duration>  Fallback rescan interval, such as 250ms, 2s, or 1m (default: 30s)
   --replay=<count>            Messages replayed for a newly discovered file (default: 3)
   --replay-all                Replay all records for a newly discovered file
+  --native                    Include native data in JSON/ZeroMQ records
   -h, --help                  Show this help"
     ),
   }
@@ -646,6 +662,7 @@ mod tests {
         "--opencode-dir",
         "/tmp/opencode.db",
         "--replay=5",
+        "--native",
         "--poll-interval",
         "250ms",
       ]
@@ -663,6 +680,7 @@ mod tests {
     );
     assert_eq!(args.poll_interval, Duration::from_millis(250));
     assert_eq!(args.new_file_replay, NewFileReplay::Messages(5));
+    assert!(args.include_native);
     assert_eq!(args.opencode_dir, Some(PathBuf::from("/tmp/opencode.db")));
   }
 
@@ -698,6 +716,7 @@ mod tests {
         color: false,
       }
     );
+    assert!(!defaults.include_native);
 
     let ArgsParse::Run(args) = Args::parse(
       ["stdout", "--format", "pretty", "--color"]
@@ -744,10 +763,10 @@ mod tests {
   }
 
   #[test]
-  fn writes_relay_event_jsonl() {
+  fn writes_relay_record_jsonl() {
     let event = message_event();
     let mut output = RecordingWriter::default();
-    write_jsonl_event(&mut output, &event).unwrap();
+    write_jsonl_event(&mut output, &as_record(event)).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&output.bytes).unwrap();
     assert_eq!(value["topic"], "pi.session-1");
     assert_eq!(value["session"]["project"]["name"], "project");
@@ -755,9 +774,39 @@ mod tests {
     assert_eq!(value["session"]["project"]["folder_name"], "project");
     assert!(value["session"]["project"]["repository_name"].is_null());
     assert!(value["session"]["agent_path"].is_null());
-    assert_eq!(value["event"]["type"], "message");
-    assert_eq!(value["event"]["text"], "done");
+    assert_eq!(value["events"][0]["type"], "message");
+    assert_eq!(value["events"][0]["text"], "done");
+    assert_eq!(value["record_id"], "jsonl:0");
+    assert_eq!(value["operation"], "upsert");
+    assert!(value.get("native").is_none());
+    assert!(value.get("event").is_none());
     assert_eq!(output.flushes, 1);
+  }
+
+  #[test]
+  fn writes_native_only_records_and_renders_all_events_in_a_batch() {
+    let mut record = as_record(message_event());
+    record.record.events.clear();
+    record.record.native = Some(serde_json::json!({"type": "future", "payload": 42}));
+    let mut output = RecordingWriter::default();
+    super::write_stdout_record(&mut output, record, StdoutFormat::Json, true, &mut Default::default()).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&output.bytes).unwrap();
+    assert_eq!(value["events"], serde_json::json!([]));
+    assert_eq!(value["native"]["payload"], 42);
+    assert_eq!(output.flushes, 1);
+
+    let mut record = as_record(message_event());
+    record.record.events.push(message_event().event);
+    let mut output = RecordingWriter::default();
+    super::write_stdout_record(
+      &mut output,
+      record,
+      StdoutFormat::Summary,
+      false,
+      &mut Default::default(),
+    )
+    .unwrap();
+    assert_eq!(String::from_utf8(output.bytes).unwrap().matches("done").count(), 2);
   }
 
   #[test]
@@ -793,7 +842,14 @@ mod tests {
     assert!(String::from_utf8(colored.bytes).unwrap().contains("\u{1b}["));
 
     let mut json = RecordingWriter::default();
-    write_stdout_event(&mut json, &event, StdoutFormat::Json, true, false).unwrap();
+    super::write_stdout_record(
+      &mut json,
+      as_record(event),
+      StdoutFormat::Json,
+      true,
+      &mut Default::default(),
+    )
+    .unwrap();
     assert!(!String::from_utf8(json.bytes).unwrap().contains("\u{1b}["));
   }
 
@@ -882,6 +938,20 @@ mod tests {
       String::from_utf8(output.bytes).unwrap(),
       "project pi/session-1 session started session-1\n\n"
     );
+  }
+
+  fn as_record(event: RelayEvent) -> tokn_session_relay::RelayRecord {
+    tokn_session_relay::RelayRecord {
+      path: event.path,
+      topic: event.topic,
+      session: event.session,
+      operation: tokn_session_relay::RecordOperation::Upsert,
+      record: tokn_session_core::NormalizedRecord {
+        record_id: "jsonl:0".into(),
+        native: None,
+        events: vec![event.event],
+      },
+    }
   }
 
   fn message_event() -> RelayEvent {

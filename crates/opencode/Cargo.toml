@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+serde.workspace = true
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde_json.workspace = true
 tokn-opencode-protocol.workspace = true

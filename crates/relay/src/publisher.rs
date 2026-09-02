@@ -1,6 +1,6 @@
 use zeromq::{PubSocket, Socket, SocketSend, ZmqMessage};
 
-use crate::RelayEvent;
+use crate::RelayRecord;
 
 pub struct ZmqPublisher {
   socket: PubSocket,
@@ -16,7 +16,7 @@ impl ZmqPublisher {
     Ok(Self { socket })
   }
 
-  pub async fn publish(&mut self, event: &RelayEvent) -> Result<(), String> {
+  pub async fn publish(&mut self, event: &RelayRecord) -> Result<(), String> {
     let payload = serde_json::to_vec(event).map_err(|err| format!("failed to serialize relay event: {err}"))?;
     let mut message = ZmqMessage::from(event.topic.as_str());
     message.push_back(payload.into());
@@ -38,7 +38,7 @@ mod tests {
   use zeromq::{Socket, SocketRecv, SubSocket};
 
   use super::ZmqPublisher;
-  use crate::{ProjectContext, RelayEvent, SessionContext};
+  use crate::{ProjectContext, RelayRecord, SessionContext};
 
   #[tokio::test]
   async fn publishes_topic_and_json_as_multipart_message() {
@@ -63,7 +63,7 @@ mod tests {
       timestamp: None,
     });
     publisher
-      .publish(&RelayEvent {
+      .publish(&RelayRecord {
         path: PathBuf::from("session.jsonl"),
         topic: "pi.session-1".to_string(),
         session: SessionContext {
@@ -88,7 +88,12 @@ mod tests {
             commit_hash: None,
           }),
         },
-        event,
+        operation: crate::RecordOperation::Upsert,
+        record: tokn_session_core::NormalizedRecord {
+          record_id: "jsonl:0".into(),
+          native: None,
+          events: vec![event],
+        },
       })
       .await
       .unwrap();
@@ -106,9 +111,9 @@ mod tests {
     assert_eq!(payload["session"]["project"]["folder_name"], "project");
     assert!(payload["session"]["project"]["repository_name"].is_null());
     assert!(payload["session"]["agent_path"].is_null());
-    assert_eq!(payload["event"]["type"], "message");
-    assert_eq!(payload["event"]["session_id"], "session-1");
-    assert_eq!(payload["event"]["delivery"], "final");
-    assert_eq!(payload["event"]["text"], "done");
+    assert_eq!(payload["events"][0]["type"], "message");
+    assert_eq!(payload["events"][0]["session_id"], "session-1");
+    assert_eq!(payload["events"][0]["delivery"], "final");
+    assert_eq!(payload["events"][0]["text"], "done");
   }
 }

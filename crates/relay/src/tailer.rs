@@ -8,11 +8,10 @@ use std::time::SystemTime;
 use serde::Serialize;
 use serde_json::Value;
 use tokn_session_codex::{event::CodexLine, normalize::CodexNormalizer};
-use tokn_session_core::{AgentEvent, LoadedSession, Provider};
+use tokn_session_core::{AgentEvent, LoadedSessionRecords, NormalizedRecord, Provider};
 use tokn_session_opencode::OpenCodeSessionSource;
 use tokn_session_pi::{event::PiSessionLine, normalize::PiNormalizer};
 
-use crate::context::session_id_from_path;
 use crate::project::ProjectCatalog;
 use crate::{NewFileReplay, SessionContext};
 
@@ -30,7 +29,8 @@ impl ProviderRoot {
   }
 }
 
-#[derive(Debug, Serialize)]
+/// Flattened input for event-oriented renderers, not the wire envelope.
+#[derive(Debug)]
 pub struct RelayEvent {
   pub path: PathBuf,
   pub topic: String,
@@ -38,9 +38,40 @@ pub struct RelayEvent {
   pub event: AgentEvent,
 }
 
+/// Wire envelope. Upserts replace the entire event batch for this record ID;
+/// removals invalidate an observed SQLite record and carry an empty batch.
+#[derive(Debug, Serialize)]
+pub struct RelayRecord {
+  pub path: PathBuf,
+  pub topic: String,
+  pub session: SessionContext,
+  pub operation: RecordOperation,
+  #[serde(flatten)]
+  pub record: NormalizedRecord,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordOperation {
+  Upsert,
+  Remove,
+}
+
+impl RelayRecord {
+  /// Event-oriented consumers may flatten a record without reparsing its JSON.
+  pub fn into_events(self) -> impl Iterator<Item = RelayEvent> {
+    self.record.events.into_iter().map(move |event| RelayEvent {
+      path: self.path.clone(),
+      topic: self.topic.clone(),
+      session: self.session.clone(),
+      event,
+    })
+  }
+}
+
 #[derive(Debug, Default)]
 pub struct TailUpdate {
-  pub events: Vec<RelayEvent>,
+  pub records: Vec<RelayRecord>,
   pub warnings: Vec<String>,
 }
 
@@ -49,6 +80,7 @@ pub struct SessionTailer {
   files: HashMap<PathBuf, FileState>,
   opencode: HashMap<PathBuf, OpenCodeState>,
   new_file_replay: NewFileReplay,
+  include_native: bool,
   project_catalog: SharedProjectCatalog,
   project_catalog_source: Option<ProjectCatalogSource>,
   project_catalog_warning: Option<String>,
@@ -56,7 +88,16 @@ pub struct SessionTailer {
 
 impl SessionTailer {
   pub fn initialize(roots: Vec<ProviderRoot>, new_file_replay: NewFileReplay) -> Result<(Self, TailUpdate), String> {
+    Self::initialize_with_native(roots, new_file_replay, false)
+  }
+
+  pub fn initialize_with_native(
+    roots: Vec<ProviderRoot>,
+    new_file_replay: NewFileReplay,
+    include_native: bool,
+  ) -> Result<(Self, TailUpdate), String> {
     let mut tailer = Self::prepare(roots, new_file_replay)?;
+    tailer.include_native = include_native;
     let update = tailer.start()?;
     Ok((tailer, update))
   }
@@ -78,6 +119,7 @@ impl SessionTailer {
       files: HashMap::new(),
       opencode: HashMap::new(),
       new_file_replay,
+      include_native: false,
       project_catalog,
       project_catalog_source,
       project_catalog_warning,
@@ -99,6 +141,10 @@ impl SessionTailer {
     Ok(tailer)
   }
 
+  pub(crate) fn set_include_native(&mut self, include_native: bool) {
+    self.include_native = include_native;
+  }
+
   pub(crate) fn start(&mut self) -> Result<TailUpdate, String> {
     let mut update = TailUpdate::default();
     if let Some(warning) = self.project_catalog_warning.take() {
@@ -106,6 +152,7 @@ impl SessionTailer {
     }
     let new_file_replay = self.new_file_replay;
     for state in self.files.values_mut() {
+      state.include_native = self.include_native;
       let mode = if state.matches_initial_snapshot()? {
         InitialRead::Follow
       } else {
@@ -115,6 +162,7 @@ impl SessionTailer {
       update.append(initial);
     }
     for state in self.opencode.values_mut() {
+      state.include_native = self.include_native;
       update.append(state.scan(false, self.new_file_replay)?);
     }
     Ok(update)
@@ -142,7 +190,7 @@ impl SessionTailer {
       }
       let (mut appended, restarted) = state.read_appended(true)?;
       if restarted {
-        apply_replay_policy(&mut appended.events, self.new_file_replay);
+        apply_replay_policy(&mut appended.records, self.new_file_replay);
       }
       update.append(appended);
     }
@@ -218,7 +266,7 @@ impl SessionTailer {
     };
     let (mut appended, restarted) = state.read_appended(true)?;
     if restarted {
-      apply_replay_policy(&mut appended.events, self.new_file_replay);
+      apply_replay_policy(&mut appended.records, self.new_file_replay);
     }
     update.append(appended);
     Ok(())
@@ -232,6 +280,7 @@ impl SessionTailer {
     update: &mut TailUpdate,
   ) -> Result<(), String> {
     let mut state = FileState::open(path.clone(), provider, Arc::clone(&self.project_catalog))?;
+    state.include_native = self.include_native;
     let initial = read_initial(&mut state, mode)?;
     update.append(initial);
     self.files.insert(path, state);
@@ -292,7 +341,7 @@ fn read_initial(state: &mut FileState, mode: InitialRead) -> Result<TailUpdate, 
     InitialRead::Replay(NewFileReplay::All) => Ok(state.read_appended(true)?.0),
     InitialRead::Replay(NewFileReplay::Messages(message_count)) => {
       let mut update = state.read_appended(true)?.0;
-      retain_message_history(&mut update.events, message_count);
+      retain_message_history(&mut update.records, message_count);
       Ok(update)
     }
   }
@@ -306,7 +355,7 @@ enum InitialRead {
 
 impl TailUpdate {
   fn append(&mut self, mut other: Self) {
-    self.events.append(&mut other.events);
+    self.records.append(&mut other.records);
     self.warnings.append(&mut other.warnings);
   }
 }
@@ -316,11 +365,12 @@ struct OpenCodeState {
   source: OpenCodeSessionSource,
   sessions: HashMap<String, OpenCodeSessionState>,
   database_version: Option<OpenCodeDatabaseVersion>,
+  include_native: bool,
 }
 
 struct OpenCodeSessionState {
   summary: OpenCodeSessionSummary,
-  fingerprints: Vec<String>,
+  fingerprints: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -355,6 +405,7 @@ impl OpenCodeState {
       root_path,
       sessions: HashMap::new(),
       database_version: None,
+      include_native: false,
     }
   }
 
@@ -397,19 +448,29 @@ impl OpenCodeState {
     }
 
     for (session_id, summary) in to_load {
-      let loaded = self.source.load_session_exact(&session_id)?;
-      let fingerprints = loaded.events.iter().map(event_fingerprint).collect::<Vec<_>>();
+      let loaded = self
+        .source
+        .load_session_records_exact(&session_id, self.include_native)?;
+      let fingerprints = loaded
+        .records
+        .iter()
+        .map(|record| {
+          serde_json::to_string(record)
+            .map(|value| (record.record_id.clone(), value))
+            .map_err(|err| err.to_string())
+        })
+        .collect::<Result<HashMap<_, _>, _>>()?;
       let context = SessionContext::from_session_ref(&loaded.reference);
-      let events = relay_events_from_loaded(loaded, &context, &fingerprints, self.sessions.get(&session_id));
+      let events = relay_records_from_loaded(loaded, &context, &fingerprints, self.sessions.get(&session_id));
 
       match self.sessions.get(&session_id) {
         None if publish_new_sessions => {
           let mut events = events;
           apply_replay_policy(&mut events, replay);
-          update.events.extend(events);
+          update.records.extend(events);
         }
         Some(_) if publish_new_sessions => {
-          update.events.extend(events);
+          update.records.extend(events);
         }
         _ => {}
       }
@@ -448,33 +509,50 @@ impl OpenCodeState {
   }
 }
 
-fn relay_events_from_loaded(
-  loaded: LoadedSession,
+fn relay_records_from_loaded(
+  loaded: LoadedSessionRecords,
   context: &SessionContext,
-  fingerprints: &[String],
+  fingerprints: &HashMap<String, String>,
   previous: Option<&OpenCodeSessionState>,
-) -> Vec<RelayEvent> {
+) -> Vec<RelayRecord> {
   let path = loaded.reference.path.clone();
-  loaded
-    .events
+  let topic = format!("opencode.{}", context.session_id);
+  let mut records: Vec<_> = loaded
+    .records
     .into_iter()
-    .enumerate()
-    .filter_map(|(index, event)| {
+    .filter_map(|record| {
       let changed = previous
-        .and_then(|previous| previous.fingerprints.get(index))
-        .is_none_or(|fingerprint| fingerprint != &fingerprints[index]);
-      changed.then(|| RelayEvent {
-        topic: event_topic(Provider::OpenCode, &path, &event),
+        .and_then(|previous| previous.fingerprints.get(&record.record_id))
+        .is_none_or(|fingerprint| fingerprint != &fingerprints[&record.record_id]);
+      changed.then(|| RelayRecord {
+        topic: topic.clone(),
         path: path.clone(),
         session: context.clone(),
-        event,
+        operation: RecordOperation::Upsert,
+        record,
       })
     })
-    .collect()
-}
-
-fn event_fingerprint(event: &AgentEvent) -> String {
-  serde_json::to_string(event).unwrap_or_else(|_| format!("{event:?}"))
+    .collect();
+  if let Some(previous) = previous {
+    let mut removed: Vec<_> = previous
+      .fingerprints
+      .keys()
+      .filter(|id| !fingerprints.contains_key(*id))
+      .collect();
+    removed.sort();
+    records.extend(removed.into_iter().map(|id| RelayRecord {
+      path: path.clone(),
+      topic: topic.clone(),
+      session: context.clone(),
+      operation: RecordOperation::Remove,
+      record: NormalizedRecord {
+        record_id: id.clone(),
+        native: None,
+        events: Vec::new(),
+      },
+    }));
+  }
+  records
 }
 
 struct FileState {
@@ -487,6 +565,7 @@ struct FileState {
   normalizer: SessionNormalizer,
   context: SessionContext,
   project_catalog: SharedProjectCatalog,
+  include_native: bool,
 }
 
 impl FileState {
@@ -503,6 +582,7 @@ impl FileState {
       normalizer: SessionNormalizer::new(provider),
       context,
       project_catalog,
+      include_native: false,
     })
   }
 
@@ -525,11 +605,13 @@ impl FileState {
       if bytes == 0 || !line.ends_with('\n') {
         break;
       }
-      match self
-        .normalizer
-        .normalize_line(line.trim_end_matches(['\r', '\n']), &mut self.context, &project_catalog)
-      {
-        Ok(events)
+      match self.normalizer.normalize_line(
+        line.trim_end_matches(['\r', '\n']),
+        &mut self.context,
+        &project_catalog,
+        false,
+      ) {
+        Ok((_, events))
           if events
             .iter()
             .any(|event| matches!(event, AgentEvent::SessionStarted(_))) =>
@@ -596,6 +678,7 @@ impl FileState {
       return Ok((TailUpdate::default(), restarted));
     }
 
+    let mut line_offset = self.offset - self.pending.len() as u64;
     let complete = self.pending.drain(..complete_length).collect::<Vec<_>>();
     let mut update = TailUpdate::default();
     let project_catalog = self
@@ -603,6 +686,8 @@ impl FileState {
       .read()
       .unwrap_or_else(|poisoned| poisoned.into_inner());
     for raw_line in complete.split(|byte| *byte == b'\n') {
+      let record_id = format!("jsonl:{line_offset}");
+      line_offset += raw_line.len() as u64 + 1;
       let line = match std::str::from_utf8(raw_line) {
         Ok(line) if !line.trim().is_empty() => line,
         Ok(_) => continue,
@@ -616,15 +701,20 @@ impl FileState {
 
       match self
         .normalizer
-        .normalize_line(line, &mut self.context, &project_catalog)
+        .normalize_line(line, &mut self.context, &project_catalog, self.include_native)
       {
-        Ok(events) if should_publish => {
-          update.events.extend(events.into_iter().map(|event| RelayEvent {
-            topic: event_topic(self.provider, &self.path, &event),
+        Ok((native, events)) if should_publish => {
+          update.records.push(RelayRecord {
+            topic: format!("{}.{}", provider_name(self.provider), self.context.session_id),
             path: self.path.clone(),
             session: self.context.clone(),
-            event,
-          }));
+            operation: RecordOperation::Upsert,
+            record: NormalizedRecord {
+              record_id,
+              native,
+              events,
+            },
+          });
         }
         Ok(_) => {}
         Err(err) => update
@@ -636,7 +726,7 @@ impl FileState {
   }
 }
 
-fn retain_message_history(events: &mut Vec<RelayEvent>, message_count: usize) {
+fn retain_message_history(events: &mut Vec<RelayRecord>, message_count: usize) {
   if message_count == 0 {
     events.clear();
     return;
@@ -645,8 +735,12 @@ fn retain_message_history(events: &mut Vec<RelayEvent>, message_count: usize) {
   let message_indices = events
     .iter()
     .enumerate()
-    .filter_map(|(index, event)| {
-      (matches!(event.event, AgentEvent::Message(_)) && !event.event.is_hidden()).then_some(index)
+    .flat_map(|(index, record)| {
+      record
+        .record
+        .events
+        .iter()
+        .filter_map(move |event| (matches!(event, AgentEvent::Message(_)) && !event.is_hidden()).then_some(index))
     })
     .collect::<Vec<_>>();
   if message_indices.len() <= message_count {
@@ -657,7 +751,7 @@ fn retain_message_history(events: &mut Vec<RelayEvent>, message_count: usize) {
   events.drain(..start);
 }
 
-fn apply_replay_policy(events: &mut Vec<RelayEvent>, replay: NewFileReplay) {
+fn apply_replay_policy(events: &mut Vec<RelayRecord>, replay: NewFileReplay) {
   if let NewFileReplay::Messages(message_count) = replay {
     retain_message_history(events, message_count);
   }
@@ -719,23 +813,26 @@ impl SessionNormalizer {
     line: &str,
     context: &mut SessionContext,
     project_catalog: &ProjectCatalog,
-  ) -> Result<Vec<AgentEvent>, String> {
+    include_native: bool,
+  ) -> Result<(Option<Value>, Vec<AgentEvent>), String> {
     let value: Value = serde_json::from_str(line).map_err(|err| format!("invalid session JSONL: {err}"))?;
     context.update(&value);
     if matches!(context.provider, Provider::Codex) {
       context.resolve_project_name(project_catalog);
     }
 
-    match self {
+    let native = include_native.then(|| value.clone());
+    let events = match self {
       Self::Codex(normalizer) => {
         let event: CodexLine = serde_json::from_value(value).map_err(|err| format!("invalid codex JSONL: {err}"))?;
-        Ok(normalizer.normalize(event))
+        normalizer.normalize(event)
       }
       Self::Pi(normalizer) => {
         let event: PiSessionLine = serde_json::from_value(value).map_err(|err| format!("invalid pi JSONL: {err}"))?;
-        Ok(normalizer.normalize(event))
+        normalizer.normalize(event)
       }
-    }
+    };
+    Ok((native, events))
   }
 }
 
@@ -815,14 +912,6 @@ fn sqlite_sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
   database_path.with_file_name(format!("{name}{suffix}"))
 }
 
-fn event_topic(provider: Provider, path: &Path, event: &AgentEvent) -> String {
-  let provider = provider_name(provider);
-  let session_id = event_session_id(event)
-    .map(str::to_string)
-    .unwrap_or_else(|| session_id_from_path(path));
-  format!("{provider}.{session_id}")
-}
-
 fn provider_name(provider: Provider) -> &'static str {
   match provider {
     Provider::Codex => "codex",
@@ -831,24 +920,6 @@ fn provider_name(provider: Provider) -> &'static str {
     Provider::ZCode => "zcode",
     Provider::WorkBuddy => "workbuddy",
     Provider::Dsh => "dsh",
-  }
-}
-
-fn event_session_id(event: &AgentEvent) -> Option<&str> {
-  match event {
-    AgentEvent::SessionStarted(event) => Some(&event.session_id),
-    AgentEvent::ProviderChanged(event) => event.session_id.as_deref(),
-    AgentEvent::SessionSettingsApplied(event) => event.session_id.as_deref(),
-    AgentEvent::Message(event) => event.session_id.as_deref(),
-    AgentEvent::Reasoning(event) => event.session_id.as_deref(),
-    AgentEvent::GoalUpdated(event) => event.session_id.as_deref(),
-    AgentEvent::AgentActivity(event) => event.session_id.as_deref(),
-    AgentEvent::ToolCall(event) => event.session_id.as_deref(),
-    AgentEvent::Error(event) => event.session_id.as_deref(),
-    AgentEvent::Unknown(event) => event.session_id.as_deref(),
-    AgentEvent::Lifecycle(event) => event.session_id.as_deref(),
-    AgentEvent::Usage(event) => event.session_id.as_deref(),
-    AgentEvent::Metadata(event) => event.session_id.as_deref(),
   }
 }
 
@@ -948,26 +1019,26 @@ mod tests {
       NewFileReplay::Messages(3),
     )
     .unwrap();
-    assert!(initial.events.is_empty());
+    assert!(initial.records.is_empty());
 
     append(
       &path,
       "{\"type\":\"message\",\"id\":\"new\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n",
     );
     let update = tailer.scan().unwrap();
-    assert_eq!(update.events.len(), 1);
-    assert_eq!(update.events[0].topic, "pi.pi-session");
-    assert_eq!(update.events[0].session.session_id, "pi-session");
-    assert_eq!(update.events[0].session.started_at.as_deref(), Some("2026-01-01"));
+    assert_eq!(update.records.len(), 1);
+    assert_eq!(update.records[0].topic, "pi.pi-session");
+    assert_eq!(update.records[0].session.session_id, "pi-session");
+    assert_eq!(update.records[0].session.started_at.as_deref(), Some("2026-01-01"));
     assert_eq!(
-      update.events[0]
+      update.records[0]
         .session
         .project
         .as_ref()
         .and_then(|project| project.name.as_deref()),
       Some("tmp")
     );
-    let AgentEvent::Message(message) = &update.events[0].event else {
+    let AgentEvent::Message(message) = &update.records[0].record.events[0] else {
       panic!("expected message");
     };
     assert_eq!(message.text, "done");
@@ -993,7 +1064,7 @@ mod tests {
       NewFileReplay::All,
     )
     .unwrap();
-    assert!(initial.events.is_empty());
+    assert!(initial.records.is_empty());
     assert!(initial.warnings.is_empty());
 
     append(
@@ -1001,8 +1072,8 @@ mod tests {
       "{\"type\":\"message\",\"id\":\"new\",\"message\":{\"role\":\"user\",\"content\":\"new\"}}\n",
     );
     let update = tailer.scan().unwrap();
-    assert_eq!(update.events.len(), 1);
-    let AgentEvent::Message(message) = &update.events[0].event else {
+    assert_eq!(update.records.len(), 1);
+    let AgentEvent::Message(message) = &update.records[0].record.events[0] else {
       panic!("expected message");
     };
     assert_eq!(message.text, "new");
@@ -1027,11 +1098,11 @@ mod tests {
       &path,
       "{\"type\":\"message\",\"id\":\"new\",\"message\":{\"role\":\"user\",\"content\":\"not lost\"}}\n",
     );
-    assert!(tailer.start().unwrap().events.is_empty());
+    assert!(tailer.start().unwrap().records.is_empty());
 
     let update = tailer.scan().unwrap();
-    assert_eq!(update.events.len(), 1);
-    let AgentEvent::Message(message) = &update.events[0].event else {
+    assert_eq!(update.records.len(), 1);
+    let AgentEvent::Message(message) = &update.records[0].record.events[0] else {
       panic!("expected message");
     };
     assert_eq!(message.text, "not lost");
@@ -1065,8 +1136,8 @@ mod tests {
     std::fs::rename(replacement, &path).unwrap();
 
     let update = tailer.start().unwrap();
-    assert_eq!(update.events.len(), 1);
-    let AgentEvent::Message(message) = &update.events[0].event else {
+    assert_eq!(update.records.len(), 1);
+    let AgentEvent::Message(message) = &update.records[0].record.events[0] else {
       panic!("expected message");
     };
     assert_eq!(message.text, "recent");
@@ -1092,9 +1163,9 @@ mod tests {
       &path,
       "{\"type\":\"message\",\"id\":\"new\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}",
     );
-    assert!(tailer.scan().unwrap().events.is_empty());
+    assert!(tailer.scan().unwrap().records.is_empty());
     append(&path, "\n");
-    assert_eq!(tailer.scan().unwrap().events.len(), 1);
+    assert_eq!(tailer.scan().unwrap().records.len(), 1);
   }
 
   #[test]
@@ -1125,12 +1196,12 @@ mod tests {
     );
 
     let first_update = tailer.scan_paths(HashSet::from([first])).unwrap();
-    assert_eq!(first_update.events.len(), 1);
-    assert_eq!(first_update.events[0].topic, "pi.first");
+    assert_eq!(first_update.records.len(), 1);
+    assert_eq!(first_update.records[0].topic, "pi.first");
 
     let second_update = tailer.scan_paths(HashSet::from([second])).unwrap();
-    assert_eq!(second_update.events.len(), 1);
-    assert_eq!(second_update.events[0].topic, "pi.second");
+    assert_eq!(second_update.records.len(), 1);
+    assert_eq!(second_update.records[0].topic, "pi.second");
   }
 
   #[test]
@@ -1178,8 +1249,8 @@ mod tests {
 
     append(&path, "\n");
     let update = tailer.scan().unwrap();
-    assert_eq!(update.events.len(), 1);
-    let AgentEvent::Message(message) = &update.events[0].event else {
+    assert_eq!(update.records.len(), 1);
+    let AgentEvent::Message(message) = &update.records[0].record.events[0] else {
       panic!("expected message");
     };
     assert_eq!(message.text, "hello");
@@ -1205,8 +1276,8 @@ mod tests {
     .unwrap();
 
     let update = tailer.scan_paths(HashSet::from([path])).unwrap();
-    assert_eq!(update.events.len(), 3);
-    assert!(update.events.iter().all(|event| event.topic == "pi.new-session"));
+    assert_eq!(update.records.len(), 3);
+    assert!(update.records.iter().all(|event| event.topic == "pi.new-session"));
   }
 
   #[test]
@@ -1235,13 +1306,20 @@ mod tests {
     .unwrap();
 
     let update = tailer.scan_paths(HashSet::from([path])).unwrap();
-    assert_eq!(update.events.len(), 5);
-    assert_eq!(update.events.iter().filter(|event| event.event.is_hidden()).count(), 1);
+    assert_eq!(update.records.len(), 5);
+    assert_eq!(
+      update
+        .records
+        .iter()
+        .filter(|event| event.record.events[0].is_hidden())
+        .count(),
+      1
+    );
     let texts = update
-      .events
+      .records
       .iter()
-      .filter(|event| !event.event.is_hidden())
-      .filter_map(|event| match &event.event {
+      .filter(|event| !event.record.events[0].is_hidden())
+      .filter_map(|event| match &event.record.events[0] {
         AgentEvent::Message(message) => Some(message.text.as_str()),
         _ => None,
       })
@@ -1249,9 +1327,9 @@ mod tests {
     assert_eq!(texts, ["three", "four", "five"]);
     assert!(
       update
-        .events
+        .records
         .iter()
-        .any(|event| matches!(event.event, AgentEvent::Error(_)))
+        .any(|event| matches!(event.record.events[0], AgentEvent::Error(_)))
     );
   }
 
@@ -1269,19 +1347,23 @@ mod tests {
       format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"accounting-session\"}}}}\n{accounting_line}"),
     )
     .unwrap();
-    let (mut tailer, initial) = SessionTailer::initialize(
+    let (mut tailer, initial) = SessionTailer::initialize_with_native(
       vec![ProviderRoot::new(Provider::Codex, fixture.path().to_path_buf())],
       NewFileReplay::Messages(3),
+      true,
     )
     .unwrap();
-    assert!(initial.events.is_empty());
+    assert!(initial.records.is_empty());
     append(&path, &accounting_line);
     append(&path, &accounting_line);
     let update = tailer.scan_paths(HashSet::from([path])).unwrap();
     assert!(update.warnings.is_empty());
-    assert_eq!(update.events.len(), 1);
-    assert_eq!(update.events[0].topic, "codex.accounting-session");
-    assert!(matches!(&update.events[0].event, AgentEvent::Usage(event)
+    assert_eq!(update.records.len(), 2);
+    assert_eq!(update.records[0].topic, "codex.accounting-session");
+    assert!(update.records[1].record.events.is_empty());
+    assert_eq!(update.records[1].record.native.as_ref(), Some(&record));
+    assert_ne!(update.records[0].record.record_id, update.records[1].record.record_id);
+    assert!(matches!(&update.records[0].record.events[0], AgentEvent::Usage(event)
       if event.kind == tokn_session_core::UsageKind::SessionSnapshot
         && event.input_tokens == 100 && event.total_tokens == Some(105)));
   }
@@ -1315,7 +1397,7 @@ mod tests {
       NewFileReplay::Messages(3),
     )
     .unwrap();
-    assert!(initial.events.is_empty());
+    assert!(initial.records.is_empty());
 
     append(
       &path,
@@ -1328,9 +1410,9 @@ mod tests {
       ),
     );
     let update = tailer.scan_paths(HashSet::from([path])).unwrap();
-    assert_eq!(update.events.len(), 2);
-    assert_eq!(update.events[0].topic, "codex.codex-session");
-    let context = &update.events[0].session;
+    assert_eq!(update.records.len(), 2);
+    assert_eq!(update.records[0].topic, "codex.codex-session");
+    let context = &update.records[0].session;
     assert_eq!(context.session_id, "codex-session");
     assert_eq!(context.parent_session_id.as_deref(), Some("parent-session"));
     assert_eq!(context.agent_path.as_deref(), Some("/root/researcher"));
@@ -1338,7 +1420,7 @@ mod tests {
     assert_eq!(context.agent_role.as_deref(), Some("explorer"));
     assert_eq!(context.cwd.as_deref(), Some("/tmp/worktree/subdir"));
     assert_eq!(context.started_at.as_deref(), Some("2026-06-04T00:00:00Z"));
-    let relay_json = serde_json::to_value(&update.events[0]).unwrap();
+    let relay_json = serde_json::to_value(&update.records[0]).unwrap();
     assert_eq!(relay_json["session"]["agent_path"], "/root/researcher");
     assert_eq!(relay_json["session"]["agent_nickname"], "Hubble");
     assert_eq!(relay_json["session"]["agent_role"], "explorer");
@@ -1354,11 +1436,11 @@ mod tests {
     assert_eq!(project.repository_name.as_deref(), Some("tokn-session"));
     assert_eq!(project.branch.as_deref(), Some("main"));
     assert_eq!(project.commit_hash.as_deref(), Some("abcdef123456"));
-    let AgentEvent::SessionSettingsApplied(settings) = &update.events[0].event else {
+    let AgentEvent::SessionSettingsApplied(settings) = &update.records[0].record.events[0] else {
       panic!("expected settings event");
     };
     assert_eq!(settings.cwd.as_deref(), Some("/tmp/worktree/subdir"));
-    let AgentEvent::Message(message) = &update.events[1].event else {
+    let AgentEvent::Message(message) = &update.records[1].record.events[0] else {
       panic!("expected message");
     };
     assert_eq!(message.text, "hello");
@@ -1410,7 +1492,7 @@ mod tests {
       NewFileReplay::Messages(3),
     )
     .unwrap();
-    assert!(initial.events.is_empty());
+    assert!(initial.records.is_empty());
     assert!(initial.warnings.is_empty());
 
     append(
@@ -1418,8 +1500,8 @@ mod tests {
       "{\"timestamp\":\"2026-06-04T00:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hello\"}}\n",
     );
     let update = tailer.scan_paths(HashSet::from([path])).unwrap();
-    assert_eq!(update.events.len(), 1);
-    let project = update.events[0].session.project.as_ref().unwrap();
+    assert_eq!(update.records.len(), 1);
+    let project = update.records[0].session.project.as_ref().unwrap();
     assert_eq!(project.name.as_deref(), Some("tokn"));
     assert_eq!(project.project_name.as_deref(), Some("llm-router_2"));
     assert_eq!(project.folder.as_deref(), Some("/workspace/llm-router"));
@@ -1444,7 +1526,7 @@ mod tests {
     )
     .unwrap();
 
-    assert!(initial.events.is_empty());
+    assert!(initial.records.is_empty());
     assert_eq!(initial.warnings.len(), 1);
     assert!(initial.warnings[0].contains("Codex Desktop project catalog"));
   }
@@ -1498,7 +1580,7 @@ mod tests {
     );
     let first = tailer.scan_paths(HashSet::from([path.clone()])).unwrap();
     assert_eq!(
-      first.events[0]
+      first.records[0]
         .session
         .project
         .as_ref()
@@ -1533,7 +1615,7 @@ mod tests {
     );
     let second = tailer.scan_paths(HashSet::from([path.clone()])).unwrap();
     assert_eq!(
-      second.events[0]
+      second.records[0]
         .session
         .project
         .as_ref()
@@ -1548,7 +1630,7 @@ mod tests {
     );
     let third = tailer.scan_paths(HashSet::from([path])).unwrap();
     assert_eq!(
-      third.events[0]
+      third.records[0]
         .session
         .project
         .as_ref()
@@ -1584,8 +1666,8 @@ mod tests {
     std::fs::rename(replacement, &path).unwrap();
 
     let update = tailer.scan_paths(HashSet::from([path])).unwrap();
-    assert_eq!(update.events.len(), 2);
-    assert!(update.events.iter().all(|event| event.topic == "pi.new-session"));
+    assert_eq!(update.records.len(), 2);
+    assert!(update.records.iter().all(|event| event.topic == "pi.new-session"));
   }
 
   #[test]
@@ -1620,12 +1702,13 @@ mod tests {
       .unwrap();
     drop(connection);
 
-    let (mut tailer, initial) = SessionTailer::initialize(
+    let (mut tailer, initial) = SessionTailer::initialize_with_native(
       vec![ProviderRoot::new(Provider::OpenCode, database.clone())],
       NewFileReplay::Messages(3),
+      true,
     )
     .unwrap();
-    assert!(initial.events.is_empty());
+    assert!(initial.records.is_empty());
 
     let connection = Connection::open(&database).unwrap();
     connection
@@ -1645,19 +1728,19 @@ mod tests {
     );
 
     let first = tailer.scan().unwrap();
-    assert_eq!(first.events.len(), 2);
-    assert!(first.events.iter().all(|event| event.topic == "opencode.ses_1"));
+    assert_eq!(first.records.len(), 2);
+    assert!(first.records.iter().all(|event| event.topic == "opencode.ses_1"));
     assert!(
       first
-        .events
+        .records
         .iter()
-        .any(|event| matches!(event.event, AgentEvent::SessionStarted(_)))
+        .any(|event| matches!(event.record.events[0], AgentEvent::SessionStarted(_)))
     );
     assert!(
       first
-        .events
+        .records
         .iter()
-        .any(|event| matches!(event.event, AgentEvent::Message(_)))
+        .any(|event| matches!(event.record.events[0], AgentEvent::Message(_)))
     );
 
     insert_opencode_message(
@@ -1677,11 +1760,16 @@ mod tests {
     );
 
     let second = tailer.scan().unwrap();
-    assert_eq!(second.events.len(), 1);
-    let AgentEvent::Message(message) = &second.events[0].event else {
+    assert_eq!(second.records.len(), 1);
+    let AgentEvent::Message(message) = &second.records[0].record.events[0] else {
       panic!("expected assistant message");
     };
     assert_eq!(message.text, "world");
+    assert_eq!(second.records[0].record.record_id, "message:msg_assistant");
+    assert_eq!(
+      second.records[0].record.native.as_ref().unwrap()["parts"][0]["data"]["text"],
+      "world"
+    );
 
     connection
       .execute(
@@ -1690,11 +1778,122 @@ mod tests {
       )
       .unwrap();
     let third = tailer.scan().unwrap();
-    assert_eq!(third.events.len(), 1);
-    let AgentEvent::Message(message) = &third.events[0].event else {
+    assert_eq!(third.records.len(), 1);
+    let AgentEvent::Message(message) = &third.records[0].record.events[0] else {
       panic!("expected updated assistant message");
     };
     assert_eq!(message.text, "updated");
+    assert_eq!(third.records[0].record.record_id, second.records[0].record.record_id);
+
+    connection
+      .execute(
+        "update part set data = ?1 where id = 'part_assistant'",
+        params![r#"{"type":"text","text":"updated","future_field":42}"#],
+      )
+      .unwrap();
+    let native_only = tailer.scan().unwrap();
+    assert_eq!(native_only.records.len(), 1);
+    assert_eq!(
+      serde_json::to_value(&native_only.records[0].record.events).unwrap(),
+      serde_json::to_value(&third.records[0].record.events).unwrap()
+    );
+    assert_eq!(
+      native_only.records[0].record.native.as_ref().unwrap()["parts"][0]["data"]["future_field"],
+      42
+    );
+
+    // Inserting an earlier message must not re-emit later, unchanged records.
+    insert_opencode_message(&connection, "msg_earlier", "ses_1", 0, r#"{"role":"user"}"#);
+    insert_opencode_part(
+      &connection,
+      "part_earlier",
+      "msg_earlier",
+      "ses_1",
+      0,
+      r#"{"type":"text","text":"earlier"}"#,
+    );
+    let fourth = tailer.scan().unwrap();
+    assert_eq!(fourth.records.len(), 1);
+    assert_eq!(fourth.records[0].record.record_id, "message:msg_earlier");
+
+    // A second part belongs to the same replacement snapshot, not a new record.
+    insert_opencode_part(
+      &connection,
+      "part_more",
+      "msg_assistant",
+      "ses_1",
+      4,
+      r#"{"type":"text","text":"more"}"#,
+    );
+    let fifth = tailer.scan().unwrap();
+    assert_eq!(fifth.records.len(), 1);
+    assert_eq!(fifth.records[0].record.record_id, "message:msg_assistant");
+    assert_eq!(fifth.records[0].record.events.len(), 2);
+    assert_eq!(
+      fifth.records[0].record.native.as_ref().unwrap()["parts"]
+        .as_array()
+        .unwrap()
+        .len(),
+      2
+    );
+
+    connection
+      .execute("delete from message where id = 'msg_earlier'", [])
+      .unwrap();
+    let removed = tailer.scan().unwrap();
+    assert_eq!(removed.records.len(), 1);
+    assert_eq!(removed.records[0].operation, super::RecordOperation::Remove);
+    assert_eq!(removed.records[0].record.record_id, "message:msg_earlier");
+    assert!(removed.records[0].record.events.is_empty());
+    assert!(tailer.scan().unwrap().records.is_empty());
+  }
+
+  #[test]
+  fn preserves_pi_record_batches_native_fields_and_byte_offsets() {
+    let fixture = TempDir::new().unwrap();
+    let path = fixture.path().join("pi.jsonl");
+    let header = "{\"type\":\"session\",\"id\":\"pi-session\"}\n";
+    std::fs::write(&path, header).unwrap();
+    let roots = || vec![ProviderRoot::new(Provider::Pi, fixture.path().to_path_buf())];
+    let (mut native, _) = SessionTailer::initialize_with_native(roots(), NewFileReplay::All, true).unwrap();
+    let (mut plain, _) = SessionTailer::initialize(roots(), NewFileReplay::All).unwrap();
+    let value = serde_json::json!({
+      "type": "message", "id": "assistant-1", "future_field": {"answer": 42},
+      "message": {"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "planning"},
+        {"type": "text", "text": "hello"},
+        {"type": "toolCall", "id": "call-1", "name": "read", "arguments": {"path": "a"}}
+      ]}
+    });
+    let line = serde_json::to_string(&value).unwrap();
+    append(&path, &line[..20]);
+    assert!(native.scan().unwrap().records.is_empty());
+    append(&path, &format!("{}\r\n", &line[20..]));
+    let native_update = native.scan().unwrap();
+    assert_eq!(native_update.records.len(), 1);
+    let record = &native_update.records[0].record;
+    assert_eq!(record.record_id, format!("jsonl:{}", header.len()));
+    assert_eq!(record.native.as_ref(), Some(&value));
+    assert_eq!(record.events.len(), 3);
+    let plain_update = plain.scan().unwrap();
+    let serialized = serde_json::to_value(&plain_update.records[0]).unwrap();
+    assert!(serialized.get("native").is_none());
+    assert!(serialized.get("event").is_none());
+    assert_eq!(serialized["events"], serde_json::to_value(&record.events).unwrap());
+    assert_eq!(serialized["operation"], "upsert");
+
+    // Add an earlier visible message so the replay cutoff actually advances.
+    let mut records = plain_update.records;
+    records[0].record.record_id = "earlier-record".into();
+    records.extend(native_update.records);
+    super::retain_message_history(&mut records, 1);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].record.record_id, format!("jsonl:{}", header.len()));
+    assert_eq!(
+      records[0].record.events.len(),
+      3,
+      "replay must keep the entire source record"
+    );
   }
 
   fn insert_opencode_message(connection: &Connection, id: &str, session_id: &str, time_created: i64, data: &str) {

@@ -3,6 +3,11 @@
 `@tokn/terminal-pet` is a Bun prototype that turns `tokn-session-relay`
 events into a small animated terminal companion.
 
+The shared reader consumes [Relay records](../../docs/relay.md), dispatching
+each `events` array in order. Native data is optional and ignored; empty
+batches do not activate sessions. Custom stdin producers must migrate from
+the old single-`event` envelope.
+
 It follows the Codex pet state vocabulary:
 
 - `running`

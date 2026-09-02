@@ -7,7 +7,9 @@ use crate::schema::OpenCodeCapabilities;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use serde_json::Value;
 use tokn_opencode_protocol::v1::{MessageData, MessageItem, PartData, PartItem, SessionModel};
-use tokn_session_core::{LoadedSession, Provider, SessionHeader, SessionHistoryStatus, SessionRef};
+use tokn_session_core::{
+  LoadedSession, LoadedSessionRecords, NormalizedRecord, Provider, SessionHeader, SessionHistoryStatus, SessionRef,
+};
 
 #[derive(Clone, Copy)]
 enum SessionDatabaseFlavor {
@@ -152,7 +154,32 @@ impl OpenCodeSessionSource {
   }
 
   fn load_session_from_database(&self, database_path: PathBuf, session_id: &str) -> Result<LoadedSession, String> {
-    let connection = connect_database(&database_path)?;
+    self
+      .load_records_from_database(database_path, session_id, false)
+      .map(Into::into)
+  }
+
+  /// Read one consistent session snapshot grouped by session/message/entry ID.
+  /// Native messages contain the decoded row plus all of its ordered parts,
+  /// not an individual SQLite change or a lossless dump of every SQL column.
+  pub fn load_session_records_exact(
+    &self,
+    session_id: &str,
+    include_native: bool,
+  ) -> Result<LoadedSessionRecords, String> {
+    self.load_records_from_database(self.database_path()?, session_id, include_native)
+  }
+
+  fn load_records_from_database(
+    &self,
+    database_path: PathBuf,
+    session_id: &str,
+    include_native: bool,
+  ) -> Result<LoadedSessionRecords, String> {
+    let mut database = connect_database(&database_path)?;
+    let connection = database
+      .transaction()
+      .map_err(|err| format!("failed to start session snapshot: {err}"))?;
     let capabilities = OpenCodeCapabilities::detect(&connection)?;
     let session = load_session_row(&connection, capabilities, session_id, self.flavor.name())?
       .ok_or_else(|| format!("no {} session found for `{session_id}`", self.flavor.name()))?;
@@ -180,7 +207,14 @@ impl OpenCodeSessionSource {
       SessionDatabaseFlavor::OpenCode => OpenCodeNormalizer::new(session.id.clone()),
       SessionDatabaseFlavor::ZCode => OpenCodeNormalizer::with_provider(session.id.clone(), self.flavor.provider()),
     };
-    let mut events = normalizer.normalize_session(&session);
+    let mut records = vec![NormalizedRecord {
+      record_id: format!("session:{}", session.id),
+      native: include_native
+        .then(|| serde_json::to_value(&session))
+        .transpose()
+        .map_err(|err| err.to_string())?,
+      events: normalizer.normalize_session(&session),
+    }];
     let mut timeline: Vec<_> = load_messages(&connection, &session.id, self.flavor.name())?
       .into_iter()
       .map(SessionTimelineRow::Message)
@@ -200,14 +234,28 @@ impl OpenCodeSessionSource {
     });
     for row in timeline {
       match row {
-        SessionTimelineRow::Message(message) => events.extend(normalizer.normalize_message(message)),
-        SessionTimelineRow::Entry(entry) => events.push(normalizer.normalize_session_entry(entry)),
+        SessionTimelineRow::Message(message) => records.push(NormalizedRecord {
+          record_id: format!("message:{}", message.id),
+          native: include_native
+            .then(|| serde_json::to_value(&message))
+            .transpose()
+            .map_err(|err| err.to_string())?,
+          events: normalizer.normalize_message(message),
+        }),
+        SessionTimelineRow::Entry(entry) => records.push(NormalizedRecord {
+          record_id: format!("entry:{}", entry.id),
+          native: include_native
+            .then(|| serde_json::to_value(&entry))
+            .transpose()
+            .map_err(|err| err.to_string())?,
+          events: vec![normalizer.normalize_session_entry(entry)],
+        }),
       }
     }
 
-    Ok(LoadedSession {
+    Ok(LoadedSessionRecords {
       reference,
-      events,
+      records,
       history_status: SessionHistoryStatus::Complete,
     })
   }

@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 
 import { consumeJsonl, JsonlDecoder } from "./jsonl";
-import { parseRelayEvent, type RelayEvent } from "./protocol";
+import { parseRelayRecord, RelayActivityDispatcher, type RelayEvent } from "./protocol";
 
 export interface RelayOptions {
   stdin: boolean;
@@ -46,8 +46,14 @@ export async function followRelay(
         options.diagnostics ?? "inherit"
       )
       : Promise.resolve();
-    const decoder = new JsonlDecoder(parseRelayEvent);
-    await consumeJsonl(stream, decoder, onEvent, abort.signal);
+    const decoder = new JsonlDecoder(parseRelayRecord);
+    const activity = new RelayActivityDispatcher();
+    await consumeJsonl(
+      stream,
+      decoder,
+      (record) => activity.dispatch(record, onEvent, abort.signal),
+      abort.signal
+    );
     if (child) {
       const exitCode = await child.process.exited;
       await diagnostics;
