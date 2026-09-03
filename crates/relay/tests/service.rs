@@ -63,6 +63,103 @@ fn messages(snapshot: &SessionSnapshot) -> Vec<&str> {
     .collect()
 }
 
+async fn catalog_with_presentation(endpoint: &str, title: Option<&str>, preview: Option<&str>) -> CatalogEntry {
+  tokio::time::timeout(Duration::from_secs(6), async {
+    loop {
+      let catalog = load_catalog(endpoint).await.unwrap();
+      assert!(catalog.warnings.is_empty());
+      if let Some(entry) = catalog
+        .entries
+        .into_iter()
+        .find(|entry| entry.header.title.as_deref() == title && entry.header.preview.as_deref() == preview)
+      {
+        return entry;
+      }
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+  })
+  .await
+  .expect("catalog presentation was not backfilled")
+}
+
+#[tokio::test]
+async fn pi_catalog_backfills_without_follow_and_names_update_without_replaying_history() {
+  for native in [false, true] {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("session.jsonl");
+    std::fs::write(
+      &path,
+      format!("{HEADER}{MESSAGE}{{\"type\":\"session_info\",\"name\":\"Pi task\"}}\n"),
+    )
+    .unwrap();
+    let server = server(root.path(), Provider::Pi, native).await;
+    let entry = catalog_with_presentation(&server.endpoint, Some("Pi task"), Some("hello")).await;
+    let mut subscription = RelaySubscription::connect(&server.endpoint, &entry.key).await.unwrap();
+    let initial = snapshot(&mut subscription).await;
+    assert_eq!(initial.loaded.reference.title.as_deref(), Some("Pi task"));
+    for (record, title) in [
+      (
+        "{\"type\":\"session_info\",\"name\":\"Renamed task\"}\n",
+        Some("Renamed task"),
+      ),
+      ("{\"type\":\"session_info\",\"name\":\"\"}\n", None),
+    ] {
+      append(&path, record);
+      // No catalog request triggers this update: the active follow observes it.
+      let update = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+          let next = snapshot(&mut subscription).await;
+          assert_eq!(next.generation, initial.generation);
+          assert_eq!(messages(&next), ["hello"]);
+          if next.loaded.reference.title.as_deref() == title {
+            break next;
+          }
+        }
+      })
+      .await
+      .unwrap();
+      assert_ne!(update.revision, initial.revision);
+      let catalog = catalog_with_presentation(&server.endpoint, title, Some("hello")).await;
+      assert_eq!(catalog.key, entry.key);
+    }
+  }
+}
+
+#[tokio::test]
+async fn opencode_catalog_backfills_eligible_prompt_and_tracks_wal_edits_and_native_titles() {
+  let root = TempDir::new().unwrap();
+  let path = root.path().join("opencode.db");
+  let db = rusqlite::Connection::open(&path).unwrap();
+  db.execute_batch(r#"
+    pragma journal_mode = wal;
+    create table session (id text primary key, parent_id text, directory text, title text, time_created integer, time_updated integer);
+    create table message (id text primary key, session_id text, time_created integer, data text);
+    create table part (id text primary key, message_id text, session_id text, time_created integer, data text);
+    insert into session values ('ses_1', null, '/tmp', 'New session - 2026-01-01T00:00:00.000Z', 1, 1);
+    insert into message values ('msg_assistant', 'ses_1', 0, '{"role":"assistant"}');
+    insert into message values ('msg_user', 'ses_1', 1, '{"role":"user"}');
+    insert into part values ('p0', 'msg_assistant', 'ses_1', 0, '{"type":"text","text":"not a prompt"}');
+    insert into part values ('p1', 'msg_user', 'ses_1', 1, '{"type":"text","text":"synthetic","synthetic":true}');
+    insert into part values ('p2', 'msg_user', 'ses_1', 2, '{"type":"text","text":"ignored","ignored":true}');
+    insert into part values ('p3', 'msg_user', 'ses_1', 3, '{"type":"text","text":"Build an app"}');
+  "#).unwrap();
+  let server = server(&path, Provider::OpenCode, false).await;
+  let entry = catalog_with_presentation(&server.endpoint, None, Some("Build an app")).await;
+  db.execute(
+    "update part set data = ?1 where id = 'p3'",
+    [r#"{"type":"text","text":"Fix an app"}"#],
+  )
+  .unwrap();
+  catalog_with_presentation(&server.endpoint, None, Some("Fix an app")).await;
+  db.execute_batch("update session set title = 'Native task name';")
+    .unwrap();
+  let titled = catalog_with_presentation(&server.endpoint, Some("Native task name"), None).await;
+  assert_eq!(titled.key, entry.key);
+  // Clearing a native title must not resurrect an older cached title.
+  db.execute_batch("update session set title = null;").unwrap();
+  catalog_with_presentation(&server.endpoint, None, Some("Fix an app")).await;
+}
+
 #[tokio::test]
 async fn subscribers_share_snapshot_generation_and_follow_without_duplicate_history() {
   let root = TempDir::new().unwrap();
@@ -130,7 +227,7 @@ async fn partial_records_wait_for_newline_and_replacement_starts_a_generation() 
 }
 
 #[tokio::test]
-async fn catalog_does_not_decode_invalid_bodies_and_follow_rejects_them() {
+async fn catalog_discovery_survives_invalid_bodies_and_follow_rejects_them() {
   let root = TempDir::new().unwrap();
   std::fs::write(root.path().join("session.jsonl"), format!("{HEADER}invalid-json\n")).unwrap();
   let server = server(root.path(), Provider::Pi, false).await;
@@ -150,6 +247,33 @@ async fn catalog_does_not_decode_invalid_bodies_and_follow_rejects_them() {
       .unwrap_err()
       .contains("Unknown Relay session")
   );
+}
+
+#[tokio::test]
+async fn codex_root_prompt_backfill_reaches_an_already_followed_session() {
+  let root = TempDir::new().unwrap();
+  let path = root.path().join("session.jsonl");
+  let header = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-preview\"}}\n";
+  let message = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Build a viewer\"}}\n";
+  std::fs::write(&path, header).unwrap();
+  let server = server(root.path(), Provider::Codex, false).await;
+  let key = load_catalog(&server.endpoint).await.unwrap().entries.remove(0).key;
+  let mut subscription = RelaySubscription::connect(&server.endpoint, &key).await.unwrap();
+  let initial = snapshot(&mut subscription).await;
+  append(&path, message);
+  tokio::time::timeout(Duration::from_secs(4), async {
+    loop {
+      let next = snapshot(&mut subscription).await;
+      assert_eq!(next.generation, initial.generation);
+      assert_eq!(messages(&next), ["Build a viewer"]);
+      if next.loaded.reference.preview.as_deref() == Some("Build a viewer") {
+        break;
+      }
+    }
+  })
+  .await
+  .unwrap();
+  catalog_with_presentation(&server.endpoint, None, Some("Build a viewer")).await;
 }
 
 #[tokio::test]

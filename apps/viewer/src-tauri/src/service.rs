@@ -10248,7 +10248,8 @@ mod tests {
       .relay
       .configure(crate::relay::RelaySettings {
         endpoint: "tcp://127.0.0.1:1".into(),
-        enabled: true,
+        mode: crate::relay::RelayMode::External,
+        ..Default::default()
       })
       .unwrap();
     let locator = SessionLocator {
@@ -10276,7 +10277,8 @@ mod tests {
       .relay
       .configure(crate::relay::RelaySettings {
         endpoint: "tcp://127.0.0.1:1".into(),
-        enabled: false,
+        mode: crate::relay::RelayMode::Local,
+        ..Default::default()
       })
       .unwrap();
   }

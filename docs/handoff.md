@@ -33,10 +33,17 @@ The old `tokn-session sessions list/show` shape is intentionally unsupported.
 
 ## Session Relay
 
-The viewer can now connect to an independently started
+The viewer defaults to an app-owned Relay child for its lifetime, running the
+existing service through a headless entry point in the bundled viewer executable.
+No separate installation/PATH lookup is needed. It binds an OS-assigned loopback
+port, reports readiness over stdout, and exits when the parent-owned stdin pipe
+closes (including parent death). The supervisor reaps only its own child, with
+ten-second startup timeout and at most three attempts using one-/two-second
+backoff. Failed startup/crashes remain visible with Retry.
+External mode still connects to an independently started
 `tokn-session-relay serve --bind tcp://127.0.0.1:5557 [--native]`. This is a
 versioned local TCP snapshot/follow endpoint, separate from the unchanged
-stdout/ZeroMQ modes below. Metadata catalogs are shared, bodies load on demand,
+stdout/ZeroMQ modes below. Metadata catalogs are shared, event snapshots load on demand,
 and concurrent clients reuse one JSONL normalizer per session. Appends decode
 only new complete lines; replacement/truncation triggers an atomic new
 generation. OpenCode reconciles consistent raw row snapshots on DB/WAL changes,
@@ -47,11 +54,30 @@ changes when native is enabled. Raw SQL rows are still scanned (timestamps are
 not reliable change tokens); historical and stdout/ZeroMQ loading are unchanged.
 See [Relay service](relay.md#local-snapshotfollow-service) for framing and limits.
 
-Viewer Relay settings persist in app config `relay.json`. Covered providers
-skip local body reads/indexing; timeline, trajectories and Inspector share
-received snapshots. Disconnect/reconnect retains last-good data, switching
-endpoints clears it. Live updates refresh loaded timeline/trajectory items even
-when scrolled up, retaining the reading position; New activity jumps to latest.
+Catalog title/preview backfill runs in a shared background cache, replacing the
+local viewer body-index backfill bypassed by Relay. Pi's latest `session_info`
+name (including explicit clears) and first user preview are accumulated through
+a complete-line byte cursor; ordinary appends do not reparse prior history.
+Untitled OpenCode/Codex root-session prompt fallbacks use provider hydration
+cached by source revision (including OpenCode WAL). Native titles win. The
+cache retains bounded 512-character strings, not events/native bodies, and
+rebuilds after restart. Initial catalogs do not wait for scans; subsequent polls
+pick up names. Followed Pi names also update without replacing event history.
+
+Viewer mode (`automatic`/`external`/`local`), external endpoint, and optional
+native inclusion persist in app config `relay.json`. Missing settings default
+to Automatic with native off; legacy enabled connections migrate to External,
+explicit disabled choices to Local. Automatic uses provider-owned root
+resolution and environment overrides. Codex's explicitly resolved active/archive
+roots retain their home-owned title/preview metadata; unrelated explicit roots
+remain isolated from the active home's database and session-name index.
+Local clears Relay routing/snapshots
+and wakes local cataloging. Covered providers skip local body reads/indexing;
+timeline, trajectories and Inspector share
+received snapshots. Failures/child restarts retain last-good data; explicit
+mode/endpoint/native changes clear it. External services are never terminated.
+Live updates refresh loaded timeline/trajectory items even when scrolled up,
+retaining the reading position; New activity jumps to latest.
 Refreshes are coalesced and page through one pinned snapshot. Append refreshes preserve expansion keys;
 generation resets invalidate them. Native remains optional and bounded in
 Inspector. Next gap: durable Relay unread tracking (local unread indexing is
@@ -363,14 +389,16 @@ Encrypted and provider-redacted reasoning remain opaque in the timeline; a
 redaction is visible metadata rather than a hidden event.
 
 The Tauri backend calls `tokn-session-client`, `tokn-session-core`, and
-`tokn-session-render` directly from async commands; it does not parse CLI
-output or depend on Relay. The frontend receives source-neutral snake-case
+`tokn-session-render` directly from async commands for local providers, and uses
+received Relay snapshots for covered providers. It does not parse CLI output.
+The frontend receives source-neutral snake-case
 DTOs with opaque, source-aware session keys. Session and event pages keep IPC
 responses bounded, including tool-card command and query fields, while expanded
 native event detail and inline tool output are fetched lazily and hidden Pi
 content stays redacted.
 
-The viewer owns a SQLite index at `~/.tokn/sessions/index.sqlite`. It stores
+For local providers, the viewer owns a SQLite index at
+`~/.tokn/sessions/index.sqlite`. It stores
 opaque source checkpoints; source/session identity and paths; bounded sidebar
 metadata (title, preview, cwd, timestamps, parent, and agent labels); and
 opaque attention markers/revisions. It never stores normalized event records,

@@ -83,6 +83,18 @@ Catalog responses contain `header` frames followed by `catalog_end`, including
 discovery warnings. Follow requests accept only keys from the discovered
 catalog, never arbitrary paths.
 
+Catalog discovery returns lightweight headers immediately. A shared background
+cache backfills Pi's latest `session_info` name and first user preview, plus
+first-prompt fallbacks for untitled OpenCode/Codex root sessions. Native titles
+take precedence. Names/previews arrive on subsequent catalog polls, independent
+of `--native`; a cleared Pi name falls back to its first prompt.
+Pi advances a byte cursor through complete appended lines rather than rescanning
+history on each update. Other hydration is cached by file/DB+WAL revision.
+The cache retains at most 512 characters per title/preview, not events or native
+bodies; work runs in bounded batches off the request path. Failed reads preserve
+last-good metadata and retry on source changes. It is in-memory and backfills
+again after service restart. Followed Pi names can update in header-only commits.
+
 A follow connection receives `begin`, zero or more `record` frames, then
 `commit`. Begin and commit carry matching generation and decimal-string
 revision values; begin also carries the session header and `reset` flag.
@@ -100,7 +112,7 @@ changes can commit without record frames. With `--native`, changes to existing
 native data (including session update timestamps) also require a reset under
 the v1 append/reset protocol. This does not change stdout/ZeroMQ loading.
 
-Session bodies are loaded on demand. Concurrent subscribers share one reader
+Full event snapshots are loaded on demand. Concurrent subscribers share one reader
 and normalizer per session; complete appended JSONL lines decode only once.
 An idle session is released after its last subscriber leaves. Source errors,
 invalid frames and interrupted transactions never commit partial data.
@@ -118,14 +130,37 @@ Any local process can connect; `--native` may expose sensitive provider data.
 
 ### Viewer connection
 
-The viewer's Relay panel saves endpoint and enabled state in its application
-config `relay.json`. It never launches or terminates Relay. Catalog polling
-updates the sidebar; up to eight recently opened sessions share received
-snapshots between timeline, trajectories and Inspector. Covered providers
+The viewer defaults to **Automatic Relay**: it launches a headless child of its
+own executable, running this same service on an OS-assigned loopback port. The
+shipped app needs no separate Relay installation or PATH lookup. The child uses
+the same provider-root environment overrides as local history. A readiness pipe
+reports the bound endpoint; the private port never replaces the saved external
+endpoint. Codex roots verified as the active home's `sessions` or
+`archived_sessions` retain that home's title/preview metadata without parsing
+transcript bodies. Unrelated explicit directories do not inherit this metadata.
+The app closes a lifetime pipe and reaps its child on exit/mode changes;
+the child also exits on EOF if its parent crashes. Startup has a ten-second
+timeout. Failures/crashes get at most three launch attempts with one-/two-second
+backoff, then show Failed with an explicit Retry. Other Relay processes are
+never stopped.
+
+The panel persists `mode` (`automatic`, `external`, or `local`), external
+`endpoint`, and `include_native` in app config `relay.json`. Native is off by
+default and optional for Automatic; External uses the service's capability.
+Legacy `enabled: true` settings migrate to External with the same endpoint;
+explicitly disabled settings migrate to Local. Missing settings use Automatic.
+Invalid settings produce a visible error instead of silent fallback.
+
+External connects to a separately started `tokn-session-relay serve` and never
+owns that process. Local explicitly clears Relay snapshots, stops any owned
+child, and wakes the local catalog/index path. Switching mode, external endpoint,
+or native inclusion clears snapshots to avoid mixing data sources.
+Catalog polling updates the sidebar; up to eight recently opened sessions share
+received snapshots between timeline, trajectories and Inspector. Covered providers
 bypass local body indexing/reading. Uncovered providers retain local history.
-An enabled connection reconnects automatically and keeps the last committed
-data through failures. Explicit Disconnect also retains cached sessions until
-restart; switching endpoints clears them to avoid mixing independent sources.
+Connection failures and automatic child restarts retain last-good committed
+data without local fallback. Catalog and session connections are cancelled
+before reconnecting to a restarted child's new port.
 
 Live updates refresh the loaded event window and expanded trajectory items,
 including while reading older events. Scrolling follows only at the bottom;

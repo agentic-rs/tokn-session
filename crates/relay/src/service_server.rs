@@ -13,6 +13,7 @@ use tokn_session_core::Provider;
 
 use crate::{
   RelayConfig,
+  service_metadata::PresentationCache,
   service_protocol::*,
   service_source::{SessionReader, Snapshot},
 };
@@ -25,10 +26,11 @@ struct Service {
   config: RelayConfig,
   sessions: Mutex<HashMap<String, Weak<FollowedSession>>>,
   catalog: Mutex<Option<(std::time::Instant, Arc<Vec<CatalogEntry>>, Vec<String>)>>,
+  metadata: Arc<PresentationCache>,
 }
 
 /// Serve independently configured local consumers. Session bodies are opened
-/// only for follow requests and shared until the last subscriber leaves.
+/// for follow requests and a shared background title/preview backfill.
 pub async fn serve(endpoint: &str, config: RelayConfig) -> Result<(), String> {
   let listener = TcpListener::bind(local_endpoint(endpoint)?)
     .await
@@ -47,11 +49,23 @@ pub async fn serve_listener(listener: TcpListener, config: RelayConfig) -> Resul
     config,
     sessions: Mutex::new(HashMap::new()),
     catalog: Mutex::new(None),
+    metadata: Arc::new(PresentationCache::default()),
   });
   let connections = Arc::new(Semaphore::new(64));
   // Dropping the service future closes its client sockets as well as its
   // listener, so consumers actually reconnect after a service shutdown.
   let mut peers = tokio::task::JoinSet::new();
+  let mut background = tokio::task::JoinSet::new();
+  let metadata = service.metadata.clone();
+  background.spawn(async move {
+    loop {
+      tokio::time::sleep(Duration::from_millis(250)).await;
+      let metadata = metadata.clone();
+      if tokio::task::spawn_blocking(move || metadata.step()).await.is_err() {
+        break;
+      }
+    }
+  });
   loop {
     let accepted = tokio::select! {
       accepted = listener.accept() => accepted,
@@ -81,9 +95,10 @@ impl Service {
     if let Some((time, entries, warnings)) = cached.as_ref()
       && time.elapsed() < Duration::from_secs(2)
     {
-      return Ok((entries.clone(), warnings.clone()));
+      return Ok((Arc::new(self.metadata.decorate(entries)), warnings.clone()));
     }
     let roots = self.config.roots.clone();
+    let metadata = self.metadata.clone();
     let (entries, warnings) = tokio::task::spawn_blocking(move || {
       let mut entries = Vec::new();
       let mut warnings = Vec::new();
@@ -108,13 +123,14 @@ impl Service {
       }
       entries.sort_by(|a, b| a.key.cmp(&b.key));
       entries.dedup_by(|a, b| a.key == b.key);
+      metadata.reconcile(&entries);
       (entries, warnings)
     })
     .await
     .map_err(|err| err.to_string())?;
     let entries = Arc::new(entries);
     *cached = Some((std::time::Instant::now(), entries.clone(), warnings.clone()));
-    Ok((entries, warnings))
+    Ok((Arc::new(self.metadata.decorate(&entries)), warnings))
   }
 
   async fn follow(&self, key: &str) -> Result<Arc<FollowedSession>, String> {
@@ -152,6 +168,7 @@ impl Service {
     // avoids racing a last-client strong-count check against a new follow.
     let worker = Arc::downgrade(&session);
     let interval = self.config.poll_interval;
+    let metadata = self.metadata.clone();
     tokio::spawn(async move {
       let mut reader = reader;
       loop {
@@ -159,8 +176,27 @@ impl Service {
         let Some(worker) = worker.upgrade() else {
           break;
         };
+        let metadata = metadata.clone();
         let result = tokio::task::spawn_blocking(move || {
-          let result = reader.poll();
+          let result = reader.poll().map(|changed| {
+            // Refresh even when a metadata-only source row produced no events.
+            metadata.refresh_followed(&reader.snapshot.entry);
+            // OpenCode follows already load current presentation metadata.
+            // JSONL follows need their separately cached names/previews.
+            if reader.snapshot.entry.provider != Provider::OpenCode {
+              let before = reader.snapshot.entry.header.clone();
+              metadata.apply(
+                &reader.snapshot.entry.key,
+                reader.snapshot.entry.provider,
+                &mut reader.snapshot.entry.header,
+              );
+              if before != reader.snapshot.entry.header {
+                reader.snapshot.revision += 1;
+                return true;
+              }
+            }
+            changed
+          });
           (reader, result)
         })
         .await;

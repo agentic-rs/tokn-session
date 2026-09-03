@@ -4281,6 +4281,7 @@ dependencies = [
  "tokn-session-client",
  "tokn-session-core",
  "tokn-session-index",
+ "tokn-session-opencode",
  "tokn-session-relay",
  "tokn-session-render",
 ]

@@ -1,6 +1,7 @@
 mod commands;
 mod model;
 mod relay;
+pub mod relay_child;
 mod repository;
 mod service;
 mod watcher;
@@ -248,10 +249,10 @@ pub fn run() {
       {
         Ok(settings) => {
           if let Err(error) = service.relay.configure(settings) {
-            eprintln!("Relay settings: {error}");
+            service.relay.configuration_failed(error);
           }
         }
-        Err(error) => eprintln!("Relay settings: {error}"),
+        Err(error) => service.relay.configuration_failed(error),
       }
       let (retry_sender, mut retry_receiver) = tokio::sync::mpsc::unbounded_channel();
       service.set_session_index_retry_sender(retry_sender);
@@ -542,8 +543,14 @@ pub fn run() {
       commands::relay::get_relay_status,
       commands::relay::configure_relay,
     ])
-    .run(tauri::generate_context!())
-    .expect("error while running tokn session viewer");
+    .build(tauri::generate_context!())
+    .expect("error while building tokn session viewer")
+    .run(|app, event| {
+      if matches!(event, tauri::RunEvent::Exit) {
+        let relay = app.state::<ViewerService>().relay.clone();
+        tauri::async_runtime::block_on(relay.shutdown());
+      }
+    });
 }
 
 #[cfg(test)]
