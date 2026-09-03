@@ -45,28 +45,52 @@ pub fn run_if_requested() {
 }
 
 async fn run(native: bool) -> Result<(), String> {
-  let mut relay = SessionRelay::new(default_config(native)?).await?;
-  write_line(&serde_json::json!({"type":"ready", "version":VERSION}))?;
+  let mut stdout = std::io::stdout().lock();
+  let mut relay = initialize(&mut stdout, default_config(native)?).await?;
   loop {
     let update = relay.next_update().await?;
     for warning in update.warnings {
       eprintln!("{warning}");
     }
     for record in update.records {
-      write_line(&record)?;
+      write_line(&mut stdout, &record)?;
     }
   }
 }
 
-fn write_line(value: &impl serde::Serialize) -> Result<(), String> {
+/// Readiness describes the managed pipe, not completion of Relay's seed scan.
+/// Viewer-core owns catalogs and snapshots, so it can connect as soon as the
+/// transport exists while this child seeds its live-feed cursors.
+async fn initialize(writer: &mut impl Write, config: RelayConfig) -> Result<SessionRelay, String> {
+  write_line(writer, &serde_json::json!({"type":"ready", "version":VERSION}))?;
+  SessionRelay::new(config).await
+}
+
+fn write_line(writer: &mut impl Write, value: &impl serde::Serialize) -> Result<(), String> {
   let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
   if bytes.len() >= MAX_LINE_BYTES {
     return Err("Relay record exceeds pipe frame limit".into());
   }
-  let mut stdout = std::io::stdout().lock();
-  stdout
+  writer
     .write_all(&bytes)
-    .and_then(|_| stdout.write_all(b"\n"))
-    .and_then(|_| stdout.flush())
+    .and_then(|_| writer.write_all(b"\n"))
+    .and_then(|_| writer.flush())
     .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn readiness_precedes_provider_initialization() {
+    let mut config = RelayConfig::new(Vec::new());
+    config.poll_interval = std::time::Duration::ZERO;
+    let mut output = Vec::new();
+    assert!(initialize(&mut output, config).await.is_err());
+    assert_eq!(
+      serde_json::from_slice::<serde_json::Value>(&output).unwrap(),
+      serde_json::json!({"type":"ready", "version":VERSION})
+    );
+  }
 }
