@@ -50,7 +50,7 @@ impl SessionContext {
     }
   }
 
-  pub(crate) fn from_session_ref(provider: Provider, reference: &SessionRef) -> Self {
+  pub fn from_session_ref(provider: Provider, reference: &SessionRef) -> Self {
     let project = project_context(reference.cwd.as_deref(), None);
     Self {
       provider,

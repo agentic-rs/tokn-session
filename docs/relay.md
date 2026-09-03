@@ -84,16 +84,16 @@ wire migration does not add incremental SQLite parsing.
 
 ## Local snapshot/follow service
 
-Start a separately configured service for the viewer:
+Snapshot ownership lives in `viewer-core`. For browser access use the separate
+[viewer HTTP API](viewer-api.md). Desktop External mode can use this local
+compatibility endpoint:
 
 ```sh
-tokn-session-relay serve --bind tcp://127.0.0.1:5557 --native
+tokn-viewer-api snapshot --bind tcp://127.0.0.1:5557 --native
 ```
 
-`--native` is optional. The usual `--codex-dir`, `--pi-dir`,
-`--opencode-dir`, `--zcode-dir`, `--workbuddy-dir`, and `--dsh-dir` source
-overrides apply. Defaults use provider-owned root resolution and environment
-variables, shared with the viewer's automatic Relay:
+`--native` is optional. Snapshot roots use provider-owned environment
+overrides, shared with the viewer's automatic Relay:
 
 | Provider | Default storage | Environment override |
 | --- | --- | --- |
@@ -104,9 +104,9 @@ variables, shared with the viewer's automatic Relay:
 | WorkBuddy | `~/.workbuddy-ai` catalog and `projects` histories | `WORKBUDDY_CONFIG_DIR`, `CODEBUDDY_CONFIG_DIR` |
 | DSH | `~/.dsh/sessions` | `DSH_HOME` |
 
-`--poll-interval` defaults to 500ms
+The snapshot polling interval is 500ms
 for active sessions; the shared metadata catalog is cached for two seconds.
-`serve` always supplies complete history and rejects replay-window flags.
+`snapshot` always supplies complete history; replay-window flags apply only to live feeds.
 It does not start a PUB socket: pets can continue using an independently
 configured `zeromq` process on port 5556, without changing their wire format.
 
@@ -174,11 +174,10 @@ Any local process can connect; `--native` may expose sensitive provider data.
 ### Viewer connection
 
 The viewer defaults to **Automatic Relay**: it launches a headless child of its
-own executable, running this same service on an OS-assigned loopback port. The
+own executable, sending live records over stdio to viewer-core snapshot readers. The
 shipped app needs no separate Relay installation or PATH lookup. The child uses
-the same provider-root environment overrides as local history. A readiness pipe
-reports the bound endpoint; the private port never replaces the saved external
-endpoint. Codex roots verified as the active home's `sessions` or
+the same provider-root environment overrides as local history. A readiness record precedes the JSONL live stream. Core owns snapshots
+and uses live records as refresh hints, retaining polling for recovery. Codex roots verified as the active home's `sessions` or
 `archived_sessions` retain that home's title/preview metadata without parsing
 transcript bodies. Unrelated explicit directories do not inherit this metadata.
 The app closes a lifetime pipe and reaps its child on exit/mode changes;
@@ -194,7 +193,7 @@ Legacy `enabled: true` settings migrate to External with the same endpoint;
 explicitly disabled settings migrate to Local. Missing settings use Automatic.
 Invalid settings produce a visible error instead of silent fallback.
 
-External connects to a separately started `tokn-session-relay serve` and never
+External connects to a separately started `tokn-viewer-api snapshot` and never
 owns that process. Local explicitly clears Relay snapshots, stops any owned
 child, and wakes the local catalog/index path. Switching mode, external endpoint,
 or native inclusion clears snapshots to avoid mixing data sources.
@@ -203,7 +202,7 @@ received snapshots between timeline, trajectories and Inspector. Covered provide
 bypass local body indexing/reading. Uncovered providers retain local history.
 Connection failures and automatic child restarts retain last-good committed
 data without local fallback. Catalog and session connections are cancelled
-before reconnecting to a restarted child's new port.
+before reattaching the managed feed and core snapshots.
 
 Live updates refresh the loaded event window and expanded trajectory items,
 including while reading older events. Scrolling follows only at the bottom;

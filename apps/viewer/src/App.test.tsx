@@ -1,0 +1,20 @@
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, expect, it, vi } from "vitest";
+import App from "./App";
+import { RemoteClient } from "./lib/transport";
+vi.mock("./pages/ViewerPage", () => ({ ViewerPage: ({ remote }: { remote?: boolean }) => <div>{remote ? "Remote sessions" : "Desktop sessions"}</div> }));
+afterEach(() => vi.restoreAllMocks());
+it("reports connection failures, retries, and disconnects before switching machines", async () => {
+  const client = new RemoteClient("http://selected-machine:5558", "secret");
+  const close = vi.spyOn(client, "close");
+  vi.spyOn(RemoteClient, "connect").mockRejectedValueOnce(new Error("Invalid viewer API token")).mockResolvedValueOnce(client);
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Invalid viewer API token");
+  fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+  expect(await screen.findByText("Remote sessions")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Change machine" }));
+  await waitFor(() => expect(close).toHaveBeenCalled());
+  expect(screen.getByRole("button", { name: "Connect" })).toBeInTheDocument();
+  expect(screen.queryByText("Remote sessions")).not.toBeInTheDocument();
+});

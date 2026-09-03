@@ -60,11 +60,19 @@ pub struct SessionRelay {
 impl SessionRelay {
   /// Creates a relay and starts watching all provider paths that already exist.
   pub async fn new(config: RelayConfig) -> Result<Self, String> {
+    Self::new_with_ready(config, || Ok(())).await
+  }
+
+  /// Registers root watches, announces transport readiness, then performs the
+  /// potentially expensive initial discovery and cursor seed.
+  pub async fn new_with_ready(config: RelayConfig, ready: impl FnOnce() -> Result<(), String>) -> Result<Self, String> {
     if config.poll_interval.is_zero() {
       return Err("relay poll interval must be greater than zero".to_string());
     }
 
-    let mut tailer = SessionTailer::prepare(config.roots, config.new_file_replay)?;
+    // Root watches can be registered without enumerating every historical
+    // session. Defer that expensive discovery until after readiness.
+    let mut tailer = SessionTailer::prepare_deferred(config.roots, config.new_file_replay)?;
     tailer.set_include_native(config.include_native);
     let (wake_tx, wake_rx) = mpsc::unbounded_channel();
     let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
@@ -93,6 +101,9 @@ impl SessionRelay {
       .poll
       .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     relay.watch_available_roots()?;
+    ready()?;
+    // Watcher callbacks are already queued, closing the discovery/follow gap.
+    relay.tailer.discover_initial()?;
     relay.initial = Some(relay.tailer.start()?);
     Ok(relay)
   }

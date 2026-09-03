@@ -249,7 +249,7 @@ impl PresentationCache {
             complete,
           ))
         } else {
-          let source = crate::providers::source(provider);
+          let source = tokn_session_relay::providers::source(provider);
           let hydrated = AgentClient::hydrate_session_header(source, header.clone())?;
           Ok((
             Presentation {

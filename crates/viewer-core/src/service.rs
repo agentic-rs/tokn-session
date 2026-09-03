@@ -59,8 +59,8 @@ const INDEX_BODY_SCAN_BATCH_SIZE: usize = 8;
 const TOOL_OUTPUT_TRUNCATION_MARKER: &str = "\n\u{2026} output truncated \u{2026}\n";
 
 #[derive(Clone)]
-pub(crate) struct ViewerService {
-  pub(crate) relay: Arc<crate::relay::ViewerRelay>,
+pub struct ViewerService {
+  pub relay: Arc<crate::relay::ViewerRelay>,
   repository: Arc<dyn ViewerRepository>,
   session_index: Arc<SessionIndex>,
   index_refresh_gate: Arc<Mutex<()>>,
@@ -654,12 +654,12 @@ impl ViewerService {
 
   /// Returns the latest in-memory index worker state without touching SQLite
   /// or provider storage. The Tauri command and event bridge both use this.
-  pub(crate) fn session_index_progress(&self) -> SessionIndexProgress {
+  pub fn session_index_progress(&self) -> SessionIndexProgress {
     self.index_progress.snapshot()
   }
 
   /// Subscribes a window-level bridge to compact progress replacements.
-  pub(crate) fn subscribe_session_index_progress(&self) -> watch::Receiver<SessionIndexProgress> {
+  pub fn subscribe_session_index_progress(&self) -> watch::Receiver<SessionIndexProgress> {
     self.index_progress.subscribe()
   }
 
@@ -691,7 +691,7 @@ impl ViewerService {
   /// Enqueues an immediate scheduler wake for a user-requested retry. The
   /// resulting snapshot intentionally says `waiting_to_retry`: acceptance by
   /// the queue is not evidence that a provider scan has begun.
-  pub(crate) fn request_session_index_retry(&self) -> Result<SessionIndexProgress, String> {
+  pub fn request_session_index_retry(&self) -> Result<SessionIndexProgress, String> {
     let sender = self
       .index_retry_sender
       .lock()
@@ -1140,6 +1140,24 @@ impl ViewerService {
       .collect::<Result<Vec<_>, _>>()?;
 
     Ok(ListSessionChildrenResponse { sessions, next_cursor })
+  }
+
+  /// Admission check for untrusted remote keys. Decoding alone is insufficient:
+  /// keys contain source paths, so only the committed catalog grants access.
+  pub fn validate_session_key(&self, key: &str) -> Result<(), String> {
+    let locator = decode_session_key(key)?;
+    let inventory = self
+      .indexed_session_inventory(locator.provider)?
+      .ok_or("Session catalog is not ready")?;
+    if inventory
+      .headers
+      .iter()
+      .any(|header| locator_for_header(locator.provider, header) == locator)
+    {
+      Ok(())
+    } else {
+      Err("Session is not in this machine's catalog".into())
+    }
   }
 
   /// Returns one provider's complete committed catalog from the durable index.

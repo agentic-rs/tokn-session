@@ -60,9 +60,9 @@ export function RelayConnection() {
         </label>}
         <button type="button" disabled={busy || !status} onClick={() => void save()}>{busy ? "Saving…" : status?.phase === "failed" && settings.mode === "automatic" ? "Retry" : "Apply"}</button>
         <p>{settings.mode === "automatic"
-          ? "Relay starts with this app on a private local port and stops when the app exits. Native records are optional and may contain sensitive data."
+          ? "Relay starts with this app through a private stdio pipe and stops when the app exits. Native records are optional and may contain sensitive data."
           : settings.mode === "external"
-            ? "Connect to an independently started local tokn-session-relay serve. This app never stops an external Relay."
+            ? "Connect to an independently started local tokn-viewer-api snapshot. This app never stops an external Relay."
             : "Read provider history directly. Applying Local mode clears Relay snapshots and stops any app-owned Relay."}</p>
         {status?.active_endpoint && <p>Active endpoint: <code>{status.active_endpoint}</code></p>}
         {status && status.settings.mode !== "local" && <p>Native records: {status.native ? "available" : "not available"}. Other providers use local history.</p>}

@@ -5,7 +5,7 @@ use std::{
 };
 
 use tokio::{
-  net::{TcpListener, TcpStream},
+  net::TcpListener,
   sync::{Mutex, Semaphore, watch},
 };
 use tokn_session_client::AgentClient;
@@ -22,7 +22,8 @@ struct FollowedSession {
   current: watch::Sender<Arc<Snapshot>>,
 }
 
-struct Service {
+pub struct Service {
+  wake: watch::Sender<()>,
   config: RelayConfig,
   sessions: Mutex<HashMap<String, Weak<FollowedSession>>>,
   catalog: Mutex<Option<(std::time::Instant, Arc<Vec<CatalogEntry>>, Vec<String>)>>,
@@ -45,27 +46,11 @@ pub async fn serve_listener(listener: TcpListener, config: RelayConfig) -> Resul
   if !listener.local_addr().map_err(|e| e.to_string())?.ip().is_loopback() {
     return Err("Relay service listener must be loopback-only".into());
   }
-  let service = Arc::new(Service {
-    config,
-    sessions: Mutex::new(HashMap::new()),
-    catalog: Mutex::new(None),
-    metadata: Arc::new(PresentationCache::default()),
-  });
+  let service = Service::new(config)?;
   let connections = Arc::new(Semaphore::new(64));
   // Dropping the service future closes its client sockets as well as its
   // listener, so consumers actually reconnect after a service shutdown.
   let mut peers = tokio::task::JoinSet::new();
-  let mut background = tokio::task::JoinSet::new();
-  let metadata = service.metadata.clone();
-  background.spawn(async move {
-    loop {
-      tokio::time::sleep(Duration::from_millis(250)).await;
-      let metadata = metadata.clone();
-      if tokio::task::spawn_blocking(move || metadata.step()).await.is_err() {
-        break;
-      }
-    }
-  });
   loop {
     let accepted = tokio::select! {
       accepted = listener.accept() => accepted,
@@ -90,6 +75,41 @@ pub async fn serve_listener(listener: TcpListener, config: RelayConfig) -> Resul
 }
 
 impl Service {
+  pub fn new(config: RelayConfig) -> Result<Arc<Self>, String> {
+    if config.poll_interval.is_zero() {
+      return Err("Poll interval must be positive".into());
+    }
+    let service = Arc::new(Self {
+      config,
+      sessions: Mutex::new(HashMap::new()),
+      catalog: Mutex::new(None),
+      metadata: Arc::new(PresentationCache::default()),
+      wake: watch::channel(()).0,
+    });
+    let weak = Arc::downgrade(&service);
+    tokio::spawn(async move {
+      loop {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let Some(service) = weak.upgrade() else {
+          return;
+        };
+        let metadata = service.metadata.clone();
+        drop(service);
+        if tokio::task::spawn_blocking(move || metadata.step()).await.is_err() {
+          return;
+        }
+      }
+    });
+    Ok(service)
+  }
+
+  /// Live feed notifications only wake authoritative readers. Polling remains
+  /// the recovery path for feed startup gaps, restarts, or omitted records.
+  pub async fn invalidate(&self) {
+    *self.catalog.lock().await = None;
+    self.wake.send_replace(());
+  }
+
   async fn catalog(&self) -> Result<(Arc<Vec<CatalogEntry>>, Vec<String>), String> {
     let mut cached = self.catalog.lock().await;
     if let Some((time, entries, warnings)) = cached.as_ref()
@@ -103,7 +123,12 @@ impl Service {
       let mut entries = Vec::new();
       let mut warnings = Vec::new();
       for root in roots {
-        let source = crate::providers::source(root.provider);
+        // Providers are optional installations. An absent resolved root is an
+        // empty source; corrupt or inaccessible existing roots still report errors.
+        if matches!(std::fs::metadata(&root.path), Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+          continue;
+        }
+        let source = tokn_session_relay::providers::source(root.provider);
         match AgentClient::list_session_headers(source, Some(root.path)) {
           Ok(headers) => entries.extend(headers.into_iter().map(|header| CatalogEntry {
             key: serde_json::to_string(&(root.provider, &header.path, &header.id)).expect("header key is serializable"),
@@ -161,10 +186,11 @@ impl Service {
     let worker = Arc::downgrade(&session);
     let interval = self.config.poll_interval;
     let metadata = self.metadata.clone();
+    let mut wake = self.wake.subscribe();
     tokio::spawn(async move {
       let mut reader = reader;
       loop {
-        tokio::time::sleep(interval).await;
+        tokio::select! { _ = tokio::time::sleep(interval) => {}, result = wake.changed() => { if result.is_err() { break; } } }
         let Some(worker) = worker.upgrade() else {
           break;
         };
@@ -218,7 +244,10 @@ impl Service {
     Ok(session)
   }
 
-  async fn handle(&self, stream: &mut TcpStream) -> Result<(), String> {
+  pub async fn handle(
+    &self,
+    stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send),
+  ) -> Result<(), String> {
     let request: Request = tokio::time::timeout(Duration::from_secs(10), read_frame(stream))
       .await
       .map_err(|_| "Relay request timed out")??;
@@ -300,7 +329,7 @@ impl Service {
   }
 }
 
-async fn send(stream: &mut TcpStream, frame: Frame) -> Result<(), String> {
+async fn send(stream: &mut (impl tokio::io::AsyncWrite + Unpin), frame: Frame) -> Result<(), String> {
   tokio::time::timeout(Duration::from_secs(10), write_frame(stream, &frame))
     .await
     .map_err(|_| "Relay subscriber is too slow; reconnect for a fresh snapshot")?

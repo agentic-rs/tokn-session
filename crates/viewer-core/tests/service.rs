@@ -3,8 +3,8 @@ use std::{fs::OpenOptions, io::Write, path::Path, time::Duration};
 use tempfile::TempDir;
 use tokio::{io::AsyncWriteExt, net::TcpListener};
 use tokn_session_core::{AgentEvent, Provider};
-use tokn_session_relay::{
-  ProviderRoot, RelayConfig,
+use tokn_session_relay::{ProviderRoot, RelayConfig};
+use tokn_viewer_core::{
   service_client::{RelaySubscription, SessionSnapshot, load_catalog},
   service_protocol::*,
   service_server::serve_listener,
@@ -562,4 +562,64 @@ async fn workbuddy_and_dsh_catalog_follow_and_live_feed_preserve_history() {
       assert!(tailer.scan().unwrap().records.is_empty());
     }
   }
+}
+
+#[tokio::test]
+async fn embedded_snapshots_recover_history_and_wake_on_live_feed_hints() {
+  use tokn_viewer_core::service_client::{Connection, load_catalog_from};
+  let root = TempDir::new().unwrap();
+  let path = root.path().join("session.jsonl");
+  std::fs::write(&path, format!("{HEADER}{MESSAGE}")).unwrap();
+  let mut config = RelayConfig::new(vec![
+    ProviderRoot::new(Provider::Pi, root.path().into()),
+    ProviderRoot::new(Provider::OpenCode, root.path().join("not-installed.db")),
+    ProviderRoot::new(Provider::ZCode, root.path().join("not-installed-zcode.db")),
+  ]);
+  config.include_native = true;
+  // A hint, not the polling fallback, must deliver this update.
+  config.poll_interval = Duration::from_secs(60);
+  let service = tokn_viewer_core::service_server::Service::new(config).unwrap();
+  let connection = Connection::Embedded(service.clone());
+  let catalog = load_catalog_from(&connection).await.unwrap();
+  assert!(catalog.warnings.is_empty());
+  let key = &catalog.entries[0].key;
+  let mut client = RelaySubscription::connect_from(&connection, key).await.unwrap();
+  let initial = snapshot(&mut client).await;
+  assert_eq!(messages(&initial), ["hello"]);
+  assert!(initial.native.iter().any(Option::is_some));
+  append(
+    &path,
+    "{\"type\":\"message\",\"id\":\"two\",\"message\":{\"role\":\"user\",\"content\":\"again\"}}\n",
+  );
+  service.invalidate().await;
+  let updated = snapshot(&mut client).await;
+  assert_eq!(messages(&updated), ["hello", "again"]);
+  assert_eq!(initial.generation, updated.generation);
+  drop(client);
+  let mut recovered = RelaySubscription::connect_from(&connection, key).await.unwrap();
+  assert_eq!(messages(&snapshot(&mut recovered).await), ["hello", "again"]);
+}
+
+#[tokio::test]
+async fn embedded_catalog_discovers_codex_active_and_archive_roots_without_body_reads() {
+  use tokn_viewer_core::service_client::{Connection, load_catalog_from};
+  let root = TempDir::new().unwrap();
+  let mut roots = Vec::new();
+  for (directory, id) in [("sessions", "active-title"), ("archived_sessions", "archived-title")] {
+    let path = root.path().join(directory);
+    std::fs::create_dir_all(&path).unwrap();
+    let header = serde_json::json!({"type":"session_meta", "payload":{"id":id,"cwd":"/tmp"}});
+    std::fs::write(
+      path.join("session.jsonl"),
+      format!("{header}\nnot a transcript record\n"),
+    )
+    .unwrap();
+    roots.push(ProviderRoot::new(Provider::Codex, path));
+  }
+  // Explicit unrelated roots deliberately do not borrow the current home's titles.
+  let service = tokn_viewer_core::service_server::Service::new(RelayConfig::new(roots)).unwrap();
+  let catalog = load_catalog_from(&Connection::Embedded(service)).await.unwrap();
+  assert_eq!(catalog.entries.len(), 2);
+  assert!(catalog.entries.iter().any(|entry| entry.header.id == "active-title"));
+  assert!(catalog.entries.iter().any(|entry| entry.header.id == "archived-title"));
 }

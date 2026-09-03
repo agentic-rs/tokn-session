@@ -10,14 +10,14 @@ use std::{
   time::{Duration, Instant},
 };
 
+use crate::{
+  service_client::{Connection, RelaySubscription, load_catalog_from},
+  service_protocol::CatalogEntry,
+};
 use serde::Serialize;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tokn_session_core::{LoadedSession, Provider, SessionHeader};
-use tokn_session_relay::{
-  service_client::{RelaySubscription, load_catalog},
-  service_protocol::CatalogEntry,
-};
 
 use crate::model::{SessionLocator, ViewerProvider, encode_session_key};
 
@@ -56,6 +56,7 @@ struct State {
   cancel: CancellationToken,
   connection_cancel: CancellationToken,
   active_endpoint: Option<String>,
+  connection: Option<Connection>,
   providers: Vec<ViewerProvider>,
   entries: Option<Vec<CatalogEntry>>,
   sessions: HashMap<SessionLocator, CachedSession>,
@@ -83,6 +84,7 @@ impl ViewerRelay {
         cancel: CancellationToken::new(),
         connection_cancel: CancellationToken::new(),
         active_endpoint: None,
+        connection: None,
         providers: Vec::new(),
         entries: None,
         sessions: HashMap::new(),
@@ -139,6 +141,7 @@ impl ViewerRelay {
       state.epoch += 1;
       state.cancel = CancellationToken::new();
       state.active_endpoint = None;
+      state.connection = None;
       state.native = false;
       state.settings = settings.clone();
       state.phase = match settings.mode {
@@ -155,7 +158,7 @@ impl ViewerRelay {
     match settings.mode {
       RelayMode::Automatic => {
         let manager = self.clone();
-        tauri::async_runtime::spawn(async move {
+        tokio::task::spawn(async move {
           manager.run_managed(epoch, cancel, settings.include_native).await;
         });
       }
@@ -180,6 +183,10 @@ impl ViewerRelay {
   }
 
   fn connect_endpoint(self: &Arc<Self>, endpoint: String, epoch: u64) {
+    self.connect_source(Connection::Tcp(endpoint.clone()), endpoint, epoch);
+  }
+
+  fn connect_source(self: &Arc<Self>, connection: Connection, endpoint: String, epoch: u64) {
     let cancel = {
       let mut state = self.state.lock().unwrap();
       if state.epoch != epoch || state.cancel.is_cancelled() {
@@ -188,22 +195,23 @@ impl ViewerRelay {
       state.connection_cancel.cancel();
       state.connection_cancel = state.cancel.child_token();
       state.active_endpoint = Some(endpoint.clone());
+      state.connection = Some(connection.clone());
       state.phase = "connecting".into();
       state.error = None;
       state.connection_cancel.clone()
     };
     let manager = self.clone();
-    tauri::async_runtime::spawn(async move {
-      manager.catalog_loop(endpoint, epoch, cancel).await;
+    tokio::task::spawn(async move {
+      manager.catalog_loop(connection, epoch, cancel).await;
     });
     self.notify(None, false);
   }
 
-  async fn catalog_loop(self: Arc<Self>, endpoint: String, epoch: u64, cancel: CancellationToken) {
+  async fn catalog_loop(self: Arc<Self>, connection: Connection, epoch: u64, cancel: CancellationToken) {
     loop {
       let result = tokio::select! {
         _ = cancel.cancelled() => return,
-        result = load_catalog(&endpoint) => result,
+        result = load_catalog_from(&connection) => result,
       };
       let (changed, first_catalog, resume) = {
         let mut state = self.state.lock().unwrap();
@@ -254,7 +262,7 @@ impl ViewerRelay {
       }
       for locator in resume {
         let manager = self.clone();
-        tauri::async_runtime::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
           let _ = manager.load(&locator);
         });
       }
@@ -284,7 +292,7 @@ impl ViewerRelay {
       .collect()
   }
 
-  pub fn load(self: &Arc<Self>, locator: &SessionLocator) -> Result<Arc<LoadedSession>, String> {
+  pub(crate) fn load(self: &Arc<Self>, locator: &SessionLocator) -> Result<Arc<LoadedSession>, String> {
     let mut state = self.state.lock().unwrap();
     let should_start =
       state.active_endpoint.is_some() && state.sessions.get(locator).is_none_or(|s| s.cancel.is_cancelled());
@@ -328,11 +336,13 @@ impl ViewerRelay {
         },
       );
       let manager = self.clone();
-      let endpoint = state.active_endpoint.clone().expect("active endpoint checked above");
+      let connection = state.connection.clone().expect("active connection checked above");
       let epoch = state.epoch;
       let locator = locator.clone();
-      tauri::async_runtime::spawn(async move {
-        manager.session_loop(endpoint, entry.key, locator, epoch, cancel).await;
+      tokio::task::spawn(async move {
+        manager
+          .session_loop(connection, entry.key, locator, epoch, cancel)
+          .await;
       });
     }
     let deadline = Instant::now() + Duration::from_secs(12);
@@ -370,7 +380,7 @@ impl ViewerRelay {
 
   async fn session_loop(
     self: Arc<Self>,
-    endpoint: String,
+    connection: Connection,
     key: String,
     locator: SessionLocator,
     epoch: u64,
@@ -379,7 +389,7 @@ impl ViewerRelay {
     loop {
       let result = tokio::select! {
         _ = cancel.cancelled() => return,
-        result = self.consume_session(&endpoint, &key, &locator, epoch, &cancel) => result,
+        result = self.consume_session(&connection, &key, &locator, epoch, &cancel) => result,
       };
       if let Err(error) = result {
         let mut state = self.state.lock().unwrap();
@@ -398,13 +408,13 @@ impl ViewerRelay {
 
   async fn consume_session(
     &self,
-    endpoint: &str,
+    connection: &Connection,
     key: &str,
     locator: &SessionLocator,
     epoch: u64,
     cancel: &CancellationToken,
   ) -> Result<(), String> {
-    let mut subscription = RelaySubscription::connect(endpoint, key).await?;
+    let mut subscription = RelaySubscription::connect_from(connection, key).await?;
     loop {
       let snapshot = subscription.next_snapshot().await?;
       let reset = {
@@ -427,7 +437,7 @@ impl ViewerRelay {
     }
   }
 
-  pub fn native(
+  pub(crate) fn native(
     &self,
     locator: &SessionLocator,
     index: usize,
@@ -447,7 +457,7 @@ impl ViewerRelay {
 
   /// Only newest-page requests advance the displayed snapshot. Pagination,
   /// expanded trajectories and Inspector requests remain on that same image.
-  pub fn advance(self: &Arc<Self>, locator: &SessionLocator) -> Result<Arc<LoadedSession>, String> {
+  pub(crate) fn advance(self: &Arc<Self>, locator: &SessionLocator) -> Result<Arc<LoadedSession>, String> {
     self.load(locator)?;
     let mut state = self.state.lock().unwrap();
     let session = state
@@ -506,9 +516,10 @@ pub fn write_settings(path: &PathBuf, settings: &RelaySettings) -> Result<(), St
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::service_protocol::DEFAULT_SERVICE_ENDPOINT;
+  use crate::service_server::serve_listener;
   use std::{fs::OpenOptions, io::Write};
-  use tokn_session_relay::service_protocol::DEFAULT_SERVICE_ENDPOINT;
-  use tokn_session_relay::{ProviderRoot, RelayConfig, service_server::serve_listener};
+  use tokn_session_relay::{ProviderRoot, RelayConfig};
 
   #[test]
   fn saves_settings_and_rejects_nonlocal_endpoint_without_overwriting() {

@@ -1,6 +1,6 @@
 # Tokn Sessions Viewer
 
-The viewer is a read-only Tauri desktop app for browsing historical Pi, Codex,
+The viewer is a read-only desktop and browser app for browsing historical Pi, Codex,
 OpenCode, ZCode, WorkBuddy, and DeepSeek Harness (DSH) sessions in one place. It
 shows root sessions in a searchable, provider-filterable sidebar, expands their
 known subagents on demand, and renders each selected normalized event stream as
@@ -10,16 +10,16 @@ It does not create sessions, append messages, or modify provider data.
 ## Relay lifetime and data modes
 
 By default the viewer starts **Automatic Relay** for its lifetime. It runs the
-existing Relay snapshot service in a headless child of the bundled viewer
-executable, on a private OS-assigned loopback port. Development and packaged
+Relay live feed in a headless child of the bundled viewer
+executable, over stdio. Shared `viewer-core` owns authoritative snapshots. Development and packaged
 builds need no separate Relay installation. The child stops when the app exits,
 including parent crashes; external Relay processes are never terminated.
 
 The Relay panel offers Automatic, External, and Local history only modes.
 Automatic has optional native Inspector records (off by default). External
-connects to an independently configured `tokn-session-relay serve` endpoint.
+connects to an independently configured `tokn-viewer-api snapshot` endpoint.
 Local explicitly clears Relay snapshots and resumes direct provider history.
-Relay covers Codex, Pi, and OpenCode; other providers remain local. Automatic
+Automatic mode covers all six providers. Automatic
 uses the same provider-root environment overrides listed below as local reads.
 
 Startup/status is visible as Starting, Connecting, Live, Retrying, or Failed.
@@ -42,8 +42,9 @@ pnpm run check
 pnpm tauri dev
 ```
 
-`pnpm run dev` starts only the Vite frontend and is useful for visual work that
-does not require native commands. Build the desktop application with:
+`pnpm run dev` starts the browser frontend. Start `cargo run -p tokn-viewer-api --
+--allow-origin http://localhost:1437` separately, then connect to its address.
+See [remote setup and API contract](../../docs/viewer-api.md). Build the desktop application with:
 
 ```sh
 pnpm tauri build

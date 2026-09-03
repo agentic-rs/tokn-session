@@ -47,28 +47,39 @@ request, while ZCode/DSH expose explicit start/end observations. ZCode coverage
 is based on the installed 3.7.3 bundle and representative fixtures, not a real
 captured compaction. Upgrade strict `AgentEvent` consumers with the producer.
 
-## Session Relay
+## Viewer core and remote API
 
-The viewer defaults to an app-owned Relay child for its lifetime, running the
-existing service through a headless entry point in the bundled viewer executable.
-No separate installation/PATH lookup is needed. It binds an OS-assigned loopback
-port, reports readiness over stdout, and exits when the parent-owned stdin pipe
-closes (including parent death). The supervisor reaps only its own child, with
-ten-second startup timeout and at most three attempts using one-/two-second
-backoff. Failed startup/crashes remain visible with Retry.
-External mode still connects to an independently started
-`tokn-session-relay serve --bind tcp://127.0.0.1:5557 [--native]`. This is a
-versioned local TCP snapshot/follow endpoint, separate from the unchanged
-stdout/ZeroMQ modes below. Metadata catalogs are shared, event snapshots load on demand,
-and concurrent clients reuse one JSONL normalizer per session. Appends decode
-only new complete lines; replacement/truncation triggers an atomic new
-generation. OpenCode reconciles consistent raw row snapshots on DB/WAL changes,
-reusing unchanged decoded records and normalization checkpoints. Unrelated
-writes/checkpoints are silent; appended suffixes preserve the generation.
-Existing record edits/deletions/reordering reset safely, including native-only
-changes when native is enabled. Raw SQL rows are still scanned (timestamps are
-not reliable change tokens); historical and stdout/ZeroMQ loading are unchanged.
-See [Relay service](relay.md#local-snapshotfollow-service) for framing and limits.
+Desktop calls shared Rust `crates/viewer-core` directly through Tauri. The
+browser frontend connects to `crates/viewer-api` over HTTP/SSE, one selected
+machine at a time. The API is data-only; Vite/build serves the UI independently.
+Run `cargo run -p tokn-viewer-api -- --allow-origin http://localhost:1437`
+and `pnpm --dir apps/viewer dev`. See [viewer-api.md](viewer-api.md) for the
+contract, authentication, origins, and SSH-tunnel setup. Remote keys must match
+the discovered catalog before history can be read. Browser tokens stay in memory;
+switching machines aborts old requests and clears the UI. SSE reconnects trigger
+catalog/timeline refreshes. Desktop does not consume HTTP for local viewing.
+
+Core now owns the old viewer service/model/repository, native index scheduler,
+and snapshot/follow/metadata code formerly in Relay. Automatic mode launches a
+bundled Relay live-feed child over stdio; stdout is bounded versioned JSONL,
+stderr carries diagnostics, and stdin EOF ends the child even after parent death.
+Core uses live records as invalidation hints and retains authoritative snapshot
+readers and polling recovery. The supervisor keeps the ten-second readiness
+limit and three attempts with one-/two-second backoff. No private TCP port is
+needed. Missing provider roots are empty catalogs; corrupt existing roots remain
+errors. External desktop mode connects to `tokn-viewer-api snapshot --bind
+tcp://127.0.0.1:5557 [--native]`, the unchanged loopback framed protocol.
+`tokn-session-relay serve` now reports migration guidance. Relay remains the
+provider-normalization/feed component and never serves a web UI.
+
+## Session snapshots
+
+Metadata catalogs are shared; event snapshots load on demand. Concurrent clients
+reuse one JSONL normalizer per session. Appends decode new complete lines;
+replacement/truncation starts an atomic generation. OpenCode/ZCode reconcile raw
+DB/WAL snapshots and reuse unchanged records/checkpoints. Unrelated changes are
+silent; suffix appends preserve generations, while edits/deletions/reordering
+reset them. See [snapshot protocol](relay.md#local-snapshotfollow-service).
 
 Catalog title/preview backfill runs in a shared background cache, replacing the
 local viewer body-index backfill bypassed by Relay. Pi's latest `session_info`

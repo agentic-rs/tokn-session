@@ -36,12 +36,8 @@ async fn run(args: Args) -> Result<(), String> {
     new_file_replay: args.new_file_replay,
     include_native: args.include_native,
   };
-  if let Command::Serve { endpoint } = &args.command {
-    eprintln!("serving local Relay snapshots on {endpoint}");
-    return tokio::select! {
-      result = tokn_session_relay::service_server::serve(endpoint, config) => result,
-      _ = tokio::signal::ctrl_c() => Ok(()),
-    };
+  if let Command::Serve { .. } = &args.command {
+    return Err("Snapshot serving moved to tokn-viewer-api snapshot --bind <endpoint>".into());
   }
   let mut relay = SessionRelay::new(config).await?;
   let mut output = match args.command {
@@ -475,7 +471,7 @@ impl Args {
     let mut parsed = Self {
       command: match command.as_str() {
         "serve" => Command::Serve {
-          endpoint: tokn_session_relay::service_protocol::DEFAULT_SERVICE_ENDPOINT.into(),
+          endpoint: "tcp://127.0.0.1:5557".into(),
         },
         "zeromq" => Command::ZeroMq {
           endpoint: DEFAULT_ENDPOINT.to_string(),
@@ -622,7 +618,7 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
 fn print_help(help: Help) {
   match help {
     Help::Serve => println!(
-      "Local snapshot-and-follow service (version 1).\n\nUsage:\n  tokn-session-relay serve [options]\n\nOptions:\n  --bind <endpoint>       Numeric loopback TCP endpoint (default: tcp://127.0.0.1:5557)\n  --native                Include native records\n  --codex-dir <path>       Codex session root\n  --pi-dir <path>          Pi session root\n  --opencode-dir <path>    OpenCode directory or database\n  --zcode-dir <path>       ZCode storage directory or database\n  --workbuddy-dir <path>   WorkBuddy config directory\n  --dsh-dir <path>         DSH sessions directory\n  --poll-interval <time>   Active-session polling interval (default: 500ms)\n\nHistory is loaded on demand. Replay-window flags do not apply to serve."
+      "Snapshot serving moved to viewer-core.\n\nUse: tokn-viewer-api snapshot --bind tcp://127.0.0.1:5557 [--native]\nProvider roots use the same environment overrides as Relay."
     ),
     Help::Root => println!(
       "\
@@ -632,7 +628,7 @@ Usage:
   tokn-session-relay <subcommand> [options]
 
 Subcommands:
-  serve   Serve on-demand snapshots and live updates to local viewers
+  serve   Show migration guidance for the viewer snapshot service
   zeromq  Publish two-frame ZeroMQ messages
   stdout  Write formatted AgentEvent output to stdout
 
