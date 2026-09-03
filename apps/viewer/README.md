@@ -7,6 +7,29 @@ known subagents on demand, and renders each selected normalized event stream as
 a conversation with inspectable technical events.
 It does not create sessions, append messages, or modify provider data.
 
+## Relay lifetime and data modes
+
+By default the viewer starts **Automatic Relay** for its lifetime. It runs the
+existing Relay snapshot service in a headless child of the bundled viewer
+executable, on a private OS-assigned loopback port. Development and packaged
+builds need no separate Relay installation. The child stops when the app exits,
+including parent crashes; external Relay processes are never terminated.
+
+The Relay panel offers Automatic, External, and Local history only modes.
+Automatic has optional native Inspector records (off by default). External
+connects to an independently configured `tokn-session-relay serve` endpoint.
+Local explicitly clears Relay snapshots and resumes direct provider history.
+Relay covers Codex, Pi, and OpenCode; other providers remain local. Automatic
+uses the same provider-root environment overrides listed below as local reads.
+
+Startup/status is visible as Starting, Connecting, Live, Retrying, or Failed.
+Each child gets ten seconds to report readiness; up to three launch attempts
+use one-/two-second backoff. Retry starts a new attempt budget. Failures retain
+last-good snapshots without local fallback. Settings persist in app-config
+`relay.json`; legacy enabled connections keep their external endpoint, and
+legacy explicit disabled settings remain Local. Missing settings default to
+Automatic. Relay-backed sessions do not yet have durable unread tracking.
+
 ## Development
 
 Install the platform prerequisites from the
@@ -28,8 +51,9 @@ pnpm tauri build
 
 ## Using the viewer
 
-The sidebar starts from the local session index rather than reading provider
-storage in the initial viewport. On a fresh database, it shows an indexing
+For Relay-backed providers the sidebar reads Relay's metadata catalog. For
+local providers it starts from the local session index rather than reading
+provider storage in the initial viewport. On a fresh database, it shows an indexing
 state until the background cataloger has committed each selected provider. Use
 the provider pills to include or exclude sources, type in the search box to
 match indexed title, preview, session id, project, working directory, or agent
@@ -106,7 +130,7 @@ Provider storage is resolved as follows:
 - DSH: `$DSH_HOME/sessions`, then the platform home directory's `.dsh/sessions`
   folder.
 
-The app commits a stable provider-header catalog to its shared index at
+For providers using local history, the app commits a stable provider-header catalog to its shared index at
 `~/.tokn/sessions/index.sqlite`, then uses only that durable index for sidebar,
 search, and subagent-tree requests. Provider reads at startup belong to the
 background cataloger, not those UI requests. It then backfills event-derived
@@ -125,20 +149,22 @@ backfilling, except that a relocated row retains an already-unread dot while
 its new path is validated. Sessions first discovered after a provider catalog
 exists can become unread only after that body confirmation finds a new unhidden
 user message or final assistant reply. A dot on a collapsed parent can represent
-unread activity in a known subagent. The currently open timeline refreshes only
-when that exact session gains such activity. This version remains historical and
-read-only: it has no composer and never mutates provider session files.
+unread activity in a known subagent. The open timeline refreshes after successful
+body updates, including progress that does not qualify as unread activity.
+This version remains read-only: it has no composer and never mutates provider
+session files.
 
 ## Architecture
 
 React owns the presentation and calls a small set of typed Tauri commands. The
 Rust backend invokes the workspace's `client`, `core`, and `render` crates
-directly; it does not parse CLI output or depend on the session relay. Provider
-histories normalize to `AgentEvent` before source-neutral, snake-case DTOs
+directly for local providers; Relay-backed providers use received snapshots.
+It does not parse CLI output. Provider histories normalize to `AgentEvent`
+before source-neutral, snake-case DTOs
 cross the IPC boundary. Source errors remain isolated so one unavailable
 provider does not hide sessions from the others.
 
-Session discovery starts with provider headers in the background and
+Local session discovery starts with provider headers in the background and
 deliberately does not compute message or event counts. A complete header
 catalog is committed promptly to the shared SQLite sidebar index at
 `~/.tokn/sessions/index.sqlite`; sidebar, search, and tree queries are strictly

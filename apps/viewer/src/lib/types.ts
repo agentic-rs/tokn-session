@@ -190,10 +190,12 @@ export interface SessionIndexChangedEvent {
   attention_session_keys: string[];
 }
 
-export interface RelaySettings { endpoint: string; enabled: boolean; }
+export type RelayMode = "automatic" | "external" | "local";
+export interface RelaySettings { mode: RelayMode; endpoint: string; include_native: boolean; }
 export interface RelayStatus {
   settings: RelaySettings;
-  phase: "disconnected" | "connecting" | "live" | "reconnecting";
+  active_endpoint: string | null;
+  phase: "local" | "starting" | "connecting" | "live" | "reconnecting" | "retrying" | "failed";
   native: boolean;
   error: string | null;
 }

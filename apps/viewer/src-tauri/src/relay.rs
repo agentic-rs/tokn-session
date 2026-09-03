@@ -1,5 +1,8 @@
-//! Connection-only viewer adapter. Covered providers never fall back to local
+//! Viewer Relay adapter. Covered providers never fall back to local
 //! body reads while a Relay catalog is authoritative, including reconnects.
+mod managed;
+mod settings;
+pub use settings::{RelayMode, RelaySettings};
 use std::{
   collections::HashMap,
   path::PathBuf,
@@ -7,34 +10,21 @@ use std::{
   time::{Duration, Instant},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tokn_session_core::{LoadedSession, Provider, SessionHeader};
 use tokn_session_relay::{
   service_client::{RelaySubscription, load_catalog},
-  service_protocol::{CatalogEntry, DEFAULT_SERVICE_ENDPOINT, local_endpoint},
+  service_protocol::CatalogEntry,
 };
 
 use crate::model::{SessionLocator, ViewerProvider, encode_session_key};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct RelaySettings {
-  pub endpoint: String,
-  pub enabled: bool,
-}
-impl Default for RelaySettings {
-  fn default() -> Self {
-    Self {
-      endpoint: DEFAULT_SERVICE_ENDPOINT.into(),
-      enabled: false,
-    }
-  }
-}
-
 #[derive(Clone, Debug, Serialize)]
 pub struct RelayStatus {
   pub settings: RelaySettings,
+  pub active_endpoint: Option<String>,
   pub phase: String,
   pub native: bool,
   pub error: Option<String>,
@@ -64,6 +54,8 @@ struct State {
   native: bool,
   epoch: u64,
   cancel: CancellationToken,
+  connection_cancel: CancellationToken,
+  active_endpoint: Option<String>,
   providers: Vec<ViewerProvider>,
   entries: Option<Vec<CatalogEntry>>,
   sessions: HashMap<SessionLocator, CachedSession>,
@@ -71,6 +63,7 @@ struct State {
 
 pub struct ViewerRelay {
   pub configure_lock: tokio::sync::Mutex<()>,
+  managed_lock: tokio::sync::Mutex<()>,
   state: Mutex<State>,
   ready: Condvar,
   pub changes: broadcast::Sender<RelayChange>,
@@ -80,13 +73,16 @@ impl ViewerRelay {
   pub fn new() -> Arc<Self> {
     Arc::new(Self {
       configure_lock: tokio::sync::Mutex::new(()),
+      managed_lock: tokio::sync::Mutex::new(()),
       state: Mutex::new(State {
         settings: RelaySettings::default(),
-        phase: "disconnected".into(),
+        phase: "starting".into(),
         error: None,
         native: false,
         epoch: 0,
         cancel: CancellationToken::new(),
+        connection_cancel: CancellationToken::new(),
+        active_endpoint: None,
         providers: Vec::new(),
         entries: None,
         sessions: HashMap::new(),
@@ -104,7 +100,8 @@ impl ViewerRelay {
       .or_else(|| state.sessions.values().find_map(|session| session.error.clone()));
     RelayStatus {
       settings: state.settings.clone(),
-      phase: if error.is_some() && state.settings.enabled {
+      active_endpoint: state.active_endpoint.clone(),
+      phase: if error.is_some() && state.phase == "live" {
         "reconnecting".into()
       } else {
         state.phase.clone()
@@ -115,43 +112,85 @@ impl ViewerRelay {
   }
 
   pub fn configure(self: &Arc<Self>, settings: RelaySettings) -> Result<(), String> {
-    local_endpoint(&settings.endpoint)?;
+    settings.validate()?;
     let (epoch, cancel, reset) = {
       let mut state = self.state.lock().unwrap();
       state.cancel.cancel();
+      state.connection_cancel.cancel();
       for session in state.sessions.values() {
         session.cancel.cancel();
       }
-      // Disconnect retains last-good data; switching endpoint must never mix
-      // snapshots from independently configured services.
-      let reset = state.settings.endpoint != settings.endpoint || state.entries.is_none();
-      if state.settings.endpoint != settings.endpoint {
+      // Explicit source changes clear snapshots. Child crash/restart does not.
+      let reset = state.settings != settings || state.entries.is_none();
+      if reset || settings.mode == RelayMode::Local {
         state.entries = None;
         state.providers.clear();
         state.sessions.clear();
       }
-      if settings.enabled && state.entries.is_none() {
+      if settings.mode != RelayMode::Local && state.entries.is_none() {
         state.providers = vec![ViewerProvider::Codex, ViewerProvider::Pi, ViewerProvider::OpenCode];
       }
-      if !settings.enabled && state.entries.is_none() {
+      if settings.mode == RelayMode::Local {
         state.providers.clear();
       }
       state.epoch += 1;
       state.cancel = CancellationToken::new();
+      state.active_endpoint = None;
+      state.native = false;
       state.settings = settings.clone();
-      state.phase = if settings.enabled { "connecting" } else { "disconnected" }.into();
+      state.phase = match settings.mode {
+        RelayMode::Automatic => "starting",
+        RelayMode::External => "connecting",
+        RelayMode::Local => "local",
+      }
+      .into();
       state.error = None;
       self.ready.notify_all();
       (state.epoch, state.cancel.clone(), reset)
     };
     self.notify(None, reset);
-    if settings.enabled {
-      let manager = self.clone();
-      tauri::async_runtime::spawn(async move {
-        manager.catalog_loop(settings.endpoint, epoch, cancel).await;
-      });
+    match settings.mode {
+      RelayMode::Automatic => {
+        let manager = self.clone();
+        tauri::async_runtime::spawn(async move {
+          manager.run_managed(epoch, cancel, settings.include_native).await;
+        });
+      }
+      RelayMode::External => self.connect_endpoint(settings.endpoint, epoch),
+      RelayMode::Local => {}
     }
     Ok(())
+  }
+
+  pub fn configuration_failed(&self, error: String) {
+    {
+      let mut state = self.state.lock().unwrap();
+      state.phase = "failed".into();
+      state.error = Some(error);
+      // Never silently read a different source when saved settings are invalid.
+      state.providers = vec![ViewerProvider::Codex, ViewerProvider::Pi, ViewerProvider::OpenCode];
+    }
+    self.notify(None, false);
+  }
+
+  fn connect_endpoint(self: &Arc<Self>, endpoint: String, epoch: u64) {
+    let cancel = {
+      let mut state = self.state.lock().unwrap();
+      if state.epoch != epoch || state.cancel.is_cancelled() {
+        return;
+      }
+      state.connection_cancel.cancel();
+      state.connection_cancel = state.cancel.child_token();
+      state.active_endpoint = Some(endpoint.clone());
+      state.phase = "connecting".into();
+      state.error = None;
+      state.connection_cancel.clone()
+    };
+    let manager = self.clone();
+    tauri::async_runtime::spawn(async move {
+      manager.catalog_loop(endpoint, epoch, cancel).await;
+    });
+    self.notify(None, false);
   }
 
   async fn catalog_loop(self: Arc<Self>, endpoint: String, epoch: u64, cancel: CancellationToken) {
@@ -162,7 +201,7 @@ impl ViewerRelay {
       };
       let (changed, first_catalog, resume) = {
         let mut state = self.state.lock().unwrap();
-        if state.epoch != epoch {
+        if state.epoch != epoch || cancel.is_cancelled() {
           return;
         }
         let before = serde_json::to_vec(&state.entries).ok();
@@ -241,7 +280,8 @@ impl ViewerRelay {
 
   pub fn load(self: &Arc<Self>, locator: &SessionLocator) -> Result<Arc<LoadedSession>, String> {
     let mut state = self.state.lock().unwrap();
-    let should_start = state.settings.enabled && state.sessions.get(locator).is_none_or(|s| s.cancel.is_cancelled());
+    let should_start =
+      state.active_endpoint.is_some() && state.sessions.get(locator).is_none_or(|s| s.cancel.is_cancelled());
     if should_start {
       let entry = state
         .entries
@@ -263,7 +303,7 @@ impl ViewerRelay {
           old.cancel.cancel();
         }
       }
-      let cancel = state.cancel.child_token();
+      let cancel = state.connection_cancel.child_token();
       let mut old = state.sessions.remove(locator);
       state.sessions.insert(
         locator.clone(),
@@ -282,7 +322,7 @@ impl ViewerRelay {
         },
       );
       let manager = self.clone();
-      let endpoint = state.settings.endpoint.clone();
+      let endpoint = state.active_endpoint.clone().expect("active endpoint checked above");
       let epoch = state.epoch;
       let locator = locator.clone();
       tauri::async_runtime::spawn(async move {
@@ -295,10 +335,11 @@ impl ViewerRelay {
       if state.epoch != epoch {
         return Err("Relay connection changed; reload the session".into());
       }
-      let session = state
-        .sessions
-        .get_mut(locator)
-        .ok_or("Relay is disconnected; connect to load this session")?;
+      let unavailable = state
+        .error
+        .clone()
+        .unwrap_or_else(|| "Waiting for Relay; retry once it is live".into());
+      let session = state.sessions.get_mut(locator).ok_or_else(|| unavailable.clone())?;
       session.accessed = Instant::now();
       if session.displayed.is_none() {
         session.displayed = session.loaded.clone();
@@ -309,6 +350,9 @@ impl ViewerRelay {
       }
       if let Some(error) = &session.error {
         return Err(error.clone());
+      }
+      if session.cancel.is_cancelled() {
+        return Err(unavailable);
       }
       let remaining = deadline.saturating_duration_since(Instant::now());
       if remaining.is_zero() {
@@ -442,7 +486,7 @@ pub fn read_settings(path: &PathBuf) -> Result<RelaySettings, String> {
 }
 
 pub fn write_settings(path: &PathBuf, settings: &RelaySettings) -> Result<(), String> {
-  local_endpoint(&settings.endpoint)?;
+  settings.validate()?;
   let parent = path.parent().ok_or("Invalid settings path")?;
   std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
   let bytes = serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())?;
@@ -455,18 +499,20 @@ pub fn write_settings(path: &PathBuf, settings: &RelaySettings) -> Result<(), St
 mod tests {
   use super::*;
   use std::{fs::OpenOptions, io::Write};
+  use tokn_session_relay::service_protocol::DEFAULT_SERVICE_ENDPOINT;
   use tokn_session_relay::{ProviderRoot, RelayConfig, service_server::serve_listener};
 
   #[test]
   fn saves_settings_and_rejects_nonlocal_endpoint_without_overwriting() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("settings/relay.json");
-    assert!(!read_settings(&path).unwrap().enabled);
+    assert_eq!(read_settings(&path).unwrap().mode, RelayMode::Automatic);
     write_settings(
       &path,
       &RelaySettings {
         endpoint: DEFAULT_SERVICE_ENDPOINT.into(),
-        enabled: true,
+        mode: RelayMode::External,
+        ..Default::default()
       },
     )
     .unwrap();
@@ -475,12 +521,13 @@ mod tests {
         &path,
         &RelaySettings {
           endpoint: "tcp://0.0.0.0:5557".into(),
-          enabled: false
+          mode: RelayMode::External,
+          ..Default::default()
         }
       )
       .is_err()
     );
-    assert!(read_settings(&path).unwrap().enabled);
+    assert_eq!(read_settings(&path).unwrap().mode, RelayMode::External);
   }
 
   #[tokio::test]
@@ -496,13 +543,14 @@ mod tests {
     let mut config = RelayConfig::new(vec![ProviderRoot::new(Provider::Pi, root.path().into())]);
     config.include_native = true;
     config.poll_interval = Duration::from_millis(20);
-    let server = tokio::spawn(serve_listener(listener, config));
+    let server = tokio::spawn(serve_listener(listener, config.clone()));
     let manager = ViewerRelay::new();
     let mut changes = manager.changes.subscribe();
     manager
       .configure(RelaySettings {
         endpoint: endpoint.clone(),
-        enabled: true,
+        mode: RelayMode::External,
+        ..Default::default()
       })
       .unwrap();
     tokio::time::timeout(Duration::from_secs(4), async {
@@ -561,18 +609,18 @@ mod tests {
       manager.native(&locator, 0, &initial).is_none(),
       "native payload cannot cross snapshots"
     );
-    manager
-      .configure(RelaySettings {
-        endpoint: endpoint.clone(),
-        enabled: false,
-      })
-      .unwrap();
-    assert_eq!(manager.status().phase, "disconnected");
+    server.abort();
+    let _ = server.await;
     assert!(Arc::ptr_eq(&latest, &manager.load(&locator).unwrap()));
+    let listener = tokio::net::TcpListener::bind(endpoint.trim_start_matches("tcp://"))
+      .await
+      .unwrap();
+    let server = tokio::spawn(serve_listener(listener, config));
     manager
       .configure(RelaySettings {
         endpoint: endpoint.clone(),
-        enabled: true,
+        mode: RelayMode::External,
+        ..Default::default()
       })
       .unwrap();
     OpenOptions::new()
@@ -602,13 +650,15 @@ mod tests {
     manager
       .configure(RelaySettings {
         endpoint,
-        enabled: false,
+        mode: RelayMode::Local,
+        ..Default::default()
       })
       .unwrap();
     manager
       .configure(RelaySettings {
         endpoint: "tcp://127.0.0.1:1".into(),
-        enabled: false,
+        mode: RelayMode::Local,
+        ..Default::default()
       })
       .unwrap();
     assert!(!manager.covers(ViewerProvider::Pi));

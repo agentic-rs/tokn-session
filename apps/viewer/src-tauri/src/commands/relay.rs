@@ -27,5 +27,8 @@ pub async fn configure_relay(
     .await
     .map_err(|e| e.to_string())??;
   state.relay.configure(settings)?;
+  // A source-mode change may bring a previously covered provider back to local
+  // history; do not leave its catalog waiting for the five-minute safety sweep.
+  let _ = state.request_session_index_retry();
   Ok(state.relay.status())
 }

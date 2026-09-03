@@ -118,14 +118,34 @@ Any local process can connect; `--native` may expose sensitive provider data.
 
 ### Viewer connection
 
-The viewer's Relay panel saves endpoint and enabled state in its application
-config `relay.json`. It never launches or terminates Relay. Catalog polling
-updates the sidebar; up to eight recently opened sessions share received
-snapshots between timeline, trajectories and Inspector. Covered providers
+The viewer defaults to **Automatic Relay**: it launches a headless child of its
+own executable, running this same service on an OS-assigned loopback port. The
+shipped app needs no separate Relay installation or PATH lookup. The child uses
+the same provider-root environment overrides as local history. A readiness pipe
+reports the bound endpoint; the private port never replaces the saved external
+endpoint. The app closes a lifetime pipe and reaps its child on exit/mode changes;
+the child also exits on EOF if its parent crashes. Startup has a ten-second
+timeout. Failures/crashes get at most three launch attempts with one-/two-second
+backoff, then show Failed with an explicit Retry. Other Relay processes are
+never stopped.
+
+The panel persists `mode` (`automatic`, `external`, or `local`), external
+`endpoint`, and `include_native` in app config `relay.json`. Native is off by
+default and optional for Automatic; External uses the service's capability.
+Legacy `enabled: true` settings migrate to External with the same endpoint;
+explicitly disabled settings migrate to Local. Missing settings use Automatic.
+Invalid settings produce a visible error instead of silent fallback.
+
+External connects to a separately started `tokn-session-relay serve` and never
+owns that process. Local explicitly clears Relay snapshots, stops any owned
+child, and wakes the local catalog/index path. Switching mode, external endpoint,
+or native inclusion clears snapshots to avoid mixing data sources.
+Catalog polling updates the sidebar; up to eight recently opened sessions share
+received snapshots between timeline, trajectories and Inspector. Covered providers
 bypass local body indexing/reading. Uncovered providers retain local history.
-An enabled connection reconnects automatically and keeps the last committed
-data through failures. Explicit Disconnect also retains cached sessions until
-restart; switching endpoints clears them to avoid mixing independent sources.
+Connection failures and automatic child restarts retain last-good committed
+data without local fallback. Catalog and session connections are cancelled
+before reconnecting to a restarted child's new port.
 
 Live updates refresh the loaded event window and expanded trajectory items,
 including while reading older events. Scrolling follows only at the bottom;
