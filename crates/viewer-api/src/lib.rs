@@ -1,4 +1,4 @@
-//! HTTP adapter for viewer-core. The browser bundle is served independently.
+//! HTTP adapter and static browser host for viewer-core.
 use axum::{
   Json, Router,
   extract::{DefaultBodyLimit, Path, Request, State},
@@ -8,14 +8,17 @@ use axum::{
     IntoResponse, Response, Sse,
     sse::{Event, KeepAlive},
   },
-  routing::{get, post},
+  routing::{any, get, post},
 };
 use serde_json::{Value, json};
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{convert::Infallible, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{Semaphore, broadcast};
 use tokio_util::sync::CancellationToken;
 use tokn_viewer_core::{ViewerService, runtime::ViewerEvent};
-use tower_http::cors::CorsLayer;
+use tower_http::{
+  cors::CorsLayer,
+  services::{ServeDir, ServeFile},
+};
 
 #[derive(Clone)]
 struct ApiState {
@@ -51,6 +54,8 @@ pub fn router(
     .route("/api/v1/health", get(|| async { Json(json!({"version": 1})) }))
     .route("/api/v1/events", get(event_stream))
     .route("/api/v1/{command}", post(command))
+    .route("/api", any(api_not_found))
+    .route("/api/{*path}", any(api_not_found))
     .layer(middleware::from_fn_with_state(state.clone(), authenticate))
     .layer(DefaultBodyLimit::max(1024 * 1024))
     .layer(
@@ -60,6 +65,23 @@ pub fn router(
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
     )
     .with_state(state)
+}
+
+/// Serve a Vite production build without allowing its SPA fallback to hide
+/// misspelled API routes.
+pub fn with_web_ui(app: Router, web_root: PathBuf) -> Result<Router, String> {
+  let index = web_root.join("index.html");
+  if !index.is_file() {
+    return Err(format!(
+      "Viewer web UI is missing at {}. Run `pnpm --dir apps/viewer build` or pass --web-root.",
+      index.display()
+    ));
+  }
+  Ok(app.fallback_service(ServeDir::new(web_root).fallback(ServeFile::new(index))))
+}
+
+async fn api_not_found() -> ApiError {
+  error(StatusCode::NOT_FOUND, "Unknown viewer API route")
 }
 
 async fn authenticate(State(state): State<ApiState>, request: Request, next: Next) -> Response {
@@ -187,6 +209,53 @@ mod tests {
   use super::*;
   use axum::body::{Body, to_bytes};
   use tower::ServiceExt;
+
+  #[tokio::test]
+  async fn serves_the_browser_without_exposing_or_masking_api_routes() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("index.html"), "<main>viewer shell</main>").unwrap();
+    std::fs::write(root.path().join("app.js"), "console.log('viewer')").unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let service = ViewerService::native(data.path().join("index.sqlite")).unwrap();
+    let (events, _) = broadcast::channel(16);
+    let app = with_web_ui(
+      router(
+        service,
+        events,
+        Some("test-secret".into()),
+        vec![],
+        CancellationToken::new(),
+      ),
+      root.path().to_path_buf(),
+    )
+    .unwrap();
+
+    for path in ["/", "/sessions/selected", "/app.js"] {
+      let response = app
+        .clone()
+        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+      assert_eq!(response.status(), StatusCode::OK, "{path}");
+    }
+    let response = app
+      .oneshot(
+        Request::builder()
+          .method(Method::POST)
+          .uri("/api/v1/missing")
+          .header(header::AUTHORIZATION, "Bearer test-secret")
+          .header(header::CONTENT_TYPE, "application/json")
+          .body(Body::from("{}"))
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+      response.headers().get(header::CONTENT_TYPE).unwrap(),
+      "application/json"
+    );
+  }
 
   #[tokio::test]
   async fn protects_http_and_events_and_rejects_forged_keys() {

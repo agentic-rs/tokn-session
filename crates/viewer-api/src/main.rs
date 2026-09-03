@@ -7,7 +7,7 @@ use tokn_viewer_core::{
 };
 
 #[derive(Parser)]
-#[command(about = "Viewer HTTP API; serves session data, not the web UI")]
+#[command(about = "Viewer web server and HTTP API")]
 struct Args {
   #[command(subcommand)]
   command: Option<Command>,
@@ -19,6 +19,9 @@ struct Args {
   /// Exact browser origins allowed to read this API (repeatable).
   #[arg(long)]
   allow_origin: Vec<String>,
+  /// Directory containing the compiled viewer index.html and assets.
+  #[arg(long, env = "TOKN_VIEWER_WEB_ROOT", default_value = "apps/viewer/dist")]
+  web_root: PathBuf,
   #[arg(long)]
   index_path: Option<PathBuf>,
   #[arg(long)]
@@ -84,18 +87,21 @@ async fn run(args: Args) -> Result<(), String> {
   })?;
   let runtime = ViewerRuntime::start(service.clone());
   let shutdown = tokio_util::sync::CancellationToken::new();
-  let app = tokn_viewer_api::router(
-    service.clone(),
-    runtime.events.clone(),
-    token,
-    origins,
-    shutdown.clone(),
-  );
+  let app = tokn_viewer_api::with_web_ui(
+    tokn_viewer_api::router(
+      service.clone(),
+      runtime.events.clone(),
+      token,
+      origins,
+      shutdown.clone(),
+    ),
+    args.web_root,
+  )?;
   let listener = tokio::net::TcpListener::bind(args.bind)
     .await
     .map_err(|e| e.to_string())?;
   eprintln!(
-    "Viewer API listening on http://{}",
+    "Viewer listening on http://{}",
     listener.local_addr().map_err(|e| e.to_string())?
   );
   let result = axum::serve(listener, app)

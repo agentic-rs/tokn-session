@@ -42,9 +42,12 @@ pnpm run check
 pnpm tauri dev
 ```
 
-`pnpm run dev` starts the browser frontend. Start `cargo run -p tokn-viewer-api --
---allow-origin http://localhost:1437` separately, then connect to its address.
-See [remote setup and API contract](../../docs/viewer-api.md). Build the desktop application with:
+`pnpm run dev` starts the browser frontend for development. Start `cargo run -p
+tokn-viewer-api -- --allow-origin http://localhost:1437` separately, then
+connect to its address. For the integrated browser viewer, run `pnpm run build`
+and start `tokn-viewer-api` from the repository root; it serves `dist/` and the
+API at `http://127.0.0.1:5558`. See [remote setup and API
+contract](../../docs/viewer-api.md). Build the desktop application with:
 
 ```sh
 pnpm tauri build

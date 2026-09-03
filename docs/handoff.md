@@ -51,10 +51,12 @@ captured compaction. Upgrade strict `AgentEvent` consumers with the producer.
 
 Desktop calls shared Rust `crates/viewer-core` directly through Tauri. The
 browser frontend connects to `crates/viewer-api` over HTTP/SSE, one selected
-machine at a time. The API is data-only; Vite/build serves the UI independently.
-Run `cargo run -p tokn-viewer-api -- --allow-origin http://localhost:1437`
-and `pnpm --dir apps/viewer dev`. See [viewer-api.md](viewer-api.md) for the
-contract, authentication, origins, and SSH-tunnel setup. Remote keys must match
+machine at a time. `viewer-api` serves the compiled `apps/viewer/dist` frontend
+with SPA fallback as well as authenticated `/api/v1` data routes. Build with
+`pnpm --dir apps/viewer build`, then run `cargo run -p tokn-viewer-api` and open
+`http://127.0.0.1:5558`. Vite remains available as a separate development
+server with an explicit allowed origin. See [viewer-api.md](viewer-api.md) for
+the contract, authentication, origins, and SSH-tunnel setup. Remote keys must match
 the discovered catalog before history can be read. Browser tokens stay in memory;
 switching machines aborts old requests and clears the UI. SSE reconnects trigger
 catalog/timeline refreshes. Desktop does not consume HTTP for local viewing.

@@ -4,7 +4,9 @@ import { ViewerPage } from "./pages/ViewerPage";
 import { isDesktop, RemoteClient, selectMachine, type ConnectionState } from "./lib/transport";
 
 function BrowserViewer() {
-  const [endpoint, setEndpoint] = useState("http://127.0.0.1:5558");
+  const [endpoint, setEndpoint] = useState(() => import.meta.env.DEV
+    ? "http://127.0.0.1:5558"
+    : window.location.origin);
   const [token, setToken] = useState("");
   const [client, setClient] = useState<RemoteClient>();
   const [state, setState] = useState<ConnectionState>("connecting");
@@ -31,8 +33,8 @@ function BrowserViewer() {
   return <main className="machine-connect">
     <form onSubmit={(event) => { event.preventDefault(); void connect(); }}>
       <h1>Session viewer</h1>
-      <p>Connect to the viewer API on the machine whose sessions you want to read.</p>
-      <label htmlFor="machine-url">API address</label>
+      <p>Connect to the viewer server on the machine whose sessions you want to read.</p>
+      <label htmlFor="machine-url">Viewer address</label>
       <input id="machine-url" type="url" value={endpoint} disabled={busy} required onChange={(event) => setEndpoint(event.target.value)} />
       <label htmlFor="machine-token">Access token</label>
       <input id="machine-token" type="password" value={token} disabled={busy} autoComplete="off" onChange={(event) => setToken(event.target.value)} />

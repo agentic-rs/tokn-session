@@ -1,13 +1,13 @@
 # Remote session viewer
 
 The same frontend runs in Tauri or a browser. Desktop calls `viewer-core`
-directly through Tauri commands. A browser calls the separate Rust
-`viewer-api`, which also consumes `viewer-core`. The API never serves the UI.
+directly through Tauri commands. In browser mode, the Rust `viewer-api` hosts
+the compiled frontend and exposes the HTTP/SSE adapter over the same origin.
 
 ```text
 Desktop UI → Tauri commands ─┐
                             ├→ viewer-core → provider history / snapshot readers
-Browser UI → HTTP/SSE API ───┘             ↖ Relay live feed (managed stdio)
+Browser → viewer-api (UI + HTTP/SSE) ──────┘ ↖ Relay live feed (managed stdio)
 ```
 
 `viewer-core` owns catalogs, history, paging, trajectories, native Inspector
@@ -22,23 +22,25 @@ simplification, not a measured throughput claim.
 
 ## Run locally
 
-From the repository root, start the API on the machine containing sessions:
-
-```sh
-cargo run -p tokn-viewer-api -- --allow-origin http://localhost:1437
-```
-
-Then independently start the UI:
+From the repository root, build the reused frontend and start the viewer server
+on the machine containing sessions:
 
 ```sh
 pnpm --dir apps/viewer install --frozen-lockfile
-pnpm --dir apps/viewer dev
+pnpm --dir apps/viewer build
+cargo run -p tokn-viewer-api
 ```
 
-Open `http://localhost:1437`, enter `http://127.0.0.1:5558`, and connect.
+Open `http://127.0.0.1:5558`; the browser defaults to the server that delivered
+the page. The connection screen remains available for selecting another
+machine.
 The API defaults to loopback with no token. Set `TOKN_VIEWER_TOKEN` to require
 bearer authentication on every data and event endpoint. The browser keeps the
 token in memory only; reloads require reconnecting.
+
+During frontend development, `pnpm --dir apps/viewer dev` still runs Vite at
+`http://localhost:1437`. Start `viewer-api` with `--allow-origin
+http://localhost:1437`, then connect to `http://127.0.0.1:5558`.
 
 For a remote machine, a loopback API plus an SSH tunnel is sufficient:
 
@@ -46,16 +48,19 @@ For a remote machine, a loopback API plus an SSH tunnel is sufficient:
 ssh -N -L 5558:127.0.0.1:5558 your-machine
 ```
 
-Run the frontend locally and connect to the forwarded address. The API's
-`--allow-origin` must match the frontend's exact origin. Repeat the flag to
-allow additional origins. No origins are allowed by default. There is no
+Open `http://127.0.0.1:5558` after creating the tunnel. Same-origin requests do
+not need CORS configuration. `--allow-origin` is only needed when Vite or a UI
+loaded from another viewer host connects across origins; it must match that
+frontend's exact origin. Repeat the flag for additional origins. There is no
 wildcard option. Non-loopback `--bind` requires a token; use HTTPS termination
-or a private encrypted tunnel when transmitting sessions across a network.
-The API itself speaks HTTP and does not configure TLS or a hosting provider.
+or a private encrypted tunnel when transmitting sessions across a network. The
+server speaks HTTP and does not configure TLS or a hosting provider.
 
 Options:
 
 - `--bind 127.0.0.1:5558`: listening address; port `0` chooses a free port.
+- `--web-root apps/viewer/dist`: compiled Vite directory containing
+  `index.html`; `TOKN_VIEWER_WEB_ROOT` provides the same setting.
 - `--allow-origin http://localhost:1437`: allowed frontend origin.
 - `--index-path <file>`: defaults to `~/.tokn/sessions/index.sqlite`.
 - `--native`: include provider-native Inspector records in automatic mode.
