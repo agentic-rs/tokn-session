@@ -29,6 +29,16 @@ not added to every `AgentEvent` variant. Existing native/provenance fields in
 the IR remain unchanged. Opting in can expose additional provider metadata;
 neither mode is a redaction or security boundary.
 
+Compaction observations use the same record batches and snapshot/follow updates;
+no extra transport or native subscription is required. Codex, Pi, and OpenCode
+normalization supplies these events even with native disabled. The viewer
+projects correlated observations into a stable expandable card; terminal-pet
+does not treat them as conversation replies or turn completion. ZCode and DSH
+currently reach the viewer through local history, not Relay.
+This adds an `AgentEvent` variant: strict enum consumers must upgrade alongside
+the producer. The transport framing/version is unchanged; older consumers are
+not guaranteed to understand the expanded event vocabulary.
+
 ## Source boundaries and identity
 
 Record keys are scoped by `(path, topic, record_id)`. An `upsert` replaces the

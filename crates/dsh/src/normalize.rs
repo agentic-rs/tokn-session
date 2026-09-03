@@ -91,6 +91,9 @@ impl Normalizer {
     if !valid_surface(&native) {
       return vec![self.unknown(native, time)];
     }
+    if let Some(events) = super::compaction::normalize(&self.session_id, &native) {
+      return events.unwrap_or_else(|| vec![self.unknown(native.clone(), time.clone())]);
+    }
     let DshSessionItem::Event(event) = item else {
       if let Some((kind, summary)) = super::metadata::classify(&native) {
         return vec![self.metadata(kind, summary, native, time)];

@@ -358,6 +358,7 @@ pub struct AcknowledgeSessionAttentionResponse {
 
 #[derive(Debug, Serialize)]
 pub struct EventSummary {
+  pub compaction: Option<CompactionCardSummary>,
   pub event_key: String,
   #[serde(rename = "type")]
   pub event_type: String,
@@ -381,6 +382,23 @@ pub struct EventSummary {
   /// activity's provider-native target ID resolves to a canonical direct child
   /// of the session being viewed.
   pub agent_activity: Option<AgentActivityCardSummary>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompactionCardSummary {
+  pub state: String,
+  pub trigger: Option<String>,
+  pub reason: Option<String>,
+  pub has_summary: bool,
+  pub summary_opaque: bool,
+  pub measurements: Vec<CompactionTokenSummary>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompactionTokenSummary {
+  pub scope: String,
+  pub tokens: String,
+  pub estimated: Option<bool>,
 }
 
 /// Bounded, source-neutral presentation metadata for one collapsed run of

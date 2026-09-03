@@ -256,6 +256,14 @@ pub fn render_event_pretty(event: &AgentEvent) -> String {
       }
     }
     AgentEvent::SessionSettingsApplied(event) => render_session_settings(&mut output, event),
+    AgentEvent::Compaction(event) => {
+      output.push_str(event.state.label());
+      if let Some(summary) = &event.summary {
+        output.push_str("\n");
+        output.push_str(summary);
+      }
+      output.push_str("\n\n");
+    }
     AgentEvent::Lifecycle(_) | AgentEvent::Usage(_) | AgentEvent::Metadata(_) => {
       output.push_str(&render_event_summary(event));
       output.push_str("\n\n");
@@ -346,6 +354,7 @@ pub fn render_event_summary(event: &AgentEvent) -> String {
     AgentEvent::SessionSettingsApplied(event) => render_session_settings_summary(event),
     AgentEvent::Lifecycle(event) => render_lifecycle(event),
     AgentEvent::Usage(event) => render_usage(event),
+    AgentEvent::Compaction(event) => event.state.label().to_string(),
     AgentEvent::Metadata(event) => format!("[{}] {}", event.native_type, first_line(&event.summary)),
     AgentEvent::Message(event) => format!("{} {}", role_label(event.role), first_line(&event.text)),
     AgentEvent::Reasoning(event) => {
@@ -390,6 +399,7 @@ pub fn event_type(event: &AgentEvent) -> &'static str {
     AgentEvent::SessionSettingsApplied(_) => "settings",
     AgentEvent::Lifecycle(_) => "lifecycle",
     AgentEvent::Usage(_) => "usage",
+    AgentEvent::Compaction(_) => "compaction",
     AgentEvent::Metadata(_) => "metadata",
     AgentEvent::Message(_) => "message",
     AgentEvent::Reasoning(_) => "reasoning",

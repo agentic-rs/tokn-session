@@ -21,6 +21,29 @@ fn record(kind: &str, seq: u64, data: Value) -> Value {
   json!({"type":kind,"seq":seq,"time":1000+seq,"data":data})
 }
 
+#[test]
+fn compaction_plugin_records_and_checkpoint_are_not_user_messages() {
+  let mut checkpoint = record(
+    "user/message",
+    3,
+    json!({"id":"summary","content":[{"type":"text","text":"retained context"}],
+    "source":{"kind":"plugin","plugin":"compact","compactionId":"op"}}),
+  );
+  checkpoint["surfaceOp"] = json!({"op":"replace","start":0,"end":1});
+  let events = normalize(vec![
+    record("compaction/start", 2, json!({"compactionId":"op","turn":null})),
+    checkpoint,
+    record("compaction/end", 4, json!({"compactionId":"op","turn":null})),
+    record("compaction/start", 5, json!({"compactionId":"broken"})),
+  ]);
+  assert_eq!(
+    events.iter().map(|e| e["type"].as_str().unwrap()).collect::<Vec<_>>(),
+    ["compaction", "compaction", "compaction", "unknown"]
+  );
+  assert_eq!(events[1]["summary"], "retained context");
+  assert_eq!(events[2]["state"], "completed");
+}
+
 fn assistant(seq: u64, step: u64, usage: Option<Value>) -> Value {
   let mut value = record(
     "assistant/message",

@@ -26,6 +26,7 @@ import {
 import { MarkdownContent } from "./MarkdownContent";
 import type { TechnicalCardHeading } from "./CardPresentation";
 import { ReasoningCard, reasoningHeading } from "./ReasoningCard";
+import { CompactionCard } from "./CompactionCard";
 import { UsageCard, usageHeading } from "./UsageCard";
 
 interface EventCardProps {
@@ -360,10 +361,14 @@ function cardHeading(event: EventSummary): TechnicalCardHeading | null {
 }
 
 function usesControlledExpansion(event: EventSummary): boolean {
-  return event.type === "tool_call" || event.type === "reasoning";
+  return event.type === "tool_call" || event.type === "reasoning" || event.type === "compaction";
 }
 
 function eventStatus(event: EventSummary): { label: string; tone: string } | null {
+  if (event.type === "compaction") {
+    const state = event.compaction?.state;
+    return state ? { label: humanize(state), tone: state === "failed" ? "error" : "neutral" } : null;
+  }
   if (event.type === "agent_activity") {
     const kind = event.agent_activity?.kind.trim();
     if (!kind) {
@@ -878,6 +883,14 @@ export function EventCard({
             <UsageCard usage={event.usage} />
           ) : event.type === "reasoning" ? (
             <ReasoningCard
+              detail={detail}
+              error={detail_error}
+              event={event}
+              is_loading={detail_loading}
+              on_retry={on_retry_detail}
+            />
+          ) : event.type === "compaction" ? (
+            <CompactionCard
               detail={detail}
               error={detail_error}
               event={event}

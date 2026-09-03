@@ -2,8 +2,8 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokn_session_core::{
-  AgentEvent, MessageDelivery, MessageEvent, MessageProvenance, MetadataEvent, MetadataKind, Phase, Provider, Role,
-  UnknownEvent, UsageEvent, UsageKind,
+  AgentEvent, CompactionEvent, CompactionState, CompactionTokenScope, MessageDelivery, MessageEvent, MessageProvenance,
+  MetadataEvent, MetadataKind, Phase, Provider, Role, UnknownEvent, UsageEvent, UsageKind,
 };
 
 pub(crate) fn normalize(session_id: Option<String>, native: Value, timestamp: Option<String>) -> Vec<AgentEvent> {
@@ -47,15 +47,31 @@ pub(crate) fn normalize(session_id: Option<String>, native: Value, timestamp: Op
         timestamp.clone(),
       )
     });
-  let mut events = vec![AgentEvent::Metadata(MetadataEvent {
-    provider: Provider::Pi,
-    session_id,
-    kind,
-    native_type: native["type"].as_str().unwrap().into(),
-    summary,
-    native,
-    timestamp,
-  })];
+  let observation = if native["type"] == "compaction" {
+    let mut event = CompactionEvent::new(Provider::Pi, session_id.clone(), CompactionState::Completed);
+    event.compaction_id = native["id"].as_str().map(str::to_owned);
+    event.source_refs = event.compaction_id.iter().cloned().collect();
+    event.timestamp = timestamp.clone();
+    event.summary = native["summary"].as_str().map(str::to_owned);
+    event.context.first_kept_entry_id = native["firstKeptEntryId"].as_str().map(str::to_owned);
+    event.tokens(
+      CompactionTokenScope::ContextBefore,
+      native["tokensBefore"].as_u64().unwrap(),
+      None,
+    );
+    AgentEvent::Compaction(event)
+  } else {
+    AgentEvent::Metadata(MetadataEvent {
+      provider: Provider::Pi,
+      session_id,
+      kind,
+      native_type: native["type"].as_str().unwrap().into(),
+      summary,
+      native,
+      timestamp,
+    })
+  };
+  let mut events = vec![observation];
   events.extend(accounting);
   events
 }

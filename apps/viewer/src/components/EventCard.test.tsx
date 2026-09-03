@@ -171,6 +171,30 @@ function renderCard(
 }
 
 describe("EventCard conversation content", () => {
+  it("expands compaction summaries with precisely scoped measurements", () => {
+    const onToggle = vi.fn();
+    const compaction = event({
+      type: "compaction", role: null, title: "Context compacted", summary: "Context compacted", phase: "completed",
+      compaction: { state: "completed", trigger: "auto", reason: null, has_summary: true, summary_opaque: false,
+        measurements: [{ scope: "replaced_context", tokens: "9007199254740993", estimated: true }] },
+    });
+    renderCard(compaction, { on_toggle: onToggle, is_expanded: true,
+      detail: detail({ event: { type: "compaction", summary: "## Retained context\nA **decision**" } }),
+    });
+    expect(screen.getByRole("heading", { name: "Retained context" })).toBeInTheDocument();
+    expect(screen.getByText("decision").tagName).toBe("STRONG");
+    expect(screen.getByText("Replaced context: 9007199254740993 tokens (estimated)")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { expanded: true }));
+    expect(onToggle).toHaveBeenCalledWith("event.v1.1");
+  });
+
+  it("explains opaque compaction summaries without inventing readable content", () => {
+    renderCard(event({ type: "compaction", title: "Context compacted", role: null,
+      compaction: { state: "completed", trigger: null, reason: null, has_summary: false, summary_opaque: true, measurements: [] },
+    }), { is_expanded: true });
+    expect(screen.getByText("The provider stored an opaque compaction summary.")).toBeInTheDocument();
+  });
+
   it("renders visible conversation Markdown outside the inspect button", () => {
     const onSelect = vi.fn();
     const { container } = renderCard(event(), { on_select: onSelect });

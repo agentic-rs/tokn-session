@@ -1,5 +1,5 @@
 use serde_json::{Value, json};
-use tokn_session_core::{AgentEvent, MessageDelivery, MetadataKind, Role, UsageKind};
+use tokn_session_core::{AgentEvent, MessageDelivery, Role, UsageKind};
 use tokn_session_pi::normalize::PiNormalizer;
 
 fn normalize(mut record: Value) -> Vec<AgentEvent> {
@@ -142,15 +142,27 @@ fn invalid_usage_does_not_swallow_readable_message() {
 }
 
 #[test]
-fn compaction_is_context_metadata_not_completion() {
+fn compaction_is_a_context_checkpoint_not_a_reply() {
   let events = normalize(
     json!({"type":"compaction","summary":"private context","firstKeptEntryId":"keep",
     "tokensBefore":200,"fromHook":true,"details":{"plugin":"custom"}}),
   );
-  let [AgentEvent::Metadata(event)] = &events[..] else {
+  let [AgentEvent::Compaction(event)] = &events[..] else {
     panic!("expected context")
   };
-  assert!(matches!(event.kind, MetadataKind::Context));
-  assert!(!event.summary.contains("private context"));
-  assert_eq!(event.native["fromHook"], true);
+  assert_eq!(event.state, tokn_session_core::CompactionState::Completed);
+  assert_eq!(event.summary.as_deref(), Some("private context"));
+  assert_eq!(event.context.first_kept_entry_id.as_deref(), Some("keep"));
+  assert_eq!(event.measurements[0].tokens, 200);
+  assert_eq!(event.measurements[0].estimated, None);
+}
+
+#[test]
+fn compaction_fixture_preserves_the_earlier_conversation() {
+  let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compaction.jsonl");
+  let session = tokn_session_pi::PiSessionSource::new(None)
+    .load_session_path(&path)
+    .unwrap();
+  assert!(matches!(&session.events[1], AgentEvent::Message(e) if e.text == "Keep this conversation visible."));
+  assert!(matches!(&session.events[2], AgentEvent::Compaction(e) if e.compaction_id.as_deref() == Some("compact-1")));
 }

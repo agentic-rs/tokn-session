@@ -42,6 +42,62 @@ async fn snapshot(subscription: &mut RelaySubscription) -> SessionSnapshot {
     .unwrap()
 }
 
+#[tokio::test]
+async fn compaction_appends_and_correlates_with_and_without_native_without_replaying_messages() {
+  for native in [false, true] {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("rollout-compaction.jsonl");
+    std::fs::write(
+      &path,
+      concat!(
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"compact-session\"}}\n",
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hello\"}}\n"
+      ),
+    )
+    .unwrap();
+    let server = server(root.path(), Provider::Codex, native).await;
+    let key = load_catalog(&server.endpoint).await.unwrap().entries.remove(0).key;
+    let mut client = RelaySubscription::connect(&server.endpoint, &key).await.unwrap();
+    let initial = snapshot(&mut client).await;
+    append(
+      &path,
+      concat!(
+        "{\"type\":\"compacted\",\"payload\":{\"message\":\"kept decisions\"}}\n",
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"context_compacted\"}}\n"
+      ),
+    );
+    let updated = tokio::time::timeout(Duration::from_secs(4), async {
+      loop {
+        let next = snapshot(&mut client).await;
+        if next
+          .loaded
+          .events
+          .iter()
+          .filter(|e| matches!(e, AgentEvent::Compaction(_)))
+          .count()
+          == 2
+        {
+          break next;
+        }
+      }
+    })
+    .await
+    .unwrap();
+    assert_eq!(updated.generation, initial.generation);
+    assert_eq!(messages(&updated), ["hello"]);
+    let operations = tokn_session_core::compaction_operations(&updated.loaded.events);
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].event.summary.as_deref(), Some("kept decisions"));
+    for index in &operations[0].source_event_indices {
+      assert_eq!(updated.native[*index].is_some(), native);
+    }
+    let mut reconnect = RelaySubscription::connect(&server.endpoint, &key).await.unwrap();
+    let replay = snapshot(&mut reconnect).await;
+    assert_eq!(replay.loaded.events.len(), updated.loaded.events.len());
+    assert_eq!(tokn_session_core::compaction_operations(&replay.loaded.events).len(), 1);
+  }
+}
+
 fn append(path: &Path, text: &str) {
   OpenOptions::new()
     .append(true)

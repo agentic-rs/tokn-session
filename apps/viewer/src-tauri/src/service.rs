@@ -31,6 +31,7 @@ use crate::model::{
 };
 use crate::repository::{NativeRepository, ViewerRepository};
 
+mod compaction;
 mod trajectory_state;
 
 const MAX_DETAIL_VALUE_BYTES: usize = 512 * 1024;
@@ -2496,6 +2497,18 @@ impl ViewerService {
     }
 
     let source_event_index = decode_event_key(&request.event_key)?;
+    if let Some(operation) = compaction::for_source(&loaded.events, source_event_index) {
+      let mut detail = event_detail(
+        encode_event_key(source_event_index),
+        &AgentEvent::Compaction(operation.event),
+        &loaded.events,
+        source_event_index,
+      )?;
+      if let Some(native) = self.relay_native_detail(&locator, &loaded, &operation.source_event_indices)? {
+        detail.native = Some(native);
+      }
+      return Ok(detail);
+    }
     let entry = base_timeline_entry_for_source(&loaded.events, source_event_index)
       .ok_or_else(|| "event key is outside the session".to_string())?;
 
@@ -3704,6 +3717,9 @@ fn event_page_bounds(
 fn base_timeline_entries(events: &[AgentEvent]) -> Vec<TimelineEntry> {
   let mut operations_by_timeline_source = HashMap::new();
   let mut hidden_tool_sources = HashSet::new();
+  for operation in tokn_session_core::compaction_operations(events) {
+    hidden_tool_sources.extend(operation.source_event_indices.into_iter().skip(1));
+  }
 
   for operation in assemble_tool_operations(events) {
     let Some(timeline_source_event_index) = operation.timeline_source_event_index() else {
@@ -3867,7 +3883,7 @@ fn is_trajectory_boundary(entry: &TimelineEntry, events: &[AgentEvent]) -> bool 
 
   match event {
     AgentEvent::Message(message) => !is_non_final_assistant_message(message.role, message.delivery),
-    AgentEvent::SessionStarted(_) | AgentEvent::ProviderChanged(_) => true,
+    AgentEvent::SessionStarted(_) | AgentEvent::ProviderChanged(_) | AgentEvent::Compaction(_) => true,
     _ => false,
   }
 }
@@ -3988,6 +4004,7 @@ fn trajectory_event_summary(trajectory: &Trajectory, events: &[AgentEvent]) -> E
     reasoning: None,
     trajectory: Some(card),
     agent_activity: None,
+    compaction: None,
   }
 }
 
@@ -4062,7 +4079,8 @@ fn trajectory_card_summary(trajectory: &Trajectory, events: &[AgentEvent]) -> Tr
           | AgentEvent::Message(_)
           | AgentEvent::GoalUpdated(_)
           | AgentEvent::ToolCall(_)
-          | AgentEvent::Metadata(_) => {}
+          | AgentEvent::Metadata(_)
+          | AgentEvent::Compaction(_) => {}
         }
         if error_for_event(event) == Some(true) && !matches!(event, AgentEvent::Error(_)) {
           error_count += 1;
@@ -4171,11 +4189,17 @@ fn event_summary(events: &[AgentEvent], index: usize, event: &AgentEvent) -> Eve
 }
 
 fn event_summary_with_delegation_targets(
-  _events: &[AgentEvent],
+  events: &[AgentEvent],
   index: usize,
   event: &AgentEvent,
   delegation_targets: &HashMap<String, SessionSummary>,
 ) -> EventSummary {
+  let projected = if matches!(event, AgentEvent::Compaction(_)) {
+    compaction::for_source(events, index).map(|operation| AgentEvent::Compaction(operation.event))
+  } else {
+    None
+  };
+  let event = projected.as_ref().unwrap_or(event);
   let hidden = event.is_hidden();
   let title = if hidden {
     "Hidden provider content".to_string()
@@ -4231,6 +4255,7 @@ fn event_summary_with_delegation_targets(
     reasoning,
     trajectory: None,
     agent_activity,
+    compaction: compaction::card(event),
   }
 }
 
@@ -4274,6 +4299,7 @@ fn tool_operation_event_summary(source_event_index: usize, operation: &ToolOpera
     reasoning: None,
     trajectory: None,
     agent_activity: None,
+    compaction: None,
   }
 }
 
@@ -4602,6 +4628,7 @@ fn normalized_event_type(event: &AgentEvent) -> &'static str {
     AgentEvent::Lifecycle(_) => "lifecycle",
     AgentEvent::Usage(_) => "usage",
     AgentEvent::Metadata(_) => "metadata",
+    AgentEvent::Compaction(_) => "compaction",
     AgentEvent::Error(_) => "error",
     AgentEvent::Unknown(_) => "unknown",
   }
@@ -4626,6 +4653,7 @@ fn event_title(event: &AgentEvent) -> String {
     AgentEvent::Lifecycle(_) => "Lifecycle".to_string(),
     AgentEvent::Usage(_) => "Usage".to_string(),
     AgentEvent::Metadata(event) => event.native_type.clone(),
+    AgentEvent::Compaction(event) => event.state.label().into(),
     AgentEvent::Error(_) => "Error".to_string(),
     AgentEvent::Unknown(event) => event.native_type.clone().unwrap_or_else(|| "Unknown event".to_string()),
   }
@@ -4644,6 +4672,7 @@ fn provider_for_event(event: &AgentEvent) -> ViewerProvider {
     AgentEvent::Lifecycle(event) => event.provider,
     AgentEvent::Usage(event) => event.provider,
     AgentEvent::Metadata(event) => event.provider,
+    AgentEvent::Compaction(event) => event.provider,
     AgentEvent::Error(event) => event.provider,
     AgentEvent::Unknown(event) => event.provider,
   };
@@ -4674,6 +4703,7 @@ fn timestamp_for_event(event: &AgentEvent) -> Option<&str> {
     AgentEvent::Lifecycle(event) => event.timestamp.as_deref(),
     AgentEvent::Usage(event) => event.timestamp.as_deref(),
     AgentEvent::Metadata(event) => event.timestamp.as_deref(),
+    AgentEvent::Compaction(event) => event.timestamp.as_deref(),
     AgentEvent::Error(event) => event.timestamp.as_deref(),
     AgentEvent::Unknown(event) => event.timestamp.as_deref(),
   }
@@ -4685,6 +4715,7 @@ fn phase_for_event(event: &AgentEvent) -> Option<String> {
     AgentEvent::Reasoning(event) => serialized_label(event.phase),
     AgentEvent::ToolCall(event) => serialized_label(event.phase),
     AgentEvent::Lifecycle(event) => serialized_label(event.phase),
+    AgentEvent::Compaction(event) => serialized_label(event.state),
     _ => None,
   }
 }
@@ -4705,6 +4736,7 @@ fn error_for_event(event: &AgentEvent) -> Option<bool> {
     AgentEvent::Error(_) => Some(true),
     AgentEvent::ToolCall(event) => event.is_error,
     AgentEvent::Lifecycle(event) => Some(matches!(event.outcome, Some(LifecycleOutcome::Failed))),
+    AgentEvent::Compaction(event) => Some(event.state == tokn_session_core::CompactionState::Failed),
     _ => None,
   }
 }
@@ -5062,6 +5094,7 @@ fn native_detail(event: &AgentEvent) -> Option<Value> {
     | AgentEvent::ProviderChanged(_)
     | AgentEvent::GoalUpdated(_)
     | AgentEvent::ToolCall(_)
+    | AgentEvent::Compaction(_)
     | AgentEvent::Error(_) => None,
   }
 }
@@ -10601,6 +10634,7 @@ mod tests {
       AgentEvent::Metadata(event) => event.timestamp = timestamp,
       AgentEvent::Error(event) => event.timestamp = timestamp,
       AgentEvent::Unknown(event) => event.timestamp = timestamp,
+      AgentEvent::Compaction(event) => event.timestamp = timestamp,
     }
     event
   }

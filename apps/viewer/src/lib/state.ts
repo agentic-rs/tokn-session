@@ -43,6 +43,10 @@ export function readableEventContent(
     const text = readableString(event.text);
     return text ? { sections: [{ label: null, text }] } : null;
   }
+  if (summary.type === "compaction") {
+    const text = readableString(event.summary);
+    return text ? { sections: [{ label: "Summary", text }] } : null;
+  }
   if (summary.type !== "reasoning") {
     return null;
   }

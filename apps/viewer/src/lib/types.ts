@@ -16,6 +16,7 @@ export type EventType =
   | "session_settings_applied"
   | "message"
   | "reasoning"
+  | "compaction"
   | "goal_updated"
   | "agent_activity"
   | "tool_call"
@@ -318,9 +319,23 @@ export interface EventSummary {
   agent_activity?: AgentActivityCardSummary | null;
   /** Present only for a projected whole-turn timeline entry. */
   trajectory?: TrajectoryCardSummary | null;
+  compaction?: CompactionCardSummary | null;
   tool: ToolCardSummary | null;
   usage: UsageCardSummary | null;
   reasoning: ReasoningCardSummary | null;
+}
+
+export interface CompactionCardSummary {
+  state: string;
+  trigger: string | null;
+  reason: string | null;
+  has_summary: boolean;
+  summary_opaque: boolean;
+  measurements: {
+    scope: string;
+    tokens: string;
+    estimated: boolean | null;
+  }[];
 }
 
 export type EventPageDirection = "forward" | "backward";
