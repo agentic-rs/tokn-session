@@ -104,6 +104,12 @@ impl SessionTailer {
   }
 
   pub(crate) fn prepare(roots: Vec<ProviderRoot>, new_file_replay: NewFileReplay) -> Result<Self, String> {
+    let mut tailer = Self::prepare_deferred(roots, new_file_replay)?;
+    tailer.discover_initial()?;
+    Ok(tailer)
+  }
+
+  pub(crate) fn prepare_deferred(roots: Vec<ProviderRoot>, new_file_replay: NewFileReplay) -> Result<Self, String> {
     let (project_catalog, project_catalog_source, project_catalog_warning) = load_project_catalog(&roots);
     let project_catalog = Arc::new(RwLock::new(project_catalog));
     let mut tailer = Self {
@@ -132,14 +138,17 @@ impl SessionTailer {
       .cloned()
       .map(crate::snapshot_tailer::SnapshotTailer::new)
       .collect();
-    let paths = tailer.discover_paths()?;
-    for (path, provider) in paths {
-      tailer.files.insert(
+    Ok(tailer)
+  }
+
+  pub(crate) fn discover_initial(&mut self) -> Result<(), String> {
+    for (path, provider) in self.discover_paths()? {
+      self.files.insert(
         path.clone(),
-        FileState::open(path, provider, Arc::clone(&tailer.project_catalog))?,
+        FileState::open(path, provider, Arc::clone(&self.project_catalog))?,
       );
     }
-    Ok(tailer)
+    Ok(())
   }
 
   pub(crate) fn set_include_native(&mut self, include_native: bool) {

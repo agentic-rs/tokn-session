@@ -62,8 +62,10 @@ async fn run(native: bool) -> Result<(), String> {
 /// Viewer-core owns catalogs and snapshots, so it can connect as soon as the
 /// transport exists while this child seeds its live-feed cursors.
 async fn initialize(writer: &mut impl Write, config: RelayConfig) -> Result<SessionRelay, String> {
-  write_line(writer, &serde_json::json!({"type":"ready", "version":VERSION}))?;
-  SessionRelay::new(config).await
+  SessionRelay::new_with_ready(config, || {
+    write_line(writer, &serde_json::json!({"type":"ready", "version":VERSION}))
+  })
+  .await
 }
 
 fn write_line(writer: &mut impl Write, value: &impl serde::Serialize) -> Result<(), String> {
@@ -84,12 +86,20 @@ mod tests {
 
   #[tokio::test]
   async fn readiness_precedes_provider_initialization() {
-    let mut config = RelayConfig::new(Vec::new());
-    config.poll_interval = std::time::Duration::ZERO;
-    let mut output = Vec::new();
-    assert!(initialize(&mut output, config).await.is_err());
+    struct StopAfterReady(Vec<u8>);
+    impl Write for StopAfterReady {
+      fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+      }
+      fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("stop after readiness"))
+      }
+    }
+    let mut output = StopAfterReady(Vec::new());
+    assert!(initialize(&mut output, RelayConfig::new(Vec::new())).await.is_err());
     assert_eq!(
-      serde_json::from_slice::<serde_json::Value>(&output).unwrap(),
+      serde_json::from_slice::<serde_json::Value>(&output.0).unwrap(),
       serde_json::json!({"type":"ready", "version":VERSION})
     );
   }
