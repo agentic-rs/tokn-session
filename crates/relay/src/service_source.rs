@@ -207,15 +207,15 @@ impl SessionReader {
   }
 }
 
-#[derive(PartialEq, Eq)]
-struct FileVersion {
-  length: u64,
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct FileVersion {
+  pub(crate) length: u64,
   modified: SystemTime,
   #[cfg(unix)]
-  identity: (u64, u64),
+  pub(crate) identity: (u64, u64),
 }
 
-fn versions(path: &PathBuf, database: bool) -> Vec<Option<FileVersion>> {
+pub(crate) fn versions(path: &PathBuf, database: bool) -> Vec<Option<FileVersion>> {
   let mut paths = vec![path.clone()];
   if database {
     let mut wal = path.as_os_str().to_os_string();

@@ -83,6 +83,18 @@ Catalog responses contain `header` frames followed by `catalog_end`, including
 discovery warnings. Follow requests accept only keys from the discovered
 catalog, never arbitrary paths.
 
+Catalog discovery returns lightweight headers immediately. A shared background
+cache backfills Pi's latest `session_info` name and first user preview, plus
+first-prompt fallbacks for untitled OpenCode/Codex root sessions. Native titles
+take precedence. Names/previews arrive on subsequent catalog polls, independent
+of `--native`; a cleared Pi name falls back to its first prompt.
+Pi advances a byte cursor through complete appended lines rather than rescanning
+history on each update. Other hydration is cached by file/DB+WAL revision.
+The cache retains at most 512 characters per title/preview, not events or native
+bodies; work runs in bounded batches off the request path. Failed reads preserve
+last-good metadata and retry on source changes. It is in-memory and backfills
+again after service restart. Followed Pi names can update in header-only commits.
+
 A follow connection receives `begin`, zero or more `record` frames, then
 `commit`. Begin and commit carry matching generation and decimal-string
 revision values; begin also carries the session header and `reset` flag.
@@ -100,7 +112,7 @@ changes can commit without record frames. With `--native`, changes to existing
 native data (including session update timestamps) also require a reset under
 the v1 append/reset protocol. This does not change stdout/ZeroMQ loading.
 
-Session bodies are loaded on demand. Concurrent subscribers share one reader
+Full event snapshots are loaded on demand. Concurrent subscribers share one reader
 and normalizer per session; complete appended JSONL lines decode only once.
 An idle session is released after its last subscriber leaves. Source errors,
 invalid frames and interrupted transactions never commit partial data.

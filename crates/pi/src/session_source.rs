@@ -228,11 +228,32 @@ fn inspect_session(path: &Path) -> Result<SessionRef, String> {
   Ok(reference)
 }
 
-#[derive(Default)]
-struct PiSessionSummary {
-  title: Option<String>,
-  preview: Option<String>,
+/// Lightweight presentation accumulator shared by historical and incremental
+/// readers. It does not retain messages or normalize an event stream.
+#[derive(Clone, Default)]
+pub struct PiSessionSummary {
+  pub title: Option<String>,
+  pub preview: Option<String>,
   message_count: usize,
+}
+
+impl PiSessionSummary {
+  /// Inspect one complete record. A missing/blank session_info name clears
+  /// the previous name; only the first eligible user message supplies preview.
+  pub fn ingest_line(&mut self, line: &str) -> Result<(), String> {
+    let line: PiSessionLine = serde_json::from_str(line).map_err(|err| err.to_string())?;
+    match line.into_item() {
+      PiSessionItem::SessionInfo(info) => self.title = info.name.and_then(non_blank),
+      PiSessionItem::Message(message) => {
+        self.message_count = self.message_count.saturating_add(1);
+        if self.preview.is_none() {
+          self.preview = message.message.and_then(pi_user_preview);
+        }
+      }
+      _ => {}
+    }
+    Ok(())
+  }
 }
 
 fn inspect_session_summary(path: &Path) -> Result<PiSessionSummary, String> {
@@ -245,23 +266,9 @@ fn inspect_session_summary(path: &Path) -> Result<PiSessionSummary, String> {
     if line.trim().is_empty() {
       continue;
     }
-    let line: PiSessionLine = serde_json::from_str(&line)
+    summary
+      .ingest_line(&line)
       .map_err(|err| format!("invalid pi jsonl at {}:{}: {err}", path.display(), index + 1))?;
-    match line.into_item() {
-      PiSessionItem::SessionInfo(info) => {
-        // Pi treats the latest session_info as authoritative. An absent or
-        // blank name is an explicit clear, rather than a request to retain an
-        // older name.
-        summary.title = info.name.and_then(non_blank);
-      }
-      PiSessionItem::Message(message) => {
-        summary.message_count += 1;
-        if summary.preview.is_none() {
-          summary.preview = message.message.and_then(pi_user_preview);
-        }
-      }
-      _ => {}
-    }
   }
 
   Ok(summary)

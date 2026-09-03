@@ -43,7 +43,7 @@ backoff. Failed startup/crashes remain visible with Retry.
 External mode still connects to an independently started
 `tokn-session-relay serve --bind tcp://127.0.0.1:5557 [--native]`. This is a
 versioned local TCP snapshot/follow endpoint, separate from the unchanged
-stdout/ZeroMQ modes below. Metadata catalogs are shared, bodies load on demand,
+stdout/ZeroMQ modes below. Metadata catalogs are shared, event snapshots load on demand,
 and concurrent clients reuse one JSONL normalizer per session. Appends decode
 only new complete lines; replacement/truncation triggers an atomic new
 generation. OpenCode reconciles consistent raw row snapshots on DB/WAL changes,
@@ -53,6 +53,16 @@ Existing record edits/deletions/reordering reset safely, including native-only
 changes when native is enabled. Raw SQL rows are still scanned (timestamps are
 not reliable change tokens); historical and stdout/ZeroMQ loading are unchanged.
 See [Relay service](relay.md#local-snapshotfollow-service) for framing and limits.
+
+Catalog title/preview backfill runs in a shared background cache, replacing the
+local viewer body-index backfill bypassed by Relay. Pi's latest `session_info`
+name (including explicit clears) and first user preview are accumulated through
+a complete-line byte cursor; ordinary appends do not reparse prior history.
+Untitled OpenCode/Codex root-session prompt fallbacks use provider hydration
+cached by source revision (including OpenCode WAL). Native titles win. The
+cache retains bounded 512-character strings, not events/native bodies, and
+rebuilds after restart. Initial catalogs do not wait for scans; subsequent polls
+pick up names. Followed Pi names also update without replacing event history.
 
 Viewer mode (`automatic`/`external`/`local`), external endpoint, and optional
 native inclusion persist in app config `relay.json`. Missing settings default

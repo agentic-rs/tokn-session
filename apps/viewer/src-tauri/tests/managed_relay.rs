@@ -60,12 +60,31 @@ async fn stop(child: &mut Child) {
 async fn packaged_child_serves_fixtures_with_optional_native_and_exits_on_eof() {
   let root = tempfile::tempdir().unwrap();
   std::fs::create_dir(root.path().join("pi")).unwrap();
-  std::fs::write(root.path().join("pi/session.jsonl"), format!("{HEADER}{MESSAGE}")).unwrap();
+  std::fs::write(
+    root.path().join("pi/session.jsonl"),
+    format!("{HEADER}{MESSAGE}{{\"type\":\"session_info\",\"name\":\"Pi task title\"}}\n"),
+  )
+  .unwrap();
   for native in [false, true] {
     let (mut child, endpoint) = start(root.path(), native).await;
-    let catalog = load_catalog(&endpoint).await.unwrap();
+    let catalog = tokio::time::timeout(Duration::from_secs(6), async {
+      loop {
+        let catalog = load_catalog(&endpoint).await.unwrap();
+        if catalog
+          .entries
+          .first()
+          .is_some_and(|entry| entry.header.title.as_deref() == Some("Pi task title"))
+        {
+          break catalog;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
+    })
+    .await
+    .expect("automatic Relay did not backfill the Pi title");
     assert_eq!(catalog.native, native);
     assert_eq!(catalog.entries.len(), 1);
+    assert_eq!(catalog.entries[0].header.preview.as_deref(), Some("hello"));
     let mut subscription = RelaySubscription::connect(&endpoint, &catalog.entries[0].key)
       .await
       .unwrap();
