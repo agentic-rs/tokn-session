@@ -4,10 +4,7 @@
 use std::io::{Read, Write};
 use std::time::Duration;
 
-use tokn_session_client::{AgentClient, Source};
-use tokn_session_core::Provider;
-use tokn_session_opencode::OpenCodeSessionSource;
-use tokn_session_relay::{ProviderRoot, RelayConfig, service_server::serve_listener};
+use tokn_session_relay::{PROVIDERS, RelayConfig, provider_roots, service_server::serve_listener};
 
 pub(crate) const CHILD_FLAG: &str = "--tokn-viewer-relay-child";
 
@@ -44,17 +41,9 @@ pub fn run_if_requested() {
 
 fn config(native: bool) -> Result<RelayConfig, String> {
   let mut roots = Vec::new();
-  for (source, provider) in [(Source::Codex, Provider::Codex), (Source::Pi, Provider::Pi)] {
-    roots.extend(
-      AgentClient::file_session_roots(source, None)?
-        .into_iter()
-        .map(|path| ProviderRoot::new(provider, path)),
-    );
+  for provider in PROVIDERS {
+    roots.extend(provider_roots(provider, None)?);
   }
-  roots.push(ProviderRoot::new(
-    Provider::OpenCode,
-    OpenCodeSessionSource::new(None).database_path()?,
-  ));
   let mut config = RelayConfig::new(roots);
   config.include_native = native;
   config.poll_interval = Duration::from_millis(500);

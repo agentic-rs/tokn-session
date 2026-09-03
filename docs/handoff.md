@@ -101,27 +101,39 @@ currently bypassed for these sessions). The v1 append/reset contract still
 requires replacement generations for mutable OpenCode records; avoiding those
 resets would need a record-update protocol and stable viewer event identities.
 
-`tokn-session-relay` follows active Codex and Pi JSONL session trees plus the
-OpenCode SQLite database. It requires an output subcommand:
+`tokn-session-relay` follows all six providers: Codex, Pi, OpenCode, ZCode,
+WorkBuddy, and DSH. It requires an output subcommand:
 
 ```sh
 tokn-session-relay zeromq --bind tcp://127.0.0.1:5556
 tokn-session-relay stdout --format summary
 ```
 
-Both modes watch `~/.codex/sessions`, `~/.pi/agent/sessions`, and
-`~/.local/share/opencode/opencode.db` by default. Existing JSONL files seed
-their session header before following from the snapshotted EOF, while existing
-OpenCode sessions are snapshotted without replay. `--codex-dir`, `--pi-dir`,
-`--opencode-dir` (a data directory or database path), `--poll-interval`,
-`--replay=<count>`, `--replay-all`, and `--native` are shared options.
+All output modes and the automatic viewer child share provider-owned root
+resolution, including environment overrides. Use `--codex-dir`, `--pi-dir`,
+`--opencode-dir`, `--zcode-dir`, `--workbuddy-dir`, or `--dsh-dir` for explicit
+roots. Codex includes active/archive roots by default. Existing sessions seed
+without replay; `--poll-interval`, `--replay=<count>`, `--replay-all`, and
+`--native` remain shared feed options.
+
+ZCode reuses the OpenCode SQLite cache with distinct provider identity.
+WorkBuddy and DSH expose grouped source snapshots; changed files currently
+reload and normalize, while unchanged revisions are cached. WorkBuddy also
+tracks catalog DB/WAL changes. DSH supports plain/concatenated Zstandard logs,
+preserves packed native rows, filters inherited subagent events, and resets
+follow generations when assembled output revises earlier chunks or usage.
+Complete JSONL lines are required; malformed rows/compressed frames never
+commit partial snapshots. The source/decoded DSH and serialized snapshot
+limits are 128 MiB. Incremental WorkBuddy/DSH decoding is a remaining
+performance opportunity. Shared pet activity deduplication covers their
+mutable records as well as OpenCode/ZCode.
 
 Native filesystem watching is registered between the initial file snapshot and
 the EOF-seeding pass, so appends during startup remain visible. The periodic
 scan is a 30-second fallback for missed notifications and roots created after
 startup. Watcher notifications retain and coalesce their affected paths, so
 normal updates inspect only changed files instead of rescanning every session.
-OpenCode is watched non-recursively at its data directory plus the database and
+OpenCode/ZCode are watched non-recursively at its data directory plus the database and
 SQLite WAL file; its transient SHM index is deliberately excluded because
 readers can update it and feed their own watcher notifications back into the
 relay. Unrelated logs, snapshots, and auth files do not trigger database work.
@@ -596,7 +608,7 @@ subtype-specific unknown events.
   `show` accepts paths and exact/unambiguous-prefix IDs; `browse` and tree scope
   also work. Compressed files support concatenated frames. Invalid JSON,
   corrupt/truncated frames, invalid packed runs, and unsupported format versions
-  are reported, never repaired. This is historical-only; DSH SQLite, relay,
+  are reported, never repaired. Relay follows these same logs; DSH SQLite,
   create/append, and input are not implemented.
 - Codex reads JSONL from `sessions` and `archived_sessions` below a valid,
   non-empty `$CODEX_HOME`, falling back to the platform home directory's
@@ -907,10 +919,8 @@ OpenCode has the first live-output normalizer: `OpenCodeLiveNormalizer` parses `
 ## Known Gaps
 
 - No `attach` command yet.
-- ZCode support is historical-only. Relay watching, create/append, and live
-  input are not implemented.
-- WorkBuddy support is historical-only. Relay watching, create/append, and
-  live input are not implemented.
+- ZCode, WorkBuddy, and DSH support historical reads and Relay watching;
+  create/append and live input are not implemented.
 - Codex and Pi have normalization fixtures. OpenCode now has wire-format
   fixtures plus adapter/source regression tests; full SQLite-backed CLI golden
   tests are still missing.
@@ -920,7 +930,7 @@ OpenCode has the first live-output normalizer: `OpenCodeLiveNormalizer` parses `
   provider task lifecycle and interaction events are represented in `AgentEvent`.
 - The desktop viewer remains read-only. Without a Relay connection, selected
   timelines refresh from the durable index and historical source reads. Relay
-  snapshot/follow supports Codex, Pi and OpenCode; it is not an agent-control
+  snapshot/follow supports all six providers; it is not an agent-control
   transport, and its unread tracking is not persisted yet.
 - Viewer session-file relocation is deliberately conservative. Repeated or
   overlapping moves can make the retired source ambiguous, in which case the

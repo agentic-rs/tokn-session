@@ -185,3 +185,161 @@ fn replaced_database_resets_even_when_contents_match() {
   assert!(reader.poll().unwrap());
   assert_ne!(reader.snapshot.generation, initial);
 }
+
+#[test]
+fn zcode_uses_its_identity_and_cached_sqlite_reconciliation() {
+  let fixture = Fixture::new();
+  let mut entry = fixture.reader(false).snapshot.entry;
+  entry.provider = Provider::ZCode;
+  let mut reader = SessionReader::new(entry, true, fixture.path.clone()).unwrap();
+  assert!(
+    reader
+      .snapshot
+      .records
+      .iter()
+      .all(|record| record.topic == "zcode.one" && record.session.provider == Provider::ZCode)
+  );
+  assert!(
+    reader
+      .snapshot
+      .records
+      .iter()
+      .flat_map(|record| &record.record.events)
+      .all(|event| serde_json::to_value(event).unwrap()["provider"] == "zcode")
+  );
+  let initial = reader.snapshot.generation.clone();
+  fixture
+    .database
+    .execute_batch(r#"update part set data = '{"type":"text","text":"changed"}' where id = 'p1'"#)
+    .unwrap();
+  assert!(fixture.poll(&mut reader).unwrap());
+  assert_ne!(reader.snapshot.generation, initial);
+  assert!(!fixture.poll(&mut reader).unwrap());
+}
+
+#[test]
+fn grouped_files_buffer_partial_rows_reset_edits_and_preserve_native() {
+  use std::io::Write;
+  use tokn_session_client::AgentClient;
+  for provider in [Provider::WorkBuddy, Provider::Dsh] {
+    let root = TempDir::new().unwrap();
+    let (relative, contents, append) = match provider {
+      Provider::WorkBuddy => (
+        "projects/work/session.jsonl",
+        "{\"type\":\"message\",\"id\":\"one\",\"sessionId\":\"session\",\"role\":\"user\",\"content\":\"hello\",\"timestamp\":1}\n",
+        "{\"type\":\"future\",\"id\":\"one\",\"value\":42}",
+      ),
+      _ => (
+        "session/session.jsonl",
+        "{\"type\":\"session\",\"version\":0,\"id\":\"session\",\"createdAt\":1,\"delegationDepth\":0}\n{\"type\":\"future\",\"seq\":0,\"value\":\"hello\"}\n",
+        "{\"type\":\"future\",\"seq\":1,\"value\":42}",
+      ),
+    };
+    let path = root.path().join(relative);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, contents).unwrap();
+    let header = AgentClient::list_session_headers(crate::providers::source(provider), Some(root.path().into()))
+      .unwrap()
+      .remove(0);
+    let entry = CatalogEntry {
+      key: "session".into(),
+      provider,
+      header,
+    };
+    let mut reader = SessionReader::new(entry, true, root.path().into()).unwrap();
+    let initial = reader.snapshot.clone();
+    assert!(initial.records.iter().any(|r| r.record.native.is_some()));
+    let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(append.as_bytes()).unwrap();
+    assert!(
+      !reader.poll_grouped_file(versions(&path, false)).unwrap(),
+      "no complete new row"
+    );
+    file.write_all(b"\n").unwrap();
+    assert!(reader.poll_grouped_file(versions(&path, false)).unwrap());
+    assert_eq!(initial.generation, reader.snapshot.generation);
+    assert_eq!(initial.records.len() + 1, reader.snapshot.records.len());
+    let ids: std::collections::HashSet<_> = reader.snapshot.records.iter().map(|r| &r.record.record_id).collect();
+    assert_eq!(
+      ids.len(),
+      reader.snapshot.records.len(),
+      "duplicate native IDs must not collapse"
+    );
+    std::fs::write(&path, format!("{}{append}\n", contents.replace("hello", "edits"))).unwrap();
+    assert!(reader.poll_grouped_file(versions(&path, false)).unwrap());
+    assert_ne!(initial.generation, reader.snapshot.generation);
+    let last_good = reader.snapshot.revision;
+    std::fs::write(&path, "invalid\n").unwrap();
+    assert!(reader.poll_grouped_file(versions(&path, false)).is_err());
+    assert_eq!(reader.snapshot.revision, last_good);
+  }
+}
+
+#[test]
+fn assembled_dsh_output_resets_prior_stream_batches() {
+  use tokn_session_client::{AgentClient, Source};
+  let root = TempDir::new().unwrap();
+  let path = root.path().join("session.jsonl");
+  let fixture = include_str!("../../../dsh/fixtures/basic/session.jsonl");
+  let split = fixture.find("{\"type\":\"assistant/message\"").unwrap();
+  std::fs::write(&path, &fixture[..split]).unwrap();
+  let header = AgentClient::list_session_headers(Source::Dsh, Some(root.path().into()))
+    .unwrap()
+    .remove(0);
+  let entry = CatalogEntry {
+    key: "dsh".into(),
+    provider: Provider::Dsh,
+    header,
+  };
+  let mut reader = SessionReader::new(entry, false, root.path().into()).unwrap();
+  let initial = reader.snapshot.generation.clone();
+  std::fs::write(&path, fixture).unwrap();
+  assert!(reader.poll_grouped_file(versions(&path, false)).unwrap());
+  assert_ne!(reader.snapshot.generation, initial);
+  let history = AgentClient::load_session(Source::Dsh, Some(root.path().into()), "dsh-fixture").unwrap();
+  let events: Vec<_> = reader
+    .snapshot
+    .records
+    .iter()
+    .flat_map(|record| &record.record.events)
+    .collect();
+  assert_eq!(
+    serde_json::to_value(events).unwrap(),
+    serde_json::to_value(history.events).unwrap()
+  );
+}
+
+#[test]
+fn workbuddy_catalog_wal_updates_followed_presentation() {
+  use tokn_session_client::{AgentClient, Source};
+  let root = TempDir::new().unwrap();
+  let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../workbuddy/fixtures");
+  let path = root.path().join("projects/fixture-workspace/wb-shell-command.jsonl");
+  std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+  std::fs::copy(
+    fixtures.join("projects/fixture-workspace/wb-shell-command.jsonl"),
+    &path,
+  )
+  .unwrap();
+  std::fs::copy(fixtures.join("workbuddy.db"), root.path().join("workbuddy.db")).unwrap();
+  let header = AgentClient::list_session_headers(Source::WorkBuddy, Some(root.path().into()))
+    .unwrap()
+    .into_iter()
+    .find(|h| h.id == "wb-shell-command")
+    .unwrap();
+  let entry = CatalogEntry {
+    key: "wb".into(),
+    provider: Provider::WorkBuddy,
+    header,
+  };
+  let mut reader = SessionReader::new(entry, false, root.path().into()).unwrap();
+  let initial = reader.snapshot.generation.clone();
+  let database = rusqlite::Connection::open(root.path().join("workbuddy.db")).unwrap();
+  database.execute_batch("pragma journal_mode=wal; update sessions set title = 'Changed catalog title', custom_title = 'Changed catalog title' where id = 'wb-shell-command';").unwrap();
+  assert!(reader.poll().unwrap());
+  assert_eq!(
+    reader.snapshot.entry.header.title.as_deref(),
+    Some("Changed catalog title")
+  );
+  assert_eq!(reader.snapshot.generation, initial);
+}

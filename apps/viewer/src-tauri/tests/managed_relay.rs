@@ -23,6 +23,9 @@ fn command(root: &Path, native: bool) -> Command {
     .env("CODEX_HOME", root.join("codex"))
     .env("PI_CODING_AGENT_SESSION_DIR", root.join("pi"))
     .env("OPENCODE_DB", root.join("missing-opencode.db"))
+    .env("ZCODE_STORAGE_DIR", root.join("zcode"))
+    .env("WORKBUDDY_CONFIG_DIR", root.join("workbuddy"))
+    .env("DSH_HOME", root.join("dsh"))
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::inherit())
@@ -83,6 +86,7 @@ async fn packaged_child_serves_fixtures_with_optional_native_and_exits_on_eof() 
     .await
     .expect("automatic Relay did not backfill the Pi title");
     assert_eq!(catalog.native, native);
+    assert_eq!(catalog.providers, tokn_session_relay::PROVIDERS);
     assert_eq!(catalog.entries.len(), 1);
     assert_eq!(catalog.entries[0].header.preview.as_deref(), Some("hello"));
     let mut subscription = RelaySubscription::connect(&endpoint, &catalog.entries[0].key)

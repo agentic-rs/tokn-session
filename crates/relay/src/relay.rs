@@ -213,7 +213,7 @@ fn merge_watcher_event(
 }
 
 fn watch_targets(root: &ProviderRoot) -> Vec<(PathBuf, RecursiveMode)> {
-  if !matches!(root.provider, Provider::OpenCode) {
+  if !matches!(root.provider, Provider::OpenCode | Provider::ZCode) {
     if !root.path.exists() {
       return Vec::new();
     }
@@ -225,15 +225,14 @@ fn watch_targets(root: &ProviderRoot) -> Vec<(PathBuf, RecursiveMode)> {
     return vec![(root.path.clone(), mode)];
   }
 
-  let database_path = if root.path.is_dir() {
-    root.path.join("opencode.db")
-  } else {
-    root.path.clone()
+  let Ok(database_path) = crate::providers::database(root.provider, Some(root.path.clone())).database_path() else {
+    return Vec::new();
   };
   let mut targets = Vec::new();
   if root.path.is_dir() {
     targets.push((root.path.clone(), RecursiveMode::NonRecursive));
-  } else if let Some(parent) = database_path.parent().filter(|parent| parent.exists()) {
+  }
+  if let Some(parent) = database_path.parent().filter(|parent| parent.exists()) {
     targets.push((parent.to_path_buf(), RecursiveMode::NonRecursive));
   }
 
@@ -317,19 +316,13 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn rejects_historical_only_providers_until_live_readers_exist() {
-    for (provider, name) in [
-      (Provider::Dsh, "dsh"),
-      (Provider::ZCode, "zcode"),
-      (Provider::WorkBuddy, "workbuddy"),
-    ] {
-      let config = RelayConfig::new(vec![ProviderRoot::new(provider, "unused".into())]);
-      let error = SessionRelay::new(config)
-        .await
-        .err()
-        .expect("historical-only relay provider must be rejected");
-      assert!(error.contains(&format!("{name} relay watching is not implemented")));
-    }
+  async fn accepts_all_providers_with_missing_storage() {
+    let root = TempDir::new().unwrap();
+    let roots = crate::PROVIDERS
+      .into_iter()
+      .map(|provider| ProviderRoot::new(provider, root.path().join(crate::providers::source(provider).as_str())))
+      .collect();
+    assert!(SessionRelay::new(RelayConfig::new(roots)).await.is_ok());
   }
 
   #[tokio::test]

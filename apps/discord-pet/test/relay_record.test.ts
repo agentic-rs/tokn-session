@@ -15,9 +15,9 @@ const envelope = {
 };
 
 describe("shared Relay record protocol", () => {
-  test("does not replay unchanged OpenCode event slots on native or part updates", async () => {
+  test.each(["opencode", "zcode", "workbuddy", "dsh"])("does not replay unchanged %s event slots on native or record updates", async (provider) => {
     const activity = new RelayActivityDispatcher(2);
-    const record = parseRelayRecord({ ...envelope, topic: "opencode.session-1", record_id: "message:1" })!;
+    const record = parseRelayRecord({ ...envelope, topic: `${provider}.session-1`, record_id: "message:1" })!;
     const seen: string[] = [];
     const observe = (input: RelayEvent): void => { seen.push(input.event.type); };
     await activity.dispatch(record, observe);

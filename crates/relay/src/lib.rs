@@ -1,5 +1,8 @@
 mod context;
 mod project;
+mod providers;
+mod snapshot_tailer;
+pub use providers::{PROVIDERS, provider_roots};
 mod publisher;
 mod relay;
 pub mod service_client;

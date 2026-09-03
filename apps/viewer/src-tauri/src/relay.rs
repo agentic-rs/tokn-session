@@ -128,7 +128,10 @@ impl ViewerRelay {
         state.sessions.clear();
       }
       if settings.mode != RelayMode::Local && state.entries.is_none() {
-        state.providers = vec![ViewerProvider::Codex, ViewerProvider::Pi, ViewerProvider::OpenCode];
+        state.providers = tokn_session_relay::PROVIDERS
+          .into_iter()
+          .filter_map(viewer_provider)
+          .collect();
       }
       if settings.mode == RelayMode::Local {
         state.providers.clear();
@@ -168,7 +171,10 @@ impl ViewerRelay {
       state.phase = "failed".into();
       state.error = Some(error);
       // Never silently read a different source when saved settings are invalid.
-      state.providers = vec![ViewerProvider::Codex, ViewerProvider::Pi, ViewerProvider::OpenCode];
+      state.providers = tokn_session_relay::PROVIDERS
+        .into_iter()
+        .filter_map(viewer_provider)
+        .collect();
     }
     self.notify(None, false);
   }
@@ -473,7 +479,9 @@ fn viewer_provider(provider: Provider) -> Option<ViewerProvider> {
     Provider::Codex => Some(ViewerProvider::Codex),
     Provider::Pi => Some(ViewerProvider::Pi),
     Provider::OpenCode => Some(ViewerProvider::OpenCode),
-    _ => None,
+    Provider::ZCode => Some(ViewerProvider::ZCode),
+    Provider::WorkBuddy => Some(ViewerProvider::WorkBuddy),
+    Provider::Dsh => Some(ViewerProvider::Dsh),
   }
 }
 

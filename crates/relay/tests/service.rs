@@ -334,10 +334,11 @@ async fn codex_root_prompt_backfill_reaches_an_already_followed_session() {
 
 #[tokio::test]
 async fn opencode_changes_and_deletions_replace_the_snapshot() {
-  let root = TempDir::new().unwrap();
-  let path = root.path().join("opencode.db");
-  let db = rusqlite::Connection::open(&path).unwrap();
-  db.execute_batch(r#"
+  for provider in [Provider::OpenCode, Provider::ZCode] {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("opencode.db");
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch(r#"
     pragma journal_mode = wal;
     create table session (id text primary key, parent_id text, directory text, time_created integer, time_updated integer);
     create table message (id text primary key, session_id text, time_created integer, data text);
@@ -346,27 +347,29 @@ async fn opencode_changes_and_deletions_replace_the_snapshot() {
     insert into message values ('msg_1', 'ses_1', 1, '{"role":"user"}');
     insert into part values ('part_1', 'msg_1', 'ses_1', 1, '{"type":"text","text":"hello"}');
   "#).unwrap();
-  let server = server(&path, Provider::OpenCode, true).await;
-  let key = load_catalog(&server.endpoint).await.unwrap().entries.remove(0).key;
-  let mut subscription = RelaySubscription::connect(&server.endpoint, &key).await.unwrap();
-  let initial = snapshot(&mut subscription).await;
-  assert_eq!(messages(&initial), ["hello"]);
-  db.execute("update part set data = ?1", [r#"{"type":"text","text":"edited"}"#])
-    .unwrap();
-  let edited = snapshot(&mut subscription).await;
-  assert_eq!(messages(&edited), ["edited"]);
-  assert_ne!(initial.generation, edited.generation);
-  db.execute_batch("delete from part; delete from message;").unwrap();
-  assert!(messages(&snapshot(&mut subscription).await).is_empty());
+    let server = server(&path, provider, true).await;
+    let key = load_catalog(&server.endpoint).await.unwrap().entries.remove(0).key;
+    let mut subscription = RelaySubscription::connect(&server.endpoint, &key).await.unwrap();
+    let initial = snapshot(&mut subscription).await;
+    assert_eq!(messages(&initial), ["hello"]);
+    db.execute("update part set data = ?1", [r#"{"type":"text","text":"edited"}"#])
+      .unwrap();
+    let edited = snapshot(&mut subscription).await;
+    assert_eq!(messages(&edited), ["edited"]);
+    assert_ne!(initial.generation, edited.generation);
+    db.execute_batch("delete from part; delete from message;").unwrap();
+    assert!(messages(&snapshot(&mut subscription).await).is_empty());
+  }
 }
 
 #[tokio::test]
 async fn opencode_subscribers_append_and_receive_metadata_without_replacing_history() {
-  for native in [false, true] {
-    let root = TempDir::new().unwrap();
-    let path = root.path().join("opencode.db");
-    let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute_batch(r#"
+  for provider in [Provider::OpenCode, Provider::ZCode] {
+    for native in [false, true] {
+      let root = TempDir::new().unwrap();
+      let path = root.path().join("opencode.db");
+      let db = rusqlite::Connection::open(&path).unwrap();
+      db.execute_batch(r#"
       pragma journal_mode = wal;
       create table session (id text primary key, parent_id text, directory text, title text, time_created integer, time_updated integer);
       create table message (id text primary key, session_id text, time_created integer, data text);
@@ -375,39 +378,40 @@ async fn opencode_subscribers_append_and_receive_metadata_without_replacing_hist
       insert into message values ('msg_1', 'ses_1', 1, '{"role":"user"}');
       insert into part values ('part_1', 'msg_1', 'ses_1', 1, '{"type":"text","text":"hello"}');
     "#).unwrap();
-    let server = server(&path, Provider::OpenCode, native).await;
-    let key = load_catalog(&server.endpoint).await.unwrap().entries.remove(0).key;
-    let mut first = RelaySubscription::connect(&server.endpoint, &key).await.unwrap();
-    let initial = snapshot(&mut first).await;
-    let mut second = RelaySubscription::connect(&server.endpoint, &key).await.unwrap();
-    assert_eq!(snapshot(&mut second).await.generation, initial.generation);
-    db.execute_batch(
-      r#"
+      let server = server(&path, provider, native).await;
+      let key = load_catalog(&server.endpoint).await.unwrap().entries.remove(0).key;
+      let mut first = RelaySubscription::connect(&server.endpoint, &key).await.unwrap();
+      let initial = snapshot(&mut first).await;
+      let mut second = RelaySubscription::connect(&server.endpoint, &key).await.unwrap();
+      assert_eq!(snapshot(&mut second).await.generation, initial.generation);
+      db.execute_batch(
+        r#"
       begin;
       insert into message values ('msg_2', 'ses_1', 2, '{"role":"user"}');
       insert into part values ('part_2', 'msg_2', 'ses_1', 2, '{"type":"text","text":"world"}');
     "#,
-    )
-    .unwrap();
-    if !native {
-      db.execute_batch("update session set time_updated = 2;").unwrap();
+      )
+      .unwrap();
+      if !native {
+        db.execute_batch("update session set time_updated = 2;").unwrap();
+      }
+      db.execute_batch("commit;").unwrap();
+      let update = snapshot(&mut first).await;
+      assert_eq!(update.generation, initial.generation);
+      assert_eq!(messages(&update), ["hello", "world"]);
+      assert_eq!(messages(&snapshot(&mut second).await), ["hello", "world"]);
+      if !native {
+        db.execute_batch("update session set title = 'New title';").unwrap();
+        let metadata = snapshot(&mut first).await;
+        assert_eq!(metadata.generation, initial.generation);
+        assert_eq!(metadata.loaded.reference.title.as_deref(), Some("New title"));
+        assert_eq!(messages(&metadata), ["hello", "world"]);
+      }
+      let mut reconnect = RelaySubscription::connect(&server.endpoint, &key).await.unwrap();
+      let current = snapshot(&mut reconnect).await;
+      assert_eq!(current.generation, initial.generation);
+      assert_eq!(messages(&current), ["hello", "world"]);
     }
-    db.execute_batch("commit;").unwrap();
-    let update = snapshot(&mut first).await;
-    assert_eq!(update.generation, initial.generation);
-    assert_eq!(messages(&update), ["hello", "world"]);
-    assert_eq!(messages(&snapshot(&mut second).await), ["hello", "world"]);
-    if !native {
-      db.execute_batch("update session set title = 'New title';").unwrap();
-      let metadata = snapshot(&mut first).await;
-      assert_eq!(metadata.generation, initial.generation);
-      assert_eq!(metadata.loaded.reference.title.as_deref(), Some("New title"));
-      assert_eq!(messages(&metadata), ["hello", "world"]);
-    }
-    let mut reconnect = RelaySubscription::connect(&server.endpoint, &key).await.unwrap();
-    let current = snapshot(&mut reconnect).await;
-    assert_eq!(current.generation, initial.generation);
-    assert_eq!(messages(&current), ["hello", "world"]);
   }
 }
 
@@ -499,4 +503,63 @@ fn endpoint_requires_numeric_loopback_tcp() {
   }
   assert!(local_endpoint("tcp://127.0.0.1:5557").is_ok());
   assert!(local_endpoint("tcp://[::1]:5557").is_ok());
+}
+
+#[tokio::test]
+async fn workbuddy_and_dsh_catalog_follow_and_live_feed_preserve_history() {
+  use tokn_session_client::{AgentClient, Source};
+  use tokn_session_relay::{NewFileReplay, SessionTailer};
+  for (provider, source, fixture, id) in [
+    (
+      Provider::WorkBuddy,
+      Source::WorkBuddy,
+      "../workbuddy/fixtures",
+      "wb-shell-command",
+    ),
+    (Provider::Dsh, Source::Dsh, "../dsh/fixtures", "dsh-fixture"),
+  ] {
+    let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(fixture);
+    let header = AgentClient::list_session_headers(source, Some(fixtures.clone()))
+      .unwrap()
+      .into_iter()
+      .find(|h| h.id == id)
+      .unwrap();
+    let root = TempDir::new().unwrap();
+    let relative = header.path.strip_prefix(&fixtures).unwrap();
+    let path = root.path().join(relative);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::copy(&header.path, &path).unwrap();
+    if provider == Provider::WorkBuddy {
+      std::fs::copy(fixtures.join("workbuddy.db"), root.path().join("workbuddy.db")).unwrap();
+    }
+    let roots = vec![ProviderRoot::new(provider, root.path().into())];
+    let (mut tailer, seeded) = SessionTailer::initialize_with_native(roots, NewFileReplay::All, true).unwrap();
+    assert!(seeded.records.is_empty());
+    assert!(seeded.warnings.is_empty());
+    for native in [false, true] {
+      let service = server(root.path(), provider, native).await;
+      let catalog = load_catalog(&service.endpoint).await.unwrap();
+      assert_eq!(catalog.providers, vec![provider]);
+      assert!(catalog.warnings.is_empty());
+      let entry = catalog.entries.iter().find(|e| e.header.id == id).unwrap();
+      let mut client = RelaySubscription::connect(&service.endpoint, &entry.key).await.unwrap();
+      let initial = snapshot(&mut client).await;
+      let history = AgentClient::load_session(source, Some(root.path().into()), path.to_str().unwrap()).unwrap();
+      assert_eq!(
+        serde_json::to_value(&initial.loaded.events).unwrap(),
+        serde_json::to_value(&history.events).unwrap()
+      );
+      append(&path, "{\"type\":\"future-relay-event\",\"value\":123}\n");
+      let changed = snapshot(&mut client).await;
+      assert_eq!(initial.generation, changed.generation);
+      assert_eq!(initial.loaded.events.len() + 1, changed.loaded.events.len());
+      assert_eq!(changed.native.last().unwrap().is_some(), native);
+      let update = tailer.scan_paths([path.clone()].into()).unwrap();
+      assert!(update.warnings.is_empty());
+      assert_eq!(update.records.len(), 1);
+      assert_eq!(update.records[0].session.provider, provider);
+      assert!(update.records[0].record.native.is_some());
+      assert!(tailer.scan().unwrap().records.is_empty());
+    }
+  }
 }

@@ -50,10 +50,10 @@ impl SessionContext {
     }
   }
 
-  pub(crate) fn from_session_ref(reference: &SessionRef) -> Self {
+  pub(crate) fn from_session_ref(provider: Provider, reference: &SessionRef) -> Self {
     let project = project_context(reference.cwd.as_deref(), None);
     Self {
-      provider: Provider::OpenCode,
+      provider,
       session_id: reference.id.clone(),
       parent_session_id: reference.parent_session_id.clone(),
       agent_path: reference.agent_path.clone(),

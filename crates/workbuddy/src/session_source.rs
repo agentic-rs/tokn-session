@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use rusqlite::{Connection, OpenFlags, Row};
-use tokn_session_core::{LoadedSession, SessionHeader, SessionHistoryStatus, SessionRef};
+use tokn_session_core::{
+  LoadedSession, LoadedSessionRecords, NormalizedRecord, SessionHeader, SessionHistoryStatus, SessionRef,
+};
 use tokn_workbuddy_protocol::{WorkBuddySessionItem, WorkBuddySessionLine};
 
 use crate::normalize::{WorkBuddyNormalizer, timestamp};
@@ -190,7 +192,43 @@ impl WorkBuddySessionSource {
   }
 
   pub fn load_session_path(&self, path: &Path) -> Result<LoadedSession, String> {
-    let lines = read_history(path)?;
+    Ok(self.normalize_records(path, read_history(path)?, false)?.into())
+  }
+
+  /// Complete-line snapshot for Relay. Record ordinals preserve duplicate native IDs.
+  pub fn load_session_records_path(
+    &self,
+    path: &Path,
+    include_native: bool,
+    max_bytes: usize,
+  ) -> Result<LoadedSessionRecords, String> {
+    use std::io::Read;
+    let file = File::open(path).map_err(|err| err.to_string())?;
+    let len = file.metadata().map_err(|err| err.to_string())?.len();
+    if len > max_bytes as u64 {
+      return Err("WorkBuddy source exceeds the snapshot size limit".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(len).read_to_end(&mut bytes).map_err(|err| err.to_string())?;
+    let complete = bytes
+      .iter()
+      .rposition(|byte| *byte == b'\n')
+      .map_or(0, |index| index + 1);
+    let lines = bytes[..complete]
+      .split(|byte| *byte == b'\n')
+      .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+      .map(serde_json::from_slice)
+      .collect::<Result<Vec<_>, _>>()
+      .map_err(|err| format!("invalid WorkBuddy JSONL: {err}"))?;
+    self.normalize_records(path, lines, include_native)
+  }
+
+  fn normalize_records(
+    &self,
+    path: &Path,
+    lines: Vec<WorkBuddySessionLine>,
+    include_native: bool,
+  ) -> Result<LoadedSessionRecords, String> {
     let fallback_id = history_id(path).ok_or_else(|| format!("invalid workbuddy session path {}", path.display()))?;
     let summary = summarize_history(&lines, fallback_id);
     // An explicit JSONL can live outside the configured WorkBuddy root. Only
@@ -231,13 +269,21 @@ impl WorkBuddySessionSource {
     };
 
     let mut normalizer = WorkBuddyNormalizer::new(summary.id);
-    let mut events = normalizer.start(cwd, timestamp(created_at), model);
-    for line in lines {
-      events.extend(normalizer.normalize_line(line));
+    let mut records = vec![NormalizedRecord {
+      record_id: format!("session:{}", reference.id),
+      native: None,
+      events: normalizer.start(cwd, timestamp(created_at), model),
+    }];
+    for (index, line) in lines.into_iter().enumerate() {
+      records.push(NormalizedRecord {
+        record_id: format!("row:{index}"),
+        native: include_native.then(|| line.native().clone()),
+        events: normalizer.normalize_line(line),
+      });
     }
-    Ok(LoadedSession {
+    Ok(LoadedSessionRecords {
       reference,
-      events,
+      records,
       history_status: SessionHistoryStatus::Complete,
     })
   }
@@ -246,7 +292,7 @@ impl WorkBuddySessionSource {
     Ok(self.config_dir()?.join("workbuddy.db"))
   }
 
-  fn config_dir(&self) -> Result<PathBuf, String> {
+  pub fn config_dir(&self) -> Result<PathBuf, String> {
     resolve_config_dir(
       self.config_dir.clone(),
       std::env::var_os("WORKBUDDY_CONFIG_DIR"),

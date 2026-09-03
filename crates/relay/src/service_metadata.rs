@@ -7,7 +7,7 @@ use std::{
   sync::Mutex,
 };
 
-use tokn_session_client::{AgentClient, Source};
+use tokn_session_client::AgentClient;
 use tokn_session_core::{Provider, SessionHeader};
 use tokn_session_pi::session_source::PiSessionSummary;
 
@@ -122,11 +122,11 @@ fn bounded(value: Option<String>) -> Option<String> {
 }
 
 fn revision(header: &SessionHeader, provider: Provider) -> Revision {
-  versions(&header.path, provider == Provider::OpenCode)
+  versions(&header.path, matches!(provider, Provider::OpenCode | Provider::ZCode))
 }
 
 fn needs_backfill(entry: &CatalogEntry) -> bool {
-  entry.provider == Provider::Pi
+  matches!(entry.provider, Provider::Pi | Provider::Dsh | Provider::WorkBuddy)
     || (entry.header.title.is_none()
       && entry.header.preview.is_none()
       && (entry.provider != Provider::Codex || entry.header.parent_session_id.is_none()))
@@ -197,6 +197,9 @@ impl PresentationCache {
     } else if header.title.is_none() {
       // Native titles belong to the current lightweight header, never to an
       // older body backfill. Followed OpenCode headers already have a preview.
+      if matches!(provider, Provider::Dsh | Provider::WorkBuddy) {
+        header.title = value.title.clone();
+      }
       header.preview = value.preview.clone();
     }
   }
@@ -246,15 +249,11 @@ impl PresentationCache {
             complete,
           ))
         } else {
-          let source = match provider {
-            Provider::Codex => Source::Codex,
-            Provider::OpenCode => Source::OpenCode,
-            _ => return Err("Unsupported presentation source".into()),
-          };
+          let source = crate::providers::source(provider);
           let hydrated = AgentClient::hydrate_session_header(source, header.clone())?;
           Ok((
             Presentation {
-              title: None,
+              title: bounded(hydrated.title),
               preview: bounded(hydrated.preview),
             },
             true,

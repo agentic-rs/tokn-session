@@ -4249,9 +4249,11 @@ dependencies = [
  "tokn-session-client",
  "tokn-session-codex",
  "tokn-session-core",
+ "tokn-session-dsh",
  "tokn-session-opencode",
  "tokn-session-pi",
  "tokn-session-render",
+ "tokn-session-workbuddy",
  "zeromq",
 ]
 

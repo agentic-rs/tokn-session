@@ -15,6 +15,10 @@ use tokn_session_core::{
 /// Assembled messages replace their redundant stream deltas for display, while
 /// unfinished steps still expose their partial text and reasoning.
 pub(crate) fn normalize(header: &SessionHeader, lines: Vec<DshSessionLine>) -> Vec<AgentEvent> {
+  normalize_batches(header, lines).into_iter().flatten().collect()
+}
+
+pub(crate) fn normalize_batches(header: &SessionHeader, lines: Vec<DshSessionLine>) -> Vec<Vec<AgentEvent>> {
   let mut state = Normalizer {
     session_id: header.id.clone(),
     assembled: HashSet::new(),
@@ -58,14 +62,14 @@ pub(crate) fn normalize(header: &SessionHeader, lines: Vec<DshSessionLine>) -> V
       _ => {}
     }
   }
-  let mut events = vec![AgentEvent::SessionStarted(SessionStarted {
+  let mut events = vec![vec![AgentEvent::SessionStarted(SessionStarted {
     provider: Provider::Dsh,
     session_id: header.id.clone(),
     cwd: header.cwd.clone(),
     timestamp: Some(header.created_at.to_string()),
-  })];
+  })]];
   for line in lines {
-    events.extend(state.line(line));
+    events.push(state.line(line));
   }
   events
 }
