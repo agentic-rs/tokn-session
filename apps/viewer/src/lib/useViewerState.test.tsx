@@ -1055,6 +1055,31 @@ describe("useViewerState expanded tool detail", () => {
 });
 
 describe("useViewerState expanded reasoning detail", () => {
+  it("loads a compaction summary that arrives after its card was expanded", async () => {
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [session("codex:compaction")], next_cursor: null, source_errors: [], pending_providers: [],
+    });
+    const compaction = { state: "started", trigger: null, reason: null, has_summary: false, summary_opaque: false, measurements: [] };
+    vi.mocked(loadEventPage)
+      .mockResolvedValueOnce(reasoningEventPage({ type: "compaction", title: "Compacting…", reasoning: null, compaction }))
+      .mockResolvedValue(reasoningEventPage({ type: "compaction", title: "Context compacted", reasoning: null,
+        compaction: { ...compaction, state: "completed", has_summary: true } }));
+    vi.mocked(loadEventDetail).mockResolvedValue({ event_key: "event.v1.reasoning",
+      event: { type: "compaction", summary: "Retained decisions" }, native: null, is_hidden: false, tool_output: null });
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "codex:compaction");
+    await waitFor(() => expect(result.current.events).toHaveLength(1));
+    act(() => result.current.toggleEventExpanded("event.v1.reasoning"));
+    expect(loadEventDetail).not.toHaveBeenCalled();
+    act(() => result.current.retryEvents());
+    await waitFor(() => expect(result.current.events[0].title).toBe("Context compacted"));
+    await waitFor(() => expect(result.current.expandedDetail?.event).toMatchObject({ summary: "Retained decisions" }));
+    expect(loadEventDetail).toHaveBeenCalledOnce();
+    act(() => result.current.selectEvent("event.v1.reasoning"));
+    await waitFor(() => expect(result.current.detail?.event).toMatchObject({ type: "compaction" }));
+    expect(loadEventDetail).toHaveBeenCalledOnce();
+  });
+
   it("loads readable reasoning only after expansion and shares the detail cache", async () => {
     vi.mocked(listSessions).mockResolvedValue({
       sessions: [session("codex:reasoning")],

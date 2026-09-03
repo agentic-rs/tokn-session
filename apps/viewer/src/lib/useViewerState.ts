@@ -90,6 +90,9 @@ function expandedEventNeedsDetail(event: EventSummary | null | undefined): boole
   if (event.type === "tool_call") {
     return true;
   }
+  if (event.type === "compaction") {
+    return event.compaction?.has_summary === true;
+  }
   return event.type === "reasoning"
     && event.reasoning !== null
     && !event.reasoning.is_redacted

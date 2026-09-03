@@ -55,6 +55,50 @@ kept unchanged. Invalid accounting remains a visible unknown record without
 hiding the turn's message, tool, or reasoning content. Live `step_finish`
 envelopes use the same rule when their token data is valid.
 
+## Compaction
+
+`compaction` is a context operation, never a user prompt, final assistant reply,
+or turn completion. Its `state` is `requested`, `started`, `summary_generated`,
+`completed`, `failed`, `interrupted`, or `skipped`. Only explicit provider
+evidence advances the state; a generated summary alone need not be installed.
+`provider_phase` retains timing categories such as `pre_request`, independently
+of lifecycle state. Missing trigger, reason, or measurements are not inferred.
+`summary_opaque` marks unreadable provider summary material.
+
+| Provider | Persisted evidence |
+| --- | --- |
+| Codex | `compacted` checkpoints, legacy `context_compacted` notices, canonical completed `ContextCompaction` items, and opaque response compaction items. No persisted start signal. |
+| Pi | Completed `compaction` entries: summary, first kept entry, and tokens before. Runtime auto-compaction start/end are not in the session JSONL. |
+| OpenCode | V1 compaction parts request the operation; a linked assistant `summary: true` message supplies summary and completion/error. It is not a conversation reply. |
+| ZCode | `compaction`/`timeline.context_compaction` parts carry explicit status and operation ID; `compact_summary` boundary messages carry summary and retention references. |
+| DSH | `compaction/start`, `/summary`, `/end` plus the plugin's replacement `user/message`, correlated by `compactionId`. Only a successful end completes the operation. |
+
+WorkBuddy is intentionally deferred. Tool-output pruning is separate from
+summarizing compaction and is not relabeled as a completed compaction.
+
+Measurements distinguish `context_before`, `context_after`, and
+`replaced_context`. `estimated: null` means unspecified. DSH's shadowed-token
+estimate is only the replaced span. ZCode's `truePostCompactTokenCount` estimates
+rebuilt context; its `postCompactTokenCount` is summarizer usage and must not be
+used as context-after size. Summary-call usage remains a separate `usage` event:
+DSH identifies a model call only with `llmStreamCall: true` and `rawOutput`.
+
+`compaction_operations` projects observations with the same provider/session/
+operation ID into one card, keeping the first source index stable and retaining
+all contributor indices for inspection. Anonymous observations remain separate.
+Terminal state survives later summary enrichment. Codex's adjacent checkpoint
+and completion notice may be paired across token accounting, using a checkpoint-
+scoped adapter key when no window ID exists; other records break that correlation.
+This projection never deletes earlier transcript rows
+or reconstructs the compacted model context. Relay native data stays an optional
+sibling; no `native` field is added to this event.
+
+Provider evidence: pinned `vendor/codex` rollout policy and compaction code,
+`vendor/pi` session-manager types, `vendor/opencode` V1 compaction handling,
+and `vendor/dsh/packages/compaction/compaction/src/types.ts`/checkpoint code.
+ZCode fixtures are based on the installed 3.7.3 bundle, not a captured real
+compaction session; new shapes must retain the unknown fallback.
+
 ## Metadata and provenance
 
 `metadata` means a recognized non-conversation record whose required envelope
@@ -85,11 +129,11 @@ native content/details, and the provider's `display` flag in provenance.
 Hidden content remains in JSONL; pretty output and browser rows show only a
 placeholder, including for unsupported hidden custom-message shapes. Discord
 does not publish extension messages. Hidden messages do not count toward the
-relay's recent-message replay window. Recognized compaction/branch summaries,
+relay's recent-message replay window. Recognized branch summaries,
 labels, session names, leaf changes, and active tools are metadata.
 
-Codex turn context, world state, inter-agent communication metadata, compaction,
-context-compacted notices, and rollbacks are metadata. Compaction summaries are
+Codex turn context, world state, inter-agent communication metadata,
+and rollbacks are metadata. Compaction summaries are
 not final assistant replies. Historical subagent ownership filtering runs
 before accounting and metadata normalization. No provenance is inferred from
 a session's source for otherwise unattributed messages.
@@ -102,7 +146,7 @@ turn IDs; missing IDs remain unknown rather than fabricated. Abort retains its
 existing error event as well. Pi, Codex, and
 OpenCode all normalize usage; Pi and Codex also adopt metadata, and Pi supplies
 extension provenance.
-Terminal Pet ignores usage, metadata, and hidden content for activity/focus and
+Terminal Pet ignores compaction, usage, metadata, and hidden content for activity/focus and
 lease handling. Authoritative Pet runtime state remains follow-up work;
 Pi historical logs do not contain the live agent/turn boundaries, so
 those require a separate bridge feature. DSH relay/input remain separate work.

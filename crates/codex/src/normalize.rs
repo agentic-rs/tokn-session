@@ -1889,7 +1889,9 @@ mod tests {
     assert!(matches!(&events[12], AgentEvent::ToolCall(event)
       if matches!(event.tool_kind, ToolKind::Search)
         && event.tool_call_id.as_deref() == Some("search-1")));
-    assert!(matches!(&events[13], AgentEvent::Metadata(event) if event.summary == "context compacted"));
+    assert!(
+      matches!(&events[13], AgentEvent::Compaction(event) if event.state == tokn_session_core::CompactionState::Completed)
+    );
     assert!(matches!(&events[14], AgentEvent::Unknown(event)
       if event.native_type.as_deref() == Some("event_msg.item_completed.FutureItem")));
     assert!(matches!(&events[15], AgentEvent::ToolCall(event)

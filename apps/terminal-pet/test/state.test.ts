@@ -19,6 +19,9 @@ describe("PetStore", () => {
     const store = new PetStore(policy);
     const passive = [
       { type: "metadata", native_type: "compacted", summary: "context summary" },
+      { type: "compaction", state: "started" },
+      { type: "compaction", state: "completed", summary: "context summary" },
+      { type: "compaction", state: "failed" },
       { type: "usage", kind: "session_snapshot", input_tokens: 100 },
       { type: "message", role: "user", phase: "finished", text: "hidden", provenance: { display: false } },
       { type: "unknown", provider: "pi", native: { type: "custom_message", display: false, content: "hidden" } }

@@ -13,6 +13,7 @@ pub enum AgentEvent {
   AgentActivity(AgentActivity),
   ToolCall(ToolCallEvent),
   Lifecycle(LifecycleEvent),
+  Compaction(crate::CompactionEvent),
   Usage(UsageEvent),
   Metadata(MetadataEvent),
   Error(ErrorEvent),

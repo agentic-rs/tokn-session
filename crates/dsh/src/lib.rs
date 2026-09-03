@@ -1,5 +1,6 @@
 //! Read-only discovery and historical normalization of DeepSeek Harness logs.
 
+mod compaction;
 mod metadata;
 mod normalize;
 mod session_source;

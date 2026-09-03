@@ -24,6 +24,77 @@ fn paginated_normalizer() -> CodexNormalizer {
   normalizer
 }
 
+#[test]
+fn compaction_checkpoint_and_notice_are_one_operation_without_a_reply() {
+  for canonical in [false, true] {
+    let mut normalizer = if canonical {
+      paginated_normalizer()
+    } else {
+      normalizer()
+    };
+    let mut events = line(
+      &mut normalizer,
+      json!({"type":"compacted","ordinal":10,"payload":{
+        "message":"retained context", "replacement_history":[{"type":"compaction","encrypted_content":"opaque"}],
+        "window_id":"window-2", "previous_window_id":"window-1", "window_number":2
+      }}),
+    );
+    events.extend(line(&mut normalizer, token_count(35)));
+    let notice = if canonical {
+      json!({"type":"item_completed","thread_id":"codex-1","turn_id":"turn-1",
+        "item":{"type":"ContextCompaction","id":"compact-1"},"completed_at_ms":1})
+    } else {
+      json!({"type":"context_compacted"})
+    };
+    events.extend(line(&mut normalizer, json!({"type":"event_msg","payload":notice})));
+    let operations = tokn_session_core::compaction_operations(&events);
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].source_event_indices.len(), 2);
+    assert_eq!(operations[0].event.summary.as_deref(), Some("retained context"));
+    assert!(operations[0].event.summary_opaque);
+    assert_eq!(operations[0].event.context.window_id.as_deref(), Some("window-2"));
+    assert!(
+      !events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::Message(_) | AgentEvent::Lifecycle(_)))
+    );
+  }
+}
+
+#[test]
+fn unrelated_records_break_codex_compaction_correlation() {
+  let mut normalizer = normalizer();
+  let mut events = line(
+    &mut normalizer,
+    json!({"type":"compacted","payload":{"message":"summary"}}),
+  );
+  events.extend(line(
+    &mut normalizer,
+    json!({"type":"turn_context","payload":{"turn_id":"next"}}),
+  ));
+  events.extend(line(
+    &mut normalizer,
+    json!({"type":"event_msg","payload":{"type":"context_compacted"}}),
+  ));
+  assert_eq!(tokn_session_core::compaction_operations(&events).len(), 2);
+}
+
+#[test]
+fn opaque_compaction_alias_and_marker_only_context_compaction_are_distinct() {
+  for (payload, opaque) in [
+    (json!({"type":"compaction_summary","encrypted_content":"opaque"}), true),
+    (json!({"type":"context_compaction"}), false),
+  ] {
+    let events = line(&mut normalizer(), json!({"type":"response_item","payload":payload}));
+    assert!(matches!(&events[..], [AgentEvent::Compaction(e)] if e.summary_opaque == opaque));
+  }
+  let events = line(
+    &mut normalizer(),
+    json!({"type":"response_item","payload":{"type":"compaction"}}),
+  );
+  assert!(matches!(&events[..], [AgentEvent::Unknown(_)]));
+}
+
 fn token_count(total: u64) -> Value {
   let counters = json!({"input_tokens":total-5,"output_tokens":5,"cached_input_tokens":10,
     "cache_write_input_tokens":2,"reasoning_output_tokens":2,"total_tokens":total});
@@ -123,8 +194,6 @@ fn context_records_are_metadata_not_final_messages() {
     json!({"type":"turn_context","payload":{"turn_id":"turn-1","model":"model","effort":"low"}}),
     json!({"type":"world_state","payload":{"full":false,"state":{"opaque":true}}}),
     json!({"type":"inter_agent_communication_metadata","payload":{"trigger_turn":false}}),
-    json!({"type":"compacted","payload":{"message":"context summary","replacement_history":[]}}),
-    json!({"type":"event_msg","payload":{"type":"context_compacted"}}),
     json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":2}}),
   ] {
     let events = line(&mut normalizer(), record.clone());
@@ -136,7 +205,7 @@ fn context_records_are_metadata_not_final_messages() {
   let record = json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"codex-1","turn_id":"turn-1",
     "item":{"type":"ContextCompaction","id":"compact-1"},"completed_at_ms":1}});
   assert!(matches!(&line(&mut paginated_normalizer(), record.clone())[..],
-    [AgentEvent::Metadata(event)] if event.native == record));
+    [AgentEvent::Compaction(event)] if event.compaction_id.as_deref() == Some("compact-1")));
 }
 
 #[test]

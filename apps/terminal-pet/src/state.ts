@@ -176,6 +176,7 @@ export class PetStore {
     // Ignoring them here also avoids creating a new focus row from metadata alone.
     if (
       relay.event.type === "usage"
+      || relay.event.type === "compaction"
       || relay.event.type === "metadata"
       || asObject(relay.event.provenance)?.display === false
       || (

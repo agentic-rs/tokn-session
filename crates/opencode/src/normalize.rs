@@ -9,6 +9,7 @@ use tokn_session_core::{
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenCodeNormalizer {
+  compaction_requests: std::collections::BTreeSet<String>,
   provider: Provider,
   session_id: String,
   current_provider: Option<String>,
@@ -22,6 +23,7 @@ impl OpenCodeNormalizer {
 
   pub(crate) fn with_provider(session_id: String, provider: Provider) -> Self {
     Self {
+      compaction_requests: Default::default(),
       provider,
       session_id,
       current_provider: None,
@@ -58,6 +60,41 @@ impl OpenCodeNormalizer {
   }
 
   pub fn normalize_message(&mut self, row: OpenCodeMessageRow) -> Vec<AgentEvent> {
+    if let Some(mut events) =
+      crate::compaction::normalize(self.provider, &self.session_id, &row, &mut self.compaction_requests)
+    {
+      // Reuse accounting validation, but never expose the internal summary as
+      // a final assistant reply or change the conversation's active model.
+      if let MessageItem::Assistant(message) = row.data.item() {
+        let accounting = self.normalize_assistant_turn(
+          &row.id,
+          &message.parent_id,
+          row.time_created,
+          message.tokens.as_ref(),
+          row.data.native(),
+          None,
+          true,
+          row
+            .parts
+            .iter()
+            .filter(|part| {
+              let native = part.data.native();
+              native["type"] != "compaction"
+                && !(self.provider == Provider::ZCode
+                  && native["type"] == "timeline"
+                  && native["timelineType"] == "context_compaction")
+            })
+            .cloned()
+            .collect(),
+        );
+        events.extend(
+          accounting
+            .into_iter()
+            .filter(|event| matches!(event, AgentEvent::Usage(_) | AgentEvent::Unknown(_))),
+        );
+      }
+      return events;
+    }
     let OpenCodeMessageRow {
       id,
       time_created,

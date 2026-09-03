@@ -6,6 +6,7 @@ use tokn_session_core::{AgentEvent, MetadataEvent, MetadataKind, Provider, Unkno
 
 #[derive(Default)]
 pub(crate) struct RecordsNormalizer {
+  compactions: crate::compaction::Compactions,
   last_info: Option<Value>,
   last_limits: Option<Value>,
 }
@@ -17,6 +18,10 @@ impl RecordsNormalizer {
     session_id: Option<String>,
     canonical_items: bool,
   ) -> Option<Vec<AgentEvent>> {
+    if let Some(events) = self.compactions.normalize(line, session_id.clone(), canonical_items) {
+      self.last_info = None;
+      return Some(events);
+    }
     let context = RecordContext {
       session_id,
       timestamp: line.timestamp().map(str::to_owned),
@@ -34,19 +39,14 @@ impl RecordsNormalizer {
       RolloutItem::InterAgentCommunicationMetadata(item) => item
         .trigger_turn
         .map(|_| (MetadataKind::Context, "agent communication context")),
-      RolloutItem::Compacted(item) => {
+      // Valid compaction observations were handled above. Keep malformed
+      // checkpoints visible as unknowns, never downgrade them to metadata.
+      RolloutItem::Compacted(_) => {
         self.last_info = None;
-        item
-          .message
-          .as_ref()
-          .map(|_| (MetadataKind::Context, "context compacted"))
+        None
       }
       RolloutItem::EventMessage(item) => match item.event_type.as_deref() {
         Some("token_count") => return Some(self.token_count(&context, payload, line.ordinal())),
-        Some("context_compacted") => {
-          self.last_info = None;
-          Some((MetadataKind::Context, "context compacted"))
-        }
         Some("thread_rolled_back") => {
           self.last_info = None;
           payload["num_turns"]
@@ -55,12 +55,7 @@ impl RecordsNormalizer {
         }
         Some("item_completed") if canonical_items && payload["item"]["type"] == "ContextCompaction" => {
           self.last_info = None;
-          ["thread_id", "turn_id"]
-            .iter()
-            .all(|field| payload[field].as_str().is_some_and(|value| !value.is_empty()))
-            .then(|| payload["item"]["id"].as_str().filter(|id| !id.is_empty()))
-            .flatten()
-            .map(|_| (MetadataKind::Context, "context compacted"))
+          None
         }
         _ => return None,
       },

@@ -31,6 +31,22 @@ cd apps/viewer && pnpm tauri dev
 
 The old `tokn-session sessions list/show` shape is intentionally unsupported.
 
+## Compaction
+
+First-class `AgentEvent::Compaction` is implemented for Codex, Pi, OpenCode,
+ZCode, and DSH; WorkBuddy is deliberately deferred. See [event semantics](event-ir.md#compaction)
+for source evidence and provider-specific state/measurement differences.
+The viewer projects correlated observations into one expandable card outside
+work trajectories, with a stable first-record key, readable summary, scoped
+token measurements, and optional Relay-native contributor detail. Compaction
+does not complete a turn or count as unread conversation; terminal-pet ignores
+it for activity/focus. Existing Relay follow/cache updates carry the event,
+including when native is off. Earlier transcript content remains visible.
+Codex/Pi persisted history does not expose compaction start; OpenCode exposes a
+request, while ZCode/DSH expose explicit start/end observations. ZCode coverage
+is based on the installed 3.7.3 bundle and representative fixtures, not a real
+captured compaction. Upgrade strict `AgentEvent` consumers with the producer.
+
 ## Session Relay
 
 The viewer defaults to an app-owned Relay child for its lifetime, running the
@@ -823,7 +839,7 @@ Current browser keys:
 - Pi native JSONL parsing uses `tokn-pi-protocol`. Unknown message roles such
   as historical `bashExecution` records remain visible without preventing the
   rest of the session from loading.
-- Pi compaction, branch-summary, opaque extension state, label, session-info,
+- Pi branch-summary, opaque extension state, label, session-info,
   leaf, and active-tool records are validated metadata. Extension context
   messages have system role and explicit provenance/visibility; hidden content
   is redacted from human views and does not displace replayed visible messages.
@@ -852,7 +868,7 @@ Current browser keys:
   provider-supplied author and recipient paths. Paths remain null when the
   record does not supply them.
 - Codex `world_state`, `turn_context`, `inter_agent_communication_metadata`,
-  compaction, and rollback records are metadata, not conversation replies.
+  and rollback records are metadata, not conversation replies.
   `token_count` emits replaceable usage snapshots with consecutive identical
   info suppressed; decreases and context estimates are not rewritten as deltas.
   Missing usage and changed rate limits are diagnostic metadata. Historical

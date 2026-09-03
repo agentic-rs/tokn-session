@@ -1,3 +1,4 @@
+mod compaction;
 pub mod event;
 pub mod normalize;
 mod records;

@@ -96,6 +96,7 @@ fn event_provider(event: &AgentEvent) -> Provider {
     AgentEvent::AgentActivity(event) => event.provider,
     AgentEvent::ToolCall(event) => event.provider,
     AgentEvent::Lifecycle(event) => event.provider,
+    AgentEvent::Compaction(event) => event.provider,
     AgentEvent::Usage(event) => event.provider,
     AgentEvent::Metadata(event) => event.provider,
     AgentEvent::Error(event) => event.provider,
