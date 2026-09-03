@@ -1,0 +1,163 @@
+export type UnlistenFn = () => void;
+type Handler = (event: { payload: unknown }) => void;
+export type ConnectionState = "connecting" | "connected" | "reconnecting";
+export const isDesktop = () => "__TAURI_INTERNALS__" in window;
+
+// One selected machine owns requests and subscriptions. Closing it aborts both,
+// so late responses from an old machine cannot enter the next viewer instance.
+export class RemoteClient {
+  private listeners = new Map<string, Set<Handler>>();
+  private lifetime = new AbortController();
+  private requests = new Set<AbortController>();
+  private started?: Promise<void>;
+  private closed = false;
+  private onState: (state: ConnectionState) => void = () => {};
+
+  constructor(readonly endpoint: string, private token: string) {}
+
+  static async connect(endpoint: string, token: string): Promise<RemoteClient> {
+    const url = new URL(endpoint);
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+      throw new Error("Enter an HTTP or HTTPS API address without credentials or query parameters.");
+    }
+    const client = new RemoteClient(url.toString().replace(/\/$/, ""), token);
+    try {
+      const health = await client.fetchJson("health") as { version?: number };
+      if (health.version !== 1) throw new Error("This server uses an unsupported viewer API version.");
+      return client;
+    } catch (error) { client.close(); throw error; }
+  }
+
+  setStateListener(handler: (state: ConnectionState) => void) { this.onState = handler; }
+  private headers(): Record<string, string> {
+    return this.token ? { Authorization: `Bearer ${this.token}` } : {};
+  }
+  private async fetchJson(path: string, payload?: unknown): Promise<unknown> {
+    if (this.closed) throw new Error("Machine disconnected");
+    const controller = new AbortController();
+    this.requests.add(controller);
+    const timeout = setTimeout(() => controller.abort(), 30_000);
+    try {
+      const response = await fetch(`${this.endpoint}/api/v1/${path}`, {
+        method: payload === undefined ? "GET" : "POST",
+        headers: { ...this.headers(), ...(payload === undefined ? {} : { "Content-Type": "application/json" }) },
+        body: payload === undefined ? undefined : JSON.stringify(payload),
+        signal: controller.signal,
+        credentials: "omit",
+        redirect: "error",
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error ?? `Viewer API returned ${response.status}`);
+      if (this.closed) throw new Error("Machine disconnected");
+      return body;
+    } finally { clearTimeout(timeout); this.requests.delete(controller); }
+  }
+  invoke<T>(command: string, payload: unknown = {}): Promise<T> {
+    return this.fetchJson(command, payload) as Promise<T>;
+  }
+  async listen<T>(name: string, handler: (event: { payload: T }) => void): Promise<UnlistenFn> {
+    if (this.closed) throw new Error("Machine disconnected");
+    const handlers = this.listeners.get(name) ?? new Set<Handler>();
+    const observer = handler as Handler;
+    handlers.add(observer);
+    this.listeners.set(name, handlers);
+    this.started ??= new Promise<void>((resolve, reject) => { void this.pump(resolve, reject); });
+    try { await this.started; }
+    catch (error) { handlers.delete(observer); throw error; }
+    return () => { handlers.delete(observer); };
+  }
+  private emit(name: string, payload: unknown) {
+    for (const handler of this.listeners.get(name) ?? []) handler({ payload });
+  }
+  private async pump(ready: () => void, failed: (error: unknown) => void) {
+    let connected = false;
+    let attempted = false;
+    while (!this.closed) {
+      this.onState(attempted ? "reconnecting" : "connecting");
+      attempted = true;
+      const connection = new AbortController();
+      const abort = () => connection.abort();
+      this.lifetime.signal.addEventListener("abort", abort, { once: true });
+      let watchdog = setTimeout(abort, 20_000);
+      try {
+        const response = await fetch(`${this.endpoint}/api/v1/events`, {
+          headers: this.headers(), signal: connection.signal, credentials: "omit", redirect: "error",
+        });
+        if (!response.ok || !response.body) throw new Error(`Live connection failed (${response.status})`);
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        try {
+          while (!this.closed) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            clearTimeout(watchdog);
+            watchdog = setTimeout(abort, 45_000);
+            buffer += decoder.decode(value, { stream: true }).replace(/\r/g, "");
+            if (buffer.length > 2 * 1024 * 1024) throw new Error("Live event exceeds size limit");
+            let end: number;
+            while ((end = buffer.indexOf("\n\n")) !== -1) {
+              const frame = buffer.slice(0, end); buffer = buffer.slice(end + 2);
+              const parsed = parseEvent(frame);
+              if (!parsed) continue;
+              if (parsed.event === "ready") {
+                this.onState("connected");
+                if (connected) this.emit("relay-changed", { session_key: null, reset: true });
+                connected = true; ready();
+              } else this.emit(parsed.event, parsed.payload);
+            }
+          }
+        } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+      } catch {
+        // The connection banner stays visible while both initial and later
+        // failures retry. Only a ready stream releases initial catalog reads.
+      } finally {
+        clearTimeout(watchdog);
+        this.lifetime.signal.removeEventListener("abort", abort);
+        connection.abort();
+      }
+      if (!this.closed) {
+        this.onState("reconnecting");
+        await new Promise<void>((resolve) => {
+          const finish = () => { clearTimeout(timer); this.lifetime.signal.removeEventListener("abort", finish); resolve(); };
+          const timer = setTimeout(finish, 1000);
+          this.lifetime.signal.addEventListener("abort", finish, { once: true });
+        });
+      }
+    }
+    if (!connected) failed(new Error("Machine disconnected"));
+  }
+  close() {
+    this.closed = true;
+    this.lifetime.abort();
+    for (const request of this.requests) request.abort();
+    this.listeners.clear();
+    this.token = "";
+  }
+}
+
+export function parseEvent(frame: string): { event: string; payload: unknown } | null {
+  let event = "message";
+  const data: string[] = [];
+  for (const line of frame.split("\n")) {
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
+  }
+  return data.length ? { event, payload: JSON.parse(data.join("\n")) } : null;
+}
+
+let selected: RemoteClient | undefined;
+export function selectMachine(client?: RemoteClient) {
+  selected?.close();
+  selected = client;
+}
+export async function invoke<T>(command: string, payload?: Record<string, unknown>): Promise<T> {
+  if (isDesktop()) return (await import("@tauri-apps/api/core")).invoke<T>(command, payload);
+  if (!selected) throw new Error("Connect to a machine first");
+  return selected.invoke<T>(command, payload);
+}
+export async function listen<T>(event: string, handler: (event: { payload: T }) => void): Promise<UnlistenFn> {
+  if (isDesktop()) return (await import("@tauri-apps/api/event")).listen<T>(event, handler);
+  if (!selected) throw new Error("Connect to a machine first");
+  return selected.listen<T>(event, handler);
+}

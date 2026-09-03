@@ -238,9 +238,12 @@ fn grouped_files_buffer_partial_rows_reset_edits_and_preserve_native() {
     let path = root.path().join(relative);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, contents).unwrap();
-    let header = AgentClient::list_session_headers(crate::providers::source(provider), Some(root.path().into()))
-      .unwrap()
-      .remove(0);
+    let header = AgentClient::list_session_headers(
+      tokn_session_relay::providers::source(provider),
+      Some(root.path().into()),
+    )
+    .unwrap()
+    .remove(0);
     let entry = CatalogEntry {
       key: "session".into(),
       provider,

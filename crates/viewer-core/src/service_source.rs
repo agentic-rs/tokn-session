@@ -10,7 +10,8 @@ use std::{
 use tokn_session_core::{NormalizedRecord, Provider, SessionHeader, SessionRef};
 use tokn_session_opencode::{OpenCodeSessionCache, OpenCodeSessionSource};
 
-use crate::{RecordOperation, RelayRecord, SessionContext, service_protocol::CatalogEntry, tailer::FileState};
+use crate::service_protocol::CatalogEntry;
+use tokn_session_relay::{JsonlReader as FileState, RecordOperation, RelayRecord, SessionContext};
 
 #[cfg(test)]
 mod tests;
@@ -63,7 +64,7 @@ impl SessionReader {
         None
       },
       database: matches!(entry.provider, Provider::OpenCode | Provider::ZCode)
-        .then(|| crate::providers::database(entry.provider, Some(entry.header.path.clone()))),
+        .then(|| tokn_session_relay::providers::database(entry.provider, Some(entry.header.path.clone()))),
       database_cache: OpenCodeSessionCache::with_max_source_bytes(crate::service_protocol::MAX_SNAPSHOT_BYTES),
       source_records: Vec::new(),
       native,
@@ -229,7 +230,7 @@ impl SessionReader {
         path: reference.path.clone(),
         topic: format!(
           "{}.{}",
-          crate::providers::source(context.provider).as_str(),
+          tokn_session_relay::providers::source(context.provider).as_str(),
           context.session_id
         ),
         session: context.clone(),
@@ -257,34 +258,4 @@ impl SessionReader {
   }
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct FileVersion {
-  pub(crate) length: u64,
-  modified: SystemTime,
-  #[cfg(unix)]
-  pub(crate) identity: (u64, u64),
-}
-
-pub(crate) fn versions(path: &PathBuf, database: bool) -> Vec<Option<FileVersion>> {
-  let mut paths = vec![path.clone()];
-  if database {
-    let mut wal = path.as_os_str().to_os_string();
-    wal.push("-wal");
-    paths.push(wal.into());
-  }
-  paths
-    .into_iter()
-    .map(|path| {
-      std::fs::metadata(path).ok().and_then(|m| {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
-        Some(FileVersion {
-          length: m.len(),
-          modified: m.modified().ok()?,
-          #[cfg(unix)]
-          identity: (m.dev(), m.ino()),
-        })
-      })
-    })
-    .collect()
-}
+pub(crate) use tokn_session_relay::file_version::{FileVersion, versions};

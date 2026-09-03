@@ -4,9 +4,8 @@ use tokn_session_client::AgentClient;
 use tokn_session_core::{NormalizedRecord, Provider};
 
 use crate::{
-  NewFileReplay, ProviderRoot, RecordOperation, RelayRecord, TailUpdate,
-  service_protocol::CatalogEntry,
-  service_source::{FileVersion, SessionReader, versions},
+  NewFileReplay, ProviderRoot, RecordOperation, RelayRecord, SessionContext, TailUpdate,
+  file_version::{FileVersion, versions},
   tailer::apply_replay_policy,
 };
 
@@ -62,24 +61,42 @@ impl SnapshotTailer {
       if previous.is_some_and(|previous| previous.version == version) {
         continue;
       }
-      let entry = CatalogEntry {
-        key: key.clone(),
-        provider: self.root.provider,
-        header,
+      let loaded = match self.root.provider {
+        Provider::WorkBuddy => tokn_session_workbuddy::WorkBuddySessionSource::new(Some(self.root.path.clone()))
+          .load_session_records_path(&header.path, native, 128 * 1024 * 1024),
+        Provider::Dsh => tokn_session_dsh::DshSessionSource::new(Some(self.root.path.clone()))
+          .load_session_records_path(&header.path, native, 128 * 1024 * 1024),
+        _ => unreachable!(),
       };
-      let reader = match SessionReader::new(entry, native, self.root.path.clone()) {
-        Ok(reader) => reader,
+      let loaded = match loaded {
+        Ok(loaded) => loaded,
         Err(error) => {
           update.warnings.push(error);
           continue;
         }
       };
+      let context = SessionContext::from_session_ref(self.root.provider, &loaded.reference);
+      let records: Vec<_> = loaded
+        .records
+        .into_iter()
+        .map(|record| RelayRecord {
+          path: loaded.reference.path.clone(),
+          topic: format!(
+            "{}.{}",
+            crate::providers::source(self.root.provider).as_str(),
+            context.session_id
+          ),
+          session: context.clone(),
+          operation: RecordOperation::Upsert,
+          record,
+        })
+        .collect();
       let mut fingerprints = HashMap::new();
       let mut changed = Vec::new();
-      for record in &reader.snapshot.records {
+      for record in &records {
         let fingerprint = serde_json::to_string(&record.record).map_err(|err| err.to_string())?;
         if publish && previous.and_then(|old| old.fingerprints.get(&record.record.record_id)) != Some(&fingerprint) {
-          changed.push(record.as_ref().clone());
+          changed.push(record.clone());
         }
         fingerprints.insert(record.record.record_id.clone(), fingerprint);
       }
@@ -90,7 +107,7 @@ impl SnapshotTailer {
           .filter(|id| !fingerprints.contains_key(*id))
           .collect();
         removed.sort();
-        if let Some(context) = reader.snapshot.records.first() {
+        if let Some(context) = records.first() {
           changed.extend(removed.into_iter().map(|id| RelayRecord {
             path: context.path.clone(),
             topic: context.topic.clone(),

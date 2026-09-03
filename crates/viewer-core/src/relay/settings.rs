@@ -1,5 +1,5 @@
+use crate::service_protocol::{DEFAULT_SERVICE_ENDPOINT, local_endpoint};
 use serde::{Deserialize, Serialize};
-use tokn_session_relay::service_protocol::{DEFAULT_SERVICE_ENDPOINT, local_endpoint};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -14,7 +14,7 @@ pub enum RelayMode {
 #[serde(from = "StoredSettings")]
 pub struct RelaySettings {
   pub mode: RelayMode,
-  /// Saved external endpoint, never overwritten by the child's ephemeral port.
+  /// Saved external endpoint, never overwritten by the managed stdio connection.
   pub endpoint: String,
   pub include_native: bool,
 }

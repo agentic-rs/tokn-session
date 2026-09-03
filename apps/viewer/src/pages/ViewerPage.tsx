@@ -5,12 +5,12 @@ import { Sidebar } from "../components/Sidebar";
 import { StatusBar } from "../components/StatusBar";
 import { useViewerState } from "../lib/useViewerState";
 
-export function ViewerPage() {
+export function ViewerPage({ remote = false }: { remote?: boolean }) {
   const viewer = useViewerState();
 
   return (
     <div className="viewer-app">
-      <RelayConnection />
+      {!remote && <RelayConnection />}
       <div className="viewer-shell" data-inspector-open={viewer.inspectorOpen}>
         <div className="sidebar-shell" data-mobile-open={viewer.mobileSidebarOpen}>
           <Sidebar

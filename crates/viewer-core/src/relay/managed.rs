@@ -7,7 +7,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::ViewerRelay;
-use crate::relay_child::CHILD_FLAG;
+use tokn_session_relay::stdio::CHILD_FLAG;
 
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -15,6 +15,7 @@ const MAX_ATTEMPTS: usize = 3;
 
 struct ManagedChild {
   child: Child,
+  output: BufReader<tokio::process::ChildStdout>,
   // Child::wait closes child.stdin automatically. Keep the lifetime handle
   // separately or merely monitoring exit would terminate a healthy Relay.
   lifetime: Option<ChildStdin>,
@@ -42,25 +43,41 @@ impl ManagedChild {
       .spawn()
       .map_err(|e| format!("Could not start bundled Relay: {e}"))?;
     let lifetime = child.stdin.take();
-    Ok(Self { child, lifetime })
+    let output = BufReader::new(child.stdout.take().ok_or("Relay output pipe is missing")?);
+    Ok(Self {
+      child,
+      output,
+      lifetime,
+    })
   }
 
-  async fn ready(&mut self) -> Result<String, String> {
-    let stdout = self.child.stdout.take().ok_or("Relay readiness pipe is missing")?;
-    let mut reader = BufReader::new(stdout.take(4096));
+  async fn line(&mut self) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
-    reader.read_until(b'\n', &mut bytes).await.map_err(|e| e.to_string())?;
-    if bytes.last() != Some(&b'\n') {
-      return Err("Relay exited before readiness or sent an invalid readiness frame".into());
+    (&mut self.output)
+      .take((tokn_session_relay::stdio::MAX_LINE_BYTES + 1) as u64)
+      .read_until(b'\n', &mut bytes)
+      .await
+      .map_err(|e| e.to_string())?;
+    if bytes.last() != Some(&b'\n') || bytes.len() > tokn_session_relay::stdio::MAX_LINE_BYTES {
+      return Err("Relay pipe closed or exceeded the frame limit".into());
     }
-    let endpoint: Result<String, String> =
-      serde_json::from_slice(&bytes).map_err(|e| format!("Invalid Relay readiness: {e}"))?;
-    let endpoint = endpoint?;
-    let address = tokn_session_relay::service_protocol::local_endpoint(&endpoint)?;
-    if address.port() == 0 {
-      return Err("Relay did not report its bound port".into());
+    Ok(bytes)
+  }
+
+  async fn ready(&mut self) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_slice(&self.line().await?).map_err(|e| e.to_string())?;
+    if value["type"] != "ready" || value["version"] != tokn_session_relay::stdio::VERSION {
+      return Err("Invalid Relay pipe handshake".into());
     }
-    Ok(endpoint)
+    Ok(())
+  }
+
+  async fn consume(&mut self, snapshots: &crate::service_server::Service) -> Result<(), String> {
+    loop {
+      let _record: tokn_session_relay::RelayRecord =
+        serde_json::from_slice(&self.line().await?).map_err(|e| format!("Invalid Relay record: {e}"))?;
+      snapshots.invalidate().await;
+    }
   }
 
   async fn stop(&mut self) {
@@ -91,6 +108,21 @@ impl ViewerRelay {
       _ = cancel.cancelled() => return,
       guard = self.managed_lock.lock() => guard,
     };
+    let mut config = match tokn_session_relay::stdio::default_config(native) {
+      Ok(config) => config,
+      Err(error) => {
+        self.managed_phase(epoch, "failed", Some(error));
+        return;
+      }
+    };
+    config.poll_interval = Duration::from_millis(500);
+    let snapshots = match crate::service_server::Service::new(config) {
+      Ok(service) => service,
+      Err(error) => {
+        self.managed_phase(epoch, "failed", Some(error));
+        return;
+      }
+    };
     for attempt in 0..MAX_ATTEMPTS {
       if cancel.is_cancelled() {
         return;
@@ -104,14 +136,17 @@ impl ViewerRelay {
             result = tokio::time::timeout(START_TIMEOUT, child.ready()) => result.unwrap_or_else(|_| Err("Relay startup timed out".into())),
           };
           let error = match ready {
-            Ok(endpoint) => {
-              self.connect_endpoint(endpoint, epoch);
+            Ok(()) => {
+              self.connect_source(
+                crate::service_client::Connection::Embedded(snapshots.clone()),
+                "stdio".into(),
+                epoch,
+              );
               tokio::select! {
                 biased;
                 _ = cancel.cancelled() => { child.stop().await; return; }
-                result = child.child.wait() => match result {
-                  Ok(status) => format!("Bundled Relay exited ({status})"),
-                  Err(error) => format!("Could not wait for bundled Relay: {error}"),
+                result = child.consume(&snapshots) => {
+                  result.err().unwrap_or_else(|| "Relay pipe stopped".into())
                 },
               }
             }
@@ -148,6 +183,7 @@ impl ViewerRelay {
       }
       state.connection_cancel.cancel();
       state.active_endpoint = None;
+      state.connection = None;
       state.phase = phase.into();
       state.error = error;
     }
@@ -162,6 +198,7 @@ impl ViewerRelay {
       state.cancel.cancel();
       state.connection_cancel.cancel();
       state.active_endpoint = None;
+      state.connection = None;
     }
     self.ready.notify_all();
     // The supervisor releases this only after closing stdin and reaping its child.
@@ -194,7 +231,7 @@ mod tests {
       .args(["--exact", "relay::managed::tests::lifetime_fixture"])
       .env("TOKN_RELAY_LIFETIME_FIXTURE", "1")
       .stdin(Stdio::piped())
-      .stdout(Stdio::null())
+      .stdout(Stdio::piped())
       .stderr(Stdio::inherit())
       .kill_on_drop(true);
     let mut child = ManagedChild::spawn_command(&mut command).unwrap();
@@ -264,8 +301,9 @@ mod tests {
   #[tokio::test]
   async fn new_child_port_resumes_cached_sessions_without_mixing_native_snapshots() {
     use crate::model::SessionLocator;
+    use crate::{service_client::load_catalog, service_server::serve_listener};
     use tokn_session_core::Provider;
-    use tokn_session_relay::{ProviderRoot, RelayConfig, service_client::load_catalog, service_server::serve_listener};
+    use tokn_session_relay::{ProviderRoot, RelayConfig};
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("session.jsonl");
     let initial = "{\"type\":\"session\",\"id\":\"restart\",\"timestamp\":\"2026-01-01\",\"cwd\":\"/tmp\"}\n{\"type\":\"message\",\"id\":\"one\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n";

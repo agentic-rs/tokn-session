@@ -2734,3 +2734,33 @@ button:disabled {
 .relay-settings button:hover:not(:disabled) { background: var(--surface-hover); }
 .relay-settings button:disabled { opacity: 0.5; }
 .relay-settings p { width: 100%; margin: 2px 0; }
+
+.machine-connect {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+.machine-connect form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(100%, 440px);
+}
+.machine-connect input { padding: 10px; }
+.machine-connect button { padding: 10px 16px; }
+.machine-hint { font-size: 12px; opacity: 0.65; }
+.machine-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 16px;
+  font-size: 12px;
+  border-bottom: 1px solid #7774;
+}
+
+.remote-viewer { display: grid; grid-template-rows: auto minmax(0, 1fr); height: 100%; }
+.machine-connect input { border: 1px solid var(--border); background: var(--surface); border-radius: 6px; }
+.machine-connect button, .machine-bar button { background: var(--text); color: var(--app-bg); border-radius: 6px; cursor: pointer; }
+.machine-bar button { padding: 6px 10px; }

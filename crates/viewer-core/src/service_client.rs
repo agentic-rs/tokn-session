@@ -12,11 +12,34 @@ pub struct RelayCatalog {
   pub warnings: Vec<String>,
 }
 
-async fn connect(endpoint: &str, action: Action) -> Result<(TcpStream, Vec<Provider>, bool), String> {
-  let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(local_endpoint(endpoint)?))
-    .await
-    .map_err(|_| "Relay connection timed out")?
-    .map_err(|e| e.to_string())?;
+trait SessionIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> SessionIo for T {}
+
+#[derive(Clone)]
+pub enum Connection {
+  Tcp(String),
+  Embedded(Arc<crate::service_server::Service>),
+}
+
+async fn connect(connection: &Connection, action: Action) -> Result<(Box<dyn SessionIo>, Vec<Provider>, bool), String> {
+  let mut stream: Box<dyn SessionIo> = match connection {
+    Connection::Tcp(endpoint) => Box::new(
+      tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(local_endpoint(endpoint)?))
+        .await
+        .map_err(|_| "Relay connection timed out")?
+        .map_err(|e| e.to_string())?,
+    ),
+    Connection::Embedded(service) => {
+      let (client, mut server) = tokio::io::duplex(64 * 1024);
+      let service = service.clone();
+      tokio::spawn(async move {
+        if let Err(message) = service.handle(&mut server).await {
+          let _ = write_frame(&mut server, &Frame::Error { message }).await;
+        }
+      });
+      Box::new(client)
+    }
+  };
   write_frame(
     &mut stream,
     &Request {
@@ -36,7 +59,11 @@ async fn connect(endpoint: &str, action: Action) -> Result<(TcpStream, Vec<Provi
 }
 
 pub async fn load_catalog(endpoint: &str) -> Result<RelayCatalog, String> {
-  let (mut stream, providers, native) = connect(endpoint, Action::Catalog).await?;
+  load_catalog_from(&Connection::Tcp(endpoint.into())).await
+}
+
+pub async fn load_catalog_from(connection: &Connection) -> Result<RelayCatalog, String> {
+  let (mut stream, providers, native) = connect(connection, Action::Catalog).await?;
   let mut entries = Vec::new();
   let mut bytes = 0;
   loop {
@@ -62,7 +89,7 @@ pub async fn load_catalog(endpoint: &str) -> Result<RelayCatalog, String> {
 }
 
 pub struct RelaySubscription {
-  stream: TcpStream,
+  stream: Box<dyn SessionIo>,
   generation: String,
   revision: u64,
   records: Vec<RelayRecord>,
@@ -80,8 +107,12 @@ pub struct SessionSnapshot {
 
 impl RelaySubscription {
   pub async fn connect(endpoint: &str, session_key: &str) -> Result<Self, String> {
+    Self::connect_from(&Connection::Tcp(endpoint.into()), session_key).await
+  }
+
+  pub async fn connect_from(connection: &Connection, session_key: &str) -> Result<Self, String> {
     let (stream, _, _) = connect(
-      endpoint,
+      connection,
       Action::Follow {
         session_key: session_key.into(),
       },
@@ -189,7 +220,7 @@ impl RelaySubscription {
   }
 }
 
-async fn receive(stream: &mut TcpStream) -> Result<Frame, String> {
+async fn receive(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<Frame, String> {
   let frame = tokio::time::timeout(Duration::from_secs(10), read_frame(stream))
     .await
     .map_err(|_| "Relay response timed out")??;

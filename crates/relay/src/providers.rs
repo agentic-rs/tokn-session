@@ -17,7 +17,7 @@ pub const PROVIDERS: [Provider; 6] = [
   Provider::Dsh,
 ];
 
-pub(crate) fn source(provider: Provider) -> Source {
+pub fn source(provider: Provider) -> Source {
   match provider {
     Provider::Codex => Source::Codex,
     Provider::Pi => Source::Pi,
@@ -28,7 +28,7 @@ pub(crate) fn source(provider: Provider) -> Source {
   }
 }
 
-pub(crate) fn database(provider: Provider, path: Option<PathBuf>) -> OpenCodeSessionSource {
+pub fn database(provider: Provider, path: Option<PathBuf>) -> OpenCodeSessionSource {
   match provider {
     Provider::OpenCode => OpenCodeSessionSource::new(path),
     Provider::ZCode => OpenCodeSessionSource::for_zcode(path),

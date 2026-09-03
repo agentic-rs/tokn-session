@@ -579,7 +579,7 @@ fn relay_records_from_loaded(
   records
 }
 
-pub(crate) struct FileState {
+pub struct FileState {
   path: PathBuf,
   provider: Provider,
   identity: FileIdentity,
@@ -594,19 +594,14 @@ pub(crate) struct FileState {
 
 impl FileState {
   /// Service readers start at zero and keep this exact normalizer for follow.
-  pub(crate) fn for_snapshot(
-    path: PathBuf,
-    provider: Provider,
-    include_native: bool,
-    root: &Path,
-  ) -> Result<Self, String> {
+  pub fn for_snapshot(path: PathBuf, provider: Provider, include_native: bool, root: &Path) -> Result<Self, String> {
     let (catalog, _, _) = load_project_catalog(&[ProviderRoot::new(provider, root.to_path_buf())]);
     let mut state = Self::open(path, provider, Arc::new(RwLock::new(catalog)))?;
     state.include_native = include_native;
     Ok(state)
   }
 
-  pub(crate) fn follow_snapshot(&mut self) -> Result<(TailUpdate, bool), String> {
+  pub fn follow_snapshot(&mut self) -> Result<(TailUpdate, bool), String> {
     self.read_appended(true)
   }
 
