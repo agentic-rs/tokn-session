@@ -8,7 +8,7 @@ use tokio::{
   net::{TcpListener, TcpStream},
   sync::{Mutex, Semaphore, watch},
 };
-use tokn_session_client::{AgentClient, Source};
+use tokn_session_client::AgentClient;
 use tokn_session_core::Provider;
 
 use crate::{
@@ -103,15 +103,7 @@ impl Service {
       let mut entries = Vec::new();
       let mut warnings = Vec::new();
       for root in roots {
-        let source = match root.provider {
-          Provider::Codex => Source::Codex,
-          Provider::Pi => Source::Pi,
-          Provider::OpenCode => Source::OpenCode,
-          _ => {
-            warnings.push(format!("Unsupported relay provider: {:?}", root.provider));
-            continue;
-          }
-        };
+        let source = crate::providers::source(root.provider);
         match AgentClient::list_session_headers(source, Some(root.path)) {
           Ok(headers) => entries.extend(headers.into_iter().map(|header| CatalogEntry {
             key: serde_json::to_string(&(root.provider, &header.path, &header.id)).expect("header key is serializable"),
@@ -183,7 +175,7 @@ impl Service {
             metadata.refresh_followed(&reader.snapshot.entry);
             // OpenCode follows already load current presentation metadata.
             // JSONL follows need their separately cached names/previews.
-            if reader.snapshot.entry.provider != Provider::OpenCode {
+            if matches!(reader.snapshot.entry.provider, Provider::Codex | Provider::Pi) {
               let before = reader.snapshot.entry.header.clone();
               metadata.apply(
                 &reader.snapshot.entry.key,
@@ -233,7 +225,12 @@ impl Service {
     if request.version != PROTOCOL_VERSION {
       return Err("Unsupported Relay protocol version".into());
     }
-    let providers = self.config.roots.iter().map(|root| root.provider).collect();
+    let mut providers = Vec::new();
+    for root in &self.config.roots {
+      if !providers.contains(&root.provider) {
+        providers.push(root.provider);
+      }
+    }
     send(
       stream,
       Frame::Hello {

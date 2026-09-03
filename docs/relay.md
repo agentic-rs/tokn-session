@@ -30,11 +30,10 @@ the IR remain unchanged. Opting in can expose additional provider metadata;
 neither mode is a redaction or security boundary.
 
 Compaction observations use the same record batches and snapshot/follow updates;
-no extra transport or native subscription is required. Codex, Pi, and OpenCode
+no extra transport or native subscription is required. Codex, Pi, OpenCode, ZCode, and DSH
 normalization supplies these events even with native disabled. The viewer
 projects correlated observations into a stable expandable card; terminal-pet
-does not treat them as conversation replies or turn completion. ZCode and DSH
-currently reach the viewer through local history, not Relay.
+does not treat them as conversation replies or turn completion. All six providers are available through Relay.
 This adds an `AgentEvent` variant: strict enum consumers must upgrade alongside
 the producer. The transport framing/version is unchanged; older consumers are
 not guaranteed to understand the expanded event vocabulary.
@@ -48,7 +47,7 @@ whole batch at that key, rather than appending every event again.
   original JSON value, including unknown fields (not original whitespace).
   `jsonl:<byte-offset>` identifies the line in the current file. Partial lines
   remain buffered until newline; malformed lines produce warnings.
-- OpenCode: a consistent read-only SQLite session snapshot is normalized into
+- OpenCode/ZCode: a consistent read-only SQLite session snapshot is normalized into
   a session record and one record per message, with ordered hydrated parts.
   IDs are `session:<id>` and `message:<id>`. Native data is the decoded row
   structure (`data`, `parts`, IDs and timestamps), not every SQL column or a
@@ -56,9 +55,23 @@ whole batch at that key, rather than appending every event again.
   republishes the record. Removed message records in an observed session emit
   `operation: "remove"`, an empty batch, and no native payload.
 
+- WorkBuddy: a synthetic `session:<id>` batch followed by `row:<ordinal>`
+  batches for complete nonblank JSONL rows. Native IDs can repeat; row ordinals
+  keep those records distinct. Catalog metadata supplies session context.
+- DSH: a `session:<id>` header batch followed by `row:<ordinal>` physical
+  storage rows, including packed chunks. Native payloads preserve the packed
+  row; events flatten its direct logical members. Subagent seed filtering and
+  assembled-message/usage reconciliation match historical loading. Plain JSONL
+  and concatenated `.jsonl.zstd` frames are supported.
+
 The reader shares its grouped normalization with historical OpenCode/ZCode
 loading; historical APIs still flatten to the existing `LoadedSession` shape.
-Relay provider support remains Codex, Pi and OpenCode.
+Relay supports Codex, Pi, OpenCode, ZCode, WorkBuddy, and DSH.
+
+WorkBuddy/DSH snapshots reload and normalize changed files; unchanged file
+revisions are cached. Unfinished lines wait for a newline. Invalid complete
+rows and incomplete/corrupt compressed frames fail without committing partial
+snapshots. A later complete source can be followed after reconnecting.
 
 The stdout/ZeroMQ output is a best-effort live feed, not a durable replication protocol: no ack,
 resume cursor, or complete history on startup. JSONL offsets are not stable
@@ -77,8 +90,21 @@ Start a separately configured service for the viewer:
 tokn-session-relay serve --bind tcp://127.0.0.1:5557 --native
 ```
 
-`--native` is optional. The usual `--codex-dir`, `--pi-dir`, and
-`--opencode-dir` source overrides apply. `--poll-interval` defaults to 500ms
+`--native` is optional. The usual `--codex-dir`, `--pi-dir`,
+`--opencode-dir`, `--zcode-dir`, `--workbuddy-dir`, and `--dsh-dir` source
+overrides apply. Defaults use provider-owned root resolution and environment
+variables, shared with the viewer's automatic Relay:
+
+| Provider | Default storage | Environment override |
+| --- | --- | --- |
+| Codex | `~/.codex/sessions`, `~/.codex/archived_sessions` | `CODEX_HOME` |
+| Pi | `~/.pi/agent/sessions` | `PI_CODING_AGENT_SESSION_DIR` |
+| OpenCode | `~/.local/share/opencode/opencode.db` | `OPENCODE_DB`, `XDG_DATA_HOME` |
+| ZCode | `~/.zcode/cli/db/db.sqlite` | `ZCODE_STORAGE_DIR` |
+| WorkBuddy | `~/.workbuddy-ai` catalog and `projects` histories | `WORKBUDDY_CONFIG_DIR`, `CODEBUDDY_CONFIG_DIR` |
+| DSH | `~/.dsh/sessions` | `DSH_HOME` |
+
+`--poll-interval` defaults to 500ms
 for active sessions; the shared metadata catalog is cached for two seconds.
 `serve` always supplies complete history and rejects replay-window flags.
 It does not start a PUB socket: pets can continue using an independently
@@ -95,7 +121,8 @@ catalog, never arbitrary paths.
 
 Catalog discovery returns lightweight headers immediately. A shared background
 cache backfills Pi's latest `session_info` name and first user preview, plus
-first-prompt fallbacks for untitled OpenCode/Codex root sessions. Native titles
+first-prompt fallbacks for untitled OpenCode/ZCode/Codex root sessions and
+WorkBuddy/DSH titles and previews. Native titles
 take precedence. Names/previews arrive on subsequent catalog polls, independent
 of `--native`; a cleared Pi name falls back to its first prompt.
 Pi advances a byte cursor through complete appended lines rather than rescanning
@@ -111,7 +138,7 @@ revision values; begin also carries the session header and `reset` flag.
 The first transaction has `reset: true`. Subsequent JSONL transactions append
 new records in the same generation. File replacement, truncation and detected
 same-length rewrites start a fresh generation and replace the entire snapshot.
-OpenCode DB/WAL changes reconcile raw rows in one read transaction. Unchanged
+OpenCode/ZCode DB/WAL changes reconcile raw rows in one read transaction. Unchanged
 message records reuse decoded data and normalization checkpoints; changes to
 model state recompute dependent records until the state converges. SQLite rows
 are still scanned because timestamps/counts cannot reliably identify edits.
@@ -121,6 +148,12 @@ deletions, reordering or database replacement reset the snapshot. Header-only
 changes can commit without record frames. With `--native`, changes to existing
 native data (including session update timestamps) also require a reset under
 the v1 append/reset protocol. This does not change stdout/ZeroMQ loading.
+
+WorkBuddy also invalidates followed snapshots on catalog DB/WAL changes.
+WorkBuddy/DSH share the append/reset reconciliation: an unchanged prefix keeps
+the generation; edited/deleted records reset it. Appending an assembled DSH
+message can suppress earlier stream/usage records, which requires a reset.
+DSH's 128 MiB limit applies to both the stored file and decoded source bytes.
 
 Full event snapshots are loaded on demand. Concurrent subscribers share one reader
 and normalizer per session; complete appended JSONL lines decode only once.
@@ -195,7 +228,7 @@ Workers and rules still use internal single-event `RelayEvent` values; the
 shared adapter is used by standalone pets and the supervisor. They ignore
 native data and removals and remain activity observers, not record stores or
 history-reconciliation clients. A bounded 4,096-record activity cache suppresses
-unchanged OpenCode event slots when a snapshot is updated (including native-only
+unchanged OpenCode/ZCode/WorkBuddy/DSH event slots when a snapshot is updated (including native-only
 edits); cache eviction can allow replay and is not durable deduplication.
 The default spawned Relay does not request
 native data. Legacy wire envelopes are rejected rather than guessed.

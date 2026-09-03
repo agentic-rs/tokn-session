@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use tokn_session_core::Provider;
@@ -48,12 +48,12 @@ async fn run(args: Args) -> Result<(), String> {
     Command::Serve { .. } => unreachable!(),
     Command::ZeroMq { endpoint } => {
       let publisher = ZmqPublisher::bind(&endpoint).await?;
-      eprintln!("following Codex/Pi/OpenCode session events via ZeroMQ on {endpoint}");
+      eprintln!("following Codex/Pi/OpenCode/ZCode/WorkBuddy/DSH session events via ZeroMQ on {endpoint}");
       Output::ZeroMq(publisher)
     }
     Command::Stdout { format, color } => {
       eprintln!(
-        "following Codex/Pi/OpenCode session events on stdout ({})",
+        "following Codex/Pi/OpenCode/ZCode/WorkBuddy/DSH session events on stdout ({})",
         format.name()
       );
       Output::Stdout {
@@ -442,6 +442,9 @@ struct Args {
   codex_dir: Option<PathBuf>,
   pi_dir: Option<PathBuf>,
   opencode_dir: Option<PathBuf>,
+  zcode_dir: Option<PathBuf>,
+  workbuddy_dir: Option<PathBuf>,
+  dsh_dir: Option<PathBuf>,
   poll_interval: Duration,
   new_file_replay: NewFileReplay,
   include_native: bool,
@@ -490,6 +493,9 @@ impl Args {
       codex_dir: None,
       pi_dir: None,
       opencode_dir: None,
+      zcode_dir: None,
+      workbuddy_dir: None,
+      dsh_dir: None,
       poll_interval: if command == "serve" {
         Duration::from_millis(500)
       } else {
@@ -524,6 +530,9 @@ impl Args {
         "--codex-dir" => parsed.codex_dir = Some(PathBuf::from(next_value(&mut args, "--codex-dir")?)),
         "--pi-dir" => parsed.pi_dir = Some(PathBuf::from(next_value(&mut args, "--pi-dir")?)),
         "--opencode-dir" => parsed.opencode_dir = Some(PathBuf::from(next_value(&mut args, "--opencode-dir")?)),
+        "--zcode-dir" => parsed.zcode_dir = Some(PathBuf::from(next_value(&mut args, "--zcode-dir")?)),
+        "--workbuddy-dir" => parsed.workbuddy_dir = Some(PathBuf::from(next_value(&mut args, "--workbuddy-dir")?)),
+        "--dsh-dir" => parsed.dsh_dir = Some(PathBuf::from(next_value(&mut args, "--dsh-dir")?)),
         "--poll-interval" => parsed.poll_interval = parse_duration(&next_value(&mut args, "--poll-interval")?)?,
         "--replay-all" => {
           set_replay_option(&mut replay_option_seen)?;
@@ -556,15 +565,18 @@ impl Args {
   }
 
   fn roots(&self) -> Result<Vec<ProviderRoot>, String> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let codex = resolve_root(&self.codex_dir, home.as_deref(), ".codex/sessions")?;
-    let pi = resolve_root(&self.pi_dir, home.as_deref(), ".pi/agent/sessions")?;
-    let opencode = resolve_root(&self.opencode_dir, home.as_deref(), ".local/share/opencode")?;
-    Ok(vec![
-      ProviderRoot::new(Provider::Codex, codex),
-      ProviderRoot::new(Provider::Pi, pi),
-      ProviderRoot::new(Provider::OpenCode, opencode),
-    ])
+    let mut roots = Vec::new();
+    for (provider, path) in [
+      (Provider::Codex, &self.codex_dir),
+      (Provider::Pi, &self.pi_dir),
+      (Provider::OpenCode, &self.opencode_dir),
+      (Provider::ZCode, &self.zcode_dir),
+      (Provider::WorkBuddy, &self.workbuddy_dir),
+      (Provider::Dsh, &self.dsh_dir),
+    ] {
+      roots.extend(tokn_session_relay::provider_roots(provider, path.clone())?);
+    }
+    Ok(roots)
   }
 }
 
@@ -607,21 +619,14 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
   Ok(duration)
 }
 
-fn resolve_root(explicit: &Option<PathBuf>, home: Option<&Path>, relative: &str) -> Result<PathBuf, String> {
-  explicit
-    .clone()
-    .or_else(|| home.map(|home| home.join(relative)))
-    .ok_or_else(|| format!("HOME is not set; pass an explicit directory for {relative}"))
-}
-
 fn print_help(help: Help) {
   match help {
     Help::Serve => println!(
-      "Local snapshot-and-follow service (version 1).\n\nUsage:\n  tokn-session-relay serve [options]\n\nOptions:\n  --bind <endpoint>       Numeric loopback TCP endpoint (default: tcp://127.0.0.1:5557)\n  --native                Include native records\n  --codex-dir <path>       Codex session root\n  --pi-dir <path>          Pi session root\n  --opencode-dir <path>    OpenCode directory or database\n  --poll-interval <time>   Active-session polling interval (default: 500ms)\n\nHistory is loaded on demand. Replay-window flags do not apply to serve."
+      "Local snapshot-and-follow service (version 1).\n\nUsage:\n  tokn-session-relay serve [options]\n\nOptions:\n  --bind <endpoint>       Numeric loopback TCP endpoint (default: tcp://127.0.0.1:5557)\n  --native                Include native records\n  --codex-dir <path>       Codex session root\n  --pi-dir <path>          Pi session root\n  --opencode-dir <path>    OpenCode directory or database\n  --zcode-dir <path>       ZCode storage directory or database\n  --workbuddy-dir <path>   WorkBuddy config directory\n  --dsh-dir <path>         DSH sessions directory\n  --poll-interval <time>   Active-session polling interval (default: 500ms)\n\nHistory is loaded on demand. Replay-window flags do not apply to serve."
     ),
     Help::Root => println!(
       "\
-Follow Codex and Pi session files plus OpenCode's SQLite database, and emit normalized events.
+Follow all six providers and emit normalized session events.
 
 Usage:
   tokn-session-relay <subcommand> [options]
@@ -644,7 +649,10 @@ Options:
   --bind <endpoint>           PUB endpoint (default: {DEFAULT_ENDPOINT})
   --codex-dir <path>          Codex session root (default: ~/.codex/sessions)
   --pi-dir <path>             Pi session root (default: ~/.pi/agent/sessions)
-  --opencode-dir <path>       OpenCode data directory or database (default: ~/.local/share/opencode)
+  --opencode-dir <path>       OpenCode data directory or database
+  --zcode-dir <path>          ZCode storage directory or database
+  --workbuddy-dir <path>      WorkBuddy config directory
+  --dsh-dir <path>            DSH sessions directory
   --poll-interval <duration>  Fallback rescan interval, such as 250ms, 2s, or 1m (default: 30s)
   --replay=<count>            Messages replayed for a newly discovered file (default: 3)
   --replay-all                Replay all records for a newly discovered file
@@ -652,7 +660,7 @@ Options:
   -h, --help                  Show this help
 
 Messages use two frames:
-  1. topic: codex.<session_id>, pi.<session_id>, or opencode.<session_id>
+  1. topic: <provider>.<session_id>
   2. JSON: RelayRecord envelope with session context, events array, and optional native"
     ),
     Help::Stdout => println!(
@@ -667,7 +675,10 @@ Options:
   --color                     Add ANSI colors to pretty or summary output
   --codex-dir <path>          Codex session root (default: ~/.codex/sessions)
   --pi-dir <path>             Pi session root (default: ~/.pi/agent/sessions)
-  --opencode-dir <path>       OpenCode data directory or database (default: ~/.local/share/opencode)
+  --opencode-dir <path>       OpenCode data directory or database
+  --zcode-dir <path>          ZCode storage directory or database
+  --workbuddy-dir <path>      WorkBuddy config directory
+  --dsh-dir <path>            DSH sessions directory
   --poll-interval <duration>  Fallback rescan interval, such as 250ms, 2s, or 1m (default: 30s)
   --replay=<count>            Messages replayed for a newly discovered file (default: 3)
   --replay-all                Replay all records for a newly discovered file

@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use tokn_dsh_protocol::{DshSessionItem, DshSessionLine, SessionHeader as DshSessionHeader};
-use tokn_session_core::{LoadedSession, SessionHeader, SessionHistoryStatus, SessionRef};
+use tokn_session_core::{
+  LoadedSession, LoadedSessionRecords, NormalizedRecord, SessionHeader, SessionHistoryStatus, SessionRef,
+};
 
 use crate::{normalize, storage};
 
@@ -116,14 +118,101 @@ impl DshSessionSource {
     })
   }
 
-  fn paths(&self) -> Result<Vec<PathBuf>, String> {
-    let root = session_root(
+  /// Bounded complete-line snapshot, including concatenated Zstandard frames.
+  /// Native batches retain physical packed rows, while normalization operates
+  /// on their logical members and can revise earlier unfinished stream output.
+  pub fn load_session_records_path(
+    &self,
+    path: &Path,
+    include_native: bool,
+    max_bytes: usize,
+  ) -> Result<LoadedSessionRecords, String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    storage::reader(path)?
+      .take(max_bytes as u64 + 1)
+      .read_to_end(&mut bytes)
+      .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    if bytes.len() > max_bytes {
+      return Err("DSH decoded source exceeds the snapshot size limit".into());
+    }
+    let complete = bytes
+      .iter()
+      .rposition(|byte| *byte == b'\n')
+      .map_or(0, |index| index + 1);
+    let mut rows = bytes[..complete].split(|byte| *byte == b'\n');
+    let first: DshSessionLine =
+      serde_json::from_slice(rows.next().unwrap_or_default()).map_err(|err| format!("invalid DSH header: {err}"))?;
+    let native_header = include_native.then(|| first.native().clone());
+    let header = header(first, path)?;
+    let seed_length = if header.origin.as_deref() == Some("subagent") {
+      header.seed_length.unwrap_or(0)
+    } else {
+      0
+    };
+    let mut lines = Vec::new();
+    let mut physical = Vec::new();
+    let mut summary = DshSessionSummary::default();
+    for (index, row) in rows.enumerate() {
+      if row.iter().all(u8::is_ascii_whitespace) {
+        continue;
+      }
+      let line: DshSessionLine =
+        serde_json::from_slice(row).map_err(|err| format!("invalid DSH row {}: {err}", index + 2))?;
+      let native = include_native.then(|| line.native().clone());
+      let start = lines.len();
+      for line in storage::expand(line)? {
+        let direct = !line
+          .native()
+          .get("seq")
+          .and_then(serde_json::Value::as_u64)
+          .is_some_and(|seq| seq < seed_length);
+        summary.observe(&line, direct);
+        if direct {
+          lines.push(line);
+        }
+      }
+      physical.push((index, native, lines.len() - start));
+    }
+    let mut reference = reference(path, &header);
+    reference.message_count = message_count(&lines);
+    reference.title = summary.title;
+    reference.preview = summary.preview;
+    let mut batches = normalize::normalize_batches(&header, lines).into_iter();
+    let mut records = vec![NormalizedRecord {
+      record_id: format!("session:{}", header.id),
+      native: native_header,
+      events: batches.next().unwrap_or_default(),
+    }];
+    for (index, native, count) in physical {
+      records.push(NormalizedRecord {
+        record_id: format!("row:{index}"),
+        native,
+        events: batches.by_ref().take(count).flatten().collect(),
+      });
+    }
+    Ok(LoadedSessionRecords {
+      reference,
+      records,
+      history_status: if seed_length > 0 {
+        SessionHistoryStatus::FilteredSubagent
+      } else {
+        SessionHistoryStatus::Complete
+      },
+    })
+  }
+
+  pub fn session_root(&self) -> Result<PathBuf, String> {
+    session_root(
       self.session_dir.clone(),
       std::env::var_os("DSH_HOME"),
       std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")),
-    )?;
+    )
+  }
+
+  fn paths(&self) -> Result<Vec<PathBuf>, String> {
     let mut paths = Vec::new();
-    collect(&root, &mut paths)?;
+    collect(&self.session_root()?, &mut paths)?;
     paths.sort();
     Ok(paths)
   }

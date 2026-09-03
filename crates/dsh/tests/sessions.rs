@@ -305,3 +305,38 @@ fn missing_root_is_empty_and_prefixes_must_be_unambiguous() {
   );
   assert!(source.load_session("missing").unwrap_err().contains("no dsh session"));
 }
+
+#[test]
+fn relay_batches_match_history_and_retain_packed_native_in_compressed_logs() {
+  let dir = tempfile::tempdir().unwrap();
+  let path = dir.path().join("session.jsonl.zstd");
+  let midpoint = FIXTURE.find("{\"type\":\"tool/result\"").unwrap();
+  let mut compressed = zstd::stream::encode_all(&FIXTURE.as_bytes()[..midpoint], 1).unwrap();
+  compressed.extend(zstd::stream::encode_all(&FIXTURE.as_bytes()[midpoint..], 1).unwrap());
+  fs::write(&path, compressed).unwrap();
+  let source = DshSessionSource::new(Some(dir.path().into()));
+  for native in [false, true] {
+    let records = source.load_session_records_path(&path, native, 1_000_000).unwrap();
+    assert!(records.records.iter().all(|r| r.native.is_some() == native));
+    if native {
+      assert!(
+        records
+          .records
+          .iter()
+          .any(|r| r.native.as_ref().unwrap()["type"] == "reasoning-chunks")
+      );
+    }
+    let flattened: tokn_session_core::LoadedSession = records.into();
+    let history = source.load_session_path(&path).unwrap();
+    assert_eq!(
+      serde_json::to_value(flattened).unwrap(),
+      serde_json::to_value(history).unwrap()
+    );
+  }
+  assert!(
+    source
+      .load_session_records_path(&path, false, 100)
+      .unwrap_err()
+      .contains("size limit")
+  );
+}

@@ -78,7 +78,8 @@ pub struct TailUpdate {
 pub struct SessionTailer {
   roots: Vec<ProviderRoot>,
   files: HashMap<PathBuf, FileState>,
-  opencode: HashMap<PathBuf, OpenCodeState>,
+  opencode: HashMap<(Provider, PathBuf), OpenCodeState>,
+  snapshots: Vec<crate::snapshot_tailer::SnapshotTailer>,
   new_file_replay: NewFileReplay,
   include_native: bool,
   project_catalog: SharedProjectCatalog,
@@ -103,21 +104,13 @@ impl SessionTailer {
   }
 
   pub(crate) fn prepare(roots: Vec<ProviderRoot>, new_file_replay: NewFileReplay) -> Result<Self, String> {
-    if roots.iter().any(|root| matches!(root.provider, Provider::Dsh)) {
-      return Err("dsh relay watching is not implemented; use historical list/show".into());
-    }
-    if roots.iter().any(|root| matches!(root.provider, Provider::ZCode)) {
-      return Err("zcode relay watching is not implemented; use historical list/show".into());
-    }
-    if roots.iter().any(|root| matches!(root.provider, Provider::WorkBuddy)) {
-      return Err("workbuddy relay watching is not implemented; use historical list/show".into());
-    }
     let (project_catalog, project_catalog_source, project_catalog_warning) = load_project_catalog(&roots);
     let project_catalog = Arc::new(RwLock::new(project_catalog));
     let mut tailer = Self {
       roots,
       files: HashMap::new(),
       opencode: HashMap::new(),
+      snapshots: Vec::new(),
       new_file_replay,
       include_native: false,
       project_catalog,
@@ -125,12 +118,20 @@ impl SessionTailer {
       project_catalog_warning,
     };
     for root in &tailer.roots {
-      if matches!(root.provider, Provider::OpenCode) {
-        tailer
-          .opencode
-          .insert(root.path.clone(), OpenCodeState::new(root.path.clone()));
+      if matches!(root.provider, Provider::OpenCode | Provider::ZCode) {
+        tailer.opencode.insert(
+          (root.provider, root.path.clone()),
+          OpenCodeState::with_provider(root.provider, root.path.clone()),
+        );
       }
     }
+    tailer.snapshots = tailer
+      .roots
+      .iter()
+      .filter(|root| matches!(root.provider, Provider::WorkBuddy | Provider::Dsh))
+      .cloned()
+      .map(crate::snapshot_tailer::SnapshotTailer::new)
+      .collect();
     let paths = tailer.discover_paths()?;
     for (path, provider) in paths {
       tailer.files.insert(
@@ -164,6 +165,9 @@ impl SessionTailer {
     for state in self.opencode.values_mut() {
       state.include_native = self.include_native;
       update.append(state.scan(false, self.new_file_replay)?);
+    }
+    for state in &mut self.snapshots {
+      update.append(state.scan(false, self.include_native, self.new_file_replay)?);
     }
     Ok(update)
   }
@@ -199,25 +203,34 @@ impl SessionTailer {
       update.append(state.scan(true, self.new_file_replay)?);
     }
 
+    for state in &mut self.snapshots {
+      update.append(state.scan(true, self.include_native, self.new_file_replay)?);
+    }
     Ok(update)
   }
 
   pub fn scan_paths(&mut self, changed_paths: HashSet<PathBuf>) -> Result<TailUpdate, String> {
     let mut update = TailUpdate::default();
     self.refresh_project_catalog(&mut update);
+    for state in &mut self.snapshots {
+      if changed_paths.iter().any(|path| state.matches_path(path)) {
+        update.append(state.scan(true, self.include_native, self.new_file_replay)?);
+      }
+    }
     let mut candidates = HashMap::new();
     let mut changed_directories = Vec::new();
     let mut changed_opencode = HashSet::new();
 
     for path in changed_paths {
-      if let Some(root) = self.open_code_root_for_event(&path) {
-        changed_opencode.insert(root);
+      let database_roots = self.open_code_roots_for_event(&path);
+      if !database_roots.is_empty() {
+        changed_opencode.extend(database_roots);
         continue;
       }
       let Some(provider) = self.provider_for_path(&path) else {
         continue;
       };
-      if matches!(provider, Provider::OpenCode) {
+      if !matches!(provider, Provider::Codex | Provider::Pi) {
         continue;
       }
       if path.is_dir() {
@@ -291,7 +304,7 @@ impl SessionTailer {
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
     for root in &self.roots {
-      if !matches!(root.provider, Provider::OpenCode) {
+      if matches!(root.provider, Provider::Codex | Provider::Pi) {
         collect_jsonl_files(&root.path, root.provider, &mut seen, &mut paths)?;
       }
     }
@@ -307,13 +320,13 @@ impl SessionTailer {
       .map(|root| root.provider)
   }
 
-  fn open_code_root_for_event(&self, path: &Path) -> Option<PathBuf> {
+  fn open_code_roots_for_event(&self, path: &Path) -> Vec<(Provider, PathBuf)> {
     self
       .opencode
       .iter()
       .filter(|(_, state)| state.matches_path(path))
-      .max_by_key(|(root, _)| root.components().count())
       .map(|(root, _)| root.clone())
+      .collect()
   }
 
   fn refresh_project_catalog(&mut self, update: &mut TailUpdate) {
@@ -361,6 +374,7 @@ impl TailUpdate {
 }
 
 struct OpenCodeState {
+  provider: Provider,
   root_path: PathBuf,
   source: OpenCodeSessionSource,
   sessions: HashMap<String, OpenCodeSessionState>,
@@ -399,9 +413,15 @@ struct OpenCodeDatabaseVersion {
 }
 
 impl OpenCodeState {
+  #[cfg(test)]
   fn new(root_path: PathBuf) -> Self {
+    Self::with_provider(Provider::OpenCode, root_path)
+  }
+
+  fn with_provider(provider: Provider, root_path: PathBuf) -> Self {
     Self {
-      source: OpenCodeSessionSource::new(Some(root_path.clone())),
+      provider,
+      source: crate::providers::database(provider, Some(root_path.clone())),
       root_path,
       sessions: HashMap::new(),
       database_version: None,
@@ -460,7 +480,7 @@ impl OpenCodeState {
             .map_err(|err| err.to_string())
         })
         .collect::<Result<HashMap<_, _>, _>>()?;
-      let context = SessionContext::from_session_ref(&loaded.reference);
+      let context = SessionContext::from_session_ref(self.provider, &loaded.reference);
       let events = relay_records_from_loaded(loaded, &context, &fingerprints, self.sessions.get(&session_id));
 
       match self.sessions.get(&session_id) {
@@ -516,7 +536,11 @@ fn relay_records_from_loaded(
   previous: Option<&OpenCodeSessionState>,
 ) -> Vec<RelayRecord> {
   let path = loaded.reference.path.clone();
-  let topic = format!("opencode.{}", context.session_id);
+  let topic = format!(
+    "{}.{}",
+    crate::providers::source(context.provider).as_str(),
+    context.session_id
+  );
   let mut records: Vec<_> = loaded
     .records
     .into_iter()
@@ -768,7 +792,7 @@ fn retain_message_history(events: &mut Vec<RelayRecord>, message_count: usize) {
   events.drain(..start);
 }
 
-fn apply_replay_policy(events: &mut Vec<RelayRecord>, replay: NewFileReplay) {
+pub(crate) fn apply_replay_policy(events: &mut Vec<RelayRecord>, replay: NewFileReplay) {
   if let NewFileReplay::Messages(message_count) = replay {
     retain_message_history(events, message_count);
   }

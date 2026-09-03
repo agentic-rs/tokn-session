@@ -134,7 +134,7 @@ export class RelayActivityDispatcher {
     onEvent: (event: RelayEvent) => void | Promise<void>,
     signal?: AbortSignal
   ): Promise<void> {
-    if (!record.topic.startsWith("opencode.")) {
+    if (!["opencode.", "zcode.", "workbuddy.", "dsh."].some((prefix) => record.topic.startsWith(prefix))) {
       await dispatchRelayRecord(record, onEvent, signal);
       return;
     }

@@ -7,7 +7,7 @@ use std::{
   time::SystemTime,
 };
 
-use tokn_session_core::{NormalizedRecord, Provider};
+use tokn_session_core::{NormalizedRecord, Provider, SessionHeader, SessionRef};
 use tokn_session_opencode::{OpenCodeSessionCache, OpenCodeSessionSource};
 
 use crate::{RecordOperation, RelayRecord, SessionContext, service_protocol::CatalogEntry, tailer::FileState};
@@ -41,7 +41,7 @@ pub(crate) struct SessionReader {
   file: Option<FileState>,
   database: Option<OpenCodeSessionSource>,
   database_cache: OpenCodeSessionCache,
-  database_records: Vec<Arc<NormalizedRecord>>,
+  source_records: Vec<Arc<NormalizedRecord>>,
   native: bool,
   root: PathBuf,
   bytes: usize,
@@ -62,10 +62,10 @@ impl SessionReader {
       } else {
         None
       },
-      database: matches!(entry.provider, Provider::OpenCode)
-        .then(|| OpenCodeSessionSource::new(Some(entry.header.path.clone()))),
+      database: matches!(entry.provider, Provider::OpenCode | Provider::ZCode)
+        .then(|| crate::providers::database(entry.provider, Some(entry.header.path.clone()))),
       database_cache: OpenCodeSessionCache::with_max_source_bytes(crate::service_protocol::MAX_SNAPSHOT_BYTES),
-      database_records: Vec::new(),
+      source_records: Vec::new(),
       native,
       root,
       bytes: 0,
@@ -84,8 +84,12 @@ impl SessionReader {
 
   pub fn poll(&mut self) -> Result<bool, String> {
     let path = &self.snapshot.entry.header.path;
-    let version = versions(path, self.database.is_some());
-    if self.file.is_some()
+    let mut version = versions(path, self.database.is_some());
+    if self.snapshot.entry.provider == Provider::WorkBuddy {
+      let database = tokn_session_workbuddy::WorkBuddySessionSource::new(Some(self.root.clone())).database_path()?;
+      version.extend(versions(&database, true));
+    }
+    if self.database.is_none()
       && version[0]
         .as_ref()
         .is_some_and(|v| v.length > crate::service_protocol::MAX_SNAPSHOT_BYTES as u64)
@@ -97,6 +101,9 @@ impl SessionReader {
     }
     if self.database.is_some() {
       return self.poll_database(version);
+    }
+    if matches!(self.snapshot.entry.provider, Provider::WorkBuddy | Provider::Dsh) {
+      return self.poll_grouped_file(version);
     }
     let (records, reset) = if let Some(file) = &mut self.file {
       // Same-length rewrites need a fresh reader; truncation/replacement is
@@ -149,8 +156,47 @@ impl SessionReader {
       self.native,
       &mut self.database_cache,
     )?;
+    self.reconcile(loaded.reference, loaded.header, loaded.records, version)
+  }
+
+  fn poll_grouped_file(&mut self, version: Vec<Option<FileVersion>>) -> Result<bool, String> {
+    let entry = &self.snapshot.entry;
+    let max_bytes = crate::service_protocol::MAX_SNAPSHOT_BYTES;
+    let loaded = match entry.provider {
+      Provider::WorkBuddy => tokn_session_workbuddy::WorkBuddySessionSource::new(Some(self.root.clone()))
+        .load_session_records_path(&entry.header.path, self.native, max_bytes)?,
+      Provider::Dsh => tokn_session_dsh::DshSessionSource::new(Some(self.root.clone())).load_session_records_path(
+        &entry.header.path,
+        self.native,
+        max_bytes,
+      )?,
+      _ => unreachable!(),
+    };
+    if loaded.reference.id != entry.header.id {
+      return Err("Relay session identity changed; refresh the catalog".into());
+    }
+    let mut header = entry.header.clone();
+    header.title = loaded.reference.title.clone();
+    header.preview = loaded.reference.preview.clone();
+    header.cwd = loaded.reference.cwd.clone();
+    header.parent_session_id = loaded.reference.parent_session_id.clone();
+    self.reconcile(
+      loaded.reference,
+      header,
+      loaded.records.into_iter().map(Arc::new).collect(),
+      version,
+    )
+  }
+
+  fn reconcile(
+    &mut self,
+    reference: SessionRef,
+    header: SessionHeader,
+    records: Vec<Arc<NormalizedRecord>>,
+    version: Vec<Option<FileVersion>>,
+  ) -> Result<bool, String> {
     let mut prefix = 0;
-    for (old, new) in self.database_records.iter().zip(&loaded.records) {
+    for (old, new) in self.source_records.iter().zip(&records) {
       // Unchanged rows retain their allocation. Changed raw JSON can still
       // produce identical output (e.g. unknown fields with native disabled).
       if !Arc::ptr_eq(old, new)
@@ -166,22 +212,26 @@ impl SessionReader {
       != version.first().and_then(Option::as_ref).map(|v| v.identity);
     #[cfg(not(unix))]
     let replaced = false;
-    let reset = replaced || prefix < self.database_records.len();
-    let header_changed = loaded.header != self.snapshot.entry.header;
+    let reset = replaced || prefix < self.source_records.len();
+    let header_changed = header != self.snapshot.entry.header;
     let changed =
-      reset || loaded.records.len() != self.database_records.len() || header_changed || self.snapshot.error.is_some();
+      reset || records.len() != self.source_records.len() || header_changed || self.snapshot.error.is_some();
     if !changed {
-      self.database_records = loaded.records;
+      self.source_records = records;
       self.version = version;
       return Ok(false);
     }
-    let context = SessionContext::from_session_ref(&loaded.reference);
-    let mut records = Vec::new();
+    let context = SessionContext::from_session_ref(self.snapshot.entry.provider, &reference);
+    let mut additions = Vec::new();
     let mut bytes = if reset { 0 } else { self.bytes };
-    for record in loaded.records.iter().skip(if reset { 0 } else { prefix }) {
+    for record in records.iter().skip(if reset { 0 } else { prefix }) {
       let record = RelayRecord {
-        path: loaded.reference.path.clone(),
-        topic: format!("opencode.{}", context.session_id),
+        path: reference.path.clone(),
+        topic: format!(
+          "{}.{}",
+          crate::providers::source(context.provider).as_str(),
+          context.session_id
+        ),
         session: context.clone(),
         operation: RecordOperation::Upsert,
         record: record.as_ref().clone(),
@@ -190,17 +240,17 @@ impl SessionReader {
       if bytes > crate::service_protocol::MAX_SNAPSHOT_BYTES {
         return Err("Relay session exceeds the snapshot memory limit".into());
       }
-      records.push(Arc::new(record));
+      additions.push(Arc::new(record));
     }
     if reset {
       self.snapshot.generation = generation();
       self.snapshot.records.clear();
     }
-    self.snapshot.records.extend(records);
-    self.snapshot.entry.header = loaded.header;
+    self.snapshot.records.extend(additions);
+    self.snapshot.entry.header = header;
     self.snapshot.revision += 1;
     self.snapshot.error = None;
-    self.database_records = loaded.records;
+    self.source_records = records;
     self.bytes = bytes;
     self.version = version;
     Ok(true)

@@ -1,6 +1,7 @@
 use super::*;
 use std::{fs, io::Write, path::Path};
 use tempfile::TempDir;
+use tokn_session_client::Source;
 
 const HEADER: &str = "{\"type\":\"session\",\"id\":\"pi-session\",\"timestamp\":\"2026-01-01\",\"cwd\":\"/tmp\"}\n";
 const MESSAGE: &str = "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"first prompt\"}}\n";
