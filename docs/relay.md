@@ -123,7 +123,10 @@ own executable, running this same service on an OS-assigned loopback port. The
 shipped app needs no separate Relay installation or PATH lookup. The child uses
 the same provider-root environment overrides as local history. A readiness pipe
 reports the bound endpoint; the private port never replaces the saved external
-endpoint. The app closes a lifetime pipe and reaps its child on exit/mode changes;
+endpoint. Codex roots verified as the active home's `sessions` or
+`archived_sessions` retain that home's title/preview metadata without parsing
+transcript bodies. Unrelated explicit directories do not inherit this metadata.
+The app closes a lifetime pipe and reaps its child on exit/mode changes;
 the child also exits on EOF if its parent crashes. Startup has a ten-second
 timeout. Failures/crashes get at most three launch attempts with one-/two-second
 backoff, then show Failed with an explicit Retry. Other Relay processes are

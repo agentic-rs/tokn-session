@@ -79,6 +79,34 @@ async fn packaged_child_serves_fixtures_with_optional_native_and_exits_on_eof() 
 }
 
 #[tokio::test]
+async fn automatic_catalog_keeps_codex_titles_for_active_and_archived_roots() {
+  let root = tempfile::tempdir().unwrap();
+  let home = root.path().join("codex");
+  for (directory, id) in [("sessions", "active-title"), ("archived_sessions", "archived-title")] {
+    std::fs::create_dir_all(home.join(directory)).unwrap();
+    let header = serde_json::json!({"type": "session_meta", "payload": {"id": id, "cwd": "/tmp"}});
+    // A catalog must preserve metadata without parsing the transcript body.
+    std::fs::write(
+      home.join(directory).join("session.jsonl"),
+      format!("{header}\nnot a valid transcript record\n"),
+    )
+    .unwrap();
+  }
+  std::fs::write(home.join("session_index.jsonl"), "{\"id\":\"active-title\",\"thread_name\":\"Active task title\"}\n{\"id\":\"archived-title\",\"thread_name\":\"Archived task title\"}\n").unwrap();
+  let (mut child, endpoint) = start(root.path(), false).await;
+  let catalog = load_catalog(&endpoint).await.unwrap();
+  assert_eq!(catalog.entries.len(), 2);
+  for (id, title) in [
+    ("active-title", "Active task title"),
+    ("archived-title", "Archived task title"),
+  ] {
+    let entry = catalog.entries.iter().find(|entry| entry.header.id == id).unwrap();
+    assert_eq!(entry.header.title.as_deref(), Some(title));
+  }
+  stop(&mut child).await;
+}
+
+#[tokio::test]
 async fn independent_children_do_not_share_ports_or_shutdown() {
   let root = tempfile::tempdir().unwrap();
   let (mut first, first_endpoint) = start(root.path(), false).await;

@@ -58,7 +58,10 @@ Viewer mode (`automatic`/`external`/`local`), external endpoint, and optional
 native inclusion persist in app config `relay.json`. Missing settings default
 to Automatic with native off; legacy enabled connections migrate to External,
 explicit disabled choices to Local. Automatic uses provider-owned root
-resolution and environment overrides. Local clears Relay routing/snapshots
+resolution and environment overrides. Codex's explicitly resolved active/archive
+roots retain their home-owned title/preview metadata; unrelated explicit roots
+remain isolated from the active home's database and session-name index.
+Local clears Relay routing/snapshots
 and wakes local cataloging. Covered providers skip local body reads/indexing;
 timeline, trajectories and Inspector share
 received snapshots. Failures/child restarts retain last-good data; explicit

@@ -157,15 +157,18 @@ impl CodexSessionSource {
   }
 
   fn apply_indexed_metadata(&self, references: &mut [SessionRef]) {
-    // An explicit session directory is not necessarily owned by the active
-    // Codex home, so associating it with that home's private index is unsafe.
-    if self.session_dir.is_some() || references.is_empty() {
+    if references.is_empty() {
       return;
     }
 
     let Some(codex_home) = default_codex_home().ok() else {
       return;
     };
+    // Relay supplies resolved roots explicitly. Those still belong to this
+    // home's metadata, but arbitrary custom directories must remain isolated.
+    if !owns_metadata_root(self.session_dir.as_deref(), &codex_home) {
+      return;
+    }
     let metadata = indexed_metadata(&codex_home, references);
     for reference in references {
       let Some(native) = metadata.get(&reference.id) else {
@@ -174,6 +177,21 @@ impl CodexSessionSource {
       apply_indexed_metadata_to_reference(reference, native);
     }
   }
+}
+
+fn owns_metadata_root(session_dir: Option<&Path>, codex_home: &Path) -> bool {
+  let Some(root) = session_dir else {
+    return true;
+  };
+  let Ok(root) = root.canonicalize() else {
+    return false;
+  };
+  ["sessions", "archived_sessions"].into_iter().any(|directory| {
+    codex_home
+      .join(directory)
+      .canonicalize()
+      .is_ok_and(|owned| owned == root)
+  })
 }
 
 fn default_codex_home() -> Result<PathBuf, String> {
@@ -1012,6 +1030,41 @@ mod tests {
     let source = CodexSessionSource::new(Some(explicit.clone()));
 
     assert_eq!(source.roots().expect("explicit root should resolve"), vec![explicit]);
+  }
+
+  #[test]
+  fn resolved_roots_keep_metadata_but_custom_roots_do_not_inherit_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("codex-home");
+    for name in ["sessions", "archived_sessions"] {
+      let root = home.join(name);
+      std::fs::create_dir_all(&root).unwrap();
+      assert!(owns_metadata_root(Some(&root), &home));
+      assert!(owns_metadata_root(Some(&root.join(".")), &home));
+      let nested = root.join("nested");
+      std::fs::create_dir(&nested).unwrap();
+      assert!(
+        !owns_metadata_root(Some(&nested), &home),
+        "only exact owned roots opt in"
+      );
+    }
+    let custom = directory.path().join("other-home/sessions");
+    std::fs::create_dir_all(&custom).unwrap();
+    assert!(!owns_metadata_root(Some(&custom), &home));
+    assert!(!owns_metadata_root(Some(&directory.path().join("missing")), &home));
+    assert!(owns_metadata_root(None, &home));
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn metadata_root_ownership_uses_filesystem_identity_not_path_spelling() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let sessions = home.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let alias = directory.path().join("session-alias");
+    std::os::unix::fs::symlink(&sessions, &alias).unwrap();
+    assert!(owns_metadata_root(Some(&alias), &home));
   }
 
   #[test]
