@@ -210,7 +210,7 @@ export interface RelayChange { session_key: string | null; reset: boolean; }
  * an event that arrives while the initial command snapshot is still in flight
  * from being replaced by that older snapshot.
  */
-export type SessionIndexActivity = "idle" | "catalog" | "body" | "waiting_to_retry";
+export type SessionIndexActivity = "idle" | "catalog" | "body" | "waiting_to_retry" | "waiting_for_indexer";
 /** Whether a catalog activity is complete discovery or a targeted change check. */
 export type SessionIndexCatalogScope = "full" | "targeted";
 /** Sanitized scheduler-wide failure categories; no provider path or raw error crosses IPC. */

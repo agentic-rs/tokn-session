@@ -208,6 +208,14 @@ export function describeSessionIndexProgress(
     };
   }
 
+  if (progress.activity === "waiting_for_indexer") {
+    return {
+      label: "Using shared session index",
+      detail: "Another viewer process owns indexing. This viewer reads its saved updates.",
+      tone: "neutral",
+    };
+  }
+
   if (progress.worker_error) {
     return {
       label: "Session index worker needs attention · retry scheduled",

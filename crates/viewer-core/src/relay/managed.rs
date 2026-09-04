@@ -72,11 +72,14 @@ impl ManagedChild {
     Ok(())
   }
 
-  async fn consume(&mut self, snapshots: &crate::service_server::Service) -> Result<(), String> {
+  async fn consume(&mut self, snapshots: &crate::service_server::Service, manager: &ViewerRelay) -> Result<(), String> {
     loop {
-      let _record: tokn_session_relay::RelayRecord =
+      let record: tokn_session_relay::RelayRecord =
         serde_json::from_slice(&self.line().await?).map_err(|e| format!("Invalid Relay record: {e}"))?;
       snapshots.invalidate().await;
+      if let Some(provider) = super::viewer_provider(record.session.provider) {
+        let _ = manager.index_wakes.send((provider, record.path));
+      }
     }
   }
 
@@ -116,13 +119,32 @@ impl ViewerRelay {
       }
     };
     config.poll_interval = Duration::from_millis(500);
-    let snapshots = match crate::service_server::Service::new(config) {
+    let snapshots = match self.index.as_ref().map_or_else(
+      || crate::service_server::Service::new(config.clone()),
+      |index| crate::service_server::Service::from_index(config.clone(), index.clone()),
+    ) {
       Ok(service) => service,
       Err(error) => {
         self.managed_phase(epoch, "failed", Some(error));
         return;
       }
     };
+    if self.index.is_some() {
+      // Snapshots belong to viewer-core and remain available even when its
+      // advisory Relay feed is starting, retrying, or unavailable.
+      let mut state = self.state.lock().unwrap();
+      if state.epoch != epoch || cancel.is_cancelled() {
+        return;
+      }
+      state.connection = Some(crate::service_client::Connection::Embedded(snapshots.clone()));
+      state.active_endpoint = Some("embedded".into());
+      state.native = native;
+      state.providers = tokn_session_relay::PROVIDERS
+        .into_iter()
+        .filter_map(super::viewer_provider)
+        .collect();
+      self.ready.notify_all();
+    }
     for attempt in 0..MAX_ATTEMPTS {
       if cancel.is_cancelled() {
         return;
@@ -137,15 +159,19 @@ impl ViewerRelay {
           };
           let error = match ready {
             Ok(()) => {
-              self.connect_source(
-                crate::service_client::Connection::Embedded(snapshots.clone()),
-                "stdio".into(),
-                epoch,
-              );
+              if self.index.is_some() {
+                self.managed_phase(epoch, "live", None);
+              } else {
+                self.connect_source(
+                  crate::service_client::Connection::Embedded(snapshots.clone()),
+                  "stdio".into(),
+                  epoch,
+                );
+              }
               tokio::select! {
                 biased;
                 _ = cancel.cancelled() => { child.stop().await; return; }
-                result = child.consume(&snapshots) => {
+                result = child.consume(&snapshots, &self) => {
                   result.err().unwrap_or_else(|| "Relay pipe stopped".into())
                 },
               }
@@ -181,9 +207,11 @@ impl ViewerRelay {
       if state.epoch != epoch || state.cancel.is_cancelled() {
         return;
       }
-      state.connection_cancel.cancel();
-      state.active_endpoint = None;
-      state.connection = None;
+      if self.index.is_none() {
+        state.connection_cancel.cancel();
+        state.active_endpoint = None;
+        state.connection = None;
+      }
       state.phase = phase.into();
       state.error = error;
     }
@@ -266,6 +294,101 @@ mod tests {
     assert!(manager.status().error.unwrap().contains("Could not start"));
     assert!(manager.covers(ViewerProvider::Codex));
     assert!(manager.status().active_endpoint.is_none());
+  }
+
+  #[tokio::test]
+  async fn indexed_snapshots_remain_readable_when_the_feed_cannot_start() {
+    use crate::model::SessionLocator;
+    use tokn_session_index::{SessionIndex, SessionKey, SessionMetadata, SourceReplacement, SourceState};
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("session.jsonl");
+    std::fs::write(
+      &path,
+      concat!(
+        "{\"type\":\"session\",\"id\":\"saved\",\"timestamp\":\"2026-01-01\",\"cwd\":\"/tmp\"}\n",
+        "{\"type\":\"message\",\"id\":\"one\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n"
+      ),
+    )
+    .unwrap();
+    let index = Arc::new(SessionIndex::open_in_memory().unwrap());
+    let source = crate::service::index_source_key_for_path(ViewerProvider::Pi, &path).unwrap();
+    index
+      .replace_sources(&[
+        SourceReplacement::new(
+          SourceState::new(source.clone(), "fixture", 0),
+          vec![SessionMetadata::new(
+            SessionKey::new("pi", &source.source_key, "saved"),
+            path.to_str().unwrap(),
+          )],
+        ),
+        SourceReplacement::new(
+          SourceState::new(
+            crate::service::index_catalog_source_key(ViewerProvider::Pi),
+            "fixture",
+            0,
+          ),
+          vec![],
+        ),
+      ])
+      .unwrap();
+    let manager = ViewerRelay::with_index(Some(index.clone()));
+    let cancel = manager.state.lock().unwrap().cancel.clone();
+    manager
+      .supervise(&root.path().join("missing-viewer"), 0, cancel, true)
+      .await;
+    assert_eq!(manager.status().phase, "failed");
+    let locator = SessionLocator {
+      version: 1,
+      provider: ViewerProvider::Pi,
+      session_id: "saved".into(),
+      source_path: path,
+    };
+    let loader = manager.clone();
+    let target = locator.clone();
+    let loaded = tokio::task::spawn_blocking(move || loader.load(&target))
+      .await
+      .unwrap()
+      .unwrap();
+    assert!(!loaded.events.is_empty());
+    assert!(manager.native(&locator, 0, &loaded).is_some());
+    // Metadata backfill reaches an already followed snapshot without reopening
+    // or replaying its event history, even with no Relay records arriving.
+    let mut updates = manager.changes.subscribe();
+    let mut renamed = SessionMetadata::new(
+      SessionKey::new("pi", &source.source_key, "saved"),
+      locator.source_path.to_str().unwrap(),
+    );
+    renamed.title = Some("Renamed in the index".into());
+    index
+      .replace_sources(&[SourceReplacement::new(
+        SourceState::new(source, "updated", 1),
+        vec![renamed],
+      )])
+      .unwrap();
+    tokio::time::timeout(Duration::from_secs(4), async {
+      loop {
+        updates.recv().await.unwrap();
+        if manager.state.lock().unwrap().sessions[&locator]
+          .loaded
+          .as_ref()
+          .unwrap()
+          .reference
+          .title
+          .as_deref()
+          == Some("Renamed in the index")
+        {
+          break;
+        }
+      }
+    })
+    .await
+    .unwrap();
+    let refreshed = manager.advance(&locator).unwrap();
+    assert_eq!(refreshed.events.len(), loaded.events.len());
+    let mut unknown = locator;
+    unknown.session_id = "not-indexed".into();
+    assert!(manager.load(&unknown).is_err());
+    manager.shutdown().await;
   }
 
   #[tokio::test]

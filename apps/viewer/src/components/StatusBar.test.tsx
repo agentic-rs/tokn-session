@@ -56,6 +56,14 @@ function renderStatusBar(
 }
 
 describe("StatusBar", () => {
+  it("shows shared ownership while the first catalog is still pending", () => {
+    const shared = progress({ activity: "waiting_for_indexer" });
+    shared.catalog.pending_providers = ["codex"];
+    renderStatusBar(shared);
+    expect(screen.getByText("Using shared session index")).toBeTruthy();
+    expect(document.querySelector(".status-bar__spinner")).toBeNull();
+  });
+
   it("treats a pending initial catalog as active and shows every provider state", () => {
     renderStatusBar(progress({
       catalog: {

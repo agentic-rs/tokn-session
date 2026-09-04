@@ -23,6 +23,7 @@ struct FollowedSession {
 }
 
 pub struct Service {
+  index: Option<Arc<tokn_session_index::SessionIndex>>,
   wake: watch::Sender<()>,
   config: RelayConfig,
   sessions: Mutex<HashMap<String, Weak<FollowedSession>>>,
@@ -76,10 +77,25 @@ pub async fn serve_listener(listener: TcpListener, config: RelayConfig) -> Resul
 
 impl Service {
   pub fn new(config: RelayConfig) -> Result<Arc<Self>, String> {
+    Self::with_index(config, None)
+  }
+
+  pub(crate) fn from_index(
+    config: RelayConfig,
+    index: Arc<tokn_session_index::SessionIndex>,
+  ) -> Result<Arc<Self>, String> {
+    Self::with_index(config, Some(index))
+  }
+
+  fn with_index(
+    config: RelayConfig,
+    index: Option<Arc<tokn_session_index::SessionIndex>>,
+  ) -> Result<Arc<Self>, String> {
     if config.poll_interval.is_zero() {
       return Err("Poll interval must be positive".into());
     }
     let service = Arc::new(Self {
+      index,
       config,
       sessions: Mutex::new(HashMap::new()),
       catalog: Mutex::new(None),
@@ -87,19 +103,21 @@ impl Service {
       wake: watch::channel(()).0,
     });
     let weak = Arc::downgrade(&service);
-    tokio::spawn(async move {
-      loop {
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        let Some(service) = weak.upgrade() else {
-          return;
-        };
-        let metadata = service.metadata.clone();
-        drop(service);
-        if tokio::task::spawn_blocking(move || metadata.step()).await.is_err() {
-          return;
+    if service.index.is_none() {
+      tokio::spawn(async move {
+        loop {
+          tokio::time::sleep(Duration::from_millis(250)).await;
+          let Some(service) = weak.upgrade() else {
+            return;
+          };
+          let metadata = service.metadata.clone();
+          drop(service);
+          if tokio::task::spawn_blocking(move || metadata.step()).await.is_err() {
+            return;
+          }
         }
-      }
-    });
+      });
+    }
     Ok(service)
   }
 
@@ -111,6 +129,13 @@ impl Service {
   }
 
   async fn catalog(&self) -> Result<(Arc<Vec<CatalogEntry>>, Vec<String>), String> {
+    if let Some(index) = &self.index {
+      let index = index.clone();
+      let entries = tokio::task::spawn_blocking(move || crate::index_queries::snapshot_entries(&index))
+        .await
+        .map_err(|error| error.to_string())??;
+      return Ok((Arc::new(entries), Vec::new()));
+    }
     let mut cached = self.catalog.lock().await;
     if let Some((time, entries, warnings)) = cached.as_ref()
       && time.elapsed() < Duration::from_secs(2)
@@ -159,12 +184,21 @@ impl Service {
     if sessions.len() >= 16 {
       return Err("Relay active-session limit reached; close an unused viewer session".into());
     }
-    let (catalog, _) = self.catalog().await?;
-    let entry = catalog
-      .iter()
-      .find(|entry| entry.key == key)
-      .cloned()
-      .ok_or("Unknown Relay session; refresh the catalog")?;
+    let entry = if let Some(index) = &self.index {
+      let index = index.clone();
+      let key = key.to_owned();
+      tokio::task::spawn_blocking(move || crate::index_queries::snapshot_entry_for_key(&index, &key))
+        .await
+        .map_err(|e| e.to_string())??
+    } else {
+      let (catalog, _) = self.catalog().await?;
+      catalog.iter().find(|entry| entry.key == key).cloned()
+    }
+    .ok_or(if self.index.is_some() {
+      "Unknown session; refresh the index"
+    } else {
+      "Unknown Relay session; refresh the catalog"
+    })?;
     let native = self.config.include_native;
     let root = self
       .config
@@ -186,6 +220,7 @@ impl Service {
     let worker = Arc::downgrade(&session);
     let interval = self.config.poll_interval;
     let metadata = self.metadata.clone();
+    let index = self.index.clone();
     let mut wake = self.wake.subscribe();
     tokio::spawn(async move {
       let mut reader = reader;
@@ -195,8 +230,21 @@ impl Service {
           break;
         };
         let metadata = metadata.clone();
+        let index = index.clone();
         let result = tokio::task::spawn_blocking(move || {
-          let result = reader.poll().map(|changed| {
+          let result = reader.poll().and_then(|changed| {
+            if let Some(index) = &index {
+              if let Some(entry) = crate::index_queries::snapshot_entry_for_key(index, &reader.snapshot.entry.key)? {
+                let header = &mut reader.snapshot.entry.header;
+                if header.title != entry.header.title || header.preview != entry.header.preview {
+                  header.title = entry.header.title;
+                  header.preview = entry.header.preview;
+                  reader.snapshot.revision += 1;
+                  return Ok(true);
+                }
+              }
+              return Ok(changed);
+            }
             // Refresh even when a metadata-only source row produced no events.
             metadata.refresh_followed(&reader.snapshot.entry);
             // OpenCode follows already load current presentation metadata.
@@ -210,10 +258,10 @@ impl Service {
               );
               if before != reader.snapshot.entry.header {
                 reader.snapshot.revision += 1;
-                return true;
+                return Ok(true);
               }
             }
-            changed
+            Ok(changed)
           });
           (reader, result)
         })

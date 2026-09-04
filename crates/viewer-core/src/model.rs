@@ -183,6 +183,7 @@ pub enum IndexActivity {
   Catalog,
   Body,
   WaitingToRetry,
+  WaitingForIndexer,
 }
 
 /// A sanitized failure from the scheduler task itself rather than a single
