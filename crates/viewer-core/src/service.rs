@@ -61,6 +61,7 @@ const TOOL_OUTPUT_TRUNCATION_MARKER: &str = "\n\u{2026} output truncated \u{2026
 #[derive(Clone)]
 pub struct ViewerService {
   pub relay: Arc<crate::relay::ViewerRelay>,
+  pub(crate) indexer_lock: Option<crate::indexer::IndexerLock>,
   repository: Arc<dyn ViewerRepository>,
   session_index: Arc<SessionIndex>,
   index_refresh_gate: Arc<Mutex<()>>,
@@ -396,6 +397,7 @@ pub(crate) struct IndexRefresh {
 /// scan for every active rollout append.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SessionIndexWake {
+  ProviderCatalog(BTreeSet<ViewerProvider>),
   FullCatalog,
   ChangedFiles(BTreeMap<ViewerProvider, BTreeSet<PathBuf>>),
 }
@@ -607,12 +609,11 @@ struct Trajectory {
 
 impl ViewerService {
   pub fn native(index_path: impl AsRef<Path>) -> Result<Self, String> {
-    let session_index =
-      SessionIndex::open(index_path).map_err(|error| format!("failed to open the viewer session index: {error}"))?;
-    Ok(Self::with_repository(
-      Arc::new(NativeRepository),
-      Arc::new(session_index),
-    ))
+    let session_index = SessionIndex::open(index_path.as_ref())
+      .map_err(|error| format!("failed to open the viewer session index: {error}"))?;
+    let mut service = Self::with_repository(Arc::new(NativeRepository), Arc::new(session_index));
+    service.indexer_lock = Some(crate::indexer::IndexerLock::new(index_path.as_ref())?);
+    Ok(service)
   }
 
   #[cfg(test)]
@@ -633,7 +634,8 @@ impl ViewerService {
     // the durable catalog again.
     let observed_index_data_version = session_index.data_version().ok();
     let service = Self {
-      relay: crate::relay::ViewerRelay::new(),
+      relay: crate::relay::ViewerRelay::with_index(Some(session_index.clone())),
+      indexer_lock: None,
       repository,
       session_index,
       index_refresh_gate: Arc::new(Mutex::new(())),
@@ -701,6 +703,11 @@ impl ViewerService {
     // Publish before waking an idle scheduler. If work is already active, do
     // not overwrite its truthful catalog/body state; the internal generation
     // still ensures the queued wake cannot be erased by that pass finishing.
+    if self.relay.status().settings.mode != crate::relay::RelayMode::External
+      && let Some(lock) = &self.indexer_lock
+    {
+      lock.request_retry()?;
+    }
     let request = self.index_progress.request_manual_retry();
     if sender.send(SessionIndexWake::FullCatalog).is_ok() {
       return Ok(request.snapshot);
@@ -831,6 +838,25 @@ impl ViewerService {
     self.index_progress.settle_after_latest_refresh(settlement);
   }
 
+  pub(crate) fn pause_native_index(&self) {
+    self.refresh_index_progress_from_index();
+    self.index_progress.update(set_index_progress_idle);
+  }
+
+  pub(crate) fn follow_shared_index(&self) -> Result<bool, String> {
+    let changed = self.observe_external_index_change()?;
+    self.refresh_index_progress_from_index();
+    self.index_progress.update(|progress| {
+      progress.activity = IndexActivity::WaitingForIndexer;
+      progress.is_refreshing = false;
+      progress.catalog.active_provider = None;
+      progress.body.active_provider = None;
+      progress.worker_error = None;
+      progress.retry_at_ms = None;
+    });
+    Ok(changed)
+  }
+
   fn refresh_index_progress_from_index(&self) {
     if let Ok(pending_providers) = self.pending_catalog_providers() {
       self.index_progress.update(|progress| {
@@ -852,7 +878,7 @@ impl ViewerService {
           .filter(|count| {
             !ViewerProvider::ALL
               .into_iter()
-              .any(|provider| provider.as_str() == count.provider && self.relay.covers(provider))
+              .any(|provider| provider.as_str() == count.provider && self.relay.external_catalog_covers(provider))
           })
           .collect()
       })
@@ -862,7 +888,7 @@ impl ViewerService {
   fn pending_catalog_providers(&self) -> Result<Vec<ViewerProvider>, String> {
     ViewerProvider::ALL
       .into_iter()
-      .filter(|provider| !self.relay.covers(*provider))
+      .filter(|provider| !self.relay.external_catalog_covers(*provider))
       .map(|provider| {
         self
           .session_index
@@ -1164,7 +1190,7 @@ impl ViewerService {
   /// A missing sentinel is an ordinary cold-start state, not permission to
   /// synchronously inspect provider storage on an IPC request.
   fn indexed_session_inventory(&self, provider: ViewerProvider) -> Result<Option<SessionHeaderInventory>, String> {
-    if self.relay.covers(provider) {
+    if self.relay.external_catalog_covers(provider) {
       return Ok(self.relay.has_catalog().then(|| SessionHeaderInventory {
         headers: self.relay.headers(provider),
         direct_attention: HashMap::new(),
@@ -1203,10 +1229,21 @@ impl ViewerService {
   /// header APIs, so the first viewer screen remains fast and deterministic
   /// even while a provider catalog is still pending.
   fn indexed_session_inventories(&self, providers: &[ViewerProvider]) -> Result<IndexedSessionInventories, String> {
-    if providers.iter().any(|provider| self.relay.covers(*provider)) {
-      let local: Vec<_> = providers.iter().copied().filter(|p| !self.relay.covers(*p)).collect();
+    if providers
+      .iter()
+      .any(|provider| self.relay.external_catalog_covers(*provider))
+    {
+      let local: Vec<_> = providers
+        .iter()
+        .copied()
+        .filter(|p| !self.relay.external_catalog_covers(*p))
+        .collect();
       let mut result = self.indexed_session_inventories(&local)?;
-      for provider in providers.iter().copied().filter(|p| self.relay.covers(*p)) {
+      for provider in providers
+        .iter()
+        .copied()
+        .filter(|p| self.relay.external_catalog_covers(*p))
+      {
         match self.indexed_session_inventory(provider)? {
           Some(inventory) => {
             result.by_provider.insert(provider, inventory);
@@ -1275,14 +1312,14 @@ impl ViewerService {
   }
 
   fn index_error_for(&self, provider: ViewerProvider) -> Option<String> {
-    if self.relay.covers(provider) {
+    if self.relay.external_catalog_covers(provider) {
       return self.relay.status().error;
     }
     self.index_errors.lock().ok()?.get(&provider).cloned()
   }
 
   fn attention_revision_for_locator(&self, locator: &SessionLocator) -> Option<String> {
-    if self.relay.covers(locator.provider) {
+    if self.relay.external_catalog_covers(locator.provider) {
       return None;
     }
     let catalog_key = index_catalog_source_key(locator.provider);
@@ -1433,7 +1470,7 @@ impl ViewerService {
     let mut unavailable = HashSet::new();
     let providers = ordered_providers(providers);
     for provider in providers.iter().copied() {
-      if self.relay.covers(provider) {
+      if self.relay.external_catalog_covers(provider) {
         self.finish_catalog_provider(provider, false, true);
         continue;
       }
@@ -1878,7 +1915,7 @@ impl ViewerService {
     provider: ViewerProvider,
     paths: &BTreeSet<PathBuf>,
   ) -> Result<ProviderIndexRefresh, String> {
-    if self.relay.covers(provider) {
+    if self.relay.external_catalog_covers(provider) {
       return Ok(ProviderIndexRefresh::default());
     }
     if !matches!(provider, ViewerProvider::Codex | ViewerProvider::Pi) {
@@ -2179,7 +2216,7 @@ impl ViewerService {
       .map(|jobs| jobs.clone())
       .unwrap_or_default();
     for provider in ViewerProvider::ALL {
-      if unavailable.contains(&provider) || self.relay.covers(provider) {
+      if unavailable.contains(&provider) || self.relay.external_catalog_covers(provider) {
         continue;
       }
       let sources = self
@@ -2895,7 +2932,7 @@ fn tool_operation_output_preview(operation: &ToolOperation) -> Option<ToolOutput
   (!sections.is_empty()).then(|| bound_tool_output(sections, source_event_index))
 }
 
-fn index_catalog_source_key(provider: ViewerProvider) -> SourceKey {
+pub(crate) fn index_catalog_source_key(provider: ViewerProvider) -> SourceKey {
   SourceKey::new(provider.as_str(), INDEX_CATALOG_SOURCE_KEY)
 }
 
@@ -2964,7 +3001,7 @@ fn staged_body_cursor_parts<'a>(cursor: &'a str, prefix: &str) -> Option<(u64, &
     .flatten()
 }
 
-fn index_source_key_for_path(provider: ViewerProvider, path: &Path) -> Result<SourceKey, String> {
+pub(crate) fn index_source_key_for_path(provider: ViewerProvider, path: &Path) -> Result<SourceKey, String> {
   let source_path = index_path_string(path)?;
   Ok(SourceKey::new(provider.as_str(), format!("path.v1.{source_path}")))
 }
@@ -3015,7 +3052,7 @@ fn session_catalog_topology(
   Ok(topology)
 }
 
-fn indexed_session_header(session: &IndexedSession) -> Result<SessionHeader, String> {
+pub(crate) fn indexed_session_header(session: &IndexedSession) -> Result<SessionHeader, String> {
   if session.source_path.is_empty() {
     return Err("indexed session has no source path".to_string());
   }
@@ -10289,6 +10326,120 @@ mod tests {
       })
       .unwrap();
     assert_eq!(loads.load(Ordering::SeqCst), 2);
+  }
+
+  #[tokio::test]
+  async fn automatic_listing_and_snapshots_use_durable_index_even_when_feed_fails() {
+    let repository = indexing_repository(Vec::new());
+    let service = service_with_indexed_headers(
+      repository.clone(),
+      vec![(
+        ViewerProvider::Codex,
+        vec![session_header("indexed", None, "/project", "2026-09-01T00:00:00Z")],
+      )],
+    );
+    service.relay.configure(crate::relay::RelaySettings::default()).unwrap();
+    service.relay.configuration_failed("fixture feed unavailable".into());
+    assert!(service.relay.covers(ViewerProvider::Codex));
+    let inventory = service
+      .indexed_session_inventory(ViewerProvider::Codex)
+      .unwrap()
+      .unwrap();
+    assert_eq!(inventory.headers[0].id, "indexed");
+    assert!(service.index_error_for(ViewerProvider::Codex).is_none());
+    // Stop the scheduled child before yielding; this test needs only its mode.
+    service
+      .relay
+      .configure(crate::relay::RelaySettings {
+        mode: crate::relay::RelayMode::Local,
+        ..Default::default()
+      })
+      .unwrap();
+    let snapshots =
+      crate::service_server::Service::from_index(crate::RelayConfig::new(Vec::new()), service.session_index.clone())
+        .unwrap();
+    let catalog = crate::service_client::load_catalog_from(&crate::service_client::Connection::Embedded(snapshots))
+      .await
+      .unwrap();
+    assert!(catalog.warnings.is_empty());
+    assert_eq!(catalog.entries.len(), 1);
+    assert_eq!(catalog.entries[0].header.id, "indexed");
+    assert_eq!(repository.header_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(repository.load_calls.load(Ordering::SeqCst), 0);
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn shared_index_runtime_has_one_owner_forwards_retry_and_takes_over() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("index.sqlite");
+    let first_repository = indexing_repository(Vec::new());
+    let second_repository = indexing_repository(Vec::new());
+    let make_service = |repository: Arc<IndexingRepository>| {
+      let mut service = ViewerService::new_with_index(repository, Arc::new(SessionIndex::open(&path).unwrap()));
+      service.indexer_lock = Some(crate::indexer::IndexerLock::new(&path).unwrap());
+      service
+    };
+    let first = crate::runtime::ViewerRuntime::start(make_service(first_repository.clone()));
+    async fn until(mut ready: impl FnMut() -> bool) {
+      tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        while !ready() {
+          tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+      })
+      .await
+      .expect("indexer should make progress");
+    }
+    until(|| {
+      first
+        .service
+        .session_index_progress()
+        .catalog
+        .pending_providers
+        .is_empty()
+    })
+    .await;
+    let second = crate::runtime::ViewerRuntime::start(make_service(second_repository.clone()));
+    until(|| second.service.session_index_progress().activity == IndexActivity::WaitingForIndexer).await;
+    assert_eq!(second_repository.header_calls.load(Ordering::SeqCst), 0);
+    let mut updates = second.events.subscribe();
+    let source = SourceKey::new("codex", "fixture-shared");
+    first
+      .service
+      .session_index
+      .replace_sources(&[SourceReplacement::new(
+        SourceState::new(source, "fixture", 0),
+        vec![SessionMetadata::new(
+          IndexedSessionKey::new("codex", "fixture-shared", "shared"),
+          "/fixture/shared.jsonl",
+        )],
+      )])
+      .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(4), async {
+      loop {
+        if updates.recv().await.unwrap().event == "session-index-changed" {
+          break;
+        }
+      }
+    })
+    .await
+    .expect("shared reader should publish committed index updates");
+    assert_eq!(
+      second
+        .service
+        .indexed_session_inventory(ViewerProvider::Codex)
+        .unwrap()
+        .unwrap()
+        .headers[0]
+        .id,
+      "shared"
+    );
+    let before = first_repository.header_calls.load(Ordering::SeqCst);
+    second.service.request_session_index_retry().unwrap();
+    until(|| first_repository.header_calls.load(Ordering::SeqCst) > before).await;
+    assert_eq!(second_repository.header_calls.load(Ordering::SeqCst), 0);
+    drop(first);
+    until(|| second_repository.header_calls.load(Ordering::SeqCst) > 0).await;
+    drop(second);
   }
 
   #[tokio::test]

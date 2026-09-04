@@ -43,6 +43,9 @@ function describeStatusAnnouncement(
         text: "Session index status is unavailable.",
       };
   }
+  if (progress.activity === "waiting_for_indexer") {
+    return { key: "shared-index", text: "Reading the shared session index. Another viewer process owns indexing." };
+  }
   if (progress.catalog.pending_providers.length > 0 || progress.activity === "catalog") {
     if (isTargetedCatalog(progress)) {
       return { key: "checking-changes", text: "Checking saved sessions for changes started." };

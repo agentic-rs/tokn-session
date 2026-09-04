@@ -63,6 +63,8 @@ struct State {
 }
 
 pub struct ViewerRelay {
+  index: Option<Arc<tokn_session_index::SessionIndex>>,
+  pub(crate) index_wakes: broadcast::Sender<(ViewerProvider, PathBuf)>,
   pub configure_lock: tokio::sync::Mutex<()>,
   managed_lock: tokio::sync::Mutex<()>,
   state: Mutex<State>,
@@ -72,7 +74,13 @@ pub struct ViewerRelay {
 
 impl ViewerRelay {
   pub fn new() -> Arc<Self> {
+    Self::with_index(None)
+  }
+
+  pub(crate) fn with_index(index: Option<Arc<tokn_session_index::SessionIndex>>) -> Arc<Self> {
     Arc::new(Self {
+      index,
+      index_wakes: broadcast::channel(256).0,
       configure_lock: tokio::sync::Mutex::new(()),
       managed_lock: tokio::sync::Mutex::new(()),
       state: Mutex::new(State {
@@ -115,6 +123,13 @@ impl ViewerRelay {
 
   pub fn configure(self: &Arc<Self>, settings: RelaySettings) -> Result<(), String> {
     settings.validate()?;
+    // Prepare the core reader before publishing Automatic mode. No provider
+    // history is read here, and feed startup must not gate snapshot requests.
+    let snapshots = if settings.mode == RelayMode::Automatic && self.index.is_some() {
+      Some(self.snapshot_service(settings.include_native)?)
+    } else {
+      None
+    };
     let (epoch, cancel, reset) = {
       let mut state = self.state.lock().unwrap();
       state.cancel.cancel();
@@ -140,9 +155,10 @@ impl ViewerRelay {
       }
       state.epoch += 1;
       state.cancel = CancellationToken::new();
-      state.active_endpoint = None;
-      state.connection = None;
-      state.native = false;
+      state.connection_cancel = state.cancel.child_token();
+      state.active_endpoint = snapshots.as_ref().map(|_| "embedded".into());
+      state.connection = snapshots.map(Connection::Embedded);
+      state.native = state.connection.is_some() && settings.include_native;
       state.settings = settings.clone();
       state.phase = match settings.mode {
         RelayMode::Automatic => "starting",
@@ -274,6 +290,11 @@ impl ViewerRelay {
     self.state.lock().unwrap().providers.contains(&provider)
   }
 
+  pub(crate) fn external_catalog_covers(&self, provider: ViewerProvider) -> bool {
+    let state = self.state.lock().unwrap();
+    state.settings.mode == RelayMode::External && state.providers.contains(&provider)
+  }
+
   pub fn has_catalog(&self) -> bool {
     self.state.lock().unwrap().entries.is_some()
   }
@@ -297,14 +318,18 @@ impl ViewerRelay {
     let should_start =
       state.active_endpoint.is_some() && state.sessions.get(locator).is_none_or(|s| s.cancel.is_cancelled());
     if should_start {
-      let entry = state
-        .entries
-        .as_ref()
-        .into_iter()
-        .flatten()
-        .find(|e| matches_locator(e, locator))
-        .cloned()
-        .ok_or("Session is no longer in the Relay catalog")?;
+      let entry = if let (RelayMode::Automatic, Some(index)) = (state.settings.mode, self.index.as_ref()) {
+        crate::index_queries::snapshot_entry(index, locator)?
+      } else {
+        state
+          .entries
+          .as_ref()
+          .into_iter()
+          .flatten()
+          .find(|entry| matches_locator(entry, locator))
+          .cloned()
+      }
+      .ok_or("Session is no longer in the index")?;
       if !state.sessions.contains_key(locator)
         && state.sessions.len() >= 8
         && let Some(key) = state

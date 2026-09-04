@@ -1,5 +1,7 @@
 //! Shared viewer domain and runtime. Both Tauri and HTTP adapters consume
 //! this crate; Relay provides live-feed hints while core owns snapshots.
+mod index_queries;
+mod indexer;
 pub mod model;
 pub mod relay;
 mod repository;

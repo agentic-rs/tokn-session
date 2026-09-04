@@ -89,15 +89,16 @@ DB/WAL snapshots and reuse unchanged records/checkpoints. Unrelated changes are
 silent; suffix appends preserve generations, while edits/deletions/reordering
 reset them. See [snapshot protocol](relay.md#local-snapshotfollow-service).
 
-Catalog title/preview backfill runs in a shared background cache, replacing the
-local viewer body-index backfill bypassed by Relay. Pi's latest `session_info`
-name (including explicit clears) and first user preview are accumulated through
-a complete-line byte cursor; ordinary appends do not reparse prior history.
-Untitled OpenCode/Codex root-session prompt fallbacks use provider hydration
-cached by source revision (including OpenCode WAL). Native titles win. The
-cache retains bounded 512-character strings, not events/native bodies, and
-rebuilds after restart. Initial catalogs do not wait for scans; subsequent polls
-pick up names. Followed Pi names also update without replacing event history.
+Automatic and Local modes use durable index queries for lists, search, trees,
+and snapshot admission. The viewer-core indexer discovers provider headers and
+backfills bounded titles/previews and attention in the existing SQLite index.
+Automatic snapshots no longer run a separate discovery or metadata-backfill
+cache. Conversation/native payloads still come from on-demand snapshot readers,
+which remain usable while the advisory Relay child starts or fails. Automatic
+configuration installs the reader before publishing the mode and gives each
+configuration a fresh cancellation scope; the supervisor reuses that reader. The legacy
+External snapshot server retains its independent catalog and presentation cache
+for explicitly configured provider roots.
 
 Viewer mode (`automatic`/`external`/`local`), external endpoint, and optional
 native inclusion persist in app config `relay.json`. Missing settings default
@@ -106,17 +107,16 @@ explicit disabled choices to Local. Automatic uses provider-owned root
 resolution and environment overrides. Codex's explicitly resolved active/archive
 roots retain their home-owned title/preview metadata; unrelated explicit roots
 remain isolated from the active home's database and session-name index.
-Local clears Relay routing/snapshots
-and wakes local cataloging. Covered providers skip local body reads/indexing;
-timeline, trajectories and Inspector share
-received snapshots. Failures/child restarts retain last-good data; explicit
+Local clears Relay routing/snapshots and keeps the same durable indexer.
+Only External providers bypass the native index. Automatic timeline, trajectories,
+and Inspector share viewer-core snapshots; External uses received snapshots. Failures/child restarts retain last-good data; explicit
 mode/endpoint/native changes clear it. External services are never terminated.
 Live updates refresh loaded timeline/trajectory items even when scrolled up,
 retaining the reading position; New activity jumps to latest.
 Refreshes are coalesced and page through one pinned snapshot. Append refreshes preserve expansion keys;
 generation resets invalidate them. Native remains optional and bounded in
-Inspector. Next gap: durable Relay unread tracking (local unread indexing is
-currently bypassed for these sessions). The v1 append/reset contract still
+Inspector. Automatic now uses durable indexed unread tracking; External unread
+tracking remains process-local. The v1 append/reset contract still
 requires replacement generations for mutable OpenCode records; avoiding those
 resets would need a record-update protocol and stable viewer event identities.
 
@@ -444,7 +444,7 @@ responses bounded, including tool-card command and query fields, while expanded
 native event detail and inline tool output are fetched lazily and hidden Pi
 content stays redacted.
 
-For local providers, the viewer owns a SQLite index at
+For Automatic and Local modes, viewer-core owns a SQLite index at
 `~/.tokn/sessions/index.sqlite`. It stores
 opaque source checkpoints; source/session identity and paths; bounded sidebar
 metadata (title, preview, cwd, timestamps, parent, and agent labels); and
@@ -459,11 +459,29 @@ never falls back to native headers or synchronously hydrates missing metadata.
 The background body pass backfills its bounded title/preview metadata together
 with attention, while later blank lightweight headers preserve that backfill
 until a successful body refresh replaces it. The initial viewer leaves its main
-pane unselected, so an explicit user selection is the first action that reads a
-provider session body. The selected session's normalized `total_events` arrives
+pane unselected; an explicit selection opens its conversation snapshot while
+the background indexer separately reads bodies for bounded metadata and attention. The selected session's normalized `total_events` arrives
 with its first event page. The existing CLI continues to use the counted
 `list_sessions` API. The scheduler emits its sidebar refresh as soon as that
 catalog transaction commits, before later bounded body work.
+
+One viewer-core indexer owns each database through an OS-held sidecar lock
+(`index.sqlite.indexer.lock`). Other viewer/API processes query SQLite WAL, poll
+its data version once per second, and show `Using shared session index`. They
+never scan providers until acquiring the released lock. The lease survives
+async task cancellation until any outstanding blocking scan finishes, and the
+OS releases it after a process exits. Explicit retries append a request generation
+to `index.sqlite.indexer.retry`, which the owner checks without consuming another
+process's request. Do not delete these sidecars while viewers are running.
+Processes sharing an index must use the same provider-root configuration; use
+separate `--index-path` values for different source sets. Detailed active-provider
+progress and errors currently belong to the owner; followers expose shared
+ownership and durable queue counts, not the owner's live progress snapshot.
+External mode releases the native lease and continues querying its chosen server.
+
+Relay records are bounded advisory indexer hints: Codex/Pi target changed paths;
+other providers request provider-local discovery. Overflow triggers recovery.
+Native file watchers and periodic recovery continue to cover missed feed events.
 
 The viewer also keeps a process-local operational snapshot for its one index
 scheduler. It contains only a monotonic string revision, provider identities

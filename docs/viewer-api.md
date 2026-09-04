@@ -10,11 +10,14 @@ Desktop UI → Tauri commands ─┐
 Browser → viewer-api (UI + HTTP/SSE) ──────┘ ↖ Relay live feed (managed stdio)
 ```
 
-`viewer-core` owns catalogs, history, paging, trajectories, native Inspector
-detail, reconciliation, and the index scheduler. Relay owns provider live-feed
+`viewer-core` owns index queries, history, paging, trajectories, native Inspector
+detail, and the indexer. Automatic and Local list/search/tree requests read the
+durable SQLite index; conversations load on demand. One indexer holds the
+database lease, while other API/desktop processes read updates and can take over. Relay owns provider live-feed
 normalization and its stdout/ZeroMQ/managed-stdio transports. In automatic mode,
 the viewer host starts its own headless Relay child, reads versioned JSONL from
-stdout, and uses records to wake authoritative snapshot readers in core.
+stdout, and uses records to wake the indexer and authoritative snapshot readers
+in core. Snapshot reads do not wait for the child to become ready.
 Polling recovers startup gaps and missed records; the live feed is not a history
 store. Stdin EOF stops the child, including after parent death. No private TCP
 listener is needed for this managed connection. This is an architectural
@@ -86,7 +89,8 @@ Options:
   `index.html`; `TOKN_VIEWER_WEB_ROOT` provides the same setting.
 - `--api-only`: disable static serving and skip the frontend build requirement.
 - `--allow-origin http://localhost:1437`: allowed frontend origin.
-- `--index-path <file>`: defaults to `~/.tokn/sessions/index.sqlite`.
+- `--index-path <file>`: defaults to `~/.tokn/sessions/index.sqlite`. Hosts sharing
+  this file share one indexer; use a separate path for different provider roots.
 - `--native`: include provider-native Inspector records in automatic mode.
 - `--local`: read/index history directly without a managed Relay child.
 - `TOKN_VIEWER_TOKEN`: access token (also accepted through `--token`).
@@ -108,7 +112,7 @@ Tauri adapter, normally `{"request":{...}}`. Commands without a request take
 - `acknowledge_session_attention`
 - `get_session_index_progress`, `retry_session_index`, `get_relay_status`
 
-Session keys are admitted against the server's discovered catalog before any
+Session keys are admitted against the server's index before any
 history access. A syntactically valid key containing an arbitrary source path
 does not grant access. The API allows at most 16 concurrent blocking requests,
 32 SSE clients, and 1 MiB request bodies. Error responses contain `error`;
