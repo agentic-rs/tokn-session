@@ -93,6 +93,15 @@ impl ManagedChild {
 }
 
 impl ViewerRelay {
+  pub(super) fn snapshot_service(&self, native: bool) -> Result<Arc<crate::service_server::Service>, String> {
+    let mut config = tokn_session_relay::stdio::default_config(native)?;
+    config.poll_interval = Duration::from_millis(500);
+    match &self.index {
+      Some(index) => crate::service_server::Service::from_index(config, index.clone()),
+      None => crate::service_server::Service::new(config),
+    }
+  }
+
   pub(super) async fn run_managed(self: Arc<Self>, epoch: u64, cancel: CancellationToken, native: bool) {
     let executable = match std::env::current_exe() {
       Ok(path) => path,
@@ -111,18 +120,20 @@ impl ViewerRelay {
       _ = cancel.cancelled() => return,
       guard = self.managed_lock.lock() => guard,
     };
-    let mut config = match tokn_session_relay::stdio::default_config(native) {
-      Ok(config) => config,
-      Err(error) => {
-        self.managed_phase(epoch, "failed", Some(error));
+    let configured_snapshots = {
+      let state = self.state.lock().unwrap();
+      if state.epoch != epoch || cancel.is_cancelled() {
         return;
       }
+      match &state.connection {
+        Some(crate::service_client::Connection::Embedded(service)) => Some(service.clone()),
+        _ => None,
+      }
     };
-    config.poll_interval = Duration::from_millis(500);
-    let snapshots = match self.index.as_ref().map_or_else(
-      || crate::service_server::Service::new(config.clone()),
-      |index| crate::service_server::Service::from_index(config.clone(), index.clone()),
-    ) {
+    let snapshots = match configured_snapshots
+      .map(Ok)
+      .unwrap_or_else(|| self.snapshot_service(native))
+    {
       Ok(service) => service,
       Err(error) => {
         self.managed_phase(epoch, "failed", Some(error));
@@ -331,6 +342,45 @@ mod tests {
         ),
       ])
       .unwrap();
+    // Exercise public configuration while the supervisor cannot run. Snapshot
+    // startup and a Local -> Automatic reconfiguration must both work already.
+    let configured = ViewerRelay::with_index(Some(index.clone()));
+    let owner = configured.managed_lock.lock().await;
+    for native in [true, false] {
+      configured
+        .configure(RelaySettings {
+          mode: RelayMode::Automatic,
+          include_native: native,
+          ..Default::default()
+        })
+        .unwrap();
+      let loader = configured.clone();
+      let target = SessionLocator {
+        version: 1,
+        provider: ViewerProvider::Pi,
+        session_id: "saved".into(),
+        source_path: path.clone(),
+      };
+      let locator = target.clone();
+      let loaded = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || loader.load(&target)),
+      )
+      .await
+      .expect("snapshots must not wait for the supervisor")
+      .unwrap()
+      .unwrap();
+      assert!(!loaded.events.is_empty());
+      assert_eq!(configured.native(&locator, 0, &loaded).is_some(), native);
+      configured
+        .configure(RelaySettings {
+          mode: RelayMode::Local,
+          ..Default::default()
+        })
+        .unwrap();
+    }
+    drop(owner);
+    configured.shutdown().await;
     let manager = ViewerRelay::with_index(Some(index.clone()));
     let cancel = manager.state.lock().unwrap().cancel.clone();
     manager

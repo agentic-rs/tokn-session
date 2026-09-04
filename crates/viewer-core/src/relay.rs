@@ -123,6 +123,13 @@ impl ViewerRelay {
 
   pub fn configure(self: &Arc<Self>, settings: RelaySettings) -> Result<(), String> {
     settings.validate()?;
+    // Prepare the core reader before publishing Automatic mode. No provider
+    // history is read here, and feed startup must not gate snapshot requests.
+    let snapshots = if settings.mode == RelayMode::Automatic && self.index.is_some() {
+      Some(self.snapshot_service(settings.include_native)?)
+    } else {
+      None
+    };
     let (epoch, cancel, reset) = {
       let mut state = self.state.lock().unwrap();
       state.cancel.cancel();
@@ -148,9 +155,10 @@ impl ViewerRelay {
       }
       state.epoch += 1;
       state.cancel = CancellationToken::new();
-      state.active_endpoint = None;
-      state.connection = None;
-      state.native = false;
+      state.connection_cancel = state.cancel.child_token();
+      state.active_endpoint = snapshots.as_ref().map(|_| "embedded".into());
+      state.connection = snapshots.map(Connection::Embedded);
+      state.native = state.connection.is_some() && settings.include_native;
       state.settings = settings.clone();
       state.phase = match settings.mode {
         RelayMode::Automatic => "starting",

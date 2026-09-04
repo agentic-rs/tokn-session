@@ -94,7 +94,9 @@ and snapshot admission. The viewer-core indexer discovers provider headers and
 backfills bounded titles/previews and attention in the existing SQLite index.
 Automatic snapshots no longer run a separate discovery or metadata-backfill
 cache. Conversation/native payloads still come from on-demand snapshot readers,
-which remain usable while the advisory Relay child starts or fails. The legacy
+which remain usable while the advisory Relay child starts or fails. Automatic
+configuration installs the reader before publishing the mode and gives each
+configuration a fresh cancellation scope; the supervisor reuses that reader. The legacy
 External snapshot server retains its independent catalog and presentation cache
 for explicitly configured provider roots.
 
