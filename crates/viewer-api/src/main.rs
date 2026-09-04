@@ -7,7 +7,7 @@ use tokn_viewer_core::{
 };
 
 #[derive(Parser)]
-#[command(about = "Viewer HTTP API; serves session data, not the web UI")]
+#[command(about = "Viewer web server and HTTP API")]
 struct Args {
   #[command(subcommand)]
   command: Option<Command>,
@@ -19,6 +19,12 @@ struct Args {
   /// Exact browser origins allowed to read this API (repeatable).
   #[arg(long)]
   allow_origin: Vec<String>,
+  /// Directory containing the compiled viewer index.html and assets.
+  #[arg(long, env = "TOKN_VIEWER_WEB_ROOT", default_value = "apps/viewer/dist")]
+  web_root: PathBuf,
+  /// Serve only the API while Vite handles the UI and hot module replacement.
+  #[arg(long)]
+  api_only: bool,
   #[arg(long)]
   index_path: Option<PathBuf>,
   #[arg(long)]
@@ -91,11 +97,16 @@ async fn run(args: Args) -> Result<(), String> {
     origins,
     shutdown.clone(),
   );
+  let app = if args.api_only {
+    app
+  } else {
+    tokn_viewer_api::with_web_ui(app, args.web_root)?
+  };
   let listener = tokio::net::TcpListener::bind(args.bind)
     .await
     .map_err(|e| e.to_string())?;
   eprintln!(
-    "Viewer API listening on http://{}",
+    "Viewer listening on http://{}",
     listener.local_addr().map_err(|e| e.to_string())?
   );
   let result = axum::serve(listener, app)

@@ -42,9 +42,20 @@ pnpm run check
 pnpm tauri dev
 ```
 
-`pnpm run dev` starts the browser frontend. Start `cargo run -p tokn-viewer-api --
---allow-origin http://localhost:1437` separately, then connect to its address.
-See [remote setup and API contract](../../docs/viewer-api.md). Build the desktop application with:
+`pnpm run dev:web` builds and starts the API, starts Vite with HMR, and prints
+a `#token=…` login link. Open it to connect automatically; the browser removes
+the token from the address bar before rendering. Ctrl-C stops both processes.
+Set `TOKN_VIEWER_DEV_PORT` if port 1437 is occupied. The launcher uses a free
+loopback API port and requires no frontend build.
+
+For separately managed processes, `pnpm run dev` starts Vite. Start
+`cargo run -p tokn-viewer-api -- --api-only` in another terminal, then open
+`http://localhost:1437` and connect using the prefilled address. Vite proxies
+API requests and SSE to port 5558, so no frontend build or CORS flag is needed.
+For the integrated browser viewer, run `pnpm run build`
+and start `tokn-viewer-api` from the repository root; it serves `dist/` and the
+API at `http://127.0.0.1:5558`. See [remote setup and API
+contract](../../docs/viewer-api.md). Build the desktop application with:
 
 ```sh
 pnpm tauri build

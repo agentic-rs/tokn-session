@@ -60,15 +60,41 @@ async fn stop(child: &mut Child) {
 async fn packaged_child_streams_new_records_with_optional_native_and_exits_on_eof() {
   for native in [false, true] {
     let root = tempfile::tempdir().unwrap();
-    let (mut child, mut output) = start(root.path(), native).await;
-    // A new file after readiness must be discovered and emitted.
-    std::fs::write(root.path().join("pi/session.jsonl"), format!("{HEADER}{MESSAGE}")).unwrap();
+    let (mut child, output) = start(root.path(), native).await;
+    let mut lines = output.lines();
+    // `ready` acknowledges the transport before initial discovery/EOF seeding.
+    // Files created during that seed can legitimately become baseline history.
+    // Establish live delivery using fresh probe files before testing a new file.
+    tokio::time::timeout(Duration::from_secs(10), async {
+      let mut tick = tokio::time::interval(Duration::from_millis(100));
+      let mut probe = 0;
+      loop {
+        tokio::select! {
+          line = lines.next_line() => {
+            let value: serde_json::Value = serde_json::from_str(&line.unwrap().expect("Relay exited during live probe")).unwrap();
+            if value["session"]["provider"] == "pi" { break; }
+          }
+          _ = tick.tick() => {
+            let header = HEADER.replace("managed-fixture", &format!("probe-{probe}"));
+            std::fs::write(root.path().join(format!("pi/probe-{probe}.jsonl")), format!("{header}{MESSAGE}")).unwrap();
+            probe += 1;
+          }
+        }
+      }
+    })
+    .await
+    .expect("Relay did not begin live delivery after transport readiness");
+    let path = root.path().join("pi/session.jsonl");
+    std::fs::write(&path, format!("{HEADER}{MESSAGE}")).unwrap();
     let record = tokio::time::timeout(Duration::from_secs(10), async {
       loop {
-        let mut line = String::new();
-        assert!(output.read_line(&mut line).await.unwrap() > 0);
+        let line = lines
+          .next_line()
+          .await
+          .unwrap()
+          .expect("Relay exited before delivering the new file");
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
-        if value["session"]["provider"] == "pi" {
+        if value["session"]["provider"] == "pi" && value["session"]["session_id"] == "managed-fixture" {
           break value;
         }
       }
