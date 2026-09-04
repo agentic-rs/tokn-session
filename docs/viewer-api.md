@@ -38,9 +38,18 @@ The API defaults to loopback with no token. Set `TOKN_VIEWER_TOKEN` to require
 bearer authentication on every data and event endpoint. The browser keeps the
 token in memory only; reloads require reconnecting.
 
-During frontend development, `pnpm --dir apps/viewer dev` still runs Vite at
-`http://localhost:1437`. Start `viewer-api` with `--allow-origin
-http://localhost:1437`, then connect to `http://127.0.0.1:5558`.
+For frontend development, run these commands in separate terminals:
+
+```sh
+cargo run -p tokn-viewer-api -- --api-only
+pnpm --dir apps/viewer dev
+```
+
+Open `http://localhost:1437` and connect using the prefilled address. Vite
+serves the React source with HMR and proxies `/api` requests, including SSE,
+to `127.0.0.1:5558`. No frontend build or CORS flag is needed. The Rust process
+continues running while frontend edits update the page. Rust changes still
+require restarting the API process.
 
 For a remote machine, a loopback API plus an SSH tunnel is sufficient:
 
@@ -49,8 +58,8 @@ ssh -N -L 5558:127.0.0.1:5558 your-machine
 ```
 
 Open `http://127.0.0.1:5558` after creating the tunnel. Same-origin requests do
-not need CORS configuration. `--allow-origin` is only needed when Vite or a UI
-loaded from another viewer host connects across origins; it must match that
+not need CORS configuration. `--allow-origin` is only needed when a UI
+connects directly across origins instead of using the Vite proxy; it must match that
 frontend's exact origin. Repeat the flag for additional origins. There is no
 wildcard option. Non-loopback `--bind` requires a token; use HTTPS termination
 or a private encrypted tunnel when transmitting sessions across a network. The
@@ -61,6 +70,7 @@ Options:
 - `--bind 127.0.0.1:5558`: listening address; port `0` chooses a free port.
 - `--web-root apps/viewer/dist`: compiled Vite directory containing
   `index.html`; `TOKN_VIEWER_WEB_ROOT` provides the same setting.
+- `--api-only`: disable static serving and skip the frontend build requirement.
 - `--allow-origin http://localhost:1437`: allowed frontend origin.
 - `--index-path <file>`: defaults to `~/.tokn/sessions/index.sqlite`.
 - `--native`: include provider-native Inspector records in automatic mode.

@@ -4,9 +4,7 @@ import { ViewerPage } from "./pages/ViewerPage";
 import { isDesktop, RemoteClient, selectMachine, type ConnectionState } from "./lib/transport";
 
 function BrowserViewer() {
-  const [endpoint, setEndpoint] = useState(() => import.meta.env.DEV
-    ? "http://127.0.0.1:5558"
-    : window.location.origin);
+  const [endpoint, setEndpoint] = useState(() => window.location.origin);
   const [token, setToken] = useState("");
   const [client, setClient] = useState<RemoteClient>();
   const [state, setState] = useState<ConnectionState>("connecting");

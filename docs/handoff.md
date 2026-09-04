@@ -54,8 +54,10 @@ browser frontend connects to `crates/viewer-api` over HTTP/SSE, one selected
 machine at a time. `viewer-api` serves the compiled `apps/viewer/dist` frontend
 with SPA fallback as well as authenticated `/api/v1` data routes. Build with
 `pnpm --dir apps/viewer build`, then run `cargo run -p tokn-viewer-api` and open
-`http://127.0.0.1:5558`. Vite remains available as a separate development
-server with an explicit allowed origin. See [viewer-api.md](viewer-api.md) for
+`http://127.0.0.1:5558`. During development, run the API with `--api-only`
+and `pnpm --dir apps/viewer dev`; Vite provides HMR and proxies `/api` (including
+SSE) to port 5558 without requiring a frontend build or CORS configuration.
+See [viewer-api.md](viewer-api.md) for
 the contract, authentication, origins, and SSH-tunnel setup. Remote keys must match
 the discovered catalog before history can be read. Browser tokens stay in memory;
 switching machines aborts old requests and clears the UI. SSE reconnects trigger

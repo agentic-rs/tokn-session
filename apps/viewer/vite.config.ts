@@ -17,6 +17,11 @@ export default defineConfig(async () => ({
     port: 1437,
     strictPort: true,
     host: host || false,
+    proxy: {
+      "/api": {
+        target: "http://127.0.0.1:5558",
+      },
+    },
     hmr: host
       ? {
           protocol: "ws",

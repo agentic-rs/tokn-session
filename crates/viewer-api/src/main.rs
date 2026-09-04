@@ -22,6 +22,9 @@ struct Args {
   /// Directory containing the compiled viewer index.html and assets.
   #[arg(long, env = "TOKN_VIEWER_WEB_ROOT", default_value = "apps/viewer/dist")]
   web_root: PathBuf,
+  /// Serve only the API while Vite handles the UI and hot module replacement.
+  #[arg(long)]
+  api_only: bool,
   #[arg(long)]
   index_path: Option<PathBuf>,
   #[arg(long)]
@@ -87,16 +90,18 @@ async fn run(args: Args) -> Result<(), String> {
   })?;
   let runtime = ViewerRuntime::start(service.clone());
   let shutdown = tokio_util::sync::CancellationToken::new();
-  let app = tokn_viewer_api::with_web_ui(
-    tokn_viewer_api::router(
-      service.clone(),
-      runtime.events.clone(),
-      token,
-      origins,
-      shutdown.clone(),
-    ),
-    args.web_root,
-  )?;
+  let app = tokn_viewer_api::router(
+    service.clone(),
+    runtime.events.clone(),
+    token,
+    origins,
+    shutdown.clone(),
+  );
+  let app = if args.api_only {
+    app
+  } else {
+    tokn_viewer_api::with_web_ui(app, args.web_root)?
+  };
   let listener = tokio::net::TcpListener::bind(args.bind)
     .await
     .map_err(|e| e.to_string())?;

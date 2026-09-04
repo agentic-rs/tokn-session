@@ -9,7 +9,9 @@ it("reports connection failures, retries, and disconnects before switching machi
   const close = vi.spyOn(client, "close");
   vi.spyOn(RemoteClient, "connect").mockRejectedValueOnce(new Error("Invalid viewer API token")).mockResolvedValueOnce(client);
   render(<App />);
+  expect(screen.getByRole("textbox", { name: "Viewer address" })).toHaveValue(window.location.origin);
   fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+  expect(RemoteClient.connect).toHaveBeenCalledWith(window.location.origin, "");
   expect(await screen.findByRole("alert")).toHaveTextContent("Invalid viewer API token");
   fireEvent.click(screen.getByRole("button", { name: "Connect" }));
   expect(await screen.findByText("Remote sessions")).toBeInTheDocument();
