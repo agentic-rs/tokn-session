@@ -38,7 +38,21 @@ The API defaults to loopback with no token. Set `TOKN_VIEWER_TOKEN` to require
 bearer authentication on every data and event endpoint. The browser keeps the
 token in memory only; reloads require reconnecting.
 
-For frontend development, run these commands in separate terminals:
+For frontend development, start both servers with one command:
+
+```sh
+pnpm --dir apps/viewer dev:web
+```
+
+The launcher builds and starts `viewer-api` on a free loopback port, starts
+Vite with HMR, and prints `http://127.0.0.1:1437/#token=…`. Open that link to
+connect automatically. The random token is passed to the API through its
+environment; it is not embedded in frontend code. The browser removes the
+fragment before rendering and keeps credentials in memory. Treat the printed
+link as a credential. On reload, reopen the link or enter the token manually.
+Ctrl-C stops both servers. Set `TOKN_VIEWER_DEV_PORT` to change Vite's port.
+
+To manage the processes separately, use two terminals:
 
 ```sh
 cargo run -p tokn-viewer-api -- --api-only

@@ -3,7 +3,7 @@ import "./App.css";
 import { ViewerPage } from "./pages/ViewerPage";
 import { isDesktop, RemoteClient, selectMachine, type ConnectionState } from "./lib/transport";
 
-function BrowserViewer() {
+function BrowserViewer({ initial_token }: { initial_token?: string }) {
   const [endpoint, setEndpoint] = useState(() => window.location.origin);
   const [token, setToken] = useState("");
   const [client, setClient] = useState<RemoteClient>();
@@ -11,6 +11,20 @@ function BrowserViewer() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   useEffect(() => () => selectMachine(), []);
+  useEffect(() => {
+    if (!initial_token) return;
+    let cancelled = false;
+    setBusy(true);
+    void RemoteClient.connect(window.location.origin, initial_token).then((next) => {
+      if (cancelled) { next.close(); return; }
+      next.setStateListener(setState);
+      selectMachine(next);
+      setClient(next);
+    }).catch((error: unknown) => {
+      if (!cancelled) setError(error instanceof Error ? error.message : String(error));
+    }).finally(() => { if (!cancelled) setBusy(false); });
+    return () => { cancelled = true; };
+  }, [initial_token]);
 
   async function connect() {
     setBusy(true); setError(undefined);
@@ -42,5 +56,7 @@ function BrowserViewer() {
     </form>
   </main>;
 }
-function App() { return isDesktop() ? <ViewerPage /> : <BrowserViewer />; }
+function App({ initial_token }: { initial_token?: string }) {
+  return isDesktop() ? <ViewerPage /> : <BrowserViewer initial_token={initial_token} />;
+}
 export default App;

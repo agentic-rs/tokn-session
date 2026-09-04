@@ -54,7 +54,11 @@ browser frontend connects to `crates/viewer-api` over HTTP/SSE, one selected
 machine at a time. `viewer-api` serves the compiled `apps/viewer/dist` frontend
 with SPA fallback as well as authenticated `/api/v1` data routes. Build with
 `pnpm --dir apps/viewer build`, then run `cargo run -p tokn-viewer-api` and open
-`http://127.0.0.1:5558`. During development, run the API with `--api-only`
+`http://127.0.0.1:5558`. `pnpm --dir apps/viewer dev:web` starts the API on a
+free loopback port and Vite with HMR, generates an access token, and prints a
+fragment login link. The UI removes the token from the URL before rendering
+and connects automatically; failures leave manual login available. Ctrl-C
+stops both processes. For separate development processes, run the API with `--api-only`
 and `pnpm --dir apps/viewer dev`; Vite provides HMR and proxies `/api` (including
 SSE) to port 5558 without requiring a frontend build or CORS configuration.
 See [viewer-api.md](viewer-api.md) for
