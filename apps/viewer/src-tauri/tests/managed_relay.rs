@@ -75,7 +75,8 @@ async fn packaged_child_streams_new_records_with_optional_native_and_exits_on_eo
             if value["session"]["provider"] == "pi" { break; }
           }
           _ = tick.tick() => {
-            std::fs::write(root.path().join(format!("pi/probe-{probe}.jsonl")), format!("{HEADER}{MESSAGE}")).unwrap();
+            let header = HEADER.replace("managed-fixture", &format!("probe-{probe}"));
+            std::fs::write(root.path().join(format!("pi/probe-{probe}.jsonl")), format!("{header}{MESSAGE}")).unwrap();
             probe += 1;
           }
         }
@@ -93,7 +94,7 @@ async fn packaged_child_streams_new_records_with_optional_native_and_exits_on_eo
           .unwrap()
           .expect("Relay exited before delivering the new file");
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
-        if value["session"]["provider"] == "pi" && value["path"] == path.to_string_lossy().as_ref() {
+        if value["session"]["provider"] == "pi" && value["session"]["session_id"] == "managed-fixture" {
           break value;
         }
       }
