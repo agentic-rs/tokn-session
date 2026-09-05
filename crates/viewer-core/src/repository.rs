@@ -29,6 +29,12 @@ pub(crate) trait ViewerRepository: Send + Sync {
     ))
   }
 
+  /// Avoids parsing a JSONL file while an agent is actively appending to it.
+  /// Alternate repositories are stable by construction unless they opt in.
+  fn session_body_ready(&self, _locator: &SessionLocator) -> Result<bool, String> {
+    Ok(true)
+  }
+
   fn load_session(&self, locator: &SessionLocator) -> Result<LoadedSession, String>;
 }
 
@@ -47,6 +53,20 @@ impl ViewerRepository for NativeRepository {
     AgentClient::session_header_at_path(provider.source(), None, path)
   }
 
+  fn session_body_ready(&self, locator: &SessionLocator) -> Result<bool, String> {
+    if !matches!(locator.provider, ViewerProvider::Codex | ViewerProvider::Pi) {
+      return Ok(true);
+    }
+    let modified = std::fs::metadata(&locator.source_path)
+      .and_then(|metadata| metadata.modified())
+      .map_err(|error| format!("failed to inspect {}: {error}", locator.source_path.display()))?;
+    Ok(
+      modified
+        .elapsed()
+        .is_ok_and(|age| age >= std::time::Duration::from_secs(2)),
+    )
+  }
+
   fn load_session(&self, locator: &SessionLocator) -> Result<LoadedSession, String> {
     match locator.provider {
       ViewerProvider::OpenCode | ViewerProvider::ZCode => AgentClient::load_session(
@@ -62,5 +82,24 @@ impl ViewerRepository for NativeRepository {
         AgentClient::load_session(locator.provider.source(), None, path)
       }
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn native_repository_defers_an_active_jsonl_body() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("active.jsonl");
+    std::fs::write(&path, "active").unwrap();
+    let locator = SessionLocator {
+      version: 1,
+      provider: ViewerProvider::Codex,
+      session_id: "active".into(),
+      source_path: path,
+    };
+    assert!(!NativeRepository.session_body_ready(&locator).unwrap());
   }
 }

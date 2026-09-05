@@ -562,6 +562,8 @@ struct CatalogRefresh {
 }
 
 enum BodyJobRefresh {
+  /// The source is still changing. Leave it queued until it has been quiet.
+  Deferred,
   /// The job no longer matches the current catalog or provider source. A
   /// subsequent catalog pass will create the next safe job.
   Stale,
@@ -700,6 +702,11 @@ impl ViewerService {
       .unwrap_or_else(|poisoned| poisoned.into_inner())
       .clone()
       .ok_or_else(|| "session index scheduler is not available".to_string())?;
+    // An explicit retry makes unchanged failed bodies eligible again. Automatic
+    // passes retain those failures until the source changes.
+    if let Ok(mut failures) = self.failed_body_jobs.lock() {
+      failures.clear();
+    }
     // Publish before waking an idle scheduler. If work is already active, do
     // not overwrite its truthful catalog/body state; the internal generation
     // still ensures the queued wake cannot be erased by that pass finishing.
@@ -844,7 +851,7 @@ impl ViewerService {
   }
 
   pub(crate) fn follow_shared_index(&self) -> Result<bool, String> {
-    let changed = self.observe_external_index_change()?;
+    let changed = self.observe_shared_index_change()?;
     self.refresh_index_progress_from_index();
     self.index_progress.update(|progress| {
       progress.activity = IndexActivity::WaitingForIndexer;
@@ -1348,7 +1355,7 @@ impl ViewerService {
     let result = (|| {
       let catalog_refresh = self.refresh_session_catalogs();
       self.continue_session_index_body_refresh();
-      let body_refresh = self.refresh_pending_body_jobs(&catalog_refresh.unavailable)?;
+      let body_refresh = self.refresh_pending_body_jobs(&catalog_refresh.unavailable, true)?;
       let mut refresh = catalog_refresh.refresh;
       refresh.changed |= body_refresh.refresh.changed;
       refresh
@@ -1432,7 +1439,16 @@ impl ViewerService {
   /// Advances only the bounded body queue from an already committed catalog.
   /// The background scheduler calls this between normal catalog intervals so a
   /// large provider is not rediscovered for every eight-session body batch.
-  pub(crate) fn refresh_pending_session_index(&self) -> Result<IndexRefresh, String> {
+  #[cfg(test)]
+  fn refresh_pending_session_index(&self) -> Result<IndexRefresh, String> {
+    self.refresh_pending_session_index_with_failed_retries(true)
+  }
+
+  pub(crate) fn refresh_pending_session_index_automated(&self) -> Result<IndexRefresh, String> {
+    self.refresh_pending_session_index_with_failed_retries(false)
+  }
+
+  fn refresh_pending_session_index_with_failed_retries(&self, retry_failed: bool) -> Result<IndexRefresh, String> {
     let _refresh_gate = self
       .index_refresh_gate
       .lock()
@@ -1444,7 +1460,7 @@ impl ViewerService {
         .lock()
         .map(|current_errors| current_errors.clone())
         .unwrap_or_default();
-      let body_refresh = self.refresh_pending_body_jobs(&HashSet::new())?;
+      let body_refresh = self.refresh_pending_body_jobs(&HashSet::new(), retry_failed)?;
       let mut refresh = body_refresh.refresh;
       refresh.has_catalog_errors = !catalog_errors.is_empty();
       refresh.attention_session_keys.sort();
@@ -1511,17 +1527,29 @@ impl ViewerService {
   /// global newest-first batch afterwards; a malformed rollout cannot starve
   /// older pending sources and no one refresh can become a whole-history
   /// parse again.
-  fn refresh_pending_body_jobs(&self, unavailable: &HashSet<ViewerProvider>) -> Result<BodyBackfillRefresh, String> {
+  fn refresh_pending_body_jobs(
+    &self,
+    unavailable: &HashSet<ViewerProvider>,
+    retry_failed: bool,
+  ) -> Result<BodyBackfillRefresh, String> {
     let mut refresh = IndexRefresh::default();
     let mut attention_session_keys = HashSet::new();
     let mut pending_jobs = self.pending_body_jobs(unavailable)?;
     self.replace_body_progress_queue(&pending_jobs)?;
-    let batch_len = pending_jobs.len().min(INDEX_BODY_SCAN_BATCH_SIZE);
-    for index in 0..batch_len {
+    let mut processed = 0;
+    for index in 0..pending_jobs.len() {
+      if processed >= INDEX_BODY_SCAN_BATCH_SIZE {
+        break;
+      }
       let job = pending_jobs[index].clone();
+      if job.deprioritized && !retry_failed {
+        continue;
+      }
       self.set_body_active_provider(job.provider);
       match self.refresh_pending_body_job(&job) {
+        Ok(BodyJobRefresh::Deferred) => continue,
         Ok(BodyJobRefresh::Stale) => {
+          processed += 1;
           self.clear_failed_body_job(&job);
           self.record_body_progress_stale(&job);
           // A stale body job commonly means another viewer process committed
@@ -1535,6 +1563,7 @@ impl ViewerService {
           provider_refresh,
           next_source,
         }) => {
+          processed += 1;
           self.clear_failed_body_job(&job);
           self.record_body_progress_completion(&job);
           refresh.changed |= provider_refresh.changed;
@@ -1544,6 +1573,7 @@ impl ViewerService {
           Self::retarget_pending_body_jobs(&mut pending_jobs[index + 1..], &job.source, next_source);
         }
         Err(message) => {
+          processed += 1;
           self.record_failed_body_job(&job, message);
           self.record_body_progress_failure(&job);
         }
@@ -1554,7 +1584,7 @@ impl ViewerService {
     // body-only pass can make progress without waiting for another catalog.
     let remaining_jobs = self.pending_body_jobs(&HashSet::new())?;
     self.replace_body_progress_queue(&remaining_jobs)?;
-    refresh.has_pending_body_jobs = !remaining_jobs.is_empty();
+    refresh.has_pending_body_jobs = remaining_jobs.iter().any(|job| !job.deprioritized);
     refresh.attention_session_keys = attention_session_keys.into_iter().collect();
     Ok(BodyBackfillRefresh {
       refresh,
@@ -1608,11 +1638,11 @@ impl ViewerService {
     errors: HashMap<ViewerProvider, String>,
   ) -> Result<IndexRefresh, String> {
     let mut refresh = self.finish_index_refresh(refresh, errors);
-    refresh.changed |= self.observe_external_index_change()?;
+    refresh.changed |= self.observe_shared_index_change()?;
     Ok(refresh)
   }
 
-  fn observe_external_index_change(&self) -> Result<bool, String> {
+  pub(crate) fn observe_shared_index_change(&self) -> Result<bool, String> {
     let current = self
       .session_index
       .data_version()
@@ -2335,6 +2365,9 @@ impl ViewerService {
     }
     if source_cursor(job.provider, &job.locator.source_path)? != job.raw_cursor {
       return Ok(BodyJobRefresh::Stale);
+    }
+    if !self.repository.session_body_ready(&job.locator)? {
+      return Ok(BodyJobRefresh::Deferred);
     }
 
     let existing_sessions = self
@@ -7333,6 +7366,14 @@ mod tests {
     let (retry_sender, mut retry_receiver) = tokio::sync::mpsc::unbounded_channel();
     service.set_session_index_retry_sender(retry_sender);
 
+    service.failed_body_jobs.lock().unwrap().insert(
+      (SourceKey::new("codex", "failed"), "failed".into()),
+      FailedBodyJob {
+        raw_cursor: "cursor".into(),
+        source_generation: 1,
+        message: "failed".into(),
+      },
+    );
     let before = service.session_index_progress();
     let queued = service
       .request_session_index_retry()
@@ -7345,6 +7386,7 @@ mod tests {
     assert!(progress_updates.has_changed().expect("watch sender should remain open"));
     assert_eq!(progress_updates.borrow_and_update().revision, queued.revision);
     assert!(retry_receiver.try_recv().is_ok());
+    assert!(service.failed_body_jobs.lock().unwrap().is_empty());
   }
 
   #[test]
@@ -7535,6 +7577,13 @@ mod tests {
       service.index_error_for(ViewerProvider::Codex).as_deref(),
       Some("fixture body read failed")
     );
+
+    let calls_after_failure = repository.load_calls.load(Ordering::SeqCst);
+    let automatic = service
+      .refresh_pending_session_index_automated()
+      .expect("automatic pass should retain the failed job without retrying it");
+    assert!(!automatic.has_pending_body_jobs);
+    assert_eq!(repository.load_calls.load(Ordering::SeqCst), calls_after_failure);
 
     repository
       .loads
