@@ -480,8 +480,9 @@ ownership and durable queue counts, not the owner's live progress snapshot.
 External mode releases the native lease and continues querying its chosen server.
 
 Relay records are bounded advisory indexer hints: Codex/Pi target changed paths;
-other providers request provider-local discovery. Overflow triggers recovery.
-Native file watchers and periodic recovery continue to cover missed feed events.
+other providers request provider-local discovery. A lagged Relay hint receiver drops
+its historical backlog instead of escalating it to a global catalog; native file
+watchers and periodic recovery cover missed feed events.
 
 The viewer also keeps a process-local operational snapshot for its one index
 scheduler. It contains only a monotonic string revision, provider identities
@@ -540,8 +541,13 @@ asynchronous startup; an existing SQLite sidebar remains immediately usable.
 OpenCode, ZCode, WorkBuddy, and DSH retain a ten-second *provider-local*
 catalog cadence, and a Codex/Pi root with no working native registration joins
 that subset. This preserves their update latency without repeatedly discovering
-large watched rollout trees. While any row remains unbaselined, a one-second
-body-only pass advances the next batch without rediscovering the whole provider.
+large watched rollout trees. While eligible rows remain unbaselined, a one-second body-only pass advances
+the next batch without rediscovering the whole provider. Active Codex/Pi JSONL
+waits for a two-second quiet period so an expensive parse is not discarded on
+every append. A body failure remains visible but is not retried every second;
+a source-generation change or explicit retry makes it eligible again. When no
+body work is eligible, the one-second lease tick checks only SQLite's cheap data
+version and does not enumerate the index.
 A membership or source-revision race, provider catalog warning, or transient
 refresh failure keeps the prior rows visible and makes up to two one-second
 retries of the relevant catalog scope before returning to its normal cadence;
