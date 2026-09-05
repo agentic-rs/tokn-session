@@ -92,6 +92,17 @@ reset them. See [snapshot protocol](relay.md#local-snapshotfollow-service).
 Automatic and Local modes use durable index queries for lists, search, trees,
 and snapshot admission. The viewer-core indexer discovers provider headers and
 backfills bounded titles/previews and attention in the existing SQLite index.
+After the first catalog, Codex and Pi recovery scans enumerate paths and compare
+stored file-revision cursors; unchanged rollouts reuse indexed headers, while
+only new or modified JSONL files are opened. This preserves changes made while
+the watcher was offline without repeating a cold header parse on API restart.
+Codex/Pi body backfill scales its quiet-file delay with transcript size, up to
+five minutes, so a brief pause in an active session does not start a costly
+parse that will be discarded after the next append. JSONL bodies above 8 MiB
+keep their catalog metadata and load on demand instead of being parsed by the
+background indexer. Pending-body polling
+runs every five seconds and queries only unbaselined sessions and their source
+rows, so deferred work does not repeatedly decode the complete session index.
 Automatic snapshots no longer run a separate discovery or metadata-backfill
 cache. Conversation/native payloads still come from on-demand snapshot readers,
 which remain usable while the advisory Relay child starts or fails. Automatic

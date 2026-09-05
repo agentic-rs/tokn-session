@@ -114,6 +114,7 @@ impl ViewerRuntime {
       }
       let mut next_full_catalog_refresh = Instant::now();
       let mut next_unwatched_provider_catalog_refresh = Instant::now();
+      let mut next_pending_body_refresh = Instant::now();
       let mut consecutive_catalog_retries = 0_u8;
       let mut consecutive_unwatched_provider_catalog_retries = 0_u8;
       let mut consecutive_changed_file_retries = 0_u8;
@@ -199,6 +200,7 @@ impl ViewerRuntime {
         let catalog_due = now >= next_full_catalog_refresh;
         let unwatched_provider_catalog_due = now >= next_unwatched_provider_catalog_refresh;
         let changed_file_retry_due = next_changed_file_retry.is_some_and(|deadline| now >= deadline);
+        let pending_body_due = has_pending_body_jobs && now >= next_pending_body_refresh;
         let work = if catalog_due {
           // A full pass subsumes any queued single-file checks.
           pending_wake = None;
@@ -227,7 +229,7 @@ impl ViewerRuntime {
         } else {
           None
         };
-        if work.is_none() && !has_pending_body_jobs {
+        if work.is_none() && !pending_body_due {
           match refresh_service.observe_shared_index_change() {
             Ok(true) => {
               let _ = emit(
@@ -340,6 +342,9 @@ impl ViewerRuntime {
               consecutive_changed_file_retries = 0;
             }
             has_pending_body_jobs = refresh.has_pending_body_jobs;
+            if has_pending_body_jobs {
+              next_pending_body_refresh = Instant::now() + INDEX_PENDING_BODY_REFRESH_INTERVAL;
+            }
             let needs_retry = session_index_needs_retry(&refresh);
             if refresh.changed {
               let _ = emit(&scheduler_events, "session-index-changed", refresh);
@@ -477,7 +482,7 @@ const INDEX_FULL_CATALOG_RECOVERY_INTERVAL: Duration = Duration::from_secs(5 * 6
 /// rollout tree from being rediscovered just to notice a SQLite- or
 /// compressed-log-backed provider update.
 const INDEX_UNWATCHED_PROVIDER_CATALOG_INTERVAL: Duration = Duration::from_secs(10);
-const INDEX_PENDING_BODY_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const INDEX_PENDING_BODY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const INDEX_CATALOG_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_CONSECUTIVE_CATALOG_RETRIES: u8 = 2;
 const MAX_CONSECUTIVE_CHANGED_FILE_RETRIES: u8 = 3;

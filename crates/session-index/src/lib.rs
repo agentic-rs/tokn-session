@@ -983,6 +983,18 @@ impl SessionIndex {
     )
   }
 
+  /// Lists currently present sessions that have not completed their initial
+  /// attention baseline. Viewer body backfill uses this narrow query so its
+  /// idle polling cost follows the pending queue rather than total history.
+  pub fn list_unbaselined_present_sessions(&self) -> Result<Vec<IndexedSession>> {
+    let connection = self.connection()?;
+    select_sessions(
+      &connection,
+      "WHERE session.present = 1 AND session.attention_baselined = 0",
+      [],
+    )
+  }
+
   /// Lists every indexed session, including tombstoned rows.
   pub fn list_all_sessions(&self) -> Result<Vec<IndexedSession>> {
     let connection = self.connection()?;
@@ -2204,6 +2216,17 @@ mod tests {
         vec![completed_pending],
       ))
       .expect("completed ZCode source should be indexed");
+
+    let unbaselined = index
+      .list_unbaselined_present_sessions()
+      .expect("unbaselined session query should work");
+    assert_eq!(
+      unbaselined
+        .iter()
+        .map(|session| session.key.session_id.as_str())
+        .collect::<Vec<_>>(),
+      vec!["first", "second", "stale", "waiting"]
+    );
 
     let counts = index
       .pending_session_baseline_counts(&["pending.v3.", "pending.v2."])
