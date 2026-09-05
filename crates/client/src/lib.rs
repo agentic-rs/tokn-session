@@ -32,13 +32,29 @@ impl AgentClient {
     session_source::session_source(source, session_dir)?.file_session_roots()
   }
 
+  /// Enumerates file-backed sessions without opening their contents.
+  pub fn file_session_paths(source: Source, session_dir: Option<PathBuf>) -> Result<Vec<PathBuf>, String> {
+    session_source::session_source(source, session_dir)?.file_session_paths()
+  }
+
+  /// Applies provider catalog metadata that is stored outside session files.
+  pub fn apply_catalog_metadata(
+    source: Source,
+    session_dir: Option<PathBuf>,
+    headers: &mut [SessionHeader],
+  ) -> Result<(), String> {
+    session_source::session_source(source, session_dir)?.apply_catalog_metadata(headers);
+    Ok(())
+  }
+
   /// Reads one file-backed session header at a known path.
   ///
   /// This avoids enumerating a provider's whole catalog and does not inspect
   /// the conversation body. It is currently available for Codex and Pi,
   /// whose persisted histories are one session per JSONL file. Codex reads
   /// only the rollout header here; its optional Desktop state and legacy-index
-  /// presentation metadata is refreshed by complete catalog discovery.
+  /// presentation metadata can be applied in one batch with
+  /// [`AgentClient::apply_catalog_metadata`].
   pub fn session_header_at_path(
     source: Source,
     session_dir: Option<PathBuf>,

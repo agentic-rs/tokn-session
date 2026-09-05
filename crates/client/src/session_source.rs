@@ -53,6 +53,23 @@ impl SessionSourceClient {
     }
   }
 
+  pub(crate) fn file_session_paths(&self) -> Result<Vec<PathBuf>, String> {
+    match self {
+      Self::Codex(source) => source.session_paths(),
+      Self::Pi(source) => source.session_paths(),
+      Self::Dsh(_) => Err(path_targeting_unsupported("dsh")),
+      Self::OpenCode(_) => Err(path_targeting_unsupported("opencode")),
+      Self::WorkBuddy(_) => Err(path_targeting_unsupported("workbuddy")),
+      Self::ZCode(_) => Err(path_targeting_unsupported("zcode")),
+    }
+  }
+
+  pub(crate) fn apply_catalog_metadata(&self, headers: &mut [SessionHeader]) {
+    if let Self::Codex(source) = self {
+      source.apply_catalog_metadata(headers);
+    }
+  }
+
   pub(crate) fn session_header_at_path(&self, path: &Path) -> Result<SessionHeader, String> {
     let reference = match self {
       // A watcher can receive one notification per appended rollout record.

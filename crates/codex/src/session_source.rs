@@ -47,6 +47,45 @@ impl CodexSessionSource {
     self.roots()
   }
 
+  /// Enumerates persisted rollout paths without opening their contents.
+  ///
+  /// Durable indexes use this to reconcile filesystem membership cheaply and
+  /// only reopen headers whose file revision changed.
+  pub fn session_paths(&self) -> Result<Vec<PathBuf>, String> {
+    let mut paths = Vec::new();
+    for root in self.session_roots()? {
+      collect_jsonl_files(&root, &mut paths)?;
+    }
+    paths.sort();
+    Ok(paths)
+  }
+
+  /// Applies Codex Desktop's optional title and preview metadata to an
+  /// already-discovered header inventory without reopening rollout files.
+  pub fn apply_catalog_metadata(&self, headers: &mut [SessionHeader]) {
+    let mut references = headers
+      .iter()
+      .map(|header| SessionRef {
+        id: header.id.clone(),
+        parent_session_id: header.parent_session_id.clone(),
+        agent_path: header.agent_path.clone(),
+        agent_nickname: header.agent_nickname.clone(),
+        agent_role: header.agent_role.clone(),
+        title: header.title.clone(),
+        preview: header.preview.clone(),
+        path: header.path.clone(),
+        cwd: header.cwd.clone(),
+        timestamp: header.timestamp.clone(),
+        message_count: 0,
+      })
+      .collect::<Vec<_>>();
+    self.apply_indexed_metadata(&mut references);
+    for (header, reference) in headers.iter_mut().zip(references) {
+      header.title = reference.title;
+      header.preview = reference.preview;
+    }
+  }
+
   /// Reads the header relation for one known rollout path without scanning its
   /// conversation body or sibling session files.
   ///
@@ -83,13 +122,8 @@ impl CodexSessionSource {
   }
 
   fn list_session_refs(&self, inspect: fn(&Path) -> Result<SessionRef, String>) -> Result<Vec<SessionRef>, String> {
-    let mut paths = Vec::new();
-    for root in self.session_roots()? {
-      collect_jsonl_files(&root, &mut paths)?;
-    }
-
     let mut refs = Vec::new();
-    for path in paths {
+    for path in self.session_paths()? {
       if let Ok(reference) = inspect(&path) {
         refs.push(reference);
       }

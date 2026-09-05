@@ -92,6 +92,17 @@ reset them. See [snapshot protocol](relay.md#local-snapshotfollow-service).
 Automatic and Local modes use durable index queries for lists, search, trees,
 and snapshot admission. The viewer-core indexer discovers provider headers and
 backfills bounded titles/previews and attention in the existing SQLite index.
+After the first catalog, Codex and Pi recovery scans enumerate paths and compare
+stored file-revision cursors; unchanged rollouts reuse indexed headers, while
+only new or modified JSONL files are opened. This preserves changes made while
+the watcher was offline without repeating a cold header parse on API restart.
+Codex/Pi body backfill scales its quiet-file delay with transcript size, up to
+five minutes, so a brief pause in an active session does not start a costly
+parse that will be discarded after the next append. JSONL bodies above 8 MiB
+keep their catalog metadata and load on demand instead of being parsed by the
+background indexer. Pending-body polling
+runs every five seconds and queries only unbaselined sessions and their source
+rows, so deferred work does not repeatedly decode the complete session index.
 Automatic snapshots no longer run a separate discovery or metadata-backfill
 cache. Conversation/native payloads still come from on-demand snapshot readers,
 which remain usable while the advisory Relay child starts or fails. Automatic
@@ -480,8 +491,9 @@ ownership and durable queue counts, not the owner's live progress snapshot.
 External mode releases the native lease and continues querying its chosen server.
 
 Relay records are bounded advisory indexer hints: Codex/Pi target changed paths;
-other providers request provider-local discovery. Overflow triggers recovery.
-Native file watchers and periodic recovery continue to cover missed feed events.
+other providers request provider-local discovery. A lagged Relay hint receiver drops
+its historical backlog instead of escalating it to a global catalog; native file
+watchers and periodic recovery cover missed feed events.
 
 The viewer also keeps a process-local operational snapshot for its one index
 scheduler. It contains only a monotonic string revision, provider identities
@@ -540,8 +552,13 @@ asynchronous startup; an existing SQLite sidebar remains immediately usable.
 OpenCode, ZCode, WorkBuddy, and DSH retain a ten-second *provider-local*
 catalog cadence, and a Codex/Pi root with no working native registration joins
 that subset. This preserves their update latency without repeatedly discovering
-large watched rollout trees. While any row remains unbaselined, a one-second
-body-only pass advances the next batch without rediscovering the whole provider.
+large watched rollout trees. While eligible rows remain unbaselined, a one-second body-only pass advances
+the next batch without rediscovering the whole provider. Active Codex/Pi JSONL
+waits for a two-second quiet period so an expensive parse is not discarded on
+every append. A body failure remains visible but is not retried every second;
+a source-generation change or explicit retry makes it eligible again. When no
+body work is eligible, the one-second lease tick checks only SQLite's cheap data
+version and does not enumerate the index.
 A membership or source-revision race, provider catalog warning, or transient
 refresh failure keeps the prior rows visible and makes up to two one-second
 retries of the relevant catalog scope before returning to its normal cadence;

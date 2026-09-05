@@ -5,6 +5,35 @@ use tokn_session_core::LoadedSession;
 
 use crate::model::{SessionLocator, ViewerProvider};
 
+const JSONL_BODY_BASE_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
+const JSONL_BODY_MAX_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const JSONL_BODY_BYTES_PER_QUIET_SECOND: u64 = 32 * 1024;
+const JSONL_EAGER_BODY_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionBodyIndexing {
+  Ready,
+  Deferred,
+  CatalogOnly,
+}
+
+fn jsonl_body_quiet_period(len: u64) -> std::time::Duration {
+  let size_seconds = len.div_ceil(JSONL_BODY_BYTES_PER_QUIET_SECOND);
+  JSONL_BODY_BASE_QUIET_PERIOD
+    .saturating_add(std::time::Duration::from_secs(size_seconds))
+    .min(JSONL_BODY_MAX_QUIET_PERIOD)
+}
+
+fn jsonl_body_indexing(len: u64, age: std::time::Duration) -> SessionBodyIndexing {
+  if len > JSONL_EAGER_BODY_MAX_BYTES {
+    SessionBodyIndexing::CatalogOnly
+  } else if age >= jsonl_body_quiet_period(len) {
+    SessionBodyIndexing::Ready
+  } else {
+    SessionBodyIndexing::Deferred
+  }
+}
+
 pub(crate) trait ViewerRepository: Send + Sync {
   fn list_session_headers(&self, provider: ViewerProvider) -> Result<Vec<SessionHeader>, String>;
 
@@ -18,6 +47,19 @@ pub(crate) trait ViewerRepository: Send + Sync {
     ))
   }
 
+  /// Enumerates file-backed sessions without parsing their headers.
+  fn file_session_paths(&self, provider: ViewerProvider) -> Result<Vec<PathBuf>, String> {
+    Err(format!(
+      "{} does not support path-only session cataloging",
+      provider.as_str()
+    ))
+  }
+
+  /// Applies provider metadata stored outside individual session files.
+  fn apply_catalog_metadata(&self, _provider: ViewerProvider, _headers: &mut [SessionHeader]) -> Result<(), String> {
+    Ok(())
+  }
+
   /// Reads one metadata-only session header from a known changed file. The
   /// default makes unsupported repository implementations fail closed, so a
   /// caller can fall back to a complete provider catalog instead.
@@ -27,6 +69,12 @@ pub(crate) trait ViewerRepository: Send + Sync {
       provider.as_str(),
       path.display()
     ))
+  }
+
+  /// Avoids parsing a JSONL file while an agent is actively appending to it.
+  /// Alternate repositories are stable by construction unless they opt in.
+  fn session_body_indexing(&self, _locator: &SessionLocator) -> Result<SessionBodyIndexing, String> {
+    Ok(SessionBodyIndexing::Ready)
   }
 
   fn load_session(&self, locator: &SessionLocator) -> Result<LoadedSession, String>;
@@ -43,8 +91,29 @@ impl ViewerRepository for NativeRepository {
     AgentClient::file_session_roots(provider.source(), None)
   }
 
+  fn file_session_paths(&self, provider: ViewerProvider) -> Result<Vec<PathBuf>, String> {
+    AgentClient::file_session_paths(provider.source(), None)
+  }
+
+  fn apply_catalog_metadata(&self, provider: ViewerProvider, headers: &mut [SessionHeader]) -> Result<(), String> {
+    AgentClient::apply_catalog_metadata(provider.source(), None, headers)
+  }
+
   fn session_header_at_path(&self, provider: ViewerProvider, path: &Path) -> Result<SessionHeader, String> {
     AgentClient::session_header_at_path(provider.source(), None, path)
+  }
+
+  fn session_body_indexing(&self, locator: &SessionLocator) -> Result<SessionBodyIndexing, String> {
+    if !matches!(locator.provider, ViewerProvider::Codex | ViewerProvider::Pi) {
+      return Ok(SessionBodyIndexing::Ready);
+    }
+    let metadata = std::fs::metadata(&locator.source_path)
+      .map_err(|error| format!("failed to inspect {}: {error}", locator.source_path.display()))?;
+    let modified = metadata
+      .modified()
+      .map_err(|error| format!("failed to inspect {}: {error}", locator.source_path.display()))?;
+    let age = modified.elapsed().unwrap_or_default();
+    Ok(jsonl_body_indexing(metadata.len(), age))
   }
 
   fn load_session(&self, locator: &SessionLocator) -> Result<LoadedSession, String> {
@@ -62,5 +131,49 @@ impl ViewerRepository for NativeRepository {
         AgentClient::load_session(locator.provider.source(), None, path)
       }
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn native_repository_defers_an_active_jsonl_body() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("active.jsonl");
+    std::fs::write(&path, "active").unwrap();
+    let locator = SessionLocator {
+      version: 1,
+      provider: ViewerProvider::Codex,
+      session_id: "active".into(),
+      source_path: path,
+    };
+    assert_eq!(
+      NativeRepository.session_body_indexing(&locator).unwrap(),
+      SessionBodyIndexing::Deferred
+    );
+  }
+
+  #[test]
+  fn jsonl_body_quiet_period_scales_with_parse_cost() {
+    assert_eq!(jsonl_body_quiet_period(0), std::time::Duration::from_secs(2));
+    assert_eq!(jsonl_body_quiet_period(32 * 1024), std::time::Duration::from_secs(3));
+    assert_eq!(
+      jsonl_body_quiet_period(10 * 1024 * 1024),
+      std::time::Duration::from_secs(5 * 60)
+    );
+  }
+
+  #[test]
+  fn oversized_jsonl_bodies_stay_on_demand() {
+    assert_eq!(
+      jsonl_body_indexing(JSONL_EAGER_BODY_MAX_BYTES, std::time::Duration::from_secs(5 * 60)),
+      SessionBodyIndexing::Ready
+    );
+    assert_eq!(
+      jsonl_body_indexing(JSONL_EAGER_BODY_MAX_BYTES + 1, std::time::Duration::from_secs(5 * 60)),
+      SessionBodyIndexing::CatalogOnly
+    );
   }
 }
