@@ -2,10 +2,15 @@
 //! and stdin EOF ends the child even if its async runtime stalls.
 use crate::{PROVIDERS, RelayConfig, SessionRelay, provider_roots};
 use std::io::{Read, Write};
+use std::time::Duration;
 
 pub const CHILD_FLAG: &str = "--tokn-viewer-relay-child";
 pub const VERSION: u32 = 1;
 pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+/// Managed viewers already have native index watches and their own durable
+/// recovery pass. Keep Relay's whole-history scan as a coarse safety net so
+/// an idle embedded child does not traverse every provider twice a minute.
+const MANAGED_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 pub fn default_config(native: bool) -> Result<RelayConfig, String> {
   let mut roots = Vec::new();
@@ -46,7 +51,7 @@ pub fn run_if_requested() {
 
 async fn run(native: bool) -> Result<(), String> {
   let mut stdout = std::io::stdout().lock();
-  let mut relay = initialize(&mut stdout, default_config(native)?).await?;
+  let mut relay = initialize(&mut stdout, managed_config(native)?).await?;
   loop {
     let update = relay.next_update().await?;
     for warning in update.warnings {
@@ -56,6 +61,12 @@ async fn run(native: bool) -> Result<(), String> {
       write_line(&mut stdout, &record)?;
     }
   }
+}
+
+fn managed_config(native: bool) -> Result<RelayConfig, String> {
+  let mut config = default_config(native)?;
+  config.poll_interval = MANAGED_POLL_INTERVAL;
+  Ok(config)
 }
 
 /// Readiness describes the managed pipe, not completion of Relay's seed scan.
@@ -102,5 +113,10 @@ mod tests {
       serde_json::from_slice::<serde_json::Value>(&output.0).unwrap(),
       serde_json::json!({"type":"ready", "version":VERSION})
     );
+  }
+
+  #[test]
+  fn managed_feed_uses_coarse_full_scan_recovery() {
+    assert_eq!(managed_config(false).unwrap().poll_interval, MANAGED_POLL_INTERVAL);
   }
 }
