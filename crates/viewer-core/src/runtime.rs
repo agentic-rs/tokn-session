@@ -114,6 +114,7 @@ impl ViewerRuntime {
       }
       let mut next_full_catalog_refresh = Instant::now();
       let mut next_unwatched_provider_catalog_refresh = Instant::now();
+      let mut next_pending_body_refresh = Instant::now();
       let mut consecutive_catalog_retries = 0_u8;
       let mut consecutive_unwatched_provider_catalog_retries = 0_u8;
       let mut consecutive_changed_file_retries = 0_u8;
@@ -122,6 +123,7 @@ impl ViewerRuntime {
       let mut next_changed_file_retry = None;
       let mut lease = None;
       let mut retry_generation = 0;
+      let mut has_pending_body_jobs = refresh_service.session_index_progress().body.pending_jobs > 0;
       loop {
         // An explicitly external viewer must not monopolize the native index
         // lease while sourcing all its catalogs from a different server.
@@ -198,6 +200,7 @@ impl ViewerRuntime {
         let catalog_due = now >= next_full_catalog_refresh;
         let unwatched_provider_catalog_due = now >= next_unwatched_provider_catalog_refresh;
         let changed_file_retry_due = next_changed_file_retry.is_some_and(|deadline| now >= deadline);
+        let pending_body_due = has_pending_body_jobs && now >= next_pending_body_refresh;
         let work = if catalog_due {
           // A full pass subsumes any queued single-file checks.
           pending_wake = None;
@@ -226,6 +229,33 @@ impl ViewerRuntime {
         } else {
           None
         };
+        if work.is_none() && !pending_body_due {
+          match refresh_service.observe_shared_index_change() {
+            Ok(true) => {
+              let _ = emit(
+                &scheduler_events,
+                "session-index-changed",
+                IndexRefresh {
+                  changed: true,
+                  ..Default::default()
+                },
+              );
+            }
+            Ok(false) => {}
+            Err(error) => eprintln!("shared index observation failed: {error}"),
+          }
+          if let Some(wake) = wait_for_session_index_work(
+            &mut retry_receiver,
+            &mut session_watcher,
+            &mut index_wakes,
+            Duration::from_secs(1),
+          )
+          .await
+          {
+            merge_session_index_wake(&mut pending_wake, wake);
+          }
+          continue;
+        }
         let full_catalog = matches!(work.as_ref(), Some(SessionIndexWork::FullCatalog));
         let provider_catalog = matches!(work.as_ref(), Some(SessionIndexWork::ProviderCatalog(_)));
         let service = refresh_service.clone();
@@ -238,7 +268,7 @@ impl ViewerRuntime {
             Some(SessionIndexWork::FullCatalog) => service.refresh_session_catalog(),
             Some(SessionIndexWork::ProviderCatalog(providers)) => service.refresh_session_catalog_providers(&providers),
             Some(SessionIndexWork::ChangedFiles(paths)) => service.refresh_changed_file_catalogs(paths),
-            None => service.refresh_pending_session_index(),
+            None => service.refresh_pending_session_index_automated(),
           }
         })
         .await;
@@ -311,7 +341,10 @@ impl ViewerRuntime {
             } else if !full_catalog {
               consecutive_changed_file_retries = 0;
             }
-            let has_pending_body_jobs = refresh.has_pending_body_jobs;
+            has_pending_body_jobs = refresh.has_pending_body_jobs;
+            if has_pending_body_jobs {
+              next_pending_body_refresh = Instant::now() + INDEX_PENDING_BODY_REFRESH_INTERVAL;
+            }
             let needs_retry = session_index_needs_retry(&refresh);
             if refresh.changed {
               let _ = emit(&scheduler_events, "session-index-changed", refresh);
@@ -449,7 +482,7 @@ const INDEX_FULL_CATALOG_RECOVERY_INTERVAL: Duration = Duration::from_secs(5 * 6
 /// rollout tree from being rediscovered just to notice a SQLite- or
 /// compressed-log-backed provider update.
 const INDEX_UNWATCHED_PROVIDER_CATALOG_INTERVAL: Duration = Duration::from_secs(10);
-const INDEX_PENDING_BODY_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const INDEX_PENDING_BODY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const INDEX_CATALOG_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_CONSECUTIVE_CATALOG_RETRIES: u8 = 2;
 const MAX_CONSECUTIVE_CHANGED_FILE_RETRIES: u8 = 3;
@@ -546,6 +579,7 @@ fn drain_session_index_wakes(
 enum SessionIndexWaitSignal {
   TimedOut,
   Scheduler(Option<SessionIndexWake>),
+  Relay(Result<(ViewerProvider, PathBuf), broadcast::error::RecvError>),
   Watcher(Option<WatchRequest>),
 }
 
@@ -585,7 +619,10 @@ fn index_wake_from_relay(
       SessionIndexWake::ChangedFiles(BTreeMap::from([(provider, BTreeSet::from([path]))])),
     ),
     Ok((provider, _)) => Some(SessionIndexWake::ProviderCatalog(BTreeSet::from([provider]))),
-    Err(broadcast::error::RecvError::Lagged(_)) => Some(SessionIndexWake::FullCatalog),
+    // Relay is advisory. Its historical replay can overflow this receiver;
+    // watchers and periodic recovery retain correctness without an expensive
+    // global rescan for records the indexer may already contain.
+    Err(broadcast::error::RecvError::Lagged(_)) => None,
     Err(broadcast::error::RecvError::Closed) => None,
   }
 }
@@ -600,14 +637,14 @@ async fn wait_for_session_index_work(
     tokio::select! {
       _ = tokio::time::sleep(delay) => SessionIndexWaitSignal::TimedOut,
       request = receiver.recv() => SessionIndexWaitSignal::Scheduler(request),
-      hint = relay.recv() => SessionIndexWaitSignal::Scheduler(index_wake_from_relay(hint)),
+      hint = relay.recv() => SessionIndexWaitSignal::Relay(hint),
       request = file_watcher.next_request() => SessionIndexWaitSignal::Watcher(request),
     }
   } else {
     tokio::select! {
       _ = tokio::time::sleep(delay) => SessionIndexWaitSignal::TimedOut,
       request = receiver.recv() => SessionIndexWaitSignal::Scheduler(request),
-      hint = relay.recv() => SessionIndexWaitSignal::Scheduler(index_wake_from_relay(hint)),
+      hint = relay.recv() => SessionIndexWaitSignal::Relay(hint),
     }
   };
 
@@ -620,6 +657,7 @@ async fn wait_for_session_index_work(
       tokio::time::sleep(delay).await;
       return None;
     }
+    SessionIndexWaitSignal::Relay(hint) => index_wake_from_relay(hint),
     SessionIndexWaitSignal::Watcher(Some(request)) => {
       let backend_failed = watcher.as_mut().is_some_and(SessionFileWatcher::take_backend_failure);
       if backend_failed {
@@ -646,7 +684,7 @@ async fn wait_for_session_index_work(
   loop {
     let wake = match relay.try_recv() {
       Ok(hint) => index_wake_from_relay(Ok(hint)),
-      Err(broadcast::error::TryRecvError::Lagged(_)) => Some(SessionIndexWake::FullCatalog),
+      Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
       Err(_) => break,
     };
     if let Some(wake) = wake {
@@ -674,11 +712,16 @@ mod tests {
   };
 
   use super::{
-    IndexRefresh, SessionIndexWake, full_catalog_needs_prompt_retry, index_wake_from_watch_request,
-    merge_session_index_wake, session_index_needs_retry, session_index_path_for_home,
+    IndexRefresh, SessionIndexWake, full_catalog_needs_prompt_retry, index_wake_from_relay,
+    index_wake_from_watch_request, merge_session_index_wake, session_index_needs_retry, session_index_path_for_home,
     watcher_wake_after_backend_failure,
   };
   use crate::{model::ViewerProvider, watcher::WatchRequest};
+
+  #[test]
+  fn lagged_relay_hints_do_not_force_a_global_catalog() {
+    assert!(index_wake_from_relay(Err(tokio::sync::broadcast::error::RecvError::Lagged(500))).is_none());
+  }
 
   #[test]
   fn session_index_uses_the_shared_tokn_sessions_directory() {

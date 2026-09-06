@@ -33,6 +33,16 @@ impl PiSessionSource {
     Ok(vec![self.root()?])
   }
 
+  /// Enumerates persisted session paths without opening their contents.
+  pub fn session_paths(&self) -> Result<Vec<PathBuf>, String> {
+    let mut paths = Vec::new();
+    for root in self.session_roots()? {
+      collect_jsonl_files(&root, &mut paths)?;
+    }
+    paths.sort();
+    Ok(paths)
+  }
+
   /// Reads the header relation for one known session path without scanning its
   /// conversation body or sibling session files.
   pub fn session_relation_at_path(&self, path: &Path) -> Result<SessionRef, String> {
@@ -52,13 +62,8 @@ impl PiSessionSource {
   }
 
   fn list_session_refs(&self, inspect: fn(&Path) -> Result<SessionRef, String>) -> Result<Vec<SessionRef>, String> {
-    let mut sessions = Vec::new();
-    for root in self.session_roots()? {
-      collect_jsonl_files(&root, &mut sessions)?;
-    }
-
     let mut refs = Vec::new();
-    for path in sessions {
+    for path in self.session_paths()? {
       if let Ok(reference) = inspect(&path) {
         refs.push(reference);
       }
