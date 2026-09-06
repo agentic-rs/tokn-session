@@ -852,7 +852,13 @@ impl ViewerService {
 
   pub(crate) fn follow_shared_index(&self) -> Result<bool, String> {
     let changed = self.observe_shared_index_change()?;
-    self.refresh_index_progress_from_index();
+    // The constructor already recovered the durable progress snapshot. An
+    // index follower wakes once per second, so rebuilding the grouped body
+    // totals while SQLite's data_version is unchanged turns an idle second
+    // viewer into a persistent whole-index scan.
+    if changed {
+      self.refresh_index_progress_from_index();
+    }
     self.index_progress.update(|progress| {
       progress.activity = IndexActivity::WaitingForIndexer;
       progress.is_refreshing = false;
@@ -953,6 +959,17 @@ impl ViewerService {
       progress.body.providers = providers;
       update_body_progress_totals(&mut progress.body);
     });
+    Ok(())
+  }
+
+  fn replace_body_progress_after_catalog(&self, jobs: &[PendingBodyJob], catalog_changed: bool) -> Result<(), String> {
+    // A changed catalog can reset or remove a staged source, and a non-empty
+    // queue needs current durable totals. When both are false, the existing
+    // in-memory progress is already authoritative and rerunning the grouped
+    // aggregate would scan every present indexed session on each idle pass.
+    if catalog_changed || !jobs.is_empty() {
+      self.replace_body_progress_queue(jobs)?;
+    }
     Ok(())
   }
 
@@ -1390,7 +1407,7 @@ impl ViewerService {
     let result = (|| {
       let catalog_refresh = self.refresh_session_catalogs();
       let remaining_jobs = self.pending_body_jobs(&HashSet::new())?;
-      self.replace_body_progress_queue(&remaining_jobs)?;
+      self.replace_body_progress_after_catalog(&remaining_jobs, catalog_refresh.refresh.changed)?;
       let mut refresh = catalog_refresh.refresh;
       refresh.has_pending_body_jobs = !remaining_jobs.is_empty();
       self.finalize_index_refresh(
@@ -1422,7 +1439,7 @@ impl ViewerService {
     let result = (|| {
       let catalog_refresh = self.refresh_session_catalogs_for(&providers);
       let remaining_jobs = self.pending_body_jobs(&HashSet::new())?;
-      self.replace_body_progress_queue(&remaining_jobs)?;
+      self.replace_body_progress_after_catalog(&remaining_jobs, catalog_refresh.refresh.changed)?;
       let mut refresh = catalog_refresh.refresh;
       refresh.has_pending_body_jobs = !remaining_jobs.is_empty();
       let catalog_errors = self.catalog_errors_snapshot();
@@ -2292,7 +2309,7 @@ impl ViewerService {
         });
       }
       let remaining_jobs = self.pending_body_jobs(&HashSet::new())?;
-      self.replace_body_progress_queue(&remaining_jobs)?;
+      self.replace_body_progress_after_catalog(&remaining_jobs, refresh.changed)?;
       refresh.has_pending_body_jobs = !remaining_jobs.is_empty();
       let catalog_errors = self
         .catalog_errors
@@ -6418,6 +6435,27 @@ mod tests {
       observed.changed,
       "SQLite data_version must wake this process even when its first local scan writes nothing"
     );
+  }
+
+  #[test]
+  fn unchanged_shared_index_follow_keeps_the_recovered_progress_snapshot() {
+    let service = ViewerService::new(indexing_repository(Vec::new()));
+    service.index_progress.update(|progress| {
+      let codex = provider_body_mut(&mut progress.body.providers, ViewerProvider::Codex);
+      codex.total_jobs = 42;
+      codex.completed_jobs = 42;
+    });
+
+    assert!(!service.follow_shared_index().expect("unchanged index should query"));
+    let progress = service.session_index_progress();
+    let codex = progress
+      .body
+      .providers
+      .iter()
+      .find(|provider| provider.provider == ViewerProvider::Codex)
+      .expect("Codex progress should exist");
+    assert_eq!(codex.total_jobs, 42);
+    assert_eq!(codex.completed_jobs, 42);
   }
 
   #[test]
