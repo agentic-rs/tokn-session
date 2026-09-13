@@ -1,6 +1,128 @@
 use serde_json::{Value, json};
 use tokn_codex_protocol::{ResponseItem, RolloutItem, RolloutLine};
 
+fn usage_counters() -> Value {
+  json!({
+    "input_tokens": 30,
+    "cached_input_tokens": 20,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 5,
+    "reasoning_output_tokens": 2,
+    "total_tokens": 35
+  })
+}
+
+#[test]
+fn decodes_token_usage_records_without_losing_extensions() {
+  let mut usage = usage_counters();
+  usage["future_counter"] = json!({"tokens": 3});
+  let native = json!({
+    "timestamp": "2026-09-13T00:00:00Z",
+    "ordinal": 8,
+    "type": "token_usage_record",
+    "future_envelope": true,
+    "payload": {
+      "thread_id": "thread-1",
+      "turn_id": "turn-1",
+      "session_id": "process-1",
+      "root_turn_id": "root-turn-1",
+      "response_id": "resp-1",
+      "usage": usage,
+      "turn_token_usage": usage_counters(),
+      "thread_token_usage": usage_counters(),
+      "future_field": [1, 2]
+    }
+  });
+  let line: RolloutLine = serde_json::from_value(native.clone()).expect("usage record should decode");
+  assert_eq!(line.item().native_type(), Some("token_usage_record"));
+  let RolloutItem::TokenUsageRecord(item) = line.item() else {
+    panic!("expected token usage record");
+  };
+  assert_eq!(item.thread_id.as_deref(), Some("thread-1"));
+  assert_eq!(item.turn_id.as_deref(), Some("turn-1"));
+  assert_eq!(item.session_id.as_deref(), Some("process-1"));
+  assert_eq!(item.root_turn_id.as_deref(), Some("root-turn-1"));
+  assert_eq!(item.response_id.as_deref(), Some("resp-1"));
+  let usage = item.usage.as_ref().expect("usage counters");
+  assert_eq!(usage.input_tokens, 30);
+  assert_eq!(usage.cached_input_tokens, 20);
+  assert_eq!(usage.cache_write_input_tokens, Some(0));
+  assert_eq!(usage.output_tokens, 5);
+  assert_eq!(usage.reasoning_output_tokens, 2);
+  assert_eq!(usage.total_tokens, 35);
+  assert_eq!(usage.extra["future_counter"], json!({"tokens": 3}));
+  assert_eq!(item.turn_token_usage.as_ref().unwrap().total_tokens, 35);
+  assert_eq!(item.thread_token_usage.as_ref().unwrap().total_tokens, 35);
+  assert_eq!(item.extra["future_field"], json!([1, 2]));
+  assert_eq!(serde_json::to_value(line).unwrap(), native);
+}
+
+#[test]
+fn accepts_missing_optional_token_usage_fields() {
+  for payload in [
+    json!({}),
+    json!({"usage": null}),
+    json!({"usage": {
+      "input_tokens": 30,
+      "cached_input_tokens": 20,
+      "output_tokens": 5,
+      "reasoning_output_tokens": 2,
+      "total_tokens": 35
+    }}),
+  ] {
+    let native = json!({"type": "token_usage_record", "payload": payload});
+    let line: RolloutLine = serde_json::from_value(native.clone()).unwrap();
+    let RolloutItem::TokenUsageRecord(item) = line.item() else {
+      panic!("missing optional fields must remain decodable");
+    };
+    assert!(item.response_id.is_none());
+    assert!(item.turn_token_usage.is_none());
+    assert!(item.thread_token_usage.is_none());
+    if let Some(usage) = &item.usage {
+      assert_eq!(usage.cache_write_input_tokens, None);
+    }
+    assert_eq!(serde_json::to_value(line).unwrap(), native);
+  }
+}
+
+#[test]
+fn malformed_token_usage_counters_remain_unknown_and_lossless() {
+  let required_counters = [
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+  ];
+  for counter in required_counters {
+    let mut counters = usage_counters();
+    counters.as_object_mut().unwrap().remove(counter);
+    assert_unknown_usage(counters);
+  }
+  for counter in required_counters.into_iter().chain(["cache_write_input_tokens"]) {
+    for invalid in [json!(-1), json!(1.5), json!("5"), json!(true), json!({})] {
+      let mut counters = usage_counters();
+      counters[counter] = invalid;
+      assert_unknown_usage(counters);
+    }
+  }
+}
+
+fn assert_unknown_usage(counters: Value) {
+  // Aggregates are optional, but when present they must also contain counters.
+  for field in ["usage", "turn_token_usage", "thread_token_usage"] {
+    let mut payload = json!({"response_id": "resp-1", "usage": usage_counters()});
+    payload[field] = counters.clone();
+    let native = json!({"type": "token_usage_record", "payload": payload});
+    let line: RolloutLine = serde_json::from_value(native.clone()).unwrap();
+    let RolloutItem::Unknown(item) = line.item() else {
+      panic!("malformed {field} must remain unknown");
+    };
+    assert_eq!(item.native_type.as_deref(), Some("token_usage_record"));
+    assert_eq!(serde_json::to_value(line).unwrap(), native);
+  }
+}
+
 #[test]
 fn decodes_current_rollout_control_records() {
   let world_state: RolloutLine = serde_json::from_value(json!({

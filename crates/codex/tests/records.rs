@@ -39,6 +39,7 @@ fn compaction_checkpoint_and_notice_are_one_operation_without_a_reply() {
         "window_id":"window-2", "previous_window_id":"window-1", "window_number":2
       }}),
     );
+    events.extend(line(&mut normalizer, token_usage_record()));
     events.extend(line(&mut normalizer, token_count(35)));
     let notice = if canonical {
       json!({"type":"item_completed","thread_id":"codex-1","turn_id":"turn-1",
@@ -102,6 +103,139 @@ fn token_count(total: u64) -> Value {
     "type":"token_count","info":{"total_token_usage":counters,"last_token_usage":counters,
       "model_context_window":100000,"future_field":true},"rate_limits":null
   }})
+}
+
+fn token_usage_record() -> Value {
+  let counters = |total: u64| {
+    json!({"input_tokens":total-5,"output_tokens":5,"cached_input_tokens":10,
+      "cache_write_input_tokens":2,"reasoning_output_tokens":2,"total_tokens":total})
+  };
+  json!({"type":"token_usage_record","ordinal":41,"timestamp":"2026-09-13T04:00:00Z","payload":{
+    "thread_id":"codex-1","session_id":"codex-1","turn_id":"turn-1","root_turn_id":"root-turn-1",
+    "response_id":"response-1","usage":counters(35),"turn_token_usage":counters(70),
+    "thread_token_usage":counters(140),"future_field":true
+  }})
+}
+
+#[test]
+fn token_usage_record_is_a_model_call_without_adding_aggregate_or_cached_tokens() {
+  let record = token_usage_record();
+  let events = line(&mut normalizer(), record.clone());
+  let [AgentEvent::Usage(event)] = &events[..] else {
+    panic!("expected one model call")
+  };
+  assert_eq!(event.kind, UsageKind::ModelCall);
+  assert_eq!(event.session_id.as_deref(), Some("codex-1"));
+  assert_eq!(event.turn_id.as_deref(), Some("turn-1"));
+  assert_eq!(event.record_id.as_deref(), Some("response-1"));
+  assert!(event.message_id.is_none());
+  assert!(event.step_id.is_none());
+  assert_eq!(event.input_tokens, 30);
+  assert_eq!(event.output_tokens, 5);
+  assert_eq!(event.total_tokens, Some(35));
+  assert_eq!(event.cache_read_tokens, Some(10));
+  assert_eq!(event.cache_write_tokens, Some(2));
+  assert_eq!(event.reasoning_tokens, Some(2));
+  assert_eq!(event.timestamp.as_deref(), Some("2026-09-13T04:00:00Z"));
+  assert_eq!(event.native, record["payload"]);
+}
+
+#[test]
+fn model_calls_with_equal_counters_remain_distinct_from_session_snapshots() {
+  let mut normalizer = normalizer();
+  let mut record = token_usage_record();
+  let mut events = line(&mut normalizer, record.clone());
+  events.extend(line(&mut normalizer, token_count(140)));
+  record["payload"]["response_id"] = json!("response-2");
+  events.extend(line(&mut normalizer, record));
+  // Per-call observations must not reset the separate snapshot deduplication.
+  assert!(line(&mut normalizer, token_count(140)).is_empty());
+  let kinds: Vec<_> = events
+    .iter()
+    .map(|event| match event {
+      AgentEvent::Usage(event) => event.kind,
+      _ => panic!("expected usage"),
+    })
+    .collect();
+  assert_eq!(
+    kinds,
+    [UsageKind::ModelCall, UsageKind::SessionSnapshot, UsageKind::ModelCall]
+  );
+}
+
+#[test]
+fn token_usage_record_keeps_optional_identity_and_cache_counters_absent() {
+  let mut record = token_usage_record();
+  let payload = record["payload"].as_object_mut().unwrap();
+  for field in [
+    "response_id",
+    "turn_id",
+    "root_turn_id",
+    "turn_token_usage",
+    "thread_token_usage",
+  ] {
+    payload.remove(field);
+  }
+  payload["usage"]
+    .as_object_mut()
+    .unwrap()
+    .remove("cache_write_input_tokens");
+  let events = line(&mut normalizer(), record);
+  let [AgentEvent::Usage(event)] = &events[..] else {
+    panic!("expected model call")
+  };
+  assert_eq!(event.record_id.as_deref(), Some("41"));
+  assert!(event.turn_id.is_none());
+  assert!(event.cache_write_tokens.is_none());
+}
+
+#[test]
+fn token_usage_record_retains_zero_and_large_counters() {
+  for total in [0, u64::MAX] {
+    let mut record = token_usage_record();
+    record["payload"]["usage"] = json!({"input_tokens":total,"output_tokens":0,
+      "cached_input_tokens":0,"reasoning_output_tokens":0,"total_tokens":total});
+    let events = line(&mut normalizer(), record);
+    assert!(matches!(&events[..], [AgentEvent::Usage(event)]
+      if event.input_tokens == total && event.output_tokens == 0 && event.total_tokens == Some(total)));
+  }
+}
+
+#[test]
+fn malformed_token_usage_records_retain_the_complete_native_envelope() {
+  for (pointer, value) in [
+    ("/payload/usage", Value::Null),
+    ("/payload/usage/input_tokens", json!(-1)),
+    ("/payload/usage/total_tokens", json!("bad")),
+    ("/payload/turn_token_usage/output_tokens", json!(-1)),
+    ("/payload/thread_token_usage/cached_input_tokens", json!(true)),
+  ] {
+    let mut record = token_usage_record();
+    *record.pointer_mut(pointer).unwrap() = value;
+    let events = line(&mut normalizer(), record.clone());
+    assert!(matches!(&events[..], [AgentEvent::Unknown(event)]
+      if event.native_type.as_deref() == Some("token_usage_record") && event.native.as_ref() == Some(&record)));
+  }
+}
+
+#[test]
+fn historical_subagent_filter_applies_before_per_response_usage() {
+  let mut normalizer = CodexNormalizer::new_historical();
+  line(
+    &mut normalizer,
+    json!({"type":"session_meta","payload":{"id":"child",
+    "source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}}}}),
+  );
+  assert!(line(&mut normalizer, token_usage_record()).is_empty());
+  line(
+    &mut normalizer,
+    json!({"type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}),
+  );
+  let mut record = token_usage_record();
+  record["payload"]["thread_id"] = json!("child");
+  let events = line(&mut normalizer, record);
+  assert!(matches!(&events[..], [AgentEvent::Usage(event)]
+    if event.kind == UsageKind::ModelCall && event.session_id.as_deref() == Some("child")));
 }
 
 #[test]

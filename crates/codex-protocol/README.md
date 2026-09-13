@@ -90,6 +90,7 @@ assert_eq!(message.recipient.as_deref(), Some("/root/reviewer"));
 - inter-agent communication and delivery metadata
 - compaction records
 - turn context
+- model-response token usage records with turn and thread aggregates
 - world-state snapshots and patches
 - event messages
 - unknown future records

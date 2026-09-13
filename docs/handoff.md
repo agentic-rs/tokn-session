@@ -7,6 +7,11 @@ Read `AGENTS.md` first for the project goal, stable architecture, and working ru
 `tokn-session` can list and show existing sessions from Pi, Codex, OpenCode,
 ZCode, WorkBuddy, and DSH.
 
+Codex Desktop `token_usage_record` rows now normalize to per-response usage
+cards. Turn/thread totals remain native inspection detail; the separate
+`token_count` events retain session-snapshot semantics. Both accounting forms
+can occur between correlated compaction records. See [event semantics](event-ir.md#usage).
+
 Implemented CLI:
 
 ```sh
