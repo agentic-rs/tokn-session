@@ -23,13 +23,14 @@ import {
   UsageIcon,
   WarningIcon,
 } from "./Icons";
-import { MarkdownContent } from "./MarkdownContent";
+import { MessageCard } from "./MessageCard";
 import type { TechnicalCardHeading } from "./CardPresentation";
 import { ReasoningCard, reasoningHeading } from "./ReasoningCard";
 import { CompactionCard } from "./CompactionCard";
 import { UsageCard, usageHeading } from "./UsageCard";
 
 interface EventCardProps {
+  session_key?: string;
   event: EventSummary;
   button_id: string;
   is_selected: boolean;
@@ -56,10 +57,6 @@ interface EventCardProps {
 
 function isMessage(event: EventSummary): boolean {
   return event.type === "message";
-}
-
-function usesMarkdown(event: EventSummary): boolean {
-  return !event.is_hidden && (event.role === "user" || event.role === "assistant");
 }
 
 function humanize(value: string): string {
@@ -447,6 +444,7 @@ function AgentActivityBody({
 }
 
 function TrajectorySection({
+  session_key,
   button_id,
   event,
   is_expanded,
@@ -466,6 +464,7 @@ function TrajectorySection({
   expanded_child_detail_loading,
   expanded_child_event_key,
 }: {
+  session_key?: string;
   button_id: string;
   event: EventSummary;
   is_expanded: boolean;
@@ -566,6 +565,7 @@ function TrajectorySection({
                   {page.events.map((childEvent) => (
                     <div key={childEvent.event_key} role="listitem">
                       <EventCard
+                        session_key={session_key}
                         button_id={eventButtonId(childEvent.event_key)}
                         detail={childEvent.event_key === expanded_child_event_key
                           ? expanded_child_detail
@@ -693,6 +693,7 @@ function ToolOutput({
 }
 
 export function EventCard({
+  session_key,
   event,
   button_id,
   is_selected,
@@ -724,6 +725,7 @@ export function EventCard({
   if (event.type === "trajectory") {
     return (
       <TrajectorySection
+        session_key={session_key}
         button_id={button_id}
         event={event}
         expanded_child_detail={trajectory_expanded_detail ?? null}
@@ -747,41 +749,8 @@ export function EventCard({
   }
 
   if (isMessage(event)) {
-    const role = event.role ?? "unknown";
-    const presentation = role === "user" ? "bubble" : role === "assistant" ? "transcript" : "technical";
     return (
-      <article
-        className="message-event"
-        data-presentation={presentation}
-        data-role={role}
-        data-selected={is_selected}
-      >
-        <div className="message-event__surface">
-          <span className="message-event__role">{role}</span>
-          {usesMarkdown(event) ? (
-            <MarkdownContent
-              class_name="message-event__text"
-              content={event.summary || event.title}
-            />
-          ) : (
-            <div className="message-event__text message-event__text--plain">
-              {event.is_hidden ? "Hidden extension message" : event.summary || event.title}
-            </div>
-          )}
-          <button
-            aria-label={`Inspect ${role} message`}
-            className="message-event__inspect"
-            id={button_id}
-            onClick={() => on_select(event.event_key)}
-            type="button"
-          >
-            {event.summary_truncated && !event.is_hidden ? "View full message" : "Inspect"}
-          </button>
-          <time className="message-event__time" dateTime={event.timestamp ?? undefined} title={timestampLabel}>
-            {event.phase && event.phase !== "finished" ? event.phase : ""}
-          </time>
-        </div>
-      </article>
+      <MessageCard event={event} session_key={session_key} button_id={button_id} is_selected={is_selected} on_select={on_select} />
     );
   }
 

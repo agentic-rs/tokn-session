@@ -61,6 +61,24 @@ contract](../../docs/viewer-api.md). Build the desktop application with:
 pnpm tauri build
 ```
 
+macOS builds also compile the small Swift bridge for Apple Translation. Use
+Xcode 16 or newer with the macOS 15 SDK; other platforms do not compile Swift.
+
+## Response translation
+
+On macOS 15 or newer, **Translate → 简体中文** translates a visible assistant
+response using Apple's on-device Translation framework. The first use may show
+Apple's prompt to download language packs. No LLM or API key is needed. **Cancel**
+stops a pending request, and **Show original** switches back without another
+translation. Translation is currently available in the Mac desktop app only.
+
+The viewer loads the full response before translating. It translates prose
+inside Markdown while preserving code, URLs, lists, tables, and other markup;
+formatting boundaries can limit sentence context. The original session and
+Inspector data stay unchanged. Results are kept only in the mounted response
+card and discarded when its source changes or the card closes. Responses beyond
+the existing detail size limit report an error instead of translating a preview.
+
 ## Using the viewer
 
 For Relay-backed providers the sidebar reads Relay's metadata catalog. For

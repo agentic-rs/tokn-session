@@ -1360,6 +1360,39 @@ button:disabled {
   opacity: 1;
 }
 
+.message-event__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px 12px;
+  margin-top: 6px;
+}
+
+.message-event__actions .message-event__inspect {
+  margin-top: 0;
+}
+
+.message-event__inspect:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.message-translation__status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.message-translation__error {
+  margin: 8px 0 0;
+  color: var(--text-soft);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
 .event-full-content-hint {
   color: var(--focus);
   font-size: 9.5px;

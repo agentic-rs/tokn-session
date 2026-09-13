@@ -1,0 +1,353 @@
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cancelTranslation, getTranslationStatus, loadEventDetail, translateText } from "../lib/tauri";
+import { isDesktop } from "../lib/transport";
+import type { EventDetail, EventSummary, TranslateTextResponse, TrajectoryEventPageState } from "../lib/types";
+import { EventCard } from "./EventCard";
+import { MessageCard } from "./MessageCard";
+import { TranslationProvider } from "./TranslationProvider";
+
+vi.mock("../lib/tauri", () => ({
+  cancelTranslation: vi.fn(),
+  getTranslationStatus: vi.fn(),
+  loadEventDetail: vi.fn(),
+  translateText: vi.fn(),
+}));
+vi.mock("../lib/transport", () => ({ isDesktop: vi.fn() }));
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+function message(overrides: Partial<EventSummary> = {}): EventSummary {
+  return {
+    event_key: "event.v1.1",
+    type: "message",
+    provider: "codex",
+    timestamp: "2026-09-13T00:00:00Z",
+    phase: "finished",
+    role: "assistant",
+    title: "Assistant message",
+    summary: "Original response.",
+    summary_truncated: false,
+    is_hidden: false,
+    is_error: false,
+    tool: null,
+    usage: null,
+    reasoning: null,
+    ...overrides,
+  };
+}
+
+function detail(text = "Original response.", overrides: Partial<EventDetail> = {}): EventDetail {
+  return {
+    event_key: "event.v1.1",
+    event: { type: "message", role: "assistant", text },
+    native: null,
+    is_hidden: false,
+    tool_output: null,
+    ...overrides,
+  };
+}
+
+function card(event: EventSummary, session_key: string | undefined = "session.v1.first") {
+  return (
+    <TranslationProvider>
+      <MessageCard
+        button_id="inspect-message"
+        event={event}
+        is_selected={false}
+        on_select={vi.fn()}
+        session_key={session_key}
+      />
+    </TranslationProvider>
+  );
+}
+
+async function startTranslation() {
+  fireEvent.click(await screen.findByRole("button", { name: "Translate → 简体中文" }));
+}
+
+beforeEach(() => {
+  vi.resetAllMocks();
+  vi.mocked(isDesktop).mockReturnValue(true);
+  vi.mocked(getTranslationStatus).mockResolvedValue({ available: true, reason: null });
+  vi.mocked(loadEventDetail).mockResolvedValue(detail());
+  vi.mocked(translateText).mockResolvedValue({ texts: ["中文译文。"] });
+  vi.mocked(cancelTranslation).mockResolvedValue();
+});
+afterEach(cleanup);
+
+describe("message translation availability", () => {
+  it.each([
+    { role: "user" },
+    { role: "system" },
+    { role: "tool" },
+    { role: "unknown" },
+    { is_hidden: true },
+    { summary: " \n\t " },
+  ])("excludes messages with %j", async (overrides) => {
+    render(card(message(overrides)));
+    await act(async () => {});
+    expect(screen.queryByRole("button", { name: /Translate/ })).not.toBeInTheDocument();
+    expect(loadEventDetail).not.toHaveBeenCalled();
+    expect(translateText).not.toHaveBeenCalled();
+  });
+
+  it("requires a session identity", async () => {
+    render(
+      <TranslationProvider>
+        <MessageCard button_id="inspect-message" event={message()} is_selected={false} on_select={vi.fn()} />
+      </TranslationProvider>,
+    );
+    await act(async () => {});
+    expect(screen.queryByRole("button", { name: /Translate/ })).not.toBeInTheDocument();
+  });
+
+  it("explains unavailable desktop translation without starting a request", async () => {
+    vi.mocked(getTranslationStatus).mockResolvedValue({ available: false, reason: "Requires macOS 15 or later." });
+    render(card(message()));
+    const button = await screen.findByRole("button", { name: "Translate → 简体中文" });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("title", "Requires macOS 15 or later.");
+    fireEvent.click(button);
+    expect(loadEventDetail).not.toHaveBeenCalled();
+    expect(translateText).not.toHaveBeenCalled();
+  });
+
+  it("leaves translation out of browser clients", async () => {
+    vi.mocked(isDesktop).mockReturnValue(false);
+    render(card(message()));
+    await act(async () => {});
+    expect(screen.queryByRole("button", { name: /Translate/ })).not.toBeInTheDocument();
+    expect(getTranslationStatus).not.toHaveBeenCalled();
+    expect(loadEventDetail).not.toHaveBeenCalled();
+  });
+});
+
+describe("message translation flow", () => {
+  it("loads full Markdown before translating and keeps the original visible while pending", async () => {
+    const original = "# Full answer\n\nA **complete** response beyond the preview.\n\n```ts\nconst untouched = true;\n```";
+    const pending_detail = deferred<EventDetail>();
+    const pending_translation = deferred<TranslateTextResponse>();
+    vi.mocked(loadEventDetail).mockReturnValue(pending_detail.promise);
+    vi.mocked(translateText).mockReturnValue(pending_translation.promise);
+    render(card(message({ summary: "# Full answer…", summary_truncated: true })));
+
+    await startTranslation();
+    expect(screen.getByRole("heading", { name: "Full answer…" })).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Translating");
+    expect(translateText).not.toHaveBeenCalled();
+    expect(loadEventDetail).toHaveBeenCalledWith({ session_key: "session.v1.first", event_key: "event.v1.1" });
+
+    await act(async () => pending_detail.resolve(detail(original)));
+    await waitFor(() => expect(translateText).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole("heading", { name: "Full answer" })).toBeInTheDocument();
+    expect(screen.getByText("complete").tagName).toBe("STRONG");
+    expect(screen.getByText("const untouched = true;")).toBeInTheDocument();
+    const request = vi.mocked(translateText).mock.calls[0][0];
+    expect(request.target_language).toBe("zh-Hans");
+    expect(request.request_id).toEqual(expect.any(String));
+    expect(request.texts.join(" ")).toContain("response beyond the preview.");
+    expect(request.texts.join(" ")).not.toContain("const untouched = true;");
+
+    await act(async () => pending_translation.resolve({
+      texts: request.texts.map((text) => text.replace("Full answer", "完整回答").replace("complete", "完整")),
+    }));
+    expect(await screen.findByRole("button", { name: "Show original" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "完整回答" })).toBeInTheDocument();
+    expect(screen.getByText("完整").tagName).toBe("STRONG");
+    expect(screen.getByText("const untouched = true;")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "完整回答" }).closest("[lang]")).toHaveAttribute("lang", "zh-Hans");
+  });
+
+  it("toggles cached translation and original without extra backend calls", async () => {
+    render(card(message()));
+    await startTranslation();
+    fireEvent.click(await screen.findByRole("button", { name: "Show original" }));
+    expect(screen.getByText("Original response.")).toBeInTheDocument();
+    expect(screen.queryByText("中文译文。")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show translation" }));
+    expect(screen.getByText("中文译文。")).toBeInTheDocument();
+    expect(loadEventDetail).toHaveBeenCalledTimes(1);
+    expect(translateText).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains the original after failure and supports retry", async () => {
+    vi.mocked(translateText).mockRejectedValueOnce(new Error("Language download failed."));
+    render(card(message()));
+    await startTranslation();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Language download failed.");
+    expect(screen.getByText("Original response.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry translation" }));
+    expect(await screen.findByText("中文译文。")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(translateText).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    detail("Original response.", { is_hidden: true }),
+    detail("Original response.", { event_key: "event.v1.other" }),
+    detail("Original response.", { event: { type: "message", role: "user", text: "Original response." } }),
+    detail("Original response.", { event: { type: "message", role: "assistant", text: { truncated: true } } }),
+    detail(" "),
+  ])("rejects unavailable or mismatched full detail %#", async (invalid_detail) => {
+    vi.mocked(loadEventDetail).mockResolvedValue(invalid_detail);
+    render(card(message()));
+    await startTranslation();
+    expect(await screen.findByRole("alert")).toHaveTextContent("The full response is unavailable or too large to translate.");
+    expect(translateText).not.toHaveBeenCalled();
+  });
+
+  it("rejects a changed response instead of translating another snapshot", async () => {
+    vi.mocked(loadEventDetail).mockResolvedValue(detail("New response."));
+    render(card(message()));
+    await startTranslation();
+    expect(await screen.findByRole("alert")).toHaveTextContent("This response has changed.");
+    expect(screen.getByText("Original response.")).toBeInTheDocument();
+    expect(translateText).not.toHaveBeenCalled();
+  });
+});
+
+describe("translation request lifetime", () => {
+  it("cancels during full-detail loading without starting native translation later", async () => {
+    const pending = deferred<EventDetail>();
+    vi.mocked(loadEventDetail).mockReturnValue(pending.promise);
+    render(card(message()));
+    await startTranslation();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await act(async () => pending.resolve(detail()));
+    expect(screen.getByRole("button", { name: "Translate → 简体中文" })).toBeEnabled();
+    expect(screen.getByText("Original response.")).toBeInTheDocument();
+    expect(translateText).not.toHaveBeenCalled();
+    expect(cancelTranslation).not.toHaveBeenCalled();
+  });
+
+  it("cancels the native request and ignores its late result after retry succeeds", async () => {
+    const pending = deferred<TranslateTextResponse>();
+    vi.mocked(translateText).mockReturnValueOnce(pending.promise);
+    render(card(message()));
+    await startTranslation();
+    await waitFor(() => expect(translateText).toHaveBeenCalledTimes(1));
+    const request_id = vi.mocked(translateText).mock.calls[0][0].request_id;
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(cancelTranslation).toHaveBeenCalledWith(request_id);
+    await startTranslation();
+    await screen.findByText("中文译文。");
+    await act(async () => pending.resolve({ texts: ["过期译文。"] }));
+    expect(screen.getByText("中文译文。")).toBeInTheDocument();
+    expect(screen.queryByText("过期译文。")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("cancels an outstanding request when the card unmounts", async () => {
+    const pending = deferred<TranslateTextResponse>();
+    vi.mocked(translateText).mockReturnValue(pending.promise);
+    const view = render(card(message()));
+    await startTranslation();
+    await waitFor(() => expect(translateText).toHaveBeenCalledTimes(1));
+    view.unmount();
+    expect(cancelTranslation).toHaveBeenCalledWith(vi.mocked(translateText).mock.calls[0][0].request_id);
+    await act(async () => pending.reject(new Error("Cancelled.")));
+  });
+
+  it("does not reuse a cached result for the same event key in another session", async () => {
+    const event = message();
+    const view = render(card(event));
+    await startTranslation();
+    await screen.findByText("中文译文。");
+    view.rerender(card(event, "session.v1.second"));
+    expect(screen.getByText("Original response.")).toBeInTheDocument();
+    expect(screen.queryByText("中文译文。")).not.toBeInTheDocument();
+    await startTranslation();
+    await screen.findByText("中文译文。");
+    expect(loadEventDetail).toHaveBeenLastCalledWith({ session_key: "session.v1.second", event_key: event.event_key });
+    expect(translateText).toHaveBeenCalledTimes(2);
+  });
+
+  it("invalidates a cached result when content changes under the same event key", async () => {
+    const view = render(card(message()));
+    await startTranslation();
+    await screen.findByText("中文译文。");
+    vi.mocked(loadEventDetail).mockResolvedValue(detail("Updated response."));
+    view.rerender(card(message({ summary: "Updated response." })));
+    expect(screen.getByText("Updated response.")).toBeInTheDocument();
+    expect(screen.queryByText("中文译文。")).not.toBeInTheDocument();
+    await startTranslation();
+    await screen.findByText("中文译文。");
+    expect(translateText).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(translateText).mock.calls[1][0].texts).toEqual(["Updated response."]);
+  });
+
+  it("reloads a refreshed truncated response even when its visible prefix is unchanged", async () => {
+    const event = message({ summary: "Original…", summary_truncated: true });
+    const view = render(card(event));
+    await startTranslation();
+    await screen.findByText("中文译文。");
+    vi.mocked(loadEventDetail).mockResolvedValue(detail("Original response with a new ending."));
+    view.rerender(card({ ...event }));
+    expect(screen.getByText("Original…")).toBeInTheDocument();
+    expect(screen.queryByText("中文译文。")).not.toBeInTheDocument();
+    await startTranslation();
+    await screen.findByText("中文译文。");
+    expect(loadEventDetail).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(translateText).mock.calls[1][0].texts).toEqual(["Original response with a new ending."]);
+  });
+
+  it("cancels and discards an old session's completion after navigation", async () => {
+    const pending = deferred<TranslateTextResponse>();
+    const event = message();
+    vi.mocked(translateText).mockReturnValueOnce(pending.promise);
+    const view = render(card(event));
+    await startTranslation();
+    await waitFor(() => expect(translateText).toHaveBeenCalledTimes(1));
+    view.rerender(card(event, "session.v1.second"));
+    expect(cancelTranslation).toHaveBeenCalledWith(vi.mocked(translateText).mock.calls[0][0].request_id);
+    await act(async () => pending.resolve({ texts: ["过期译文。"] }));
+    expect(screen.getByText("Original response.")).toBeInTheDocument();
+    expect(screen.queryByText("过期译文。")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Translate → 简体中文" })).toBeEnabled();
+  });
+});
+
+it("passes the parent session identity into assistant messages inside a trajectory", async () => {
+  const child = message();
+  const page: TrajectoryEventPageState = {
+    events: [child],
+    next_cursor: null,
+    previous_cursor: null,
+    total_events: 1,
+    has_loaded: true,
+    is_loading: false,
+    is_loading_older: false,
+    is_loading_newer: false,
+    error: null,
+    error_direction: null,
+    error_cursor: null,
+  };
+  render(
+    <TranslationProvider>
+      <EventCard
+        button_id="inspect-trajectory"
+        detail={null}
+        detail_error={null}
+        detail_loading={false}
+        event={message({ event_key: "trajectory.v1.1", type: "trajectory", role: null, title: "Turn events" })}
+        is_expanded
+        is_selected={false}
+        on_retry_detail={vi.fn()}
+        on_select={vi.fn()}
+        on_toggle={vi.fn()}
+        session_key="session.v1.nested"
+        trajectory_page={page}
+      />
+    </TranslationProvider>,
+  );
+  await startTranslation();
+  await screen.findByText("中文译文。");
+  expect(loadEventDetail).toHaveBeenCalledWith({ session_key: "session.v1.nested", event_key: child.event_key });
+});

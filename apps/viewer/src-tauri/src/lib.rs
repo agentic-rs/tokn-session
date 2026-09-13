@@ -1,4 +1,5 @@
 mod commands;
+mod translation;
 use tauri::{Emitter, Manager};
 pub use tokn_session_relay::stdio as relay_child;
 use tokn_viewer_core::{
@@ -72,6 +73,9 @@ pub fn run() {
       commands::indexing::retry_session_index,
       commands::relay::get_relay_status,
       commands::relay::configure_relay,
+      commands::translation::get_translation_status,
+      commands::translation::translate_text,
+      commands::translation::cancel_translation,
     ])
     .build(tauri::generate_context!())
     .expect("error while building tokn session viewer")

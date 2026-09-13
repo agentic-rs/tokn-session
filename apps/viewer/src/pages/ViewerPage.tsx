@@ -3,9 +3,14 @@ import { RelayConnection } from "../components/RelayConnection";
 import { Inspector } from "../components/Inspector";
 import { Sidebar } from "../components/Sidebar";
 import { StatusBar } from "../components/StatusBar";
+import { TranslationProvider } from "../components/TranslationProvider";
 import { useViewerState } from "../lib/useViewerState";
 
 export function ViewerPage({ remote = false }: { remote?: boolean }) {
+  return <TranslationProvider><ViewerContent remote={remote} /></TranslationProvider>;
+}
+
+function ViewerContent({ remote }: { remote: boolean }) {
   const viewer = useViewerState();
 
   return (
