@@ -1,7 +1,7 @@
-//! Persisted context records and accounting snapshots, not inferred model calls.
+//! Persisted context, per-response accounting, and session snapshots.
 use serde::Deserialize;
 use serde_json::Value;
-use tokn_codex_protocol::{RolloutItem, RolloutLine};
+use tokn_codex_protocol::{RolloutItem, RolloutLine, TokenUsageRecordItem};
 use tokn_session_core::{AgentEvent, MetadataEvent, MetadataKind, Provider, UnknownEvent, UsageEvent, UsageKind};
 
 #[derive(Default)]
@@ -29,6 +29,12 @@ impl RecordsNormalizer {
     };
     let payload = &line.native()["payload"];
     let classification = match line.item() {
+      RolloutItem::TokenUsageRecord(item) => {
+        return Some(vec![context.token_usage_record(item, line.ordinal())]);
+      }
+      RolloutItem::Unknown(item) if item.native_type.as_deref() == Some("token_usage_record") => {
+        return Some(vec![context.unknown()]);
+      }
       RolloutItem::TurnContext(item) => {
         let valid = item.turn_id.is_some() || item.model.is_some() || item.cwd.is_some();
         valid.then_some((MetadataKind::Configuration, "turn context"))
@@ -126,6 +132,37 @@ struct RecordContext<'a> {
 }
 
 impl RecordContext<'_> {
+  fn token_usage_record(&self, record: &TokenUsageRecordItem, ordinal: Option<u64>) -> AgentEvent {
+    let Some(usage) = &record.usage else {
+      return self.unknown();
+    };
+    AgentEvent::Usage(UsageEvent {
+      kind: UsageKind::ModelCall,
+      provider: Provider::Codex,
+      session_id: self.session_id.clone(),
+      turn_id: record.turn_id.clone().filter(|id| !id.is_empty()),
+      step_id: None,
+      // A response can contain several messages, reasoning, and tool items.
+      // Its ID identifies the accounting record, not an assistant message.
+      message_id: None,
+      record_id: record
+        .response_id
+        .clone()
+        .filter(|id| !id.is_empty())
+        .or_else(|| ordinal.map(|ordinal| ordinal.to_string())),
+      input_tokens: usage.input_tokens,
+      output_tokens: usage.output_tokens,
+      total_tokens: Some(usage.total_tokens),
+      cache_read_tokens: Some(usage.cached_input_tokens),
+      cache_write_tokens: usage.cache_write_input_tokens,
+      reasoning_tokens: Some(usage.reasoning_output_tokens),
+      // Turn/thread totals are inspection context only. Emitting them as
+      // additional calls would count the same usage more than once.
+      native: self.native["payload"].clone(),
+      timestamp: self.timestamp.clone(),
+    })
+  }
+
   fn native_type(&self) -> String {
     let kind = self.native["type"].as_str().unwrap_or("event");
     if kind == "event_msg" {

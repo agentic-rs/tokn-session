@@ -80,6 +80,7 @@ pub enum RolloutItem {
   InterAgentCommunicationMetadata(InterAgentCommunicationMetadataItem),
   Compacted(CompactedItem),
   TurnContext(Box<TurnContextItem>),
+  TokenUsageRecord(Box<TokenUsageRecordItem>),
   WorldState(WorldStateItem),
   EventMessage(EventMessage),
   Unknown(UnknownItem),
@@ -94,6 +95,7 @@ impl RolloutItem {
       Self::InterAgentCommunicationMetadata(_) => Some("inter_agent_communication_metadata"),
       Self::Compacted(_) => Some("compacted"),
       Self::TurnContext(_) => Some("turn_context"),
+      Self::TokenUsageRecord(_) => Some("token_usage_record"),
       Self::WorldState(_) => Some("world_state"),
       Self::EventMessage(_) => Some("event_msg"),
       Self::Unknown(item) => item.native_type.as_deref(),
@@ -179,6 +181,43 @@ pub struct CompactedItem {
   pub previous_window_id: Option<String>,
   #[serde(default)]
   pub window_id: Option<String>,
+  #[serde(flatten)]
+  pub extra: ExtraFields,
+}
+
+/// Persisted model-response usage with its native accounting attribution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TokenUsageRecordItem {
+  #[serde(default)]
+  pub thread_id: Option<String>,
+  #[serde(default)]
+  pub turn_id: Option<String>,
+  #[serde(default)]
+  pub session_id: Option<String>,
+  #[serde(default)]
+  pub root_turn_id: Option<String>,
+  #[serde(default)]
+  pub response_id: Option<String>,
+  #[serde(default)]
+  pub usage: Option<TokenUsageCounters>,
+  #[serde(default)]
+  pub turn_token_usage: Option<TokenUsageCounters>,
+  #[serde(default)]
+  pub thread_token_usage: Option<TokenUsageCounters>,
+  #[serde(flatten)]
+  pub extra: ExtraFields,
+}
+
+/// Reported counters; cached input is already included in input tokens.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TokenUsageCounters {
+  pub input_tokens: u64,
+  pub cached_input_tokens: u64,
+  #[serde(default)]
+  pub cache_write_input_tokens: Option<u64>,
+  pub output_tokens: u64,
+  pub reasoning_output_tokens: u64,
+  pub total_tokens: u64,
   #[serde(flatten)]
   pub extra: ExtraFields,
 }
@@ -611,6 +650,9 @@ fn decode_rollout_item(native_type: Option<String>, payload: Value) -> RolloutIt
     }
     Some("compacted") => decode_payload(native_type, payload, RolloutItem::Compacted),
     Some("turn_context") => decode_payload(native_type, payload, |item| RolloutItem::TurnContext(Box::new(item))),
+    Some("token_usage_record") => decode_payload(native_type, payload, |item| {
+      RolloutItem::TokenUsageRecord(Box::new(item))
+    }),
     Some("world_state") => decode_payload(native_type, payload, RolloutItem::WorldState),
     Some("event_msg") => decode_payload(native_type, payload, RolloutItem::EventMessage),
     _ => RolloutItem::Unknown(UnknownItem {

@@ -180,6 +180,7 @@ impl CodexNormalizer {
       RolloutItem::InterAgentCommunicationMetadata(_)
       | RolloutItem::TurnContext(_)
       | RolloutItem::WorldState(_)
+      | RolloutItem::TokenUsageRecord(_)
       | RolloutItem::Compacted(_) => unreachable!("context records handled before consuming native envelope"),
       RolloutItem::EventMessage(item) => normalize_event_message(
         self.session_id.clone(),

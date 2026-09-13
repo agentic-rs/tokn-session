@@ -37,6 +37,13 @@ usage are operation totals, keyed by the session entry ID. Like DSH, Pi adds
 uncached input, cache reads, and cache writes with overflow checking.
 `cacheWrite1h` is already included in cache writes and is not added again.
 
+Codex `token_usage_record.usage` is per-response `model_call` accounting.
+The response ID identifies the usage record, not an assistant message; turn
+identity is retained when present. Turn/thread aggregates stay in native detail
+and are not emitted as additional calls. Cached input is already part of input.
+This shape is based on observed Codex Desktop rollouts; the pinned vendor
+checkout predates it. Missing or malformed usage remains unknown.
+
 Codex persisted `token_count.info.total_token_usage` is a session snapshot,
 not proof of a new model call. Cached input is already included in input.
 Consecutive identical `info` objects are suppressed; changed snapshots,

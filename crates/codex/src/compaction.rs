@@ -87,6 +87,7 @@ impl Compactions {
         event.summary_opaque = payload["encrypted_content"].is_string();
       }
       RolloutItem::EventMessage(item) if item.event_type.as_deref() == Some("token_count") => return None,
+      RolloutItem::TokenUsageRecord(_) => return None,
       _ => {
         self.pending = None;
         return None;
