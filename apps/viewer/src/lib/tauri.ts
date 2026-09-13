@@ -15,7 +15,22 @@ import type {
   SessionIndexChangedEvent,
   SessionIndexProgress,
   TrajectoryEventPageResponse,
+  TranslationStatus,
+  TranslateTextRequest,
+  TranslateTextResponse,
 } from "./types";
+
+export function getTranslationStatus(): Promise<TranslationStatus> {
+  return invoke<TranslationStatus>("get_translation_status");
+}
+
+export function translateText(request: TranslateTextRequest): Promise<TranslateTextResponse> {
+  return invoke<TranslateTextResponse>("translate_text", { request });
+}
+
+export function cancelTranslation(requestId: string): Promise<void> {
+  return invoke<void>("cancel_translation", { request_id: requestId });
+}
 
 export function getRelayStatus(): Promise<RelayStatus> {
   return invoke<RelayStatus>("get_relay_status");

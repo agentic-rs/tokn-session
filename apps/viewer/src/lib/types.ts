@@ -6,6 +6,22 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
+/** Apple Translation is available in the macOS desktop app only. */
+export interface TranslationStatus {
+  available: boolean;
+  reason: string | null;
+}
+
+export interface TranslateTextRequest {
+  request_id: string;
+  texts: string[];
+  target_language: "zh-Hans";
+}
+
+export interface TranslateTextResponse {
+  texts: string[];
+}
+
 export const PROVIDERS = ["codex", "pi", "opencode", "zcode", "workbuddy", "dsh"] as const;
 
 export type ViewerProvider = (typeof PROVIDERS)[number];

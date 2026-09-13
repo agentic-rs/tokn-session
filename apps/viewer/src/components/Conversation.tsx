@@ -323,6 +323,7 @@ export function Conversation({
             {events.map((event) => (
               <div data-event-key={event.event_key} key={`${session.session_key}:${event.event_key}`}>
               <EventCard
+                session_key={session.session_key}
                 button_id={eventButtonId(event.event_key)}
                 event={event}
                 detail={event.event_key === expanded_event_key ? expanded_detail : null}

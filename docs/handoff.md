@@ -418,6 +418,17 @@ Visible user and assistant messages, expanded reasoning, and readable inspector
 content render GitHub-flavored Markdown. Raw HTML is disabled, images become
 inert placeholders, and links cannot navigate the WebView.
 
+Mac desktop responses have **Translate → 简体中文** using Apple Translation
+(macOS 15+). A small SwiftUI host in the existing window owns the native session
+and Apple's language-download UI; async Tauri commands bridge bounded prose
+batches and cancellation. Browser/other-platform translation is not implemented.
+The frontend loads complete bounded message detail, translates Markdown text
+nodes, and retains code, URLs, and structure. Formatting boundaries limit
+translation context. Originals remain available with a toggle and in Inspector;
+results live only in the mounted card, with source-change invalidation. Nested
+trajectory responses use the same component. Mac builds require Xcode 16+ and a
+macOS 15+ SDK for the Swift bridge; other platforms skip it.
+
 Known code-execution, terminal, shell, file, search, web, and task events have
 source-neutral tool cards with compact command, path, query, status, and change
 facts. Providers still contribute an append-only fact stream, but the shared
