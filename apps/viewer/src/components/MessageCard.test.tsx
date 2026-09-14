@@ -1,6 +1,8 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { browserTranslationEngine } from "../lib/browserTranslation";
 import { cancelTranslation, getTranslationStatus, loadEventDetail, translateText } from "../lib/tauri";
+import type { TranslationJob, TranslationProgress } from "../lib/translationEngine";
 import { isDesktop } from "../lib/transport";
 import type { EventDetail, EventSummary, TranslateTextResponse, TrajectoryEventPageState } from "../lib/types";
 import { EventCard } from "./EventCard";
@@ -14,6 +16,18 @@ vi.mock("../lib/tauri", () => ({
   translateText: vi.fn(),
 }));
 vi.mock("../lib/transport", () => ({ isDesktop: vi.fn() }));
+vi.mock("../lib/browserTranslation", () => ({
+  browserTranslationEngine: {
+    label: "Browser Translation",
+    description: "Translate locally in your browser.",
+    getStatus: vi.fn(),
+    start: vi.fn(),
+  },
+}));
+
+const browser_translate = vi.fn<TranslationJob["translate"]>();
+const browser_dispose = vi.fn<TranslationJob["dispose"]>();
+let browser_progress: (progress: TranslationProgress) => void;
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -78,6 +92,12 @@ beforeEach(() => {
   vi.mocked(loadEventDetail).mockResolvedValue(detail());
   vi.mocked(translateText).mockResolvedValue({ texts: ["中文译文。"] });
   vi.mocked(cancelTranslation).mockResolvedValue();
+  vi.mocked(browserTranslationEngine.getStatus).mockResolvedValue({ available: true, reason: null });
+  browser_translate.mockResolvedValue(["浏览器译文。"]);
+  vi.mocked(browserTranslationEngine.start).mockImplementation((on_progress) => {
+    browser_progress = on_progress;
+    return { translate: browser_translate, dispose: browser_dispose };
+  });
 });
 afterEach(cleanup);
 
@@ -118,13 +138,164 @@ describe("message translation availability", () => {
     expect(translateText).not.toHaveBeenCalled();
   });
 
-  it("leaves translation out of browser clients", async () => {
+  it("explains unavailable browser translation without invoking native commands", async () => {
     vi.mocked(isDesktop).mockReturnValue(false);
+    vi.mocked(browserTranslationEngine.getStatus).mockResolvedValue({ available: false, reason: "This browser does not support local translation." });
     render(card(message()));
-    await act(async () => {});
-    expect(screen.queryByRole("button", { name: /Translate/ })).not.toBeInTheDocument();
+    const button = await screen.findByRole("button", { name: "Translate → 简体中文" });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("title", "This browser does not support local translation.");
+    fireEvent.click(button);
+    expect(browserTranslationEngine.start).not.toHaveBeenCalled();
     expect(getTranslationStatus).not.toHaveBeenCalled();
     expect(loadEventDetail).not.toHaveBeenCalled();
+    expect(translateText).not.toHaveBeenCalled();
+  });
+});
+
+describe("browser message translation", () => {
+  beforeEach(() => { vi.mocked(isDesktop).mockReturnValue(false); });
+
+  it("prepares models in the click before full detail loads, with download progress and a continuation action", async () => {
+    const pending_detail = deferred<EventDetail>();
+    const pending_translation = deferred<string[]>();
+    vi.mocked(loadEventDetail).mockReturnValue(pending_detail.promise);
+    browser_translate.mockReturnValue(pending_translation.promise);
+    vi.mocked(browserTranslationEngine.start).mockImplementation((on_progress) => {
+      browser_progress = on_progress;
+      on_progress({ message: "Downloading language detector…" });
+      return { translate: browser_translate, dispose: browser_dispose };
+    });
+    render(card(message()));
+    expect(await screen.findByRole("button", { name: "Translate → 简体中文" })).toHaveAttribute("title", browserTranslationEngine.description);
+    await startTranslation();
+    expect(browserTranslationEngine.start).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(browserTranslationEngine.start).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(loadEventDetail).mock.invocationCallOrder[0]);
+    expect(screen.getByRole("status")).toHaveTextContent("Downloading language detector…");
+    expect(screen.getByText("Original response.")).toBeInTheDocument();
+    expect(browser_translate).not.toHaveBeenCalled();
+
+    act(() => browser_progress({ message: "Downloading language detector… 50%" }));
+    expect(screen.getByRole("status")).toHaveTextContent("50%");
+    const resume = vi.fn(() => browser_progress({ message: "Downloading translation model…" }));
+    act(() => browser_progress({ message: "Continue to download the translation model.", resume }));
+    fireEvent.click(screen.getByRole("button", { name: "Continue translation" }));
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("status")).toHaveTextContent("Downloading translation model…");
+    expect(screen.queryByRole("button", { name: "Continue translation" })).not.toBeInTheDocument();
+
+    await act(async () => pending_detail.resolve(detail()));
+    await waitFor(() => expect(browser_translate).toHaveBeenCalledWith(["Original response."]));
+    await act(async () => pending_translation.resolve(["浏览器译文。"]));
+    expect(await screen.findByText("浏览器译文。")).toBeInTheDocument();
+    expect(screen.getByText("简体中文 · Browser Translation")).toBeInTheDocument();
+    expect(browser_dispose).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "Show original" }));
+    expect(screen.getByText("Original response.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show translation" }));
+    expect(screen.getByText("浏览器译文。")).toBeInTheDocument();
+    expect(browser_translate).toHaveBeenCalledTimes(1);
+    expect(getTranslationStatus).not.toHaveBeenCalled();
+    expect(translateText).not.toHaveBeenCalled();
+    expect(cancelTranslation).not.toHaveBeenCalled();
+  });
+
+  it("preserves Markdown formatting while excluding code and URLs from browser translation", async () => {
+    const original = "# Full answer\n\nA **complete** response with [documentation](https://example.com/docs).\n\n```ts\nconst untouched = true;\n```";
+    vi.mocked(loadEventDetail).mockResolvedValue(detail(original));
+    browser_translate.mockImplementation(async (texts) => texts.map((text) => text
+      .replace("Full answer", "完整回答")
+      .replace("complete", "完整")
+      .replace("documentation", "文档")));
+    render(card(message({ summary: "# Full answer…", summary_truncated: true })));
+    await startTranslation();
+    expect(await screen.findByRole("heading", { name: "完整回答" })).toBeInTheDocument();
+    expect(screen.getByText("完整").tagName).toBe("STRONG");
+    expect(screen.getByText("文档")).toHaveClass("markdown-content__link");
+    expect(screen.getByText("文档")).not.toHaveAttribute("href");
+    expect(screen.getByText("const untouched = true;")).toBeInTheDocument();
+    const prose = browser_translate.mock.calls.flatMap(([texts]) => texts).join(" ");
+    expect(prose).toContain("documentation");
+    expect(prose).not.toContain("https://example.com/docs");
+    expect(prose).not.toContain("const untouched = true;");
+    expect(browser_dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("disposes model preparation after full-detail failure and permits a fresh retry", async () => {
+    vi.mocked(loadEventDetail).mockRejectedValueOnce(new Error("Session is unavailable."));
+    render(card(message()));
+    await startTranslation();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Session is unavailable.");
+    expect(browser_dispose).toHaveBeenCalledTimes(1);
+    expect(browser_translate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Retry translation" }));
+    expect(await screen.findByText("浏览器译文。")).toBeInTheDocument();
+    expect(browserTranslationEngine.start).toHaveBeenCalledTimes(2);
+    expect(browser_dispose).toHaveBeenCalledTimes(2);
+  });
+
+  it("disposes a failed browser translation and leaves the original visible", async () => {
+    browser_translate.mockRejectedValueOnce(new Error("Translation model download failed."));
+    render(card(message()));
+    await startTranslation();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Translation model download failed.");
+    expect(screen.getByText("Original response.")).toBeInTheDocument();
+    expect(browser_dispose).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Retry translation" })).toBeEnabled();
+  });
+
+  it("disposes model preparation when cancelled before full detail loads and ignores later progress", async () => {
+    const pending_detail = deferred<EventDetail>();
+    vi.mocked(loadEventDetail).mockReturnValue(pending_detail.promise);
+    render(card(message()));
+    await startTranslation();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(browser_dispose).toHaveBeenCalled();
+    act(() => browser_progress({ message: "Stale model progress", resume: vi.fn() }));
+    await act(async () => pending_detail.resolve(detail()));
+    expect(browser_translate).not.toHaveBeenCalled();
+    expect(screen.queryByText("Stale model progress")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue translation" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Translate → 简体中文" })).toBeEnabled();
+  });
+
+  it("ignores a cancelled browser job's late progress and result after a new translation succeeds", async () => {
+    const pending = deferred<string[]>();
+    browser_translate.mockReturnValueOnce(pending.promise);
+    render(card(message()));
+    await startTranslation();
+    await waitFor(() => expect(browser_translate).toHaveBeenCalledTimes(1));
+    const old_progress = browser_progress;
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(browser_dispose).toHaveBeenCalled();
+    await startTranslation();
+    expect(await screen.findByText("浏览器译文。")).toBeInTheDocument();
+    act(() => old_progress({ message: "Outdated download", resume: vi.fn() }));
+    await act(async () => pending.resolve(["过期译文。"]));
+    expect(screen.getByText("浏览器译文。")).toBeInTheDocument();
+    expect(screen.queryByText("过期译文。")).not.toBeInTheDocument();
+    expect(screen.queryByText("Outdated download")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue translation" })).not.toBeInTheDocument();
+  });
+
+  it.each(["session", "content", "unmount"])("disposes a browser job on %s changes and ignores late activity", async (change) => {
+    const pending = deferred<string[]>();
+    browser_translate.mockReturnValueOnce(pending.promise);
+    const event = message();
+    const view = render(card(event));
+    await startTranslation();
+    await waitFor(() => expect(browser_translate).toHaveBeenCalledTimes(1));
+    if (change === "unmount") view.unmount();
+    else if (change === "session") view.rerender(card(event, "session.v1.second"));
+    else view.rerender(card(message({ summary: "Updated response." })));
+    expect(browser_dispose).toHaveBeenCalled();
+    act(() => browser_progress({ message: "Outdated download", resume: vi.fn() }));
+    await act(async () => pending.resolve(["过期译文。"]));
+    expect(screen.queryByText("过期译文。")).not.toBeInTheDocument();
+    expect(screen.queryByText("Outdated download")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    if (change !== "unmount") expect(screen.getByRole("button", { name: "Translate → 简体中文" })).toBeEnabled();
   });
 });
 

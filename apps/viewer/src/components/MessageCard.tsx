@@ -2,7 +2,7 @@ import type { EventSummary } from "../lib/types";
 import { formatTimestamp } from "../lib/state";
 import { useMessageTranslation } from "../lib/useMessageTranslation";
 import { MarkdownContent } from "./MarkdownContent";
-import { useTranslationStatus } from "./TranslationProvider";
+import { useTranslationEngine, useTranslationStatus } from "./TranslationProvider";
 
 interface MessageCardProps {
   event: EventSummary;
@@ -14,7 +14,8 @@ interface MessageCardProps {
 
 export function MessageCard({ event, session_key, button_id, is_selected, on_select }: MessageCardProps) {
   const status = useTranslationStatus();
-  const translation = useMessageTranslation(event, session_key);
+  const engine = useTranslationEngine();
+  const translation = useMessageTranslation(event, session_key, engine);
   const role = event.role ?? "unknown";
   const presentation = role === "user" ? "bubble" : role === "assistant" ? "transcript" : "technical";
   const usesMarkdown = !event.is_hidden && (role === "user" || role === "assistant");
@@ -40,13 +41,17 @@ export function MessageCard({ event, session_key, button_id, is_selected, on_sel
               {translation.loading ? (
                 <>
                   <span className="message-translation__status" role="status">
-                    <span className="inline-spinner" aria-hidden="true" /> Translating…
+                    {!translation.progress?.resume ? <span className="inline-spinner" aria-hidden="true" /> : null}
+                    {translation.progress?.message ?? "Translating…"}
                   </span>
+                  {translation.progress?.resume ? (
+                    <button className="message-event__inspect" onClick={translation.progress.resume} type="button">Continue translation</button>
+                  ) : null}
                   <button className="message-event__inspect" onClick={translation.cancel} type="button">Cancel</button>
                 </>
               ) : translation.translated ? (
                 <>
-                  <span className="message-translation__status">{translation.showing_translation ? "简体中文 · Apple Translation" : "Original"}</span>
+                  <span className="message-translation__status">{translation.showing_translation ? `简体中文 · ${engine?.label}` : "Original"}</span>
                   <button className="message-event__inspect" onClick={translation.toggle} type="button">
                     {translation.showing_translation ? "Show original" : "Show translation"}
                   </button>
@@ -56,7 +61,7 @@ export function MessageCard({ event, session_key, button_id, is_selected, on_sel
                   className="message-event__inspect"
                   disabled={!status?.available}
                   onClick={() => { void translation.translate(); }}
-                  title={status?.available ? "Translate to Simplified Chinese with Apple Translation. macOS may ask to download languages." : status?.reason ?? undefined}
+                  title={status?.available ? engine?.description : status?.reason ?? undefined}
                   type="button"
                 >
                   {translation.error ? "Retry translation" : "Translate → 简体中文"}

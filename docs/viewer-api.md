@@ -41,6 +41,22 @@ The API defaults to loopback with no token. Set `TOKN_VIEWER_TOKEN` to require
 bearer authentication on every data and event endpoint. The browser keeps the
 token in memory only; reloads require reconnecting.
 
+Assistant responses offer **Translate → 简体中文** when the browser supports
+the local [Translator](https://developer.chrome.com/docs/ai/translator-api)
+and [Language Detector](https://developer.chrome.com/docs/ai/language-detection)
+APIs. Availability depends on the browser, device, and language pair. Translation
+runs on the reader's device; viewer-api only supplies the original response.
+The browser may download language models on first use. The UI shows preparation
+and download progress, with **Continue translation** if another click is needed
+to authorize a model download. Cancel also stops pending preparation.
+
+These APIs require a secure context: HTTPS or a trustworthy loopback URL such
+as `http://localhost` or `http://127.0.0.1`. A plain HTTP LAN address is not
+eligible. Unsupported browsers show a disabled translation action with the
+reason. Code, links, and Markdown formatting are preserved, and **Show original**
+switches back without another request. The desktop app continues to use Apple
+Translation on supported Macs.
+
 For frontend development, start both servers with one command:
 
 ```sh
