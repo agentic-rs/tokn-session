@@ -33,12 +33,17 @@ export async function refreshTrajectoryWindow(
   previous: EventSummary[],
   load: (request: LoadTrajectoryEventPageRequest) => Promise<TrajectoryEventPageResponse>,
   current: () => boolean,
+  reset = false,
 ): Promise<TrajectoryEventPageResponse> {
   let page = await load(request);
   const backward = request.direction === "backward";
-  const anchor = backward ? previous[0]?.event_key : previous[previous.length - 1]?.event_key;
+  // Replacement generations may reuse source offsets for different events.
+  // Preserve the window size across a reset, never its old event identities.
+  const anchor = reset ? undefined
+    : backward ? previous[0]?.event_key : previous[previous.length - 1]?.event_key;
   const cursors = new Set<string>();
-  while (current() && anchor && !page.events.some((e) => e.event_key === anchor)) {
+  while (current() && previous.length > 0
+    && (anchor ? !page.events.some((e) => e.event_key === anchor) : page.events.length < previous.length)) {
     const cursor = backward ? page.previous_cursor : page.next_cursor;
     if (!cursor) break;
     if (cursors.has(cursor)) throw new Error("Turn refresh returned a repeated cursor");

@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
+import { useLayoutEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { eventButtonId } from "./state";
 import {
@@ -65,10 +66,12 @@ afterEach(() => {
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((resolvePromise) => {
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
     resolve = resolvePromise;
+    reject = rejectPromise;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 async function selectListedSession(
@@ -286,6 +289,32 @@ function trajectoryChildPage(): TrajectoryEventPageResponse {
   };
 }
 
+function workingTrajectoryPage(event_key = "trajectory.v1.turn-1"): EventPageResponse {
+  const page = trajectoryEventPage();
+  page.events[0].event_key = event_key;
+  page.events[0].trajectory!.status = "working";
+  return page;
+}
+
+function trajectoryChildren(
+  prefix: string,
+  start: number,
+  count: number,
+  previous_cursor: string | null = null,
+  total_events = start + count,
+): TrajectoryEventPageResponse {
+  const child = trajectoryChildPage().events[0];
+  return {
+    events: Array.from({ length: count }, (_, index) => ({
+      ...child,
+      event_key: `event.v1.${prefix}-${start + index}`,
+    })),
+    next_cursor: null,
+    previous_cursor,
+    total_events,
+  };
+}
+
 function ViewerPageCommitProbe() {
   const state = useViewerState();
   return (
@@ -309,7 +338,513 @@ function ViewerPageCommitProbe() {
 }
 
 describe("useViewerState Relay updates", () => {
-  it("renders the session page working, updates a visible tool while scrolled up, then collapses finished work", async () => {
+  it("replaces a reset timeline and its loaded child window together without collapsing to the latest 40", async () => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const original = workingTrajectoryPage();
+    const oldKey = original.events[0].event_key;
+    const oldLatest = trajectoryChildren("old", 40, 40, "old-earlier");
+    const oldEarlier = trajectoryChildren("old", 0, 40, null, 80);
+    const oldRows = [...oldEarlier.events, ...oldLatest.events];
+    const oldDetail = { ...toolDetail("last good output"), event_key: oldRows[79].event_key };
+    vi.mocked(loadEventPage).mockResolvedValue(original);
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValueOnce(oldLatest).mockResolvedValueOnce(oldEarlier);
+    vi.mocked(loadEventDetail).mockResolvedValue(oldDetail);
+    const commits: ReturnType<typeof useViewerState>[] = [];
+    const { result } = renderHook(() => {
+      const state = useViewerState();
+      useLayoutEffect(() => { commits.push(state); });
+      return state;
+    });
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.trajectoryPages.get("live")?.get(oldKey)?.events).toHaveLength(40));
+    act(() => result.current.loadOlderTrajectoryEvents(oldKey));
+    await waitFor(() => expect(result.current.trajectoryPages.get("live")?.get(oldKey)?.events).toHaveLength(80));
+    act(() => result.current.toggleTrajectoryEventExpanded(oldKey, oldDetail.event_key));
+    await waitFor(() => expect(result.current.expandedTrajectoryDetail).toEqual(oldDetail));
+    commits.length = 0;
+
+    const parent = deferred<EventPageResponse>();
+    const latest = deferred<TrajectoryEventPageResponse>();
+    const earlier = deferred<TrajectoryEventPageResponse>();
+    vi.mocked(loadEventPage).mockReturnValueOnce(parent.promise);
+    vi.mocked(loadTrajectoryEventPage).mockReturnValueOnce(latest.promise).mockReturnValueOnce(earlier.promise);
+    const expectOriginalVisible = () => {
+      expect(result.current.events).toEqual(original.events);
+      expect(result.current.expandedEventKey).toBe(oldKey);
+      expect(result.current.trajectoryPages.get("live")?.get(oldKey)?.events).toEqual(oldRows);
+      expect(result.current.expandedTrajectoryDetail).toEqual(oldDetail);
+    };
+    act(() => emit?.({ session_key: "live", reset: true }));
+    expectOriginalVisible();
+
+    const replacement = workingTrajectoryPage("trajectory.v1.replacement");
+    const newKey = replacement.events[0].event_key;
+    await act(async () => parent.resolve(replacement));
+    await waitFor(() => expect(loadTrajectoryEventPage).toHaveBeenCalledTimes(3));
+    expectOriginalVisible();
+    expect(loadTrajectoryEventPage).toHaveBeenNthCalledWith(3, {
+      session_key: "live", trajectory_key: newKey, direction: "backward", limit: 40,
+    });
+    const newLatest = trajectoryChildren("fresh", 50, 40, "fresh-earlier");
+    await act(async () => latest.resolve(newLatest));
+    await waitFor(() => expect(loadTrajectoryEventPage).toHaveBeenCalledTimes(4));
+    expectOriginalVisible();
+    expect(loadTrajectoryEventPage).toHaveBeenNthCalledWith(4, {
+      session_key: "live", trajectory_key: newKey, direction: "backward", limit: 40, cursor: "fresh-earlier",
+    });
+    const newEarlier = trajectoryChildren("fresh", 10, 40, "fresh-oldest", 90);
+    await act(async () => earlier.resolve(newEarlier));
+    await waitFor(() => expect(result.current.events).toEqual(replacement.events));
+    expect(result.current.expandedEventKey).toBe(newKey);
+    expect(result.current.trajectoryPages.get("live")?.get(newKey)?.events).toEqual([...newEarlier.events, ...newLatest.events]);
+    expect(result.current.trajectoryPages.get("live")?.has(oldKey)).toBe(false);
+    expect(result.current.expandedTrajectoryEventKey).toBeNull();
+    expect(result.current.expandedTrajectoryDetail).toBeNull();
+    expect(loadTrajectoryEventPage).toHaveBeenCalledTimes(4);
+    expect(commits.length).toBeGreaterThan(0);
+    for (const state of commits) {
+      const committedKey = state.events[0].event_key;
+      expect(state.expandedEventKey).toBe(committedKey);
+      expect(state.trajectoryPages.get("live")?.get(committedKey)?.events).toHaveLength(80);
+      expect(state.expandedTrajectoryDetail).toEqual(committedKey === oldKey ? oldDetail : null);
+    }
+  });
+
+  it.each(["parent", "children"] as const)("retains the last good reset presentation after a %s failure and retries the replacement", async (failure) => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const original = workingTrajectoryPage();
+    const key = original.events[0].event_key;
+    const oldChildren = trajectoryChildren("old", 0, 40);
+    const oldDetail = { ...toolDetail("last good output"), event_key: oldChildren.events[0].event_key };
+    vi.mocked(loadEventPage).mockResolvedValue(original);
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValue(oldChildren);
+    vi.mocked(loadEventDetail).mockResolvedValue(oldDetail);
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.trajectoryPages.get("live")?.get(key)?.has_loaded).toBe(true));
+    act(() => result.current.toggleTrajectoryEventExpanded(key, oldDetail.event_key));
+    await waitFor(() => expect(result.current.expandedTrajectoryDetail).toEqual(oldDetail));
+    const replacement = workingTrajectoryPage();
+    replacement.events[0].summary = "replacement snapshot";
+    if (failure === "parent") vi.mocked(loadEventPage).mockRejectedValueOnce(new Error("refresh unavailable"));
+    else {
+      vi.mocked(loadEventPage).mockResolvedValueOnce(replacement);
+      vi.mocked(loadTrajectoryEventPage).mockRejectedValueOnce(new Error("refresh unavailable"));
+    }
+    act(() => emit?.({ session_key: "live", reset: true }));
+    await waitFor(() => expect(result.current.eventsError).toContain("refresh unavailable"));
+    expect(result.current.events).toEqual(original.events);
+    expect(result.current.expandedEventKey).toBe(key);
+    expect(result.current.trajectoryPages.get("live")?.get(key)?.events).toEqual(oldChildren.events);
+    expect(result.current.expandedTrajectoryDetail).toEqual(oldDetail);
+
+    const retryChildren = deferred<TrajectoryEventPageResponse>();
+    vi.mocked(loadEventPage).mockResolvedValueOnce(replacement);
+    vi.mocked(loadTrajectoryEventPage).mockReturnValueOnce(retryChildren.promise);
+    act(() => result.current.retryEvents());
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(3));
+    expect(result.current.events).toEqual(original.events);
+    expect(result.current.expandedEventKey).toBe(key);
+    expect(result.current.expandedTrajectoryDetail).toEqual(oldDetail);
+    const freshChildren = trajectoryChildren("fresh", 0, 40);
+    await act(async () => retryChildren.resolve(freshChildren));
+    await waitFor(() => expect(result.current.events).toEqual(replacement.events));
+    expect(result.current.trajectoryPages.get("live")?.get(key)?.events).toEqual(freshChildren.events);
+    expect(result.current.expandedTrajectoryEventKey).toBeNull();
+    expect(result.current.expandedTrajectoryDetail).toBeNull();
+    expect(result.current.eventsError).toBeNull();
+  });
+
+  it("keeps reset semantics when jumping to latest supersedes the pending replacement", async () => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const original = workingTrajectoryPage();
+    const key = original.events[0].event_key;
+    const oldLatest = trajectoryChildren("old", 40, 40, "old-earlier");
+    const oldEarlier = trajectoryChildren("old", 0, 40, null, 80);
+    const oldDetail = { ...toolDetail("old output"), event_key: oldEarlier.events[0].event_key };
+    vi.mocked(loadEventPage).mockResolvedValue(original);
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValueOnce(oldLatest).mockResolvedValueOnce(oldEarlier);
+    vi.mocked(loadEventDetail).mockResolvedValue(oldDetail);
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.trajectoryPages.get("live")?.get(key)?.events).toHaveLength(40));
+    act(() => result.current.loadOlderTrajectoryEvents(key));
+    await waitFor(() => expect(result.current.trajectoryPages.get("live")?.get(key)?.events).toHaveLength(80));
+    act(() => {
+      result.current.toggleTrajectoryEventExpanded(key, oldDetail.event_key);
+      result.current.selectEvent(oldDetail.event_key);
+      result.current.setFollowingLive(false);
+    });
+    await waitFor(() => expect(result.current.expandedTrajectoryDetail).toEqual(oldDetail));
+    expect(result.current.detail).toEqual(oldDetail);
+
+    const supersededParent = deferred<EventPageResponse>();
+    const replacement = workingTrajectoryPage();
+    replacement.events[0].summary = "replacement snapshot";
+    const latest = deferred<TrajectoryEventPageResponse>();
+    const earlier = deferred<TrajectoryEventPageResponse>();
+    vi.mocked(loadEventPage).mockReturnValueOnce(supersededParent.promise).mockResolvedValueOnce(replacement);
+    vi.mocked(loadTrajectoryEventPage).mockReturnValueOnce(latest.promise).mockReturnValueOnce(earlier.promise);
+    act(() => emit?.({ session_key: "live", reset: true }));
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(2));
+    expect(result.current.pendingLiveActivity).toBe(true);
+    act(() => result.current.showLiveActivity());
+    await waitFor(() => expect(loadTrajectoryEventPage).toHaveBeenCalledTimes(3));
+    expect(result.current.events).toEqual(original.events);
+    expect(result.current.expandedTrajectoryDetail).toEqual(oldDetail);
+
+    const newLatest = trajectoryChildren("fresh", 40, 40, "fresh-earlier");
+    newLatest.events[0].event_key = oldDetail.event_key;
+    await act(async () => latest.resolve(newLatest));
+    await waitFor(() => expect(loadTrajectoryEventPage).toHaveBeenCalledTimes(4));
+    expect(result.current.events).toEqual(original.events);
+    const newEarlier = trajectoryChildren("fresh", 0, 40, null, 80);
+    await act(async () => earlier.resolve(newEarlier));
+    await waitFor(() => expect(result.current.events).toEqual(replacement.events));
+    expect(result.current.trajectoryPages.get("live")?.get(key)?.events).toEqual([...newEarlier.events, ...newLatest.events]);
+    expect(result.current.expandedTrajectoryEventKey).toBeNull();
+    expect(result.current.expandedTrajectoryDetail).toBeNull();
+    expect(result.current.selectedEventKey).toBeNull();
+    expect(result.current.detail).toBeNull();
+    await act(async () => supersededParent.resolve(original));
+    expect(result.current.events).toEqual(replacement.events);
+    expect(loadTrajectoryEventPage).toHaveBeenCalledTimes(4);
+  });
+
+  it("releases cancelled child paging after a failed reset without discarding loaded rows", async () => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const original = workingTrajectoryPage();
+    const key = original.events[0].event_key;
+    const oldLatest = trajectoryChildren("old", 40, 40, "old-earlier");
+    const cancelled = deferred<TrajectoryEventPageResponse>();
+    vi.mocked(loadEventPage).mockResolvedValue(original);
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValueOnce(oldLatest).mockReturnValueOnce(cancelled.promise);
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.trajectoryPages.get("live")?.get(key)?.has_loaded).toBe(true));
+    act(() => result.current.loadOlderTrajectoryEvents(key));
+    expect(result.current.trajectoryPages.get("live")?.get(key)?.is_loading_older).toBe(true);
+    vi.mocked(loadEventPage).mockRejectedValueOnce(new Error("reset unavailable"));
+    act(() => emit?.({ session_key: "live", reset: true }));
+    await waitFor(() => expect(result.current.eventsError).toBe("reset unavailable"));
+    expect(result.current.trajectoryPages.get("live")?.get(key)).toMatchObject({
+      events: oldLatest.events, has_loaded: true, is_loading: false, is_loading_older: false, is_loading_newer: false,
+    });
+    await act(async () => cancelled.reject(new Error("obsolete child failure")));
+    expect(result.current.trajectoryPages.get("live")?.get(key)?.error).toBeNull();
+
+    const oldEarlier = trajectoryChildren("old", 0, 40, null, 80);
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValueOnce(oldEarlier);
+    act(() => result.current.loadOlderTrajectoryEvents(key));
+    await waitFor(() => expect(result.current.trajectoryPages.get("live")?.get(key)?.events).toHaveLength(80));
+    expect(loadTrajectoryEventPage).toHaveBeenCalledTimes(3);
+    expect(result.current.trajectoryPages.get("live")?.get(key)?.is_loading_older).toBe(false);
+  });
+
+  it("ignores a staged reset child response after switching sessions", async () => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live"), session("next")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const original = workingTrajectoryPage();
+    const key = original.events[0].event_key;
+    vi.mocked(loadEventPage).mockResolvedValueOnce(original);
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValueOnce(trajectoryChildPage());
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.trajectoryPages.get("live")?.get(key)?.has_loaded).toBe(true));
+    const replacement = workingTrajectoryPage("trajectory.v1.replacement");
+    const children = deferred<TrajectoryEventPageResponse>();
+    vi.mocked(loadEventPage).mockResolvedValueOnce(replacement);
+    vi.mocked(loadTrajectoryEventPage).mockReturnValueOnce(children.promise);
+    act(() => emit?.({ session_key: "live", reset: true }));
+    await waitFor(() => expect(loadTrajectoryEventPage).toHaveBeenCalledTimes(2));
+    const next = toolEventPage();
+    next.events[0].summary = "next session";
+    vi.mocked(loadEventPage).mockResolvedValueOnce(next);
+    act(() => result.current.selectSession("next"));
+    await waitFor(() => expect(result.current.events).toEqual(next.events));
+    await act(async () => children.resolve(trajectoryChildren("fresh", 0, 40)));
+    expect(result.current.selectedSessionKey).toBe("next");
+    expect(result.current.events).toEqual(next.events);
+    expect(result.current.expandedEventKey).toBeNull();
+    expect(result.current.trajectoryPages.size).toBe(0);
+  });
+
+  it.each([true, false])("preserves an expanded completed turn through a reset while following is %s", async (following) => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const original = trajectoryEventPage();
+    original.events[0].trajectory!.status = "complete";
+    original.events.push(workingTrajectoryPage("trajectory.v1.current").events[0]);
+    original.total_events = 2;
+    const key = original.events[0].event_key;
+    const oldChildren = trajectoryChildren("old", 0, 40);
+    const oldDetail = { ...toolDetail("old output"), event_key: oldChildren.events[0].event_key };
+    vi.mocked(loadEventPage).mockResolvedValueOnce(original);
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValueOnce(trajectoryChildPage()).mockResolvedValueOnce(oldChildren);
+    vi.mocked(loadEventDetail).mockResolvedValue(oldDetail);
+    const commits: ReturnType<typeof useViewerState>[] = [];
+    const { result } = renderHook(() => {
+      const state = useViewerState();
+      useLayoutEffect(() => { commits.push(state); });
+      return state;
+    });
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.trajectoryPages.get("live")?.get("trajectory.v1.current")?.has_loaded).toBe(true));
+    act(() => result.current.toggleEventExpanded(key));
+    await waitFor(() => expect(result.current.trajectoryPages.get("live")?.get(key)?.has_loaded).toBe(true));
+    act(() => {
+      result.current.toggleTrajectoryEventExpanded(key, oldDetail.event_key);
+      result.current.selectEvent(oldDetail.event_key);
+      result.current.setFollowingLive(following);
+    });
+    await waitFor(() => expect(result.current.expandedTrajectoryDetail).toEqual(oldDetail));
+    await waitFor(() => expect(result.current.detail).toEqual(oldDetail));
+    commits.length = 0;
+
+    const replacement = {
+      ...original,
+      events: [{ ...original.events[0], summary: "refreshed completed turn" }, original.events[1]],
+    };
+    const children = deferred<TrajectoryEventPageResponse>();
+    vi.mocked(loadEventPage).mockResolvedValueOnce(replacement);
+    vi.mocked(loadTrajectoryEventPage).mockReturnValueOnce(children.promise);
+    act(() => emit?.({ session_key: "live", reset: true }));
+    await waitFor(() => expect(loadTrajectoryEventPage).toHaveBeenCalledTimes(3));
+    expect(result.current.events).toEqual(original.events);
+    expect(result.current.expandedEventKey).toBe(key);
+    expect(result.current.expandedTrajectoryDetail).toEqual(oldDetail);
+
+    const freshChildren = trajectoryChildren("fresh", 0, 40);
+    // An ordinal can be reused after reset. Disclosure survives, but the old
+    // nested expansion and detail must not transfer to its new occupant.
+    freshChildren.events[0].event_key = oldDetail.event_key;
+    await act(async () => children.resolve(freshChildren));
+    await waitFor(() => expect(result.current.events).toEqual(replacement.events));
+    expect(result.current.expandedEventKey).toBe(key);
+    expect(result.current.trajectoryPages.get("live")?.get(key)?.events).toEqual(freshChildren.events);
+    expect(result.current.expandedTrajectoryEventKey).toBeNull();
+    expect(result.current.expandedTrajectoryDetail).toBeNull();
+    expect(result.current.selectedEventKey).toBeNull();
+    expect(result.current.detail).toBeNull();
+    expect(loadTrajectoryEventPage).toHaveBeenCalledTimes(3);
+    for (const state of commits) {
+      expect(state.expandedEventKey).toBe(key);
+      const refreshed = state.events[0].summary === "refreshed completed turn";
+      expect(state.trajectoryPages.get("live")?.get(key)?.events).toEqual(refreshed ? freshChildren.events : oldChildren.events);
+    }
+  });
+
+  it("keeps a manually collapsed turn closed through live resets", async () => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const original = workingTrajectoryPage();
+    const key = original.events[0].event_key;
+    vi.mocked(loadEventPage).mockResolvedValueOnce(original);
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValue(trajectoryChildPage());
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.trajectoryPages.get("live")?.get(key)?.has_loaded).toBe(true));
+    act(() => result.current.toggleEventExpanded(key));
+
+    const replacement = workingTrajectoryPage();
+    replacement.events[0].summary = "new progress";
+    vi.mocked(loadEventPage).mockResolvedValueOnce(replacement);
+    act(() => emit?.({ session_key: "live", reset: true }));
+    await waitFor(() => expect(result.current.events).toEqual(replacement.events));
+    expect(result.current.expandedEventKey).toBeNull();
+    expect(loadTrajectoryEventPage).toHaveBeenCalledOnce();
+
+    act(() => result.current.showLiveActivity());
+    expect(result.current.expandedEventKey).toBe(key);
+  });
+
+  it.each([
+    ["resolve", "same"], ["reject", "same"],
+    ["resolve", "new"], ["reject", "new"],
+  ] as const)("honors a manual collapse when staged children %s for a %s turn key", async (settlement, replacementKind) => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const original = workingTrajectoryPage();
+    const key = original.events[0].event_key;
+    vi.mocked(loadEventPage).mockResolvedValueOnce(original);
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValueOnce(trajectoryChildPage());
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.trajectoryPages.get("live")?.get(key)?.has_loaded).toBe(true));
+    const replacement = workingTrajectoryPage(replacementKind === "same" ? key : "trajectory.v1.replacement");
+    replacement.events[0].summary = "new progress";
+    const children = deferred<TrajectoryEventPageResponse>();
+    vi.mocked(loadEventPage).mockResolvedValueOnce(replacement);
+    vi.mocked(loadTrajectoryEventPage).mockReturnValueOnce(children.promise);
+    act(() => emit?.({ session_key: "live", reset: true }));
+    await waitFor(() => expect(loadTrajectoryEventPage).toHaveBeenCalledTimes(2));
+    expect(result.current.events).toEqual(original.events);
+    act(() => result.current.toggleEventExpanded(key));
+    expect(result.current.expandedEventKey).toBeNull();
+    await act(async () => {
+      if (settlement === "resolve") children.resolve(trajectoryChildren("fresh", 0, 40));
+      else children.reject(new Error("no longer visible"));
+    });
+    await waitFor(() => expect(result.current.events).toEqual(replacement.events));
+    expect(result.current.expandedEventKey).toBeNull();
+    expect(result.current.eventsError).toBeNull();
+    expect(loadTrajectoryEventPage).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not auto-open replacement work after following stops during its staged child load", async () => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const original = workingTrajectoryPage();
+    const key = original.events[0].event_key;
+    vi.mocked(loadEventPage).mockResolvedValueOnce(original);
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValueOnce(trajectoryChildPage());
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.trajectoryPages.get("live")?.get(key)?.has_loaded).toBe(true));
+
+    const replacement = workingTrajectoryPage("trajectory.v1.replacement");
+    const children = deferred<TrajectoryEventPageResponse>();
+    vi.mocked(loadEventPage).mockResolvedValueOnce(replacement);
+    vi.mocked(loadTrajectoryEventPage).mockReturnValueOnce(children.promise);
+    act(() => emit?.({ session_key: "live", reset: true }));
+    await waitFor(() => expect(loadTrajectoryEventPage).toHaveBeenCalledTimes(2));
+    expect(result.current.events).toEqual(original.events);
+    act(() => result.current.setFollowingLive(false));
+    await act(async () => children.resolve(trajectoryChildren("fresh", 0, 40)));
+    await waitFor(() => expect(result.current.events).toEqual(replacement.events));
+    expect(result.current.expandedEventKey).toBeNull();
+    expect(result.current.eventsError).toBeNull();
+    expect(loadTrajectoryEventPage).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["complete", "absent"] as const)("commits a reset with %s working trajectory without reopening stale work", async (status) => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const original = workingTrajectoryPage();
+    const key = original.events[0].event_key;
+    vi.mocked(loadEventPage).mockResolvedValueOnce(original);
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValueOnce(trajectoryChildPage());
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.trajectoryPages.get("live")?.get(key)?.has_loaded).toBe(true));
+    const parent = deferred<EventPageResponse>();
+    vi.mocked(loadEventPage).mockReturnValueOnce(parent.promise);
+    act(() => emit?.({ session_key: "live", reset: true }));
+    expect(result.current.expandedEventKey).toBe(key);
+    const replacement = status === "complete" ? trajectoryEventPage() : toolEventPage();
+    if (status === "complete") replacement.events[0].trajectory!.status = "complete";
+    await act(async () => parent.resolve(replacement));
+    await waitFor(() => expect(result.current.events).toEqual(replacement.events));
+    expect(result.current.expandedEventKey).toBeNull();
+    expect(result.current.trajectoryPages.size).toBe(0);
+    expect(loadTrajectoryEventPage).toHaveBeenCalledOnce();
+  });
+
+  it.each(["timeline", "trajectory"])("retains visible %s detail through live refreshes and refresh errors", async (location) => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const isTrajectory = location === "trajectory";
+    const timelinePage = isTrajectory ? trajectoryEventPage() : toolEventPage();
+    if (isTrajectory) timelinePage.events[0].trajectory!.status = "working";
+    const trajectoryKey = timelinePage.events[0].event_key;
+    const eventKey = isTrajectory ? trajectoryChildPage().events[0].event_key : trajectoryKey;
+    const existing = { ...toolDetail("visible output"), event_key: eventKey };
+    vi.mocked(loadEventPage).mockResolvedValue(timelinePage);
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValue(trajectoryChildPage());
+    vi.mocked(loadEventDetail).mockResolvedValue(existing);
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.events).toHaveLength(1));
+    if (isTrajectory) {
+      await waitFor(() => expect(result.current.trajectoryPages.get("live")?.get(trajectoryKey)?.has_loaded).toBe(true));
+      act(() => result.current.toggleTrajectoryEventExpanded(trajectoryKey, eventKey));
+    } else {
+      act(() => {
+        result.current.toggleEventExpanded(eventKey);
+        result.current.selectEvent(eventKey);
+      });
+    }
+    const currentDetail = () => isTrajectory ? result.current.expandedTrajectoryDetail : result.current.expandedDetail;
+    const currentLoading = () => isTrajectory ? result.current.expandedTrajectoryDetailLoading : result.current.expandedDetailLoading;
+    const currentError = () => isTrajectory ? result.current.expandedTrajectoryDetailError : result.current.expandedDetailError;
+    await waitFor(() => expect(currentDetail()).toEqual(existing));
+
+    const failed = deferred<EventDetail>();
+    vi.mocked(loadEventDetail).mockReturnValue(failed.promise);
+    act(() => emit?.({ session_key: "live", reset: false }));
+    await waitFor(() => expect(loadEventDetail).toHaveBeenCalledTimes(2));
+    expect(currentDetail()).toEqual(existing);
+    expect(currentLoading()).toBe(true);
+    if (!isTrajectory) expect(result.current.detail).toEqual(existing);
+    await act(async () => failed.reject(new Error("temporarily unavailable")));
+    await waitFor(() => expect(currentError()).toBe("temporarily unavailable"));
+    expect(currentDetail()).toEqual(existing);
+    if (!isTrajectory) expect(result.current.detail).toEqual(existing);
+
+    const fresh = deferred<EventDetail>();
+    vi.mocked(loadEventDetail).mockReturnValue(fresh.promise);
+    act(() => emit?.({ session_key: "live", reset: false }));
+    await waitFor(() => expect(loadEventDetail).toHaveBeenCalledTimes(3));
+    expect(currentDetail()).toEqual(existing);
+    const replacement = { ...toolDetail("latest output"), event_key: eventKey };
+    await act(async () => fresh.resolve(replacement));
+    await waitFor(() => expect(currentDetail()).toEqual(replacement));
+    expect(currentLoading()).toBe(false);
+    expect(currentError()).toBeNull();
+    if (!isTrajectory) expect(result.current.detail).toEqual(replacement);
+  });
+
+  it("drops retained detail when the owner or snapshot generation changes", async () => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const page = toolEventPage();
+    page.events.push({ ...page.events[0], event_key: "event.v1.2" });
+    vi.mocked(loadEventPage).mockResolvedValue(page);
+    vi.mocked(loadEventDetail).mockResolvedValue(toolDetail("old owner output"));
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.events).toHaveLength(2));
+    act(() => {
+      result.current.toggleEventExpanded("event.v1.1");
+      result.current.selectEvent("event.v1.1");
+    });
+    await waitFor(() => expect(result.current.expandedDetail).toEqual(toolDetail("old owner output")));
+    vi.mocked(loadEventDetail).mockReturnValue(deferred<EventDetail>().promise);
+    act(() => {
+      result.current.toggleEventExpanded("event.v1.2");
+      result.current.selectEvent("event.v1.2");
+    });
+    expect(result.current.expandedDetail).toBeNull();
+    expect(result.current.detail).toBeNull();
+    act(() => result.current.toggleEventExpanded("event.v1.1"));
+    await waitFor(() => expect(result.current.expandedDetail).toEqual(toolDetail("old owner output")));
+    act(() => emit?.({ session_key: "live", reset: true }));
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.expandedEventKey).toBeNull());
+    expect(result.current.expandedDetail).toBeNull();
+    expect(result.current.detail).toBeNull();
+    act(() => result.current.toggleEventExpanded("event.v1.1"));
+    expect(result.current.expandedDetail).toBeNull();
+    expect(result.current.expandedDetailLoading).toBe(true);
+  });
+
+  it("updates visible work while scrolled up and keeps it expanded on completion", async () => {
     let emit: ((change: RelayChange) => void) | undefined;
     vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
     vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
@@ -324,6 +859,7 @@ describe("useViewerState Relay updates", () => {
     const timeline = container.querySelector<HTMLElement>(".conversation__timeline")!;
     Object.defineProperties(timeline, { scrollHeight: { configurable: true, value: 1000 }, clientHeight: { configurable: true, value: 300 } });
     timeline.scrollTop = 120;
+    fireEvent.wheel(timeline, { deltaY: -1 });
     fireEvent.scroll(timeline);
     const updated = trajectoryChildPage();
     updated.events[0].tool!.command = "cargo check";
@@ -335,8 +871,69 @@ describe("useViewerState Relay updates", () => {
     finished.events[0].trajectory!.status = "complete";
     vi.mocked(loadEventPage).mockResolvedValue(finished);
     act(() => emit?.({ session_key: "live", reset: false }));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Worked for 1h" })).toHaveAttribute("aria-expanded", "false"));
-    expect(screen.queryByText("cargo check")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Worked for 1h" })).toHaveAttribute("aria-expanded", "true"));
+    expect(screen.getByText("cargo check")).toBeInTheDocument();
+  });
+
+  it.each([true, false])("keeps historical work expanded when newer work starts while following is %s", async (following) => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const history = trajectoryEventPage().events[0];
+    history.trajectory!.status = "complete";
+    const working = { ...history, event_key: "trajectory.v1.current", trajectory: { ...history.trajectory!, status: "working" as const } };
+    const page = { ...trajectoryEventPage(), events: [history, working], total_events: 2 };
+    vi.mocked(loadEventPage).mockResolvedValue(page);
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValue(trajectoryChildPage());
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.expandedEventKey).toBe(working.event_key));
+    act(() => {
+      result.current.setFollowingLive(following);
+      result.current.toggleEventExpanded(history.event_key);
+    });
+    const nextWorking = { ...working, event_key: "trajectory.v1.next" };
+    vi.mocked(loadEventPage).mockResolvedValue({
+      ...page,
+      events: [history, { ...working, trajectory: { ...working.trajectory, status: "complete" } }, nextWorking],
+      total_events: 3,
+    });
+    act(() => emit?.({ session_key: "live", reset: false }));
+    await waitFor(() => expect(result.current.events).toHaveLength(3));
+    expect(result.current.expandedEventKey).toBe(history.event_key);
+    act(() => result.current.showLiveActivity());
+    expect(result.current.expandedEventKey).toBe(nextWorking.event_key);
+  });
+
+  it("keeps a completed turn reopened by the reader expanded when the next turn begins", async () => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const original = workingTrajectoryPage();
+    const key = original.events[0].event_key;
+    vi.mocked(loadEventPage).mockResolvedValueOnce(original);
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValue(trajectoryChildPage());
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.trajectoryPages.get("live")?.get(key)?.has_loaded).toBe(true));
+
+    const completed = trajectoryEventPage();
+    completed.events[0].trajectory!.status = "complete";
+    vi.mocked(loadEventPage).mockResolvedValueOnce(completed);
+    act(() => emit?.({ session_key: "live", reset: false }));
+    await waitFor(() => expect(result.current.events[0].trajectory?.status).toBe("complete"));
+    expect(result.current.expandedEventKey).toBeNull();
+    act(() => result.current.toggleEventExpanded(key));
+    expect(result.current.expandedEventKey).toBe(key);
+
+    const nextWorking = workingTrajectoryPage("trajectory.v1.next").events[0];
+    const nextPage = { ...completed, events: [...completed.events, nextWorking], total_events: 2 };
+    vi.mocked(loadEventPage).mockResolvedValueOnce(nextPage);
+    act(() => emit?.({ session_key: "live", reset: false }));
+    await waitFor(() => expect(result.current.events).toEqual(nextPage.events));
+    expect(result.current.expandedEventKey).toBe(key);
+    act(() => result.current.showLiveActivity());
+    expect(result.current.expandedEventKey).toBe(nextWorking.event_key);
   });
 
   it("auto-expands active work, refreshes its children, respects manual collapse and closes on completion", async () => {
@@ -435,7 +1032,7 @@ describe("useViewerState Relay updates", () => {
     expect(result.current.expandedEventKey).toBe("event.v1.1");
     act(() => emit?.({ session_key: "live", reset: true }));
     await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(5));
-    expect(result.current.expandedEventKey).toBeNull();
+    await waitFor(() => expect(result.current.expandedEventKey).toBeNull());
   });
 
   it("ignores unrelated session bodies and unregisters its listener", async () => {

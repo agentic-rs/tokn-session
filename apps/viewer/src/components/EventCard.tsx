@@ -28,6 +28,7 @@ import type { TechnicalCardHeading } from "./CardPresentation";
 import { ReasoningCard, reasoningHeading } from "./ReasoningCard";
 import { CompactionCard } from "./CompactionCard";
 import { UsageCard, usageHeading } from "./UsageCard";
+import { DetailRefreshError } from "./DetailRefreshError";
 
 interface EventCardProps {
   session_key?: string;
@@ -563,7 +564,7 @@ function TrajectorySection({
               {page.events.length > 0 ? (
                 <div aria-label="Events in this turn" className="trajectory-section__events" role="list">
                   {page.events.map((childEvent) => (
-                    <div key={childEvent.event_key} role="listitem">
+                    <div data-scroll-key={`${event.event_key}/${childEvent.event_key}`} key={childEvent.event_key} role="listitem">
                       <EventCard
                         session_key={session_key}
                         button_id={eventButtonId(childEvent.event_key)}
@@ -633,7 +634,7 @@ function ToolOutput({
   if (event.is_hidden || detail?.is_hidden) {
     return <p className="tool-output__empty">Tool output is hidden by the provider.</p>;
   }
-  if (is_loading) {
+  if (is_loading && !detail) {
     return (
       <div className="tool-output__state" role="status">
         <span className="inline-spinner" aria-hidden="true" />
@@ -641,7 +642,7 @@ function ToolOutput({
       </div>
     );
   }
-  if (error) {
+  if (error && !detail) {
     return (
       <div className="tool-output__error" role="alert">
         <span>
@@ -660,15 +661,19 @@ function ToolOutput({
     const isPending = event.tool?.status === "pending" || event.tool?.status === "running"
       || (event.tool?.status === undefined && event.phase !== null && event.phase !== "finished");
     return (
-      <p className="tool-output__empty" role="status">
-        {isPending ? "Output is not available yet." : "No output was captured for this tool call."}
-      </p>
+      <div aria-busy={is_loading}>
+        <DetailRefreshError error={error} on_retry={on_retry} />
+        <p className="tool-output__empty" role="status">
+          {isPending ? "Output is not available yet." : "No output was captured for this tool call."}
+        </p>
+      </div>
     );
   }
 
   const toolLabel = toolHeading(event).primary;
   return (
-    <div className="tool-output">
+    <div aria-busy={is_loading} className="tool-output">
+      <DetailRefreshError error={error} on_retry={on_retry} />
       {output.sections.map((section, index) => (
         <section className="tool-output__section" key={`${section.label ?? "output"}-${index}`}>
           {section.label ? <h4>{section.label}</h4> : null}

@@ -171,6 +171,64 @@ function renderCard(
 }
 
 describe("EventCard conversation content", () => {
+  it.each(["tool_call", "reasoning"] as const)("allows retrying an empty retained %s detail", (type) => {
+    const onRetry = vi.fn();
+    renderCard(event({
+      type,
+      role: null,
+      tool: type === "tool_call" ? tool() : null,
+      reasoning: type === "reasoning" ? reasoning() : null,
+    }), {
+      is_expanded: true,
+      detail: detail({ event: { type } }),
+      detail_error: "temporary failure",
+      on_retry_detail: onRetry,
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent("temporary failure");
+    expect(screen.getByText(type === "tool_call"
+      ? "No output was captured for this tool call."
+      : "No readable reasoning was captured for this event.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(onRetry).toHaveBeenCalledOnce();
+  });
+
+  it.each(["tool_call", "reasoning", "compaction"] as const)("keeps %s detail mounted during refresh and refresh failure", (type) => {
+    const cardEvent = event({
+      type,
+      role: null,
+      title: "Detail card",
+      summary: "Preview",
+      tool: type === "tool_call" ? tool() : null,
+      reasoning: type === "reasoning" ? reasoning() : null,
+      compaction: type === "compaction" ? {
+        state: "completed", trigger: null, reason: null, has_summary: true, summary_opaque: false, measurements: [],
+      } : undefined,
+    });
+    const existing = detail({
+      event: { type, summary: "Stable detail" },
+      tool_output: type === "tool_call" ? {
+        sections: [{ label: "stdout", text: "Stable detail", format: "text" }],
+        truncated: false, original_size_bytes: 13, source_event_key: cardEvent.event_key,
+      } : null,
+    });
+    const props = {
+      button_id: "event-button", detail: existing, detail_error: null,
+      detail_loading: false, event: cardEvent, is_expanded: true, is_selected: false,
+      on_retry_detail: vi.fn(), on_select: vi.fn(), on_toggle: vi.fn(),
+    };
+    const { rerender } = render(<EventCard {...props} />);
+    const content = screen.getByText("Stable detail");
+    rerender(<EventCard {...props} detail_loading />);
+    expect(screen.getByText("Stable detail")).toBe(content);
+    expect(screen.queryByText(/Loading (tool output|reasoning|compaction summary)/)).not.toBeInTheDocument();
+    rerender(<EventCard {...props} detail_error="temporary failure" />);
+    expect(screen.getByText("Stable detail")).toBe(content);
+    expect(screen.getByRole("alert")).toHaveTextContent("temporary failure");
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(props.on_retry_detail).toHaveBeenCalledOnce();
+  });
+
   it("expands compaction summaries with precisely scoped measurements", () => {
     const onToggle = vi.fn();
     const compaction = event({

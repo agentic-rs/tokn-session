@@ -237,27 +237,28 @@ export function Inspector({
           </div>
 
           <div
+            aria-busy={is_loading}
             aria-labelledby={`inspector-tab-${activeTab}`}
             className="inspector__content"
             id="inspector-event-panel"
             role="tabpanel"
           >
-            {is_loading ? (
+            {is_loading && !detail ? (
               <div className="detail-loading" role="status">
                 <span className="spinner" />
                 Loading event detail…
               </div>
             ) : null}
             {!is_loading && error ? (
-              <div className="detail-error" role="alert">
-                <strong>Detail unavailable</strong>
+              <div className={detail ? "detail-refresh-error" : "detail-error"} role="alert">
+                <strong>{detail ? "Could not refresh detail" : "Detail unavailable"}</strong>
                 <span>{error}</span>
                 <button className="text-button" onClick={on_retry} type="button">
                   Try again
                 </button>
               </div>
             ) : null}
-            {!is_loading && !error && detail ? (
+            {detail ? (
               activeTab === "content" && readableContent ? (
                 <div className="readable-content">
                   {readableContent.sections.map((section, index) => (
