@@ -5,6 +5,16 @@ line. ZeroMQ publishes the same JSON as its second frame; the first frame is
 the unchanged `provider.session_id` topic. Use `--native` with either output
 mode to include provider data alongside the normalized events.
 
+Native filesystem notifications accelerate the feed but are not required for
+startup or continued operation. If watcher creation, registration, or its
+callback stream fails, Relay releases the backend, reports one warning, and
+continues using the configured `--poll-interval` (30 seconds by default).
+Runtime failures trigger one recovery scan before regular polling resumes;
+restart Relay to retry native watching. This also handles macOS's per-process
+file limit when recursive kqueue watches exceed the available descriptors.
+The viewer-managed child uses a five-minute polling interval because the
+viewer has its own index watcher and recovery scheduler.
+
 ```json
 {
   "path": "/sessions/pi.jsonl",

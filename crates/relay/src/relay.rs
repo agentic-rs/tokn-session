@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher, event::ModifyKind};
+use notify::{EventKind, RecursiveMode, Watcher, event::ModifyKind};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
@@ -50,7 +50,7 @@ impl RelayConfig {
 
 pub struct SessionRelay {
   tailer: SessionTailer,
-  watcher: RecommendedWatcher,
+  watcher: Option<NativeWatcher>,
   watched_paths: HashSet<PathBuf>,
   wake_rx: mpsc::UnboundedReceiver<Result<WatcherWake, String>>,
   poll: tokio::time::Interval,
@@ -58,14 +58,23 @@ pub struct SessionRelay {
 }
 
 impl SessionRelay {
-  /// Creates a relay and starts watching all provider paths that already exist.
+  /// Creates a relay and attempts to watch provider paths that already exist.
   pub async fn new(config: RelayConfig) -> Result<Self, String> {
     Self::new_with_ready(config, || Ok(())).await
   }
 
-  /// Registers root watches, announces transport readiness, then performs the
+  /// Attempts root watches, announces transport readiness, then performs the
   /// potentially expensive initial discovery and cursor seed.
+  /// Native watching is advisory; a failed backend uses the configured poll interval.
   pub async fn new_with_ready(config: RelayConfig, ready: impl FnOnce() -> Result<(), String>) -> Result<Self, String> {
+    Self::new_with_watcher(config, ready, create_native_watcher).await
+  }
+
+  async fn new_with_watcher(
+    config: RelayConfig,
+    ready: impl FnOnce() -> Result<(), String>,
+    create_watcher: impl FnOnce(WatcherSender) -> notify::Result<NativeWatcher>,
+  ) -> Result<Self, String> {
     if config.poll_interval.is_zero() {
       return Err("relay poll interval must be greater than zero".to_string());
     }
@@ -75,20 +84,14 @@ impl SessionRelay {
     let mut tailer = SessionTailer::prepare_deferred(config.roots, config.new_file_replay)?;
     tailer.set_include_native(config.include_native);
     let (wake_tx, wake_rx) = mpsc::unbounded_channel();
-    let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
-      let result = result
-        .map(|event| {
-          let need_rescan = event.need_rescan();
-          WatcherWake {
-            paths: event.paths,
-            kind: event.kind,
-            need_rescan,
-          }
-        })
-        .map_err(|err| err.to_string());
-      let _ = wake_tx.send(result);
-    })
-    .map_err(|err| format!("failed to create filesystem watcher: {err}"))?;
+    let mut warnings = Vec::new();
+    let watcher = match create_watcher(wake_tx) {
+      Ok(watcher) => Some(watcher),
+      Err(error) => {
+        warnings.push(polling_warning(format!("failed to create filesystem watcher: {error}")));
+        None
+      }
+    };
     let mut relay = Self {
       tailer,
       watcher,
@@ -100,11 +103,18 @@ impl SessionRelay {
     relay
       .poll
       .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    relay.watch_available_roots()?;
+    if let Err(error) = relay.watch_available_roots() {
+      relay.stop_watching().await;
+      warnings.push(polling_warning(error));
+    }
     ready()?;
-    // Watcher callbacks are already queued, closing the discovery/follow gap.
+    // Available watcher callbacks are queued, closing the discovery/follow
+    // gap. Polling-only startup follows the same snapshot/EOF seed policy.
     relay.tailer.discover_initial()?;
-    relay.initial = Some(relay.tailer.start()?);
+    let mut initial = relay.tailer.start()?;
+    warnings.append(&mut initial.warnings);
+    initial.warnings = warnings;
+    relay.initial = Some(initial);
     Ok(relay)
   }
 
@@ -122,18 +132,35 @@ impl SessionRelay {
 
     let wake = tokio::select! {
       _ = self.poll.tick() => ScanRequest::Full,
-      wake = self.wake_rx.recv() => {
+      wake = self.wake_rx.recv(), if self.watcher.is_some() => {
         match wake {
           Some(wake) => ScanRequest::Watcher(wake),
-          None => return Err("filesystem watcher stopped unexpectedly".to_string()),
+          None => ScanRequest::WatcherStopped,
         }
       }
     };
 
-    let (scan_all, paths, mut watcher_warnings) = match wake {
+    let (mut scan_all, paths, mut watcher_warnings) = match wake {
       ScanRequest::Full => (true, HashSet::new(), Vec::new()),
       ScanRequest::Watcher(first) => self.collect_watcher_events(first),
+      ScanRequest::WatcherStopped => (
+        true,
+        HashSet::new(),
+        vec!["filesystem watcher stopped unexpectedly".to_string()],
+      ),
     };
+    if watcher_warnings.is_empty() {
+      if let Err(error) = self.watch_available_roots() {
+        watcher_warnings.push(error);
+      }
+    }
+    if !watcher_warnings.is_empty() {
+      // A failed registration can leave partially installed watches and open
+      // descriptors. Retire the entire backend before reading any sessions.
+      self.stop_watching().await;
+      scan_all = true;
+      watcher_warnings = vec![polling_warning(watcher_warnings.join("; "))];
+    }
     let scan = if scan_all {
       self.tailer.scan()
     } else {
@@ -148,10 +175,24 @@ impl SessionRelay {
     };
     watcher_warnings.append(&mut update.warnings);
     update.warnings = watcher_warnings;
-    if let Err(err) = self.watch_available_roots() {
-      update.warnings.push(err);
-    }
     Ok(update)
+  }
+
+  async fn stop_watching(&mut self) {
+    let watcher = self.watcher.take();
+    self.watched_paths.clear();
+    // Notify 8's KqueueWatcher destructor unwraps its shutdown sends. If the
+    // backend thread already died, that destructor panics; isolate teardown
+    // of this failed third-party backend so polling can still recover.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(watcher)));
+    // Kqueue releases its per-file descriptors on a backend thread after
+    // Drop sends shutdown. Wait for its callback to go away before discovery
+    // opens files, but do not let a stuck backend block polling indefinitely.
+    let _ = tokio::time::timeout(Duration::from_secs(1), async {
+      while self.wake_rx.recv().await.is_some() {}
+    })
+    .await;
+    self.poll.reset();
   }
 
   fn collect_watcher_events(&mut self, first: Result<WatcherWake, String>) -> (bool, HashSet<PathBuf>, Vec<String>) {
@@ -177,13 +218,18 @@ impl SessionRelay {
   }
 
   fn watch_available_roots(&mut self) -> Result<(), String> {
+    let Some(watcher) = self.watcher.as_mut() else {
+      return Ok(());
+    };
+    if self.wake_rx.is_closed() {
+      return Err("filesystem watcher stopped unexpectedly".to_string());
+    }
     for root in self.tailer.roots() {
       for (path, mode) in watch_targets(root) {
         if !path.exists() || self.watched_paths.contains(&path) {
           continue;
         }
-        self
-          .watcher
+        watcher
           .watch(&path, mode)
           .map_err(|err| format!("failed to watch {}: {err}", path.display()))?;
         self.watched_paths.insert(path);
@@ -203,6 +249,31 @@ struct WatcherWake {
 enum ScanRequest {
   Full,
   Watcher(Result<WatcherWake, String>),
+  WatcherStopped,
+}
+
+type NativeWatcher = Box<dyn Watcher + Send>;
+type WatcherSender = mpsc::UnboundedSender<Result<WatcherWake, String>>;
+
+fn create_native_watcher(wake_tx: WatcherSender) -> notify::Result<NativeWatcher> {
+  notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+    let result = result
+      .map(|event| {
+        let need_rescan = event.need_rescan();
+        WatcherWake {
+          paths: event.paths,
+          kind: event.kind,
+          need_rescan,
+        }
+      })
+      .map_err(|error| error.to_string());
+    let _ = wake_tx.send(result);
+  })
+  .map(|watcher| Box::new(watcher) as NativeWatcher)
+}
+
+fn polling_warning(error: String) -> String {
+  format!("{error}; filesystem notifications disabled, continuing with periodic polling")
 }
 
 fn merge_watcher_event(
@@ -269,15 +340,22 @@ fn sqlite_sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
   use std::fs::OpenOptions;
+  use std::future::Future;
   use std::io::Write;
+  use std::path::{Path, PathBuf};
+  use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+  };
+  use std::task::{Context, Waker};
   use std::time::Duration;
 
-  use notify::{EventKind, RecursiveMode};
+  use notify::{EventKind, RecursiveMode, Watcher};
   use rusqlite::{Connection, params};
   use tempfile::TempDir;
   use tokn_session_core::{AgentEvent, Provider};
 
-  use super::{RelayConfig, SessionRelay, WatcherWake, merge_watcher_event, watch_targets};
+  use super::{RelayConfig, SessionRelay, WatcherSender, WatcherWake, merge_watcher_event, watch_targets};
   use crate::ProviderRoot;
 
   #[test]
@@ -334,6 +412,207 @@ mod tests {
       .map(|provider| ProviderRoot::new(provider, root.path().join(crate::providers::source(provider).as_str())))
       .collect();
     assert!(SessionRelay::new(RelayConfig::new(roots)).await.is_ok());
+  }
+
+  struct TestWatcher {
+    wake_tx: Option<WatcherSender>,
+    watches: Arc<AtomicUsize>,
+    dropped: Arc<AtomicBool>,
+    fail_on_watch: Option<usize>,
+    panic_on_drop: bool,
+  }
+
+  impl Watcher for TestWatcher {
+    fn new<F: notify::EventHandler>(_handler: F, _config: notify::Config) -> notify::Result<Self> {
+      unreachable!("tests construct their watcher directly")
+    }
+
+    fn watch(&mut self, _path: &Path, _mode: RecursiveMode) -> notify::Result<()> {
+      let count = self.watches.fetch_add(1, Ordering::SeqCst) + 1;
+      if self.fail_on_watch == Some(count) {
+        Err(notify::Error::generic("test watch registration failed"))
+      } else {
+        Ok(())
+      }
+    }
+
+    fn unwatch(&mut self, _path: &Path) -> notify::Result<()> {
+      Ok(())
+    }
+
+    fn kind() -> notify::WatcherKind {
+      notify::WatcherKind::NullWatcher
+    }
+  }
+
+  impl Drop for TestWatcher {
+    fn drop(&mut self) {
+      self.wake_tx.take();
+      self.dropped.store(true, Ordering::SeqCst);
+      assert!(!self.panic_on_drop, "test backend teardown panicked");
+    }
+  }
+
+  fn polling_fixture() -> (TempDir, PathBuf, RelayConfig) {
+    let fixture = TempDir::new().unwrap();
+    let path = fixture.path().join("session_polling.jsonl");
+    std::fs::write(&path, "{\"type\":\"session\",\"id\":\"polling-session\"}\n").unwrap();
+    let mut config = RelayConfig::new(vec![ProviderRoot::new(Provider::Pi, fixture.path().to_path_buf())]);
+    config.poll_interval = Duration::from_millis(100);
+    (fixture, path, config)
+  }
+
+  fn append_polling_message(path: &Path) {
+    let mut file = OpenOptions::new().append(true).open(path).unwrap();
+    file
+      .write_all(
+        b"{\"type\":\"message\",\"id\":\"appended\",\"message\":{\"role\":\"user\",\"content\":\"still following\"}}\n",
+      )
+      .unwrap();
+  }
+
+  fn assert_waits_for_poll(relay: &mut SessionRelay) {
+    relay.poll.reset();
+    // A closed callback channel must not repeatedly return ready and spin.
+    assert!(
+      std::pin::pin!(relay.next_update())
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending()
+    );
+  }
+
+  #[tokio::test]
+  async fn watcher_creation_failure_still_announces_readiness_and_follows_by_polling() {
+    let (_fixture, path, config) = polling_fixture();
+    let mut ready = false;
+    let mut relay = SessionRelay::new_with_watcher(
+      config,
+      || {
+        ready = true;
+        Ok(())
+      },
+      |_tx| Err(notify::Error::generic("test watcher unavailable")),
+    )
+    .await
+    .unwrap();
+    assert!(ready);
+    let initial = relay.next_update().await.unwrap();
+    assert!(initial.records.is_empty());
+    assert_eq!(initial.warnings.len(), 1);
+    assert!(initial.warnings[0].contains("continuing with periodic polling"));
+    assert_waits_for_poll(&mut relay);
+    append_polling_message(&path);
+    let records = wait_for_events(&mut relay).await;
+    assert_eq!(records.len(), 1);
+    assert!(relay.next_update().await.unwrap().warnings.is_empty());
+  }
+
+  #[tokio::test]
+  async fn partial_registration_failure_retires_all_watches_before_readiness() {
+    let (_fixture, path, mut config) = polling_fixture();
+    let second = TempDir::new().unwrap();
+    config
+      .roots
+      .push(ProviderRoot::new(Provider::Pi, second.path().to_path_buf()));
+    let watches = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let mut relay = SessionRelay::new_with_watcher(
+      config,
+      || {
+        assert!(dropped.load(Ordering::SeqCst));
+        Ok(())
+      },
+      |wake_tx| {
+        Ok(Box::new(TestWatcher {
+          wake_tx: Some(wake_tx),
+          watches: watches.clone(),
+          dropped: dropped.clone(),
+          fail_on_watch: Some(2),
+          panic_on_drop: false,
+        }))
+      },
+    )
+    .await
+    .unwrap();
+    assert!(relay.watcher.is_none());
+    assert!(relay.watched_paths.is_empty());
+    assert_eq!(relay.next_update().await.unwrap().warnings.len(), 1);
+    append_polling_message(&path);
+    assert_eq!(wait_for_events(&mut relay).await.len(), 1);
+    assert_eq!(
+      watches.load(Ordering::SeqCst),
+      2,
+      "failed registrations must not be retried on every poll"
+    );
+  }
+
+  #[tokio::test]
+  async fn backend_error_runs_one_recovery_scan_then_polls_without_repeating_warnings() {
+    let (_fixture, path, config) = polling_fixture();
+    let mut sender = None;
+    let dropped = Arc::new(AtomicBool::new(false));
+    let mut relay = SessionRelay::new_with_watcher(
+      config,
+      || Ok(()),
+      |wake_tx| {
+        sender = Some(wake_tx.clone());
+        Ok(Box::new(TestWatcher {
+          wake_tx: Some(wake_tx),
+          watches: Arc::new(AtomicUsize::new(0)),
+          dropped: dropped.clone(),
+          fail_on_watch: None,
+          panic_on_drop: false,
+        }))
+      },
+    )
+    .await
+    .unwrap();
+    assert!(relay.next_update().await.unwrap().warnings.is_empty());
+    append_polling_message(&path);
+    sender.as_ref().unwrap().send(Err("backend failed".into())).unwrap();
+    sender
+      .as_ref()
+      .unwrap()
+      .send(Err("backend failed again".into()))
+      .unwrap();
+    drop(sender);
+    let recovery = relay.next_update().await.unwrap();
+    assert!(dropped.load(Ordering::SeqCst));
+    assert_eq!(recovery.records.len(), 1);
+    assert_eq!(recovery.warnings.len(), 1);
+    assert_waits_for_poll(&mut relay);
+    assert!(relay.next_update().await.unwrap().warnings.is_empty());
+  }
+
+  #[tokio::test]
+  async fn closed_watcher_channel_recovers_without_terminating_or_spinning() {
+    let (_fixture, path, config) = polling_fixture();
+    let mut relay = SessionRelay::new_with_watcher(
+      config,
+      || Ok(()),
+      |wake_tx| {
+        Ok(Box::new(TestWatcher {
+          wake_tx: Some(wake_tx),
+          watches: Arc::new(AtomicUsize::new(0)),
+          dropped: Arc::new(AtomicBool::new(false)),
+          fail_on_watch: None,
+          panic_on_drop: true,
+        }))
+      },
+    )
+    .await
+    .unwrap();
+    relay.next_update().await.unwrap();
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    relay.wake_rx = receiver;
+    drop(sender);
+    append_polling_message(&path);
+    let recovery = relay.next_update().await.unwrap();
+    assert_eq!(recovery.records.len(), 1);
+    assert_eq!(recovery.warnings.len(), 1);
+    assert!(relay.watcher.is_none());
+    assert_waits_for_poll(&mut relay);
+    assert!(relay.next_update().await.unwrap().warnings.is_empty());
   }
 
   #[tokio::test]
