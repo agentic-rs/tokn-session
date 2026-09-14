@@ -1213,6 +1213,8 @@ button:disabled {
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
+  /* React and ResizeObserver share one explicit reading-position anchor. */
+  overflow-anchor: none;
   scrollbar-gutter: stable;
 }
 
@@ -2592,6 +2594,16 @@ button:disabled {
 
 .detail-error span {
   color: var(--text-muted);
+}
+
+.detail-refresh-error {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+  color: var(--danger);
+  font-size: 10.5px;
 }
 
 .sidebar-backdrop {

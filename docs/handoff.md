@@ -129,6 +129,13 @@ and Inspector share viewer-core snapshots; External uses received snapshots. Fai
 mode/endpoint/native changes clear it. External services are never terminated.
 Live updates refresh loaded timeline/trajectory items even when scrolled up,
 retaining the reading position; New activity jumps to latest.
+One scroll controller handles committed updates and asynchronous layout changes,
+preserving follow intent through browser clamping and anchoring to visible child
+rows inside long trajectories. Loading earlier history preserves a row position
+rather than compensating for the total height (which can also grow at the end).
+Same-generation detail refreshes retain rendered content until replacement,
+including on retryable errors; session or snapshot-generation changes still
+invalidate old detail ownership.
 Refreshes are coalesced and page through one pinned snapshot. Append refreshes preserve expansion keys;
 generation resets invalidate them. Native remains optional and bounded in
 Inspector. Automatic now uses durable indexed unread tracking; External unread
@@ -414,8 +421,10 @@ by a work trajectory item; metadata-only stretches remain flat.
 Terminal bookkeeping written after a final reply also remains chronological,
 inspectable flat rows rather than creating a second `Worked` item.
 Observed turn starts show `Working for …` with a ticking elapsed time and
-auto-expand the trajectory. A final reply/turn closure changes it to `Worked`
-and auto-collapses once; manual reopening remains available. Without reliable
+auto-expand the trajectory while following the latest activity. A final reply/turn
+closure changes it to `Worked` and auto-collapses once while following; reading
+history preserves the current expansion. Jump to latest opens current work, and
+manual reopening remains available. Without reliable
 turn signals the label is neutral `Work`, not a claim of runtime activity.
 Duration uses provider timestamps, never session-file metadata.
 Expanding a trajectory lazily loads its contained normal event cards

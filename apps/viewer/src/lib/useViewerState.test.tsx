@@ -65,10 +65,12 @@ afterEach(() => {
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((resolvePromise) => {
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
     resolve = resolvePromise;
+    reject = rejectPromise;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 async function selectListedSession(
@@ -309,7 +311,97 @@ function ViewerPageCommitProbe() {
 }
 
 describe("useViewerState Relay updates", () => {
-  it("renders the session page working, updates a visible tool while scrolled up, then collapses finished work", async () => {
+  it.each(["timeline", "trajectory"])("retains visible %s detail through live refreshes and refresh errors", async (location) => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const isTrajectory = location === "trajectory";
+    const timelinePage = isTrajectory ? trajectoryEventPage() : toolEventPage();
+    if (isTrajectory) timelinePage.events[0].trajectory!.status = "working";
+    const trajectoryKey = timelinePage.events[0].event_key;
+    const eventKey = isTrajectory ? trajectoryChildPage().events[0].event_key : trajectoryKey;
+    const existing = { ...toolDetail("visible output"), event_key: eventKey };
+    vi.mocked(loadEventPage).mockResolvedValue(timelinePage);
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValue(trajectoryChildPage());
+    vi.mocked(loadEventDetail).mockResolvedValue(existing);
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.events).toHaveLength(1));
+    if (isTrajectory) {
+      await waitFor(() => expect(result.current.trajectoryPages.get("live")?.get(trajectoryKey)?.has_loaded).toBe(true));
+      act(() => result.current.toggleTrajectoryEventExpanded(trajectoryKey, eventKey));
+    } else {
+      act(() => {
+        result.current.toggleEventExpanded(eventKey);
+        result.current.selectEvent(eventKey);
+      });
+    }
+    const currentDetail = () => isTrajectory ? result.current.expandedTrajectoryDetail : result.current.expandedDetail;
+    const currentLoading = () => isTrajectory ? result.current.expandedTrajectoryDetailLoading : result.current.expandedDetailLoading;
+    const currentError = () => isTrajectory ? result.current.expandedTrajectoryDetailError : result.current.expandedDetailError;
+    await waitFor(() => expect(currentDetail()).toEqual(existing));
+
+    const failed = deferred<EventDetail>();
+    vi.mocked(loadEventDetail).mockReturnValue(failed.promise);
+    act(() => emit?.({ session_key: "live", reset: false }));
+    await waitFor(() => expect(loadEventDetail).toHaveBeenCalledTimes(2));
+    expect(currentDetail()).toEqual(existing);
+    expect(currentLoading()).toBe(true);
+    if (!isTrajectory) expect(result.current.detail).toEqual(existing);
+    await act(async () => failed.reject(new Error("temporarily unavailable")));
+    await waitFor(() => expect(currentError()).toBe("temporarily unavailable"));
+    expect(currentDetail()).toEqual(existing);
+    if (!isTrajectory) expect(result.current.detail).toEqual(existing);
+
+    const fresh = deferred<EventDetail>();
+    vi.mocked(loadEventDetail).mockReturnValue(fresh.promise);
+    act(() => emit?.({ session_key: "live", reset: false }));
+    await waitFor(() => expect(loadEventDetail).toHaveBeenCalledTimes(3));
+    expect(currentDetail()).toEqual(existing);
+    const replacement = { ...toolDetail("latest output"), event_key: eventKey };
+    await act(async () => fresh.resolve(replacement));
+    await waitFor(() => expect(currentDetail()).toEqual(replacement));
+    expect(currentLoading()).toBe(false);
+    expect(currentError()).toBeNull();
+    if (!isTrajectory) expect(result.current.detail).toEqual(replacement);
+  });
+
+  it("drops retained detail when the owner or snapshot generation changes", async () => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const page = toolEventPage();
+    page.events.push({ ...page.events[0], event_key: "event.v1.2" });
+    vi.mocked(loadEventPage).mockResolvedValue(page);
+    vi.mocked(loadEventDetail).mockResolvedValue(toolDetail("old owner output"));
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.events).toHaveLength(2));
+    act(() => {
+      result.current.toggleEventExpanded("event.v1.1");
+      result.current.selectEvent("event.v1.1");
+    });
+    await waitFor(() => expect(result.current.expandedDetail).toEqual(toolDetail("old owner output")));
+    vi.mocked(loadEventDetail).mockReturnValue(deferred<EventDetail>().promise);
+    act(() => {
+      result.current.toggleEventExpanded("event.v1.2");
+      result.current.selectEvent("event.v1.2");
+    });
+    expect(result.current.expandedDetail).toBeNull();
+    expect(result.current.detail).toBeNull();
+    act(() => result.current.toggleEventExpanded("event.v1.1"));
+    await waitFor(() => expect(result.current.expandedDetail).toEqual(toolDetail("old owner output")));
+    act(() => emit?.({ session_key: "live", reset: true }));
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(2));
+    expect(result.current.expandedEventKey).toBeNull();
+    expect(result.current.expandedDetail).toBeNull();
+    expect(result.current.detail).toBeNull();
+    act(() => result.current.toggleEventExpanded("event.v1.1"));
+    expect(result.current.expandedDetail).toBeNull();
+    expect(result.current.expandedDetailLoading).toBe(true);
+  });
+
+  it("updates visible work while scrolled up and keeps it expanded on completion", async () => {
     let emit: ((change: RelayChange) => void) | undefined;
     vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
     vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
@@ -324,6 +416,7 @@ describe("useViewerState Relay updates", () => {
     const timeline = container.querySelector<HTMLElement>(".conversation__timeline")!;
     Object.defineProperties(timeline, { scrollHeight: { configurable: true, value: 1000 }, clientHeight: { configurable: true, value: 300 } });
     timeline.scrollTop = 120;
+    fireEvent.wheel(timeline, { deltaY: -1 });
     fireEvent.scroll(timeline);
     const updated = trajectoryChildPage();
     updated.events[0].tool!.command = "cargo check";
@@ -335,8 +428,37 @@ describe("useViewerState Relay updates", () => {
     finished.events[0].trajectory!.status = "complete";
     vi.mocked(loadEventPage).mockResolvedValue(finished);
     act(() => emit?.({ session_key: "live", reset: false }));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Worked for 1h" })).toHaveAttribute("aria-expanded", "false"));
-    expect(screen.queryByText("cargo check")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Worked for 1h" })).toHaveAttribute("aria-expanded", "true"));
+    expect(screen.getByText("cargo check")).toBeInTheDocument();
+  });
+
+  it("keeps historical work expanded when newer work starts until the reader jumps to latest", async () => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const history = trajectoryEventPage().events[0];
+    const working = { ...history, event_key: "trajectory.v1.current", trajectory: { ...history.trajectory!, status: "working" as const } };
+    const page = { ...trajectoryEventPage(), events: [history, working], total_events: 2 };
+    vi.mocked(loadEventPage).mockResolvedValue(page);
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValue(trajectoryChildPage());
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.expandedEventKey).toBe(working.event_key));
+    act(() => {
+      result.current.setFollowingLive(false);
+      result.current.toggleEventExpanded(history.event_key);
+    });
+    const nextWorking = { ...working, event_key: "trajectory.v1.next" };
+    vi.mocked(loadEventPage).mockResolvedValue({
+      ...page,
+      events: [history, { ...working, trajectory: { ...working.trajectory, status: "complete" } }, nextWorking],
+      total_events: 3,
+    });
+    act(() => emit?.({ session_key: "live", reset: false }));
+    await waitFor(() => expect(result.current.events).toHaveLength(3));
+    expect(result.current.expandedEventKey).toBe(history.event_key);
+    act(() => result.current.showLiveActivity());
+    expect(result.current.expandedEventKey).toBe(nextWorking.event_key);
   });
 
   it("auto-expands active work, refreshes its children, respects manual collapse and closes on completion", async () => {

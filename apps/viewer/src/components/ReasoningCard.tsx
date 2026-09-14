@@ -3,6 +3,7 @@ import type { EventDetail, EventSummary } from "../lib/types";
 import { readableEventContent } from "../lib/state";
 import type { TechnicalCardHeading } from "./CardPresentation";
 import { MarkdownContent } from "./MarkdownContent";
+import { DetailRefreshError } from "./DetailRefreshError";
 
 interface ReasoningCardProps {
   event: EventSummary;
@@ -75,7 +76,7 @@ export function ReasoningCard({
       </p>
     );
   }
-  if (is_loading) {
+  if (is_loading && !detail) {
     return (
       <div className="reasoning-card__state" role="status">
         <span className="inline-spinner" aria-hidden="true" />
@@ -83,7 +84,7 @@ export function ReasoningCard({
       </div>
     );
   }
-  if (error) {
+  if (error && !detail) {
     return (
       <div className="reasoning-card__error" role="alert">
         <span>
@@ -98,16 +99,19 @@ export function ReasoningCard({
   }
 
   const content = readableEventContent(event, detail);
-  if (!content) {
-    return <p className="reasoning-card__notice">No readable reasoning was captured for this event.</p>;
-  }
-  const [firstSection, ...remainingSections] = content.sections;
+  const [firstSection, ...remainingSections] = content?.sections ?? [];
   if (!firstSection) {
-    return <p className="reasoning-card__notice">No readable reasoning was captured for this event.</p>;
+    return (
+      <div aria-busy={is_loading}>
+        <DetailRefreshError error={error} on_retry={on_retry} />
+        <p className="reasoning-card__notice">No readable reasoning was captured for this event.</p>
+      </div>
+    );
   }
 
   return (
-    <div className="reasoning-card">
+    <div aria-busy={is_loading} className="reasoning-card">
+      <DetailRefreshError error={error} on_retry={on_retry} />
       <ReasoningSection
         label={remainingSections.length > 0 ? firstSection.label : null}
         text={firstSection.text}

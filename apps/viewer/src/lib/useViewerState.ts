@@ -225,6 +225,7 @@ export function useViewerState() {
   const workingTrajectory = useRef<string | null>(null);
   const [expandedDetail, setExpandedDetail] = useState<EventDetail | null>(null);
   const [expandedDetailOwnerKey, setExpandedDetailOwnerKey] = useState<string | null>(null);
+  const expandedDetailOwnerKeyRef = useRef<string | null>(null);
   const [expandedDetailLoading, setExpandedDetailLoading] = useState(false);
   const [expandedDetailError, setExpandedDetailError] = useState<string | null>(null);
   const [expandedDetailAttempt, setExpandedDetailAttempt] = useState(0);
@@ -236,6 +237,7 @@ export function useViewerState() {
   const [expandedTrajectoryDetailOwnerKey, setExpandedTrajectoryDetailOwnerKey] = useState<
     string | null
   >(null);
+  const expandedTrajectoryDetailOwnerKeyRef = useRef<string | null>(null);
   const [expandedTrajectoryDetailLoading, setExpandedTrajectoryDetailLoading] = useState(false);
   const [expandedTrajectoryDetailError, setExpandedTrajectoryDetailError] = useState<string | null>(
     null,
@@ -415,26 +417,33 @@ export function useViewerState() {
     return request;
   }, []);
 
-  const invalidateEventDetails = useCallback(() => {
+  const invalidateEventDetails = useCallback((retainVisible: boolean) => {
     detailGeneration.current += 1;
     detailCache.current.clear();
     detailLoads.current.clear();
     detailRequest.current += 1;
     expandedDetailRequest.current += 1;
     expandedTrajectoryDetailRequest.current += 1;
-    detailOwnerKeyRef.current = null;
-    setDetailOwnerKey(null);
-    setDetail(null);
-    setDetailLoading(false);
     setDetailError(null);
-    setExpandedDetailOwnerKey(null);
-    setExpandedDetail(null);
-    setExpandedDetailLoading(false);
     setExpandedDetailError(null);
-    setExpandedTrajectoryDetailOwnerKey(null);
-    setExpandedTrajectoryDetail(null);
-    setExpandedTrajectoryDetailLoading(false);
     setExpandedTrajectoryDetailError(null);
+    // Appends retain event identities. Keep already displayed content while
+    // the cache and requests refresh, so detail cards do not shrink to loaders.
+    // Replacement generations can reuse source positions for different events.
+    if (!retainVisible) {
+      detailOwnerKeyRef.current = null;
+      setDetailOwnerKey(null);
+      setDetail(null);
+      setDetailLoading(false);
+      expandedDetailOwnerKeyRef.current = null;
+      setExpandedDetailOwnerKey(null);
+      setExpandedDetail(null);
+      setExpandedDetailLoading(false);
+      expandedTrajectoryDetailOwnerKeyRef.current = null;
+      setExpandedTrajectoryDetailOwnerKey(null);
+      setExpandedTrajectoryDetail(null);
+      setExpandedTrajectoryDetailLoading(false);
+    }
     setDetailRevision((revision) => revision + 1);
   }, []);
 
@@ -462,6 +471,7 @@ export function useViewerState() {
     setTrajectoryPages(next);
     expandedTrajectoryDetailRequest.current += 1;
     setExpandedTrajectoryEvent(null);
+    expandedTrajectoryDetailOwnerKeyRef.current = null;
     setExpandedTrajectoryDetailOwnerKey(null);
     setExpandedTrajectoryDetail(null);
     setExpandedTrajectoryDetailLoading(false);
@@ -470,6 +480,7 @@ export function useViewerState() {
 
   const showLiveActivity = useCallback(() => {
     followingLive.current = true;
+    if (workingTrajectory.current) setExpandedEventKey(workingTrajectory.current);
     liveRefresh.current = true;
     setPendingLiveActivity(false);
     setEventsAttempt((attempt) => attempt + 1);
@@ -516,7 +527,11 @@ export function useViewerState() {
     const previous = workingTrajectory.current;
     if (active !== previous) {
       workingTrajectory.current = active;
-      setExpandedEventKey((current) => active ?? (current === previous ? null : current));
+      // A reader's expanded history must not disappear when a turn finishes
+      // or newer work begins. Jump to latest restores the active trajectory.
+      if (followingLive.current) {
+        setExpandedEventKey((current) => active ?? (current === previous ? null : current));
+      }
     }
   }, [events, eventsOwnerKey, selectedSessionKey]);
 
@@ -684,6 +699,7 @@ export function useViewerState() {
     setHistoryStatus(null);
     setEventsError(null);
     setExpandedEventKey(null);
+    expandedDetailOwnerKeyRef.current = null;
     setExpandedDetailOwnerKey(null);
     setExpandedDetail(null);
     setExpandedDetailLoading(false);
@@ -985,7 +1001,7 @@ export function useViewerState() {
         if (eventsRequest.current !== requestId) {
           return;
         }
-        invalidateEventDetails();
+        invalidateEventDetails(isLiveRefresh && !reset);
         if (isLiveRefresh && !reset) {
           // Invalidate in-flight child reads, but retain their displayed rows
           // until a fresh bounded child page arrives (no loading flicker).
@@ -1085,17 +1101,18 @@ export function useViewerState() {
 
   useEffect(() => {
     const requestId = ++detailRequest.current;
-    setDetail(null);
     setDetailError(null);
 
     if (!inspectorOpen || !selectedSessionKey || !selectedEventKey) {
       detailOwnerKeyRef.current = null;
       setDetailOwnerKey(null);
+      setDetail(null);
       setDetailLoading(false);
       return;
     }
 
     const cacheKey = `${selectedSessionKey}:${selectedEventKey}`;
+    if (detailOwnerKeyRef.current !== cacheKey) setDetail(null);
     detailOwnerKeyRef.current = cacheKey;
     setDetailOwnerKey(cacheKey);
     const cached = readCachedDetail(detailCache.current, cacheKey);
@@ -1134,17 +1151,20 @@ export function useViewerState() {
 
   useEffect(() => {
     const requestId = ++expandedDetailRequest.current;
-    setExpandedDetail(null);
     setExpandedDetailError(null);
 
     const expandedEvent = events.find((event) => event.event_key === expandedEventKey);
     if (!selectedSessionKey || !expandedEventKey || !expandedEventNeedsDetail(expandedEvent)) {
+      expandedDetailOwnerKeyRef.current = null;
       setExpandedDetailOwnerKey(null);
+      setExpandedDetail(null);
       setExpandedDetailLoading(false);
       return;
     }
 
     const cacheKey = `${selectedSessionKey}:${expandedEventKey}`;
+    if (expandedDetailOwnerKeyRef.current !== cacheKey) setExpandedDetail(null);
+    expandedDetailOwnerKeyRef.current = cacheKey;
     setExpandedDetailOwnerKey(cacheKey);
     const cached = readCachedDetail(detailCache.current, cacheKey);
     if (cached) {
@@ -1198,11 +1218,12 @@ export function useViewerState() {
 
   useEffect(() => {
     const requestId = ++expandedTrajectoryDetailRequest.current;
-    setExpandedTrajectoryDetail(null);
     setExpandedTrajectoryDetailError(null);
 
     if (!selectedSessionKey || !expandedTrajectoryEvent) {
+      expandedTrajectoryDetailOwnerKeyRef.current = null;
       setExpandedTrajectoryDetailOwnerKey(null);
+      setExpandedTrajectoryDetail(null);
       setExpandedTrajectoryDetailLoading(false);
       return;
     }
@@ -1211,12 +1232,16 @@ export function useViewerState() {
       ?.get(expandedTrajectoryEvent.trajectory_key)
       ?.events.find((event) => event.event_key === expandedTrajectoryEvent.event_key);
     if (!expandedEventNeedsDetail(childEvent)) {
+      expandedTrajectoryDetailOwnerKeyRef.current = null;
       setExpandedTrajectoryDetailOwnerKey(null);
+      setExpandedTrajectoryDetail(null);
       setExpandedTrajectoryDetailLoading(false);
       return;
     }
 
     const cacheKey = `${selectedSessionKey}:${expandedTrajectoryEvent.event_key}`;
+    if (expandedTrajectoryDetailOwnerKeyRef.current !== cacheKey) setExpandedTrajectoryDetail(null);
+    expandedTrajectoryDetailOwnerKeyRef.current = cacheKey;
     setExpandedTrajectoryDetailOwnerKey(cacheKey);
     const cached = readCachedDetail(detailCache.current, cacheKey);
     if (cached) {
@@ -1487,7 +1512,7 @@ export function useViewerState() {
         if (eventsRequest.current !== requestGeneration) {
           return;
         }
-        invalidateEventDetails();
+        invalidateEventDetails(true);
         setEvents((current) => mergeEvents(current, response.events, "before"));
         setOlderCursor(response.previous_cursor);
         setTotalEvents(response.total_events);
@@ -1526,7 +1551,7 @@ export function useViewerState() {
         if (eventsRequest.current !== requestGeneration) {
           return;
         }
-        invalidateEventDetails();
+        invalidateEventDetails(true);
         setEvents((current) => mergeEvents(current, response.events, "after"));
         setNewerCursor(response.next_cursor);
         setTotalEvents(response.total_events);
