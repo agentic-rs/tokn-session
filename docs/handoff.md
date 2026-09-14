@@ -138,7 +138,8 @@ including on retryable errors; session or snapshot-generation changes still
 invalidate old detail ownership.
 Refreshes are coalesced and page through one pinned snapshot. Append refreshes preserve expansion keys.
 Live generation resets keep the last-good view until the replacement timeline
-and followed working turn are ready, then publish them together. Fresh child
+and expanded turn are ready, then publish them together. A surviving trajectory
+slot keeps its disclosure choice while its child data is replaced. Fresh child
 pages preserve the previously loaded count instead of reverting to 40 rows;
 old selection/detail identities are invalidated at that commit. Failed resets
 retain the view and retry as replacements. Native remains optional and bounded in
@@ -425,10 +426,12 @@ by a work trajectory item; metadata-only stretches remain flat.
 Terminal bookkeeping written after a final reply also remains chronological,
 inspectable flat rows rather than creating a second `Worked` item.
 Observed turn starts show `Working for …` with a ticking elapsed time and
-auto-expand the trajectory while following the latest activity. A final reply/turn
-closure changes it to `Worked` and auto-collapses once while following; reading
-history preserves the current expansion. Jump to latest opens current work, and
-manual reopening remains available. Without reliable
+auto-expand while following if no older section is open. The latest working
+turn auto-collapses once when it transitions to `Worked` while following.
+Already finished turns reopened by the reader stay open when newer items or
+turns arrive, including generation resets. Manual collapses of the same turn
+survive refreshes and pending requests.
+Jump to latest explicitly opens current work. Without reliable
 turn signals the label is neutral `Work`, not a claim of runtime activity.
 Duration uses provider timestamps, never session-file metadata.
 Expanding a trajectory lazily loads its contained normal event cards

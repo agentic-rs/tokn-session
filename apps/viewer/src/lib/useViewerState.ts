@@ -224,6 +224,9 @@ export function useViewerState() {
   const detailGeneration = useRef(0);
   const [detailRevision, setDetailRevision] = useState(0);
   const [expandedEventKey, setExpandedEventKey] = useState<string | null>(null);
+  const expandedEventKeyRef = useRef<string | null>(null);
+  const manualExpansion = useRef(false);
+  const expansionRevision = useRef(0);
   const workingTrajectory = useRef<string | null>(null);
   const [expandedDetail, setExpandedDetail] = useState<EventDetail | null>(null);
   const [expandedDetailOwnerKey, setExpandedDetailOwnerKey] = useState<string | null>(null);
@@ -246,6 +249,11 @@ export function useViewerState() {
   );
   const [expandedTrajectoryDetailAttempt, setExpandedTrajectoryDetailAttempt] = useState(0);
   const expandedTrajectoryDetailRequest = useRef(0);
+
+  const applyExpandedEventKey = useCallback((key: string | null) => {
+    expandedEventKeyRef.current = key;
+    setExpandedEventKey(key);
+  }, []);
 
   const applySessionIndexProgress = useCallback(
     (next: SessionIndexProgress, source: "event" | "snapshot" | "retry") => {
@@ -501,11 +509,13 @@ export function useViewerState() {
 
   const showLiveActivity = useCallback(() => {
     followingLive.current = true;
-    if (workingTrajectory.current) setExpandedEventKey(workingTrajectory.current);
+    manualExpansion.current = false;
+    expansionRevision.current += 1;
+    if (workingTrajectory.current) applyExpandedEventKey(workingTrajectory.current);
     liveRefresh.current = true;
     setPendingLiveActivity(false);
     setEventsAttempt((attempt) => attempt + 1);
-  }, []);
+  }, [applyExpandedEventKey]);
 
   const setFollowingLive = useCallback((following: boolean) => {
     followingLive.current = following;
@@ -549,13 +559,22 @@ export function useViewerState() {
     const previous = workingTrajectory.current;
     if (active !== previous) {
       workingTrajectory.current = active;
-      // A reader's expanded history must not disappear when a turn finishes
-      // or newer work begins. Jump to latest restores the active trajectory.
       if (followingLive.current) {
-        setExpandedEventKey((current) => active ?? (current === previous ? null : current));
+        // Only the turn that was working can finish automatically. A finished
+        // turn reopened by the reader must survive newer activity unchanged.
+        const expanded = expandedEventKeyRef.current;
+        const finished = previous !== null && expanded === previous
+          && events.find((event) => event.event_key === previous)?.trajectory?.status === "complete";
+        if (finished) {
+          manualExpansion.current = false;
+          applyExpandedEventKey(active);
+        } else if (active && !expanded) {
+          manualExpansion.current = false;
+          applyExpandedEventKey(active);
+        }
       }
     }
-  }, [events, eventsOwnerKey, selectedSessionKey]);
+  }, [applyExpandedEventKey, events, eventsOwnerKey, selectedSessionKey]);
 
   const requestTrajectoryEventPage = useCallback(
     (
@@ -720,14 +739,16 @@ export function useViewerState() {
     setTotalEvents(null);
     setHistoryStatus(null);
     setEventsError(null);
-    setExpandedEventKey(null);
+    manualExpansion.current = false;
+    expansionRevision.current += 1;
+    applyExpandedEventKey(null);
     expandedDetailOwnerKeyRef.current = null;
     setExpandedDetailOwnerKey(null);
     setExpandedDetail(null);
     setExpandedDetailLoading(false);
     setExpandedDetailError(null);
     applyEventSelection(null, false);
-  }, [applyEventSelection, clearTrajectoryPages]);
+  }, [applyEventSelection, applyExpandedEventKey, clearTrajectoryPages]);
 
   const closeInspector = useCallback(() => {
     const trigger = inspectorTriggerRef.current;
@@ -1005,6 +1026,7 @@ export function useViewerState() {
 
     setEventsLoading(true);
     eventRefreshInFlight.current = true;
+    const refreshExpansionRevision = expansionRevision.current;
     const page = isLiveRefresh
       ? refreshEventWindow(selectedSessionKey, eventsRef.current, EVENT_PAGE_SIZE, loadEventPage, () => eventsRequest.current === requestId, reset)
       : loadEventPage({
@@ -1018,21 +1040,52 @@ export function useViewerState() {
           return;
         }
         const active = [...response.events].reverse().find((event) => event.trajectory?.status === "working");
-        let replacement: TrajectoryEventPageResponse | null = null;
-        if (isLiveRefresh && reset && active && followingLive.current) {
-          // Keep the complete old view mounted until the new working turn is
+        let replacement: { trajectory_key: string; page: TrajectoryEventPageResponse } | null = null;
+        let finishedExpandedTurn = false;
+        while (isLiveRefresh && reset) {
+          const revision = expansionRevision.current;
+          const expanded = eventsRef.current.find((event) => event.event_key === expandedEventKeyRef.current);
+          // Disclosure state can stay open for a surviving trajectory slot.
+          // Its old child rows and detail ownership are never reused on reset.
+          const retained = expanded?.type === "trajectory"
+            ? response.events.find((event) => event.event_key === expanded.event_key
+              && event.type === "trajectory" && event.provider === expanded.provider)
+            : undefined;
+          finishedExpandedTurn = followingLive.current && expanded?.event_key === workingTrajectory.current
+            && expanded?.trajectory?.status === "working" && retained?.trajectory?.status === "complete";
+          const autoOpen = followingLive.current && (!manualExpansion.current
+            || (revision === refreshExpansionRevision && active?.event_key !== workingTrajectory.current));
+          const target = (finishedExpandedTurn ? undefined : retained) ?? (autoOpen ? active : undefined);
+          replacement = null;
+          if (!target) break;
+          const selectionIsCurrent = () => expansionRevision.current === revision
+            && (target === retained || followingLive.current);
+          // Keep the complete old view mounted until the replacement turn is
           // ready. Clearing it first collapses the conversation, then expands
           // it again with only the latest 40 rows. Carry the loaded count into
           // the replacement, without trusting identities from an old generation.
           const previous = trajectoryPagesRef.current.get(selectedSessionKey)
-            ?.get(workingTrajectory.current ?? "")?.events ?? [];
-          replacement = await refreshTrajectoryWindow({
-            session_key: selectedSessionKey,
-            trajectory_key: active.event_key,
-            direction: "backward",
-            limit: TRAJECTORY_EVENT_PAGE_SIZE,
-          }, previous, loadTrajectoryEventPage, () => eventsRequest.current === requestId, true);
+            ?.get(expanded?.event_key ?? workingTrajectory.current ?? "");
+          let refreshed: TrajectoryEventPageResponse;
+          try {
+            refreshed = await refreshTrajectoryWindow({
+              session_key: selectedSessionKey,
+              trajectory_key: target.event_key,
+              direction: target.trajectory?.status === "working" || previous?.next_cursor === null
+                ? "backward" : "forward",
+              limit: TRAJECTORY_EVENT_PAGE_SIZE,
+            }, previous?.events ?? [], loadTrajectoryEventPage,
+            () => eventsRequest.current === requestId && selectionIsCurrent(), true);
+          } catch (error: unknown) {
+            if (eventsRequest.current !== requestId) return;
+            if (!selectionIsCurrent()) continue;
+            throw error;
+          }
           if (eventsRequest.current !== requestId) return;
+          // A disclosure click during loading wins over the staged choice.
+          if (!selectionIsCurrent()) continue;
+          replacement = { trajectory_key: target.event_key, page: refreshed };
+          break;
         }
         if (reset) {
           // Publish the replacement as one React update. Old source positions
@@ -1041,12 +1094,13 @@ export function useViewerState() {
           clearTrajectoryPages();
           applyEventSelection(null, false);
           workingTrajectory.current = active?.event_key ?? null;
-          setExpandedEventKey(replacement && followingLive.current ? active!.event_key : null);
+          if (finishedExpandedTurn) manualExpansion.current = false;
+          applyExpandedEventKey(replacement?.trajectory_key ?? null);
           if (replacement) {
             const ready = replacement;
-            updateTrajectoryPage(selectedSessionKey, active!.event_key, () => ({
+            updateTrajectoryPage(selectedSessionKey, ready.trajectory_key, () => ({
               ...emptyTrajectoryEventPageState(),
-              ...ready,
+              ...ready.page,
               has_loaded: true,
             }));
           }
@@ -1093,6 +1147,7 @@ export function useViewerState() {
       });
   }, [
     applyEventSelection,
+    applyExpandedEventKey,
     clearTrajectoryPages,
     eventsAttempt,
     invalidateEventDetails,
@@ -1432,8 +1487,10 @@ export function useViewerState() {
   }, [applyEventSelection]);
 
   const toggleEventExpanded = useCallback((eventKey: string) => {
-    setExpandedEventKey((current) => current === eventKey ? null : eventKey);
-  }, []);
+    manualExpansion.current = true;
+    expansionRevision.current += 1;
+    applyExpandedEventKey(expandedEventKeyRef.current === eventKey ? null : eventKey);
+  }, [applyExpandedEventKey]);
 
   const toggleTrajectoryEventExpanded = useCallback((trajectoryKey: string, eventKey: string) => {
     setExpandedTrajectoryEvent((current) => (
