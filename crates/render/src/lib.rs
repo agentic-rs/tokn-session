@@ -311,7 +311,16 @@ pub fn render_event_pretty(event: &AgentEvent) -> String {
     }
     AgentEvent::AgentActivity(event) => {
       output.push_str(&render_agent_activity_summary(event));
-      output.push_str("\n\n");
+      output.push('\n');
+      if let Some(communication) = &event.communication {
+        if let Some(text) = &communication.text {
+          write_indented(&mut output, text);
+        }
+        if communication.has_encrypted_content {
+          write_indented(&mut output, "[Encrypted content unavailable]");
+        }
+      }
+      output.push('\n');
     }
     AgentEvent::ToolCall(event) => {
       render_tool(&mut output, event);
@@ -458,14 +467,32 @@ fn render_usage(event: &UsageEvent) -> String {
 
 fn render_agent_activity_summary(event: &AgentActivity) -> String {
   let target = event.target_agent_path.as_deref().unwrap_or("unknown agent");
-  let mut summary = match event.actor_agent_path.as_deref() {
-    Some(actor) => format!("{actor} → {target} {}", event.kind),
-    None => match event.kind.as_str() {
-      "started" => format!("agent started {target}"),
-      "interacted" => format!("interaction with {target}"),
-      "interrupted" => format!("agent interrupted {target}"),
-      kind => format!("agent activity {kind} {target}"),
-    },
+  let mut summary = if let Some(communication) = &event.communication {
+    let actor = event
+      .actor_agent_path
+      .as_deref()
+      .or(event.actor_session_id.as_deref())
+      .unwrap_or("unknown agent");
+    let recipient = event
+      .target_agent_path
+      .as_deref()
+      .or(event.target_session_id.as_deref())
+      .unwrap_or("unknown agent");
+    let mut summary = format!("Message from {actor} → {recipient}");
+    if communication.trigger_turn == Some(true) {
+      summary.push_str(" (starts turn)");
+    }
+    summary
+  } else {
+    match event.actor_agent_path.as_deref() {
+      Some(actor) => format!("{actor} → {target} {}", event.kind),
+      None => match event.kind.as_str() {
+        "started" => format!("agent started {target}"),
+        "interacted" => format!("interaction with {target}"),
+        "interrupted" => format!("agent interrupted {target}"),
+        kind => format!("agent activity {kind} {target}"),
+      },
+    }
   };
   if let Some(event_id) = &event.event_id {
     summary.push_str(" #");
@@ -806,8 +833,8 @@ mod tests {
 
   use serde_json::json;
   use tokn_session_core::{
-    AgentActivity, AgentEvent, GoalUpdated, LoadedSession, MessageDelivery, MessageEvent, Provider, ProviderChanged,
-    ReasoningEvent, SessionRef, SessionSettingsApplied, ToolRecordKind, ToolTransport, UnknownEvent,
+    AgentActivity, AgentCommunication, AgentEvent, GoalUpdated, LoadedSession, MessageDelivery, MessageEvent, Provider,
+    ProviderChanged, ReasoningEvent, SessionRef, SessionSettingsApplied, ToolRecordKind, ToolTransport, UnknownEvent,
   };
 
   use super::*;
@@ -988,6 +1015,57 @@ mod tests {
       render_event_summary(&event),
       "/root/researcher → /root interacted #call-agent"
     );
+  }
+
+  #[test]
+  fn renders_agent_communication_body_without_putting_it_in_summary() {
+    let mut event = agent_activity(Some("/root/researcher"));
+    let AgentEvent::AgentActivity(activity) = &mut event else {
+      unreachable!();
+    };
+    activity.communication = Some(AgentCommunication {
+      text: Some("## Findings\n\n- Keep **Markdown** and `code`.\n- [Source](https://example.com)".into()),
+      has_encrypted_content: false,
+      trigger_turn: Some(true),
+    });
+
+    let display = display_event(&event);
+    assert_eq!(
+      display.summary,
+      "Message from /root/researcher → /root (starts turn) #call-agent"
+    );
+    assert_eq!(
+      display.detail,
+      concat!(
+        "Message from /root/researcher → /root (starts turn) #call-agent\n",
+        "  ## Findings\n  \n",
+        "  - Keep **Markdown** and `code`.\n",
+        "  - [Source](https://example.com)\n\n"
+      )
+    );
+  }
+
+  #[test]
+  fn renders_mixed_and_encrypted_agent_communication_without_ciphertext() {
+    for text in [None, Some("Readable portion")] {
+      let mut event = agent_activity(None);
+      let AgentEvent::AgentActivity(activity) = &mut event else {
+        unreachable!();
+      };
+      activity.actor_session_id = Some("sender-session".into());
+      activity.communication = Some(AgentCommunication {
+        text: text.map(str::to_owned),
+        has_encrypted_content: true,
+        trigger_turn: Some(false),
+      });
+      activity.native = Some(json!({"encrypted_content": "private-ciphertext"}));
+
+      let display = display_event(&event);
+      assert_eq!(display.summary, "Message from sender-session → /root #call-agent");
+      assert!(display.detail.contains("  [Encrypted content unavailable]\n"));
+      assert_eq!(display.detail.contains("  Readable portion\n"), text.is_some());
+      assert!(!display.detail.contains("private-ciphertext"));
+    }
   }
 
   #[test]
@@ -1459,6 +1537,7 @@ mod tests {
       target_session_id: Some("root-session".to_string()),
       target_agent_path: Some("/root".to_string()),
       kind: "interacted".to_string(),
+      communication: None,
       occurred_at_ms: Some(1_784_915_647_361),
       native: None,
       timestamp: Some("2026-07-24T17:54:07.361Z".to_string()),

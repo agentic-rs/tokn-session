@@ -590,6 +590,7 @@ fn normalize_subagent_item(
     target_session_id: Some(target_session_id),
     target_agent_path: Some(target_agent_path),
     kind,
+    communication: None,
     occurred_at_ms: Some(occurred_at_ms),
     native: Some(payload.clone()),
     timestamp,

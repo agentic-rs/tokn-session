@@ -32,7 +32,7 @@ export function readableEventContent(
   summary: EventSummary,
   detail: EventDetail | null,
 ): ReadableEventContent | null {
-  if (!detail || detail.is_hidden || summary.is_hidden) {
+  if (!detail || detail.event_key !== summary.event_key || detail.is_hidden || summary.is_hidden) {
     return null;
   }
   const event = jsonObject(detail.event);
@@ -46,6 +46,11 @@ export function readableEventContent(
   if (summary.type === "compaction") {
     const text = readableString(event.summary);
     return text ? { sections: [{ label: "Summary", text }] } : null;
+  }
+  if (summary.type === "agent_activity" && summary.agent_activity?.communication) {
+    const communication = event.communication ? jsonObject(event.communication) : null;
+    const text = communication ? readableString(communication.text) : null;
+    return text ? { sections: [{ label: null, text }] } : null;
   }
   if (summary.type !== "reasoning") {
     return null;

@@ -295,9 +295,21 @@ export interface SessionChildrenState {
 export interface AgentActivityCardSummary {
   kind: string;
   event_id: string | null;
+  actor_session_id?: string | null;
+  actor_agent_path?: string | null;
+  /** Present only when the sender resolves unambiguously relative to this task. */
+  actor?: SessionSummary | null;
   target_session_id: string | null;
   target_agent_path: string | null;
   target: SessionSummary | null;
+  /** Safe metadata only; readable message text stays behind event detail. */
+  communication?: AgentCommunicationCardSummary | null;
+}
+
+export interface AgentCommunicationCardSummary {
+  has_text: boolean;
+  has_encrypted_content: boolean;
+  trigger_turn: boolean | null;
 }
 
 /**

@@ -54,7 +54,7 @@ interface ConversationProps {
   on_trajectory_retry: (trajectory_key: string) => void;
   on_trajectory_event_toggle: (trajectory_key: string, event_key: string) => void;
   on_trajectory_retry_expanded_detail: (trajectory_key: string, event_key: string) => void;
-  on_open_subagent: (parent_session_key: string, target: SessionSummary) => void;
+  on_open_related_session: (source_session_key: string, target: SessionSummary) => void;
   on_load_older: () => void;
   on_load_newer: () => void;
   on_retry: () => void;
@@ -97,7 +97,7 @@ export function Conversation({
   on_trajectory_retry,
   on_trajectory_event_toggle,
   on_trajectory_retry_expanded_detail,
-  on_open_subagent,
+  on_open_related_session,
   on_load_older,
   on_load_newer,
   on_retry,
@@ -341,9 +341,9 @@ export function Conversation({
                 on_trajectory_retry_expanded_detail={on_trajectory_retry_expanded_detail}
                 on_select={on_event_select}
                 on_toggle={on_event_toggle}
-                on_open_subagent={(target) => {
+                on_open_related_session={(target) => {
                   if (session) {
-                    on_open_subagent(session.session_key, target);
+                    on_open_related_session(session.session_key, target);
                   }
                 }}
                 on_retry_detail={on_retry_expanded_detail}

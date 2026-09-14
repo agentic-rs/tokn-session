@@ -93,6 +93,9 @@ function expandedEventNeedsDetail(event: EventSummary | null | undefined): boole
   if (event.type === "compaction") {
     return event.compaction?.has_summary === true;
   }
+  if (event.type === "agent_activity") {
+    return event.agent_activity?.communication?.has_text === true;
+  }
   return event.type === "reasoning"
     && event.reasoning !== null
     && !event.reasoning.is_redacted
@@ -153,6 +156,9 @@ export function useViewerState() {
   const sessionChildRequests = useRef(new Map<string, number>());
   const [selectedSessionKey, setSelectedSessionKey] = useState<string | null>(null);
   const selectedSessionKeyRef = useRef<string | null>(null);
+  // A verified communication sender can be outside the loaded sidebar pages.
+  // Keep its selected metadata without asserting any new parent/child edge.
+  const [selectedSessionMetadata, setSelectedSessionMetadata] = useState<SessionSummary | null>(null);
   const [sessionsLoading, setSessionsLoading] = useState(true);
   const [sessionsLoadingMore, setSessionsLoadingMore] = useState(false);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
@@ -658,7 +664,7 @@ export function useViewerState() {
     }
   }, []);
 
-  const applySessionSelection = useCallback((sessionKey: string | null) => {
+  const applySessionSelection = useCallback((sessionKey: string | null, metadata?: SessionSummary) => {
     if (selectedSessionKeyRef.current === sessionKey) {
       return;
     }
@@ -672,6 +678,7 @@ export function useViewerState() {
     expandedDetailRequest.current += 1;
     clearTrajectoryPages();
     setSelectedSessionKey(sessionKey);
+    setSelectedSessionMetadata(metadata?.session_key === sessionKey ? metadata : null);
     setEventsOwnerKey(null);
     setInitialPageSessionKey(null);
     setEvents([]);
@@ -824,25 +831,38 @@ export function useViewerState() {
     }
   }, [requestSessionChildPage]);
 
-  const openSubagent = useCallback((parentSessionKey: string, target: SessionSummary) => {
-    // The target came from an activity event in this exact parent timeline.
+  const selectedSession = useMemo(
+    () => findKnownSession(sessions, sessionChildren, selectedSessionKey)
+      ?? (selectedSessionMetadata?.session_key === selectedSessionKey ? selectedSessionMetadata : null),
+    [selectedSessionKey, selectedSessionMetadata, sessionChildren, sessions],
+  );
+
+  const openRelatedSession = useCallback((sourceSessionKey: string, target: SessionSummary) => {
+    // The target came from an activity event in this exact source timeline.
     // Ignore a stale card after the user has already selected another session.
-    if (selectedSessionKeyRef.current !== parentSessionKey) {
+    if (selectedSessionKeyRef.current !== sourceSessionKey
+      || selectedSession?.session_key !== sourceSessionKey) {
       return;
     }
-    updateSessionChildren(parentSessionKey, (existing) => ({
-      sessions: mergeSessions(existing?.sessions ?? [], [target]),
-      next_cursor: existing?.next_cursor ?? null,
-      is_loading: existing?.is_loading ?? false,
-      is_loading_more: existing?.is_loading_more ?? false,
-      error: existing?.error ?? null,
-    }));
-    // Fetch the normal sidebar page in the background. It retains the
-    // injected target and restores any siblings omitted from the card.
-    requestSessionChildPage(parentSessionKey, null, true);
-    applySessionSelection(target.session_key);
+    const isDirectChild = target.session_key !== sourceSessionKey
+      && target.provider === selectedSession.provider
+      && target.is_subagent
+      && target.parent_session_id === selectedSession.session_id;
+    if (isDirectChild) {
+      updateSessionChildren(sourceSessionKey, (existing) => ({
+        sessions: mergeSessions(existing?.sessions ?? [], [target]),
+        next_cursor: existing?.next_cursor ?? null,
+        is_loading: existing?.is_loading ?? false,
+        is_loading_more: existing?.is_loading_more ?? false,
+        error: existing?.error ?? null,
+      }));
+      // Fetch the normal sidebar page for verified direct children only.
+      // Parent, sibling, and deeper sender links must not rewrite this tree.
+      requestSessionChildPage(sourceSessionKey, null, true);
+    }
+    applySessionSelection(target.session_key, target);
     setMobileSidebarOpen(false);
-  }, [applySessionSelection, requestSessionChildPage, updateSessionChildren]);
+  }, [applySessionSelection, requestSessionChildPage, selectedSession, updateSessionChildren]);
 
   useEffect(() => {
     if (!sessionIndexListenerReady) {
@@ -1275,10 +1295,6 @@ export function useViewerState() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [closeInspector, inspectorOpen, mobileSidebarOpen]);
 
-  const selectedSession = useMemo(
-    () => findKnownSession(sessions, sessionChildren, selectedSessionKey),
-    [selectedSessionKey, sessionChildren, sessions],
-  );
   const eventsAreOwned = selectedSessionKey !== null && eventsOwnerKey === selectedSessionKey;
   const visibleEvents = eventsAreOwned ? events : [];
   const selectedEvent = useMemo(() => {
@@ -1560,7 +1576,7 @@ export function useViewerState() {
     loadSessionChildren,
     retrySessionChildren,
     loadMoreSessionChildren,
-    openSubagent,
+    openRelatedSession,
     selectedSession,
     selectedSessionKey,
     selectSession,

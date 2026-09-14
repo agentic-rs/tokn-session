@@ -747,7 +747,7 @@ describe("useViewerState session-index signalling", () => {
 
     await selectListedSession(result, root.session_key);
     await waitFor(() => expect(result.current.selectedSessionKey).toBe(root.session_key));
-    act(() => result.current.openSubagent(root.session_key, child));
+    act(() => result.current.openRelatedSession(root.session_key, child));
     await waitFor(() => expect(result.current.selectedSessionKey).toBe(child.session_key));
     await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(2));
 
@@ -1140,6 +1140,165 @@ describe("useViewerState expanded reasoning detail", () => {
   });
 });
 
+describe("useViewerState related-session navigation", () => {
+  const root = { ...session("codex:root"), child_count: 1 };
+  const source = { ...session("codex:source"), parent_session_id: root.session_id, is_subagent: true };
+
+  beforeEach(() => {
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [root], next_cursor: null, source_errors: [], pending_providers: [],
+    });
+    vi.mocked(listSessionChildren).mockResolvedValue({ sessions: [source], next_cursor: null });
+    vi.mocked(loadEventPage).mockResolvedValue(toolEventPage());
+  });
+
+  it.each(["parent", "sibling", "grandchild"])("opens a verified %s sender without changing the sidebar ancestry", async (kind) => {
+    const target = kind === "parent" ? root : {
+      ...session(`codex:${kind}`), is_subagent: true,
+      parent_session_id: kind === "sibling" ? root.session_id : "codex:unloaded-middle-task",
+    };
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, root.session_key);
+    act(() => result.current.loadSessionChildren(root.session_key));
+    await waitFor(() => expect(result.current.sessionChildren.get(root.session_key)?.sessions).toEqual([source]));
+    act(() => result.current.selectSession(source.session_key));
+    await waitFor(() => expect(result.current.selectedSession).toEqual(source));
+    const initialTree = result.current.sessionChildren;
+    act(() => result.current.openRelatedSession(source.session_key, target));
+    await waitFor(() => expect(result.current.selectedSession).toEqual(target));
+    expect(result.current.selectedSessionKey).toBe(target.session_key);
+    expect(result.current.sessionChildren).toBe(initialTree);
+    expect(result.current.sessionChildren.has(source.session_key)).toBe(false);
+    expect(listSessionChildren).toHaveBeenCalledOnce();
+    await waitFor(() => expect(loadEventPage).toHaveBeenLastCalledWith(expect.objectContaining({ session_key: target.session_key })));
+
+    // Background root refreshes must not erase a selected sender whose
+    // metadata never belonged to the currently loaded child page.
+    act(() => result.current.retrySessions());
+    await waitFor(() => expect(listSessions).toHaveBeenCalledTimes(2));
+    expect(result.current.selectedSession).toEqual(target);
+    expect(result.current.sessionChildren).toBe(initialTree);
+  });
+
+  it("ignores a sender button from a previously selected task", async () => {
+    const sibling = { ...session("codex:sibling"), is_subagent: true, parent_session_id: root.session_id };
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, root.session_key);
+    act(() => result.current.loadSessionChildren(root.session_key));
+    await waitFor(() => expect(result.current.sessionChildren.get(root.session_key)?.sessions).toEqual([source]));
+    act(() => result.current.selectSession(source.session_key));
+    await waitFor(() => expect(result.current.selectedSession).toEqual(source));
+    const staleOpen = result.current.openRelatedSession;
+    act(() => result.current.selectSession(root.session_key));
+    const initialTree = result.current.sessionChildren;
+    act(() => staleOpen(source.session_key, sibling));
+    expect(result.current.selectedSession).toEqual(root);
+    expect(result.current.sessionChildren).toBe(initialTree);
+    expect(listSessionChildren).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a sender outside the loaded tree available as a navigation source", async () => {
+    const sender = { ...session("codex:deep-sender"), is_subagent: true, parent_session_id: "codex:missing-middle" };
+    const replySender = { ...session("codex:reply-sender"), is_subagent: true, parent_session_id: "codex:other-middle" };
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, root.session_key);
+    act(() => result.current.openRelatedSession(root.session_key, sender));
+    await waitFor(() => expect(result.current.selectedSession).toEqual(sender));
+    act(() => result.current.openRelatedSession(sender.session_key, replySender));
+    await waitFor(() => expect(result.current.selectedSession).toEqual(replySender));
+    expect(result.current.sessionChildren.size).toBe(0);
+    expect(listSessionChildren).not.toHaveBeenCalled();
+  });
+});
+
+describe("useViewerState agent communication detail", () => {
+  function communicationPage(hasText = true, hidden = false): EventPageResponse {
+    return reasoningEventPage({
+      event_key: "event.v1.communication", type: "agent_activity", title: "Agent message",
+      reasoning: null, is_hidden: hidden,
+      agent_activity: {
+        kind: "message", event_id: "delivery-1", target_session_id: null,
+        target_agent_path: "/root", target: null, actor_agent_path: "/root/reviewer",
+        communication: { has_text: hasText, has_encrypted_content: !hasText, trigger_turn: false },
+      },
+    });
+  }
+
+  function communicationDetail(): EventDetail {
+    return { event_key: "event.v1.communication", native: null, is_hidden: false, tool_output: null,
+      event: { type: "agent_activity", communication: { text: "Review result" } } };
+  }
+
+  beforeEach(() => {
+    vi.mocked(listSessions).mockResolvedValue({
+      sessions: [session("codex:communication"), session("codex:next")],
+      next_cursor: null, source_errors: [], pending_providers: [],
+    });
+  });
+
+  it("loads after expansion, retries failures, and shares detail with Inspector", async () => {
+    vi.mocked(loadEventPage).mockResolvedValue(communicationPage());
+    vi.mocked(loadEventDetail).mockRejectedValueOnce(new Error("Snapshot changed"))
+      .mockResolvedValue(communicationDetail());
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "codex:communication");
+    await waitFor(() => expect(result.current.events).toHaveLength(1));
+    expect(loadEventDetail).not.toHaveBeenCalled();
+    act(() => result.current.toggleEventExpanded("event.v1.communication"));
+    await waitFor(() => expect(result.current.expandedDetailError).toBe("Snapshot changed"));
+    act(() => result.current.retryExpandedDetail());
+    await waitFor(() => expect(result.current.expandedDetail).toEqual(communicationDetail()));
+    expect(loadEventDetail).toHaveBeenCalledTimes(2);
+    act(() => result.current.selectEvent("event.v1.communication"));
+    await waitFor(() => expect(result.current.detail).toEqual(communicationDetail()));
+    expect(loadEventDetail).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["encrypted", "hidden"])("does not request %s message content on expansion", async (kind) => {
+    vi.mocked(loadEventPage).mockResolvedValue(communicationPage(kind !== "encrypted", kind === "hidden"));
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "codex:communication");
+    await waitFor(() => expect(result.current.events).toHaveLength(1));
+    act(() => result.current.toggleEventExpanded("event.v1.communication"));
+    expect(result.current.expandedEventKey).toBe("event.v1.communication");
+    expect(result.current.expandedDetailLoading).toBe(false);
+    expect(loadEventDetail).not.toHaveBeenCalled();
+  });
+
+  it("loads communication detail through a nested trajectory expansion", async () => {
+    vi.mocked(loadEventPage).mockResolvedValue(trajectoryEventPage());
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValue(communicationPage());
+    vi.mocked(loadEventDetail).mockResolvedValue(communicationDetail());
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "codex:communication");
+    await waitFor(() => expect(result.current.events).toHaveLength(1));
+    act(() => result.current.toggleEventExpanded("trajectory.v1.turn-1"));
+    await waitFor(() => expect(result.current.trajectoryPages.get("codex:communication")
+      ?.get("trajectory.v1.turn-1")?.events).toHaveLength(1));
+    expect(loadEventDetail).not.toHaveBeenCalled();
+    act(() => result.current.toggleTrajectoryEventExpanded("trajectory.v1.turn-1", "event.v1.communication"));
+    await waitFor(() => expect(result.current.expandedTrajectoryDetail).toEqual(communicationDetail()));
+    expect(loadEventDetail).toHaveBeenCalledWith({
+      session_key: "codex:communication", event_key: "event.v1.communication",
+    });
+  });
+
+  it("discards communication detail after switching sessions", async () => {
+    const pending = deferred<EventDetail>();
+    vi.mocked(loadEventPage).mockResolvedValue(communicationPage());
+    vi.mocked(loadEventDetail).mockImplementation(() => pending.promise);
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "codex:communication");
+    await waitFor(() => expect(result.current.events).toHaveLength(1));
+    act(() => result.current.toggleEventExpanded("event.v1.communication"));
+    await waitFor(() => expect(loadEventDetail).toHaveBeenCalledOnce());
+    act(() => result.current.selectSession("codex:next"));
+    await act(async () => { pending.resolve(communicationDetail()); await pending.promise; });
+    expect(result.current.expandedDetail).toBeNull();
+    expect(result.current.expandedEventKey).toBeNull();
+  });
+});
+
 describe("useViewerState whole-turn trajectories", () => {
   it("loads a bounded child page only after opening and gives child tools their normal detail path", async () => {
     const root = session("codex:trajectory-root");
@@ -1347,7 +1506,7 @@ describe("useViewerState subagent discovery", () => {
     await selectListedSession(result, root.session_key);
     await waitFor(() => expect(result.current.selectedSession?.session_key).toBe(root.session_key));
 
-    act(() => result.current.openSubagent(root.session_key, child));
+    act(() => result.current.openRelatedSession(root.session_key, child));
 
     await waitFor(() => {
       expect(result.current.selectedSession?.session_key).toBe(child.session_key);
