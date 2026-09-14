@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { cancelTranslation, loadEventDetail, translateText } from "./tauri";
+import { loadEventDetail } from "./tauri";
 import { translateMarkdown } from "./markdownTranslation";
+import type { TranslationEngine, TranslationJob, TranslationProgress } from "./translationEngine";
 import type { EventSummary } from "./types";
 
 interface TranslationSource {
@@ -17,10 +18,11 @@ interface TranslationState {
   show_translation: boolean;
   loading: boolean;
   error: string | null;
+  progress: TranslationProgress | null;
 }
 
 /** Results belong to the source text, never just its reusable event index. */
-export function useMessageTranslation(event: EventSummary, sessionKey?: string) {
+export function useMessageTranslation(event: EventSummary, sessionKey?: string, engine?: TranslationEngine | null) {
   // A truncated preview cannot identify changes to the rest of a response.
   // Invalidate it whenever the timeline supplies a new source observation.
   const truncatedObservation = event.summary_truncated ? event : null;
@@ -33,32 +35,38 @@ export function useMessageTranslation(event: EventSummary, sessionKey?: string) 
     event.is_hidden, event.role, event.phase, truncatedObservation]);
   const currentSource = useRef(source);
   currentSource.current = source;
-  const active = useRef<{ source: TranslationSource; request_id: string | null } | null>(null);
+  const active = useRef<{ source: TranslationSource; job: TranslationJob | null } | null>(null);
   const [state, setState] = useState<TranslationState | null>(null);
   const visible = state?.source === source ? state : null;
 
   function abortActive() {
     const request = active.current;
     active.current = null;
-    if (request?.request_id) void cancelTranslation(request.request_id).catch(() => {});
+    request?.job?.dispose();
   }
 
   useEffect(() => {
     return () => { abortActive(); };
-  }, [source]);
+  }, [source, engine]);
 
   function cancel() {
     abortActive();
-    setState((previous) => previous?.source === source ? { ...previous, loading: false } : previous);
+    setState((previous) => previous?.source === source ? { ...previous, loading: false, progress: null } : previous);
   }
 
   async function translate() {
-    if (!sessionKey || active.current || event.is_hidden || event.role !== "assistant" || !event.summary.trim()) return;
-    const request = { source, request_id: null as string | null };
+    if (!engine || !sessionKey || active.current || event.is_hidden || event.role !== "assistant" || !event.summary.trim()) return;
+    const request = { source, job: null as TranslationJob | null };
     active.current = request;
     const isCurrent = () => active.current === request && currentSource.current === source;
-    setState({ source, original: null, translated: null, show_translation: false, loading: true, error: null });
+    setState({ source, original: null, translated: null, show_translation: false, loading: true, error: null, progress: null });
     try {
+      // Model preparation starts in the click handler while user activation is
+      // still available, before the potentially slow history request.
+      const job = engine.start((progress) => {
+        if (isCurrent()) setState((previous) => previous?.source === source ? { ...previous, progress } : previous);
+      });
+      request.job = job;
       const detail = await loadEventDetail({ session_key: sessionKey, event_key: event.event_key });
       if (!isCurrent()) return;
       const value = detail.event;
@@ -73,20 +81,14 @@ export function useMessageTranslation(event: EventSummary, sessionKey?: string) 
       if (source.summary_truncated ? !original.startsWith(expected) : original !== expected) {
         throw new Error("This response has changed. Refresh the conversation and try again.");
       }
-      setState({ source, original, translated: null, show_translation: false, loading: true, error: null });
+      setState((previous) => previous?.source === source ? { ...previous, original } : previous);
       const translated = await translateMarkdown(original, async (texts) => {
         if (!isCurrent()) throw new Error("Translation cancelled.");
-        request.request_id = crypto.randomUUID();
-        const response = await translateText({
-          request_id: request.request_id,
-          texts,
-          target_language: "zh-Hans",
-        });
+        const response = await job.translate(texts);
         if (!isCurrent()) throw new Error("Translation cancelled.");
-        request.request_id = null;
-        return response.texts;
+        return response;
       });
-      if (isCurrent()) setState({ source, original, translated, show_translation: true, loading: false, error: null });
+      if (isCurrent()) setState({ source, original, translated, show_translation: true, loading: false, error: null, progress: null });
     } catch (error) {
       if (isCurrent()) setState((previous) => ({
         source,
@@ -95,9 +97,11 @@ export function useMessageTranslation(event: EventSummary, sessionKey?: string) 
         show_translation: false,
         loading: false,
         error: error instanceof Error ? error.message : String(error),
+        progress: null,
       }));
     } finally {
       if (active.current === request) active.current = null;
+      request.job?.dispose();
     }
   }
 
@@ -107,6 +111,7 @@ export function useMessageTranslation(event: EventSummary, sessionKey?: string) 
     translated: visible?.translated !== null && visible?.translated !== undefined,
     showing_translation: visible?.show_translation ?? false,
     error: visible?.error ?? null,
+    progress: visible?.progress ?? null,
     translate,
     cancel,
     toggle: () => setState((previous) => previous?.source === source && previous.translated !== null

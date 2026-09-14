@@ -6,7 +6,7 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
-/** Apple Translation is available in the macOS desktop app only. */
+/** Availability of the viewer's local translation engine. */
 export interface TranslationStatus {
   available: boolean;
   reason: string | null;

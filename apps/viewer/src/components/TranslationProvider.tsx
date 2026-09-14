@@ -1,26 +1,29 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
-import { getTranslationStatus } from "../lib/tauri";
-import { isDesktop } from "../lib/transport";
+import { createTranslationEngine, type TranslationEngine } from "../lib/translationEngine";
 import type { TranslationStatus } from "../lib/types";
 
-const TranslationContext = createContext<TranslationStatus | null>(null);
+const TranslationContext = createContext<{ engine: TranslationEngine; status: TranslationStatus | null } | null>(null);
 
-/** Check native availability once per viewer; browser clients never invoke it. */
+/** Check the local translation engine once per viewer without downloading models. */
 export function TranslationProvider({ children }: { children: ReactNode }) {
+  const [engine] = useState(createTranslationEngine);
   const [status, setStatus] = useState<TranslationStatus | null>(null);
   useEffect(() => {
-    if (!isDesktop()) return;
     let disposed = false;
-    void getTranslationStatus().then((next) => {
+    void engine.getStatus().then((next) => {
       if (!disposed) setStatus(next);
     }).catch(() => {
-      if (!disposed) setStatus({ available: false, reason: "Apple Translation is unavailable in this app." });
+      if (!disposed) setStatus({ available: false, reason: `${engine.label} is unavailable in this viewer.` });
     });
     return () => { disposed = true; };
-  }, []);
-  return <TranslationContext value={status}>{children}</TranslationContext>;
+  }, [engine]);
+  return <TranslationContext value={{ engine, status }}>{children}</TranslationContext>;
 }
 
 export function useTranslationStatus() {
-  return useContext(TranslationContext);
+  return useContext(TranslationContext)?.status ?? null;
+}
+
+export function useTranslationEngine() {
+  return useContext(TranslationContext)?.engine ?? null;
 }
