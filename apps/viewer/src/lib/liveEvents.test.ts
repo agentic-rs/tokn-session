@@ -30,4 +30,55 @@ describe("live event windows", () => {
     const result = await refreshTrajectoryWindow({ session_key: "s", trajectory_key: "t", direction: "backward", limit: 2 }, [event("b")], load, () => true);
     expect(result.events.map((e) => e.event_key)).toEqual(["a", "b", "c", "d"]);
   });
+
+  it.each([
+    { name: "reuses an old ordinal key", latest: ["a", "h"] },
+    { name: "replaces every event key", latest: ["g", "h"] },
+  ])("preserves the loaded child count when a reset $name", async ({ latest }) => {
+    const load = vi.fn().mockResolvedValueOnce(page(latest, "older-6"))
+      .mockResolvedValueOnce(page(["e", "f"], "older-4"));
+    const result = await refreshTrajectoryWindow(
+      { session_key: "s", trajectory_key: "t", direction: "backward", limit: 2 },
+      [event("a"), event("b"), event("c")], load, () => true, true,
+    );
+    expect(result.events.map((e) => e.event_key)).toEqual(["e", "f", ...latest]);
+    expect(result.previous_cursor).toBe("older-4");
+    expect(load).toHaveBeenCalledTimes(2);
+    expect(load).toHaveBeenLastCalledWith({ session_key: "s", trajectory_key: "t", cursor: "older-6", direction: "backward", limit: 2 });
+  });
+
+  it("stops a reset child refresh when the replacement has fewer rows", async () => {
+    const load = vi.fn().mockResolvedValueOnce(page(["y", "z"], "older"))
+      .mockResolvedValueOnce(page(["x"], null));
+    const result = await refreshTrajectoryWindow(
+      { session_key: "s", trajectory_key: "t", direction: "backward", limit: 2 },
+      [event("a"), event("b"), event("c"), event("d")], load, () => true, true,
+    );
+    expect(result.events.map((e) => e.event_key)).toEqual(["x", "y", "z"]);
+    expect(result.previous_cursor).toBeNull();
+    expect(load).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects a repeated cursor during a reset child refresh", async () => {
+    const load = vi.fn().mockResolvedValueOnce(page(["z"], "older"))
+      .mockResolvedValueOnce(page(["y"], "older"));
+    await expect(refreshTrajectoryWindow(
+      { session_key: "s", trajectory_key: "t", direction: "backward", limit: 1 },
+      [event("a"), event("b"), event("c")], load, () => true, true,
+    )).rejects.toThrow("Turn refresh returned a repeated cursor");
+    expect(load).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops paging reset children when the request becomes obsolete", async () => {
+    const load = vi.fn().mockResolvedValueOnce(page(["z"], "older-2"))
+      .mockResolvedValueOnce(page(["y"], "older-1"));
+    const current = vi.fn().mockReturnValueOnce(true).mockReturnValue(false);
+    const result = await refreshTrajectoryWindow(
+      { session_key: "s", trajectory_key: "t", direction: "backward", limit: 1 },
+      [event("a"), event("b"), event("c")], load, current, true,
+    );
+    expect(result.events.map((e) => e.event_key)).toEqual(["y", "z"]);
+    expect(result.previous_cursor).toBe("older-1");
+    expect(load).toHaveBeenCalledTimes(2);
+  });
 });

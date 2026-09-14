@@ -136,8 +136,12 @@ rather than compensating for the total height (which can also grow at the end).
 Same-generation detail refreshes retain rendered content until replacement,
 including on retryable errors; session or snapshot-generation changes still
 invalidate old detail ownership.
-Refreshes are coalesced and page through one pinned snapshot. Append refreshes preserve expansion keys;
-generation resets invalidate them. Native remains optional and bounded in
+Refreshes are coalesced and page through one pinned snapshot. Append refreshes preserve expansion keys.
+Live generation resets keep the last-good view until the replacement timeline
+and followed working turn are ready, then publish them together. Fresh child
+pages preserve the previously loaded count instead of reverting to 40 rows;
+old selection/detail identities are invalidated at that commit. Failed resets
+retain the view and retry as replacements. Native remains optional and bounded in
 Inspector. Automatic now uses durable indexed unread tracking; External unread
 tracking remains process-local. The v1 append/reset contract still
 requires replacement generations for mutable OpenCode records; avoiding those

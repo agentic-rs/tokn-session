@@ -33,6 +33,7 @@ import {
   type SessionIndexProgress,
   type SessionSummary,
   type SourceError,
+  type TrajectoryEventPageResponse,
   type TrajectoryEventPageState,
   type TrajectoryPageLoadDirection,
   type ViewerProvider,
@@ -188,6 +189,7 @@ export function useViewerState() {
   const eventsRequest = useRef(0);
   const followingLive = useRef(true);
   const pendingLiveReset = useRef(false);
+  const uncommittedLiveReset = useRef(false);
   const liveRefresh = useRef(false);
   const eventRefreshInFlight = useRef(false);
   const liveUpdateQueued = useRef(false);
@@ -478,6 +480,25 @@ export function useViewerState() {
     setExpandedTrajectoryDetailError(null);
   }, []);
 
+  const invalidateTrajectoryPages = useCallback((reload: boolean) => {
+    trajectoryPageGeneration.current += 1;
+    trajectoryPageRequests.current.clear();
+    const retained = new Map([...trajectoryPagesRef.current].map(([sessionKey, pages]) => [
+      sessionKey,
+      new Map([...pages].map(([key, page]) => [key, {
+        ...page,
+        has_loaded: reload ? false : page.has_loaded,
+        is_loading: false,
+        is_loading_older: false,
+        is_loading_newer: false,
+      }])),
+    ]));
+    // Cancelled requests cannot clear their own loading flags. Keep rows usable
+    // if the parent refresh fails, without accepting obsolete child responses.
+    trajectoryPagesRef.current = retained;
+    setTrajectoryPages(retained);
+  }, []);
+
   const showLiveActivity = useCallback(() => {
     followingLive.current = true;
     if (workingTrajectory.current) setExpandedEventKey(workingTrajectory.current);
@@ -495,6 +516,7 @@ export function useViewerState() {
     workingTrajectory.current = null;
     liveUpdateQueued.current = false;
     pendingLiveReset.current = false;
+    uncommittedLiveReset.current = false;
     setPendingLiveActivity(false);
   }, [selectedSessionKey]);
 
@@ -948,20 +970,14 @@ export function useViewerState() {
     // reached a committed React render.
     setAcceptedInitialEventPage(null);
     const ownsSession = eventsOwnerKeyRef.current === selectedSessionKey;
-    const isLiveRefresh = liveRefresh.current && ownsSession;
+    // A failed or superseded replacement keeps its reset semantics until commit.
+    const reset = pendingLiveReset.current || uncommittedLiveReset.current;
+    const isLiveRefresh = (liveRefresh.current || reset) && ownsSession;
     liveRefresh.current = false;
-    const reset = pendingLiveReset.current;
     pendingLiveReset.current = false;
-    if (!isLiveRefresh || reset) clearTrajectoryPages();
-    else {
-      trajectoryPageGeneration.current += 1;
-      trajectoryPageRequests.current.clear();
-    }
-    if (reset) {
-      workingTrajectory.current = null;
-      setExpandedEventKey(null);
-      applyEventSelection(null, false);
-    }
+    uncommittedLiveReset.current = reset;
+    if (!isLiveRefresh) clearTrajectoryPages();
+    else invalidateTrajectoryPages(false);
     if (!ownsSession) {
       eventsOwnerKeyRef.current = selectedSessionKey;
       setEventsOwnerKey(selectedSessionKey);
@@ -997,23 +1013,49 @@ export function useViewerState() {
       limit: EVENT_PAGE_SIZE,
     });
     void page
-      .then((response) => {
+      .then(async (response) => {
         if (eventsRequest.current !== requestId) {
           return;
+        }
+        const active = [...response.events].reverse().find((event) => event.trajectory?.status === "working");
+        let replacement: TrajectoryEventPageResponse | null = null;
+        if (isLiveRefresh && reset && active && followingLive.current) {
+          // Keep the complete old view mounted until the new working turn is
+          // ready. Clearing it first collapses the conversation, then expands
+          // it again with only the latest 40 rows. Carry the loaded count into
+          // the replacement, without trusting identities from an old generation.
+          const previous = trajectoryPagesRef.current.get(selectedSessionKey)
+            ?.get(workingTrajectory.current ?? "")?.events ?? [];
+          replacement = await refreshTrajectoryWindow({
+            session_key: selectedSessionKey,
+            trajectory_key: active.event_key,
+            direction: "backward",
+            limit: TRAJECTORY_EVENT_PAGE_SIZE,
+          }, previous, loadTrajectoryEventPage, () => eventsRequest.current === requestId, true);
+          if (eventsRequest.current !== requestId) return;
+        }
+        if (reset) {
+          // Publish the replacement as one React update. Old source positions
+          // cannot continue to own expanded detail or Inspector selection.
+          uncommittedLiveReset.current = false;
+          clearTrajectoryPages();
+          applyEventSelection(null, false);
+          workingTrajectory.current = active?.event_key ?? null;
+          setExpandedEventKey(replacement && followingLive.current ? active!.event_key : null);
+          if (replacement) {
+            const ready = replacement;
+            updateTrajectoryPage(selectedSessionKey, active!.event_key, () => ({
+              ...emptyTrajectoryEventPageState(),
+              ...ready,
+              has_loaded: true,
+            }));
+          }
         }
         invalidateEventDetails(isLiveRefresh && !reset);
         if (isLiveRefresh && !reset) {
           // Invalidate in-flight child reads, but retain their displayed rows
           // until a fresh bounded child page arrives (no loading flicker).
-          trajectoryPageGeneration.current += 1;
-          trajectoryPageRequests.current.clear();
-          const retained = new Map(trajectoryPagesRef.current);
-          const pages = retained.get(selectedSessionKey);
-          if (pages) retained.set(selectedSessionKey, new Map([...pages].map(([key, value]) => [key, {
-            ...value, has_loaded: false, is_loading: false, is_loading_older: false, is_loading_newer: false,
-          }])));
-          trajectoryPagesRef.current = retained;
-          setTrajectoryPages(retained);
+          invalidateTrajectoryPages(true);
         }
         setEvents(response.events);
         setOlderCursor(response.previous_cursor);
@@ -1054,7 +1096,9 @@ export function useViewerState() {
     clearTrajectoryPages,
     eventsAttempt,
     invalidateEventDetails,
+    invalidateTrajectoryPages,
     selectedSessionKey,
+    updateTrajectoryPage,
   ]);
 
   useEffect(() => {
