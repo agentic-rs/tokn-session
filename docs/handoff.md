@@ -176,7 +176,13 @@ SQLite WAL file; its transient SHM index is deliberately excluded because
 readers can update it and feed their own watcher notifications back into the
 relay. Unrelated logs, snapshots, and auth files do not trigger database work.
 macOS uses the kqueue backend because FSEvents can omit these session-file
-writes.
+writes. Native watcher creation, registration, or runtime failure retires the
+backend and reports one warning while Relay continues at its configured polling
+interval (30 seconds standalone, five minutes for the viewer-managed child).
+This includes macOS descriptor exhaustion on large recursive session trees.
+Partial registrations are released before session discovery; failed backends
+are not repeatedly recreated. The viewer's independent FSEvents index watcher
+and provider-local recovery continue to refresh its snapshots.
 Newly discovered or replaced files emit all normalized events beginning at the
 third-most-recent message by default. `--replay=<count>` changes that window,
 while `--replay-all` emits every complete record. These replay options only
