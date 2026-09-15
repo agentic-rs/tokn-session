@@ -28,6 +28,7 @@ import type { TechnicalCardHeading } from "./CardPresentation";
 import { ReasoningCard, reasoningHeading } from "./ReasoningCard";
 import { CompactionCard } from "./CompactionCard";
 import { UsageCard, usageHeading } from "./UsageCard";
+import { AgentCommunicationCard, agentCommunicationHeading, isAgentCommunication } from "./AgentCommunicationCard";
 import { DetailRefreshError } from "./DetailRefreshError";
 
 interface EventCardProps {
@@ -42,7 +43,7 @@ interface EventCardProps {
   detail_loading: boolean;
   on_select: (event_key: string) => void;
   on_toggle: (event_key: string) => void;
-  on_open_subagent?: (target: SessionSummary) => void;
+  on_open_related_session?: (target: SessionSummary) => void;
   on_retry_detail: () => void;
   trajectory_page?: TrajectoryEventPageState | null;
   on_trajectory_load_older?: (trajectory_key: string) => void;
@@ -347,7 +348,7 @@ function cardHeading(event: EventSummary): TechnicalCardHeading | null {
     return toolHeading(event);
   }
   if (event.type === "agent_activity" && event.agent_activity) {
-    return agentActivityHeading(event);
+    return isAgentCommunication(event) ? agentCommunicationHeading(event) : agentActivityHeading(event);
   }
   if (event.type === "usage" && event.usage) {
     return usageHeading(event.usage);
@@ -359,7 +360,8 @@ function cardHeading(event: EventSummary): TechnicalCardHeading | null {
 }
 
 function usesControlledExpansion(event: EventSummary): boolean {
-  return event.type === "tool_call" || event.type === "reasoning" || event.type === "compaction";
+  return event.type === "tool_call" || event.type === "reasoning" || event.type === "compaction"
+    || isAgentCommunication(event);
 }
 
 function eventStatus(event: EventSummary): { label: string; tone: string } | null {
@@ -368,6 +370,7 @@ function eventStatus(event: EventSummary): { label: string; tone: string } | nul
     return state ? { label: humanize(state), tone: state === "failed" ? "error" : "neutral" } : null;
   }
   if (event.type === "agent_activity") {
+    if (isAgentCommunication(event)) return null;
     const kind = event.agent_activity?.kind.trim();
     if (!kind) {
       return null;
@@ -452,7 +455,7 @@ function TrajectorySection({
   is_selected,
   on_load_newer,
   on_load_older,
-  on_open_subagent,
+  on_open_related_session,
   on_retry,
   on_retry_child_detail,
   on_select,
@@ -472,7 +475,7 @@ function TrajectorySection({
   is_selected: boolean;
   on_load_newer?: (trajectory_key: string) => void;
   on_load_older?: (trajectory_key: string) => void;
-  on_open_subagent?: (target: SessionSummary) => void;
+  on_open_related_session?: (target: SessionSummary) => void;
   on_retry?: (trajectory_key: string) => void;
   on_retry_child_detail?: (trajectory_key: string, event_key: string) => void;
   on_select: (event_key: string) => void;
@@ -579,7 +582,7 @@ function TrajectorySection({
                         event={childEvent}
                         is_expanded={childEvent.event_key === expanded_child_event_key}
                         is_selected={childEvent.event_key === selected_event_key}
-                        on_open_subagent={on_open_subagent}
+                        on_open_related_session={on_open_related_session}
                         on_retry_detail={() => {
                           on_retry_child_detail?.(event.event_key, childEvent.event_key);
                         }}
@@ -709,7 +712,7 @@ export function EventCard({
   detail_loading,
   on_select,
   on_toggle,
-  on_open_subagent,
+  on_open_related_session,
   on_retry_detail,
   trajectory_page,
   on_trajectory_load_older,
@@ -741,7 +744,7 @@ export function EventCard({
         is_selected={is_selected}
         on_load_newer={on_trajectory_load_newer}
         on_load_older={on_trajectory_load_older}
-        on_open_subagent={on_open_subagent}
+        on_open_related_session={on_open_related_session}
         on_retry={on_trajectory_retry}
         on_retry_child_detail={on_trajectory_retry_expanded_detail}
         on_select={on_select}
@@ -765,7 +768,10 @@ export function EventCard({
   const regionId = `${button_id}-details`;
   const labelId = `${button_id}-label`;
   const cardIsExpanded = usesControlledExpansion(event) ? is_expanded : isLocallyExpanded;
-  const subagentTarget = event.type === "agent_activity" ? event.agent_activity?.target ?? null : null;
+  const isCommunication = isAgentCommunication(event);
+  const subagentTarget = event.type === "agent_activity"
+    ? (isCommunication ? event.agent_activity?.actor : event.agent_activity?.target) ?? null
+    : null;
   return (
     <article
       className="technical-event"
@@ -819,12 +825,13 @@ export function EventCard({
         <div className="technical-event__actions">
           {subagentTarget ? (
             <button
-              aria-label={`Open subagent ${sessionDisplayTitle(subagentTarget)}`}
+              aria-label={`Open ${isCommunication ? "sender" : "subagent"} ${sessionDisplayTitle(subagentTarget)}`}
               className="technical-event__open-subagent"
-              onClick={() => on_open_subagent?.(subagentTarget)}
+              disabled={!on_open_related_session}
+              onClick={() => on_open_related_session?.(subagentTarget)}
               type="button"
             >
-              Open
+              {isCommunication ? "Open sender" : "Open"}
             </button>
           ) : null}
           <button
@@ -865,6 +872,14 @@ export function EventCard({
             />
           ) : event.type === "compaction" ? (
             <CompactionCard
+              detail={detail}
+              error={detail_error}
+              event={event}
+              is_loading={detail_loading}
+              on_retry={on_retry_detail}
+            />
+          ) : isCommunication ? (
+            <AgentCommunicationCard
               detail={detail}
               error={detail_error}
               event={event}

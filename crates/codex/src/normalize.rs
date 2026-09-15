@@ -1,4 +1,5 @@
 mod code_mode;
+mod communication;
 mod item_lifecycle;
 mod turn_lifecycle;
 
@@ -6,8 +7,7 @@ use std::collections::{HashMap, VecDeque};
 
 use serde_json::{Value, json};
 use tokn_codex_protocol::{
-  AgentMessageItem, ContentItem, EventMessage, InterAgentCommunicationItem, MessageItem, ReasoningItem, ResponseItem,
-  RolloutItem, SessionMetaItem, UnknownItem,
+  ContentItem, EventMessage, MessageItem, ReasoningItem, ResponseItem, RolloutItem, SessionMetaItem, UnknownItem,
 };
 use tokn_session_core::{
   AgentActivity, AgentEvent, ErrorEvent, GoalUpdated, MessageDelivery, MessageEvent, Phase, Provider, ProviderChanged,
@@ -18,6 +18,7 @@ use tokn_session_core::{
 
 use crate::event::CodexLine;
 use code_mode::{DecodedCodeModeCall, decode_call, decode_output};
+use communication::{normalize_agent_message, normalize_inter_agent_communication};
 use item_lifecycle::{normalize_item_lifecycle, normalize_legacy_item_completed};
 
 const MAX_PENDING_CODE_MODE_CALLS: usize = 256;
@@ -27,6 +28,7 @@ pub struct CodexNormalizer {
   history_mode: CodexRolloutHistoryMode,
   history_boundary: Option<CodexHistoryBoundary>,
   records: crate::records::RecordsNormalizer,
+  pending_communication_trigger: Option<bool>,
   pending_code_mode_calls: HashMap<String, VecDeque<PendingCodeModeCall>>,
   pending_code_mode_order: VecDeque<(String, u64)>,
   pending_code_mode_call_count: usize,
@@ -110,6 +112,7 @@ impl CodexNormalizer {
       history_mode: CodexRolloutHistoryMode::Legacy,
       history_boundary: None,
       records: Default::default(),
+      pending_communication_trigger: None,
       pending_code_mode_calls: Default::default(),
       pending_code_mode_order: Default::default(),
       pending_code_mode_call_count: 0,
@@ -123,6 +126,7 @@ impl CodexNormalizer {
       history_mode: CodexRolloutHistoryMode::Legacy,
       history_boundary: Some(CodexHistoryBoundary::new()),
       records: Default::default(),
+      pending_communication_trigger: None,
       pending_code_mode_calls: Default::default(),
       pending_code_mode_order: Default::default(),
       pending_code_mode_call_count: 0,
@@ -132,6 +136,13 @@ impl CodexNormalizer {
 
   pub fn normalize(&mut self, line: CodexLine) -> Vec<AgentEvent> {
     let timestamp = line.timestamp().map(str::to_string);
+    // Delivery metadata belongs only to the immediately following raw record.
+    // Track it before filtering: the first child-task marker is a consumed
+    // history boundary, but its following agent message still needs the flag.
+    let communication_trigger = self.pending_communication_trigger.take();
+    if let RolloutItem::InterAgentCommunicationMetadata(item) = line.item() {
+      self.pending_communication_trigger = item.trigger_turn;
+    }
     if self
       .history_boundary
       .as_mut()
@@ -147,7 +158,7 @@ impl CodexNormalizer {
     ) {
       return events;
     }
-    self.normalize_item(line.into_item(), timestamp)
+    self.normalize_item(line.into_item(), timestamp, communication_trigger)
   }
 
   pub fn history_status(&self) -> SessionHistoryStatus {
@@ -158,9 +169,19 @@ impl CodexNormalizer {
       .unwrap_or(SessionHistoryStatus::Complete)
   }
 
-  fn normalize_item(&mut self, item: RolloutItem, timestamp: Option<String>) -> Vec<AgentEvent> {
+  fn normalize_item(
+    &mut self,
+    item: RolloutItem,
+    timestamp: Option<String>,
+    communication_trigger: Option<bool>,
+  ) -> Vec<AgentEvent> {
     match item {
       RolloutItem::SessionMeta(item) => self.normalize_session_meta(item, timestamp),
+      // Incoming agent messages have no canonical ItemCompleted equivalent.
+      // Preserve them even when ordinary response items are deduplicated.
+      RolloutItem::ResponseItem(ResponseItem::AgentMessage(item)) => {
+        normalize_agent_message(self.session_id.clone(), item, timestamp, communication_trigger)
+      }
       RolloutItem::ResponseItem(item) => {
         if matches!(self.history_mode, CodexRolloutHistoryMode::Paginated) {
           match item {
@@ -487,7 +508,7 @@ fn normalize_response_item(
 ) -> Vec<AgentEvent> {
   match item {
     ResponseItem::Message(item) => normalize_message(session_id, item, timestamp),
-    ResponseItem::AgentMessage(item) => normalize_agent_message(session_id, item, timestamp),
+    ResponseItem::AgentMessage(item) => normalize_agent_message(session_id, item, timestamp, None),
     ResponseItem::Reasoning(item) => normalize_reasoning(session_id, item, timestamp),
     ResponseItem::FunctionCall(item) => {
       let name = item
@@ -690,48 +711,6 @@ fn normalize_reasoning(session_id: Option<String>, item: ReasoningItem, timestam
     redacted: None,
     encrypted_content: item.encrypted_content,
     signature: None,
-    timestamp,
-  })]
-}
-
-fn normalize_agent_message(
-  session_id: Option<String>,
-  item: AgentMessageItem,
-  timestamp: Option<String>,
-) -> Vec<AgentEvent> {
-  let native = json_value(&item);
-  vec![AgentEvent::AgentActivity(AgentActivity {
-    provider: Provider::Codex,
-    session_id,
-    event_id: item.id,
-    actor_session_id: None,
-    actor_agent_path: item.author,
-    target_session_id: None,
-    target_agent_path: item.recipient,
-    kind: "messaged".to_string(),
-    occurred_at_ms: None,
-    native: Some(native),
-    timestamp,
-  })]
-}
-
-fn normalize_inter_agent_communication(
-  session_id: Option<String>,
-  item: InterAgentCommunicationItem,
-  timestamp: Option<String>,
-) -> Vec<AgentEvent> {
-  let native = json_value(&item);
-  vec![AgentEvent::AgentActivity(AgentActivity {
-    provider: Provider::Codex,
-    session_id,
-    event_id: item.id.clone(),
-    actor_session_id: None,
-    actor_agent_path: item.author.clone(),
-    target_session_id: None,
-    target_agent_path: item.recipient.clone(),
-    kind: "messaged".to_string(),
-    occurred_at_ms: None,
-    native: Some(native),
     timestamp,
   })]
 }
@@ -1161,6 +1140,7 @@ fn normalize_sub_agent_activity(
     target_session_id: string_field(payload, "agent_thread_id"),
     target_agent_path: string_field(payload, "agent_path"),
     kind,
+    communication: None,
     occurred_at_ms: payload.get("occurred_at_ms").and_then(Value::as_u64),
     native: Some(payload.clone()),
     timestamp,

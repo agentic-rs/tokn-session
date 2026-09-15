@@ -106,6 +106,26 @@ and `vendor/dsh/packages/compaction/compaction/src/types.ts`/checkpoint code.
 ZCode fixtures are based on the installed 3.7.3 bundle, not a captured real
 compaction session; new shapes must retain the unknown fallback.
 
+## Agent communication
+
+Incoming agent deliveries use `agent_activity` with optional `communication`:
+readable `text`, `has_encrypted_content`, and optional `trigger_turn`. They retain
+provider-supplied sender and recipient identities separately from ordinary
+assistant replies. Ciphertext stays in native detail; an exact routing-only
+header accompanying encrypted content is not presented as a readable body.
+Unsupported or malformed content remains unknown instead of partial prose.
+
+Codex `response_item.agent_message` is preserved in both legacy and paginated
+history, because incoming deliveries have no canonical completed-item duplicate.
+Only immediately preceding `inter_agent_communication_metadata` supplies its
+turn-trigger flag. The metadata record remains independently preserved, and
+legacy `inter_agent_communication` supplies its own flag.
+
+Viewer summaries carry content-presence flags; expansion and the inspector load
+readable Markdown through event detail. Sender navigation requires a unique
+identity within the selected session's canonical relation tree. Repeated agent
+paths in unrelated root sessions do not establish a relationship.
+
 ## Metadata and provenance
 
 `metadata` means a recognized non-conversation record whose required envelope

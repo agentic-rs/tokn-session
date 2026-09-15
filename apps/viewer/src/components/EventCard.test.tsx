@@ -396,7 +396,7 @@ describe("EventCard subagent activity", () => {
         target: child,
       },
     }), {
-      on_open_subagent: onOpenSubagent,
+      on_open_related_session: onOpenSubagent,
       on_select: onSelect,
       on_toggle: onToggle,
     });
@@ -511,7 +511,7 @@ describe("EventCard whole-turn trajectories", () => {
       tool: tool(),
     });
     const { container, rerender } = renderCard(trajectoryEvent, {
-      on_open_subagent: onOpenSubagent,
+      on_open_related_session: onOpenSubagent,
       on_select: onSelect,
       on_toggle: onToggle,
     });
@@ -533,7 +533,7 @@ describe("EventCard whole-turn trajectories", () => {
         event={trajectoryEvent}
         is_expanded
         is_selected={false}
-        on_open_subagent={onOpenSubagent}
+        on_open_related_session={onOpenSubagent}
         on_retry_detail={vi.fn()}
         on_select={onSelect}
         on_toggle={onToggle}

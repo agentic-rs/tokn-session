@@ -130,9 +130,20 @@ pub struct AgentActivity {
   pub target_session_id: Option<String>,
   pub target_agent_path: Option<String>,
   pub kind: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub communication: Option<AgentCommunication>,
   pub occurred_at_ms: Option<u64>,
   pub native: Option<Value>,
   pub timestamp: Option<String>,
+}
+
+/// Readable inter-agent delivery content, separate from ordinary assistant replies.
+/// Opaque provider content remains available only in the activity's native payload.
+#[derive(Debug, Serialize, Clone, Deserialize)]
+pub struct AgentCommunication {
+  pub text: Option<String>,
+  pub has_encrypted_content: bool,
+  pub trigger_turn: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -101,6 +101,11 @@ target id resolves to a canonical direct child of the selected session within
 the same provider. **Open** selects that child and makes it available in the
 sidebar; unavailable, ambiguous, or non-child targets remain inspectable but
 are never guessed. These cards describe recorded activity, not live state.
+Incoming agent messages show sender and recipient, whether delivery starts a
+turn, and expandable Markdown content. **Open sender** navigates to a verified
+session in the same task tree; ambiguous identities remain unlinked. Encrypted
+bodies show an unavailable notice, while any accompanying readable text remains
+visible. The inspector's **Content** view also shows readable communication.
 Earlier history is loaded on demand. Technical event headers expand in place,
 while their **Inspect** action opens the full inspector. Messages and reasoning
 have a readable **Content** view, while **Normalized** and **Native** expose the

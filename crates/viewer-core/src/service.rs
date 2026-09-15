@@ -31,8 +31,11 @@ use crate::model::{
 };
 use crate::repository::{NativeRepository, SessionBodyIndexing, ViewerRepository};
 
+mod agent_activity;
 mod compaction;
 mod trajectory_state;
+
+use agent_activity::{ActivityTargets, agent_activity_card_summary};
 
 const MAX_DETAIL_VALUE_BYTES: usize = 512 * 1024;
 const MAX_MESSAGE_SUMMARY_CHARS: usize = 16 * 1024;
@@ -2846,45 +2849,6 @@ impl ViewerService {
     };
     Ok(loaded)
   }
-
-  /// Returns direct, canonical descendants that are safe to open from a
-  /// parent activity card. Header discovery is deliberately fail-closed: an
-  /// unavailable provider catalog or a parent source that is no longer the
-  /// canonical header produces no links, while leaving the parent timeline
-  /// readable.
-  fn delegation_targets_for_parent(&self, parent_locator: &SessionLocator) -> HashMap<String, SessionSummary> {
-    let Ok(Some(inventory)) = self.indexed_session_inventory(parent_locator.provider) else {
-      return HashMap::new();
-    };
-    let mut ignored_errors = Vec::new();
-    let relations = session_relation_index(parent_locator.provider, inventory.headers, &mut ignored_errors);
-    let attention = session_relation_attention(parent_locator.provider, &relations, &inventory.direct_attention);
-    let Some(parent_index) = relations
-      .headers
-      .iter()
-      .position(|header| locator_for_header(parent_locator.provider, header) == *parent_locator)
-    else {
-      return HashMap::new();
-    };
-
-    relations
-      .headers
-      .into_iter()
-      .enumerate()
-      .filter_map(|(index, header)| (relations.parent_indices[index] == Some(parent_index)).then_some((index, header)))
-      .filter_map(|(index, header)| {
-        session_summary_with_child_count(
-          parent_locator.provider,
-          header,
-          relations.child_counts[index],
-          true,
-          attention[index],
-        )
-        .ok()
-      })
-      .map(|summary| (summary.session_id.clone(), summary))
-      .collect()
-  }
 }
 
 fn event_detail(
@@ -3258,8 +3222,9 @@ fn session_metadata_from_header(
     ),
     source_path,
   );
-  // These are the complete, bounded sidebar fields. In particular, no event,
-  // reasoning, native payload, tool input, or tool output enters this record.
+  // Presentation fields are bounded here; session/parent IDs and agent paths
+  // retain exact identity for relation matching. No event, reasoning, native
+  // payload, tool input, or tool output enters this record.
   metadata.title = normalize_session_text(header.title, MAX_SESSION_TITLE_CHARS);
   metadata.preview = normalize_session_text(header.preview, MAX_SESSION_PREVIEW_CHARS);
   metadata.cwd = normalize_session_text(header.cwd, MAX_INDEXED_CWD_CHARS);
@@ -3267,7 +3232,7 @@ fn session_metadata_from_header(
   metadata.updated_at = normalize_session_text(header.updated_at, MAX_INDEXED_TIMESTAMP_CHARS);
   metadata.updated_at_ms = header.updated_at_ms;
   metadata.parent_session_id = header.parent_session_id;
-  metadata.agent_path = normalize_session_text(header.agent_path, MAX_AGENT_IDENTITY_CHARS);
+  metadata.agent_path = header.agent_path;
   metadata.agent_nickname = normalize_session_text(header.agent_nickname, MAX_AGENT_IDENTITY_CHARS);
   metadata.agent_role = normalize_session_text(header.agent_role, MAX_AGENT_IDENTITY_CHARS);
   metadata.attention_marker = attention_marker;
@@ -4167,6 +4132,8 @@ fn timeline_entry_has_targeted_agent_activity(entry: &TimelineEntry, events: &[A
     TimelineEntry::Event { source_event_index } => matches!(
       events.get(*source_event_index),
       Some(AgentEvent::AgentActivity(activity)) if present_string(activity.target_session_id.as_deref()).is_some()
+        || activity.communication.is_some() && (present_string(activity.actor_session_id.as_deref()).is_some()
+          || present_string(activity.actor_agent_path.as_deref()).is_some())
     ),
     TimelineEntry::ToolOperation { .. } => false,
     TimelineEntry::Trajectory { trajectory } => trajectory
@@ -4179,7 +4146,7 @@ fn timeline_entry_has_targeted_agent_activity(entry: &TimelineEntry, events: &[A
 fn timeline_entry_event_summary(
   entry: &TimelineEntry,
   events: &[AgentEvent],
-  delegation_targets: &HashMap<String, SessionSummary>,
+  delegation_targets: &ActivityTargets,
 ) -> EventSummary {
   match entry {
     TimelineEntry::Event { source_event_index } => event_summary_with_delegation_targets(
@@ -4403,14 +4370,14 @@ fn requested_trajectory_offset(
 
 #[cfg(test)]
 fn event_summary(events: &[AgentEvent], index: usize, event: &AgentEvent) -> EventSummary {
-  event_summary_with_delegation_targets(events, index, event, &HashMap::new())
+  event_summary_with_delegation_targets(events, index, event, &ActivityTargets::default())
 }
 
 fn event_summary_with_delegation_targets(
   events: &[AgentEvent],
   index: usize,
   event: &AgentEvent,
-  delegation_targets: &HashMap<String, SessionSummary>,
+  delegation_targets: &ActivityTargets,
 ) -> EventSummary {
   let projected = if matches!(event, AgentEvent::Compaction(_)) {
     compaction::for_source(events, index).map(|operation| AgentEvent::Compaction(operation.event))
@@ -4518,34 +4485,6 @@ fn tool_operation_event_summary(source_event_index: usize, operation: &ToolOpera
     trajectory: None,
     agent_activity: None,
     compaction: None,
-  }
-}
-
-fn agent_activity_card_summary(
-  activity: &AgentActivity,
-  delegation_targets: &HashMap<String, SessionSummary>,
-) -> AgentActivityCardSummary {
-  AgentActivityCardSummary {
-    kind: normalize_one_line_text(&activity.kind, MAX_AGENT_IDENTITY_CHARS).unwrap_or_else(|| "activity".to_string()),
-    event_id: activity
-      .event_id
-      .as_deref()
-      .and_then(|value| normalize_one_line_text(value, MAX_AGENT_IDENTITY_CHARS)),
-    target_session_id: activity
-      .target_session_id
-      .as_deref()
-      .and_then(|value| normalize_one_line_text(value, MAX_AGENT_IDENTITY_CHARS)),
-    target_agent_path: activity
-      .target_agent_path
-      .as_deref()
-      .and_then(|value| normalize_one_line_text(value, MAX_AGENT_IDENTITY_CHARS)),
-    // Lookup intentionally uses the raw ID. A sanitized display string must
-    // never become a new session identity.
-    target: activity
-      .target_session_id
-      .as_deref()
-      .and_then(|target_session_id| delegation_targets.get(target_session_id))
-      .cloned(),
   }
 }
 
@@ -5365,6 +5304,7 @@ fn truncate_with_flag(value: String, max_chars: usize) -> (String, bool) {
 
 #[cfg(test)]
 mod tests {
+  mod communications;
   use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
   use std::path::PathBuf;
   use std::sync::Mutex;
@@ -8465,6 +8405,7 @@ mod tests {
     assert!(
       service
         .delegation_targets_for_parent(&parent_locator)
+        .direct_children
         .contains_key("child")
     );
     assert_eq!(repository.header_calls.load(Ordering::SeqCst), 0);
@@ -9926,7 +9867,7 @@ mod tests {
       .iter()
       .find(|entry| matches!(entry, TimelineEntry::ToolOperation { .. }))
       .expect("assembled tool operation should stay inside the trajectory");
-    let operation = timeline_entry_event_summary(operation_entry, &events, &HashMap::new());
+    let operation = timeline_entry_event_summary(operation_entry, &events, &ActivityTargets::default());
     let operation_tool = operation.tool.as_ref().unwrap();
 
     let page = service_with_session(loaded_session(events))
@@ -11192,6 +11133,7 @@ mod tests {
       target_session_id: Some(target_session_id.to_string()),
       target_agent_path: target_agent_path.map(str::to_string),
       kind: "started".to_string(),
+      communication: None,
       occurred_at_ms: Some(1_788_112_800_000),
       native: None,
       timestamp: Some("2026-08-31T00:03:00Z".to_string()),

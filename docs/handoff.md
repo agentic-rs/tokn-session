@@ -12,6 +12,11 @@ cards. Turn/thread totals remain native inspection detail; the separate
 `token_count` events retain session-snapshot semantics. Both accounting forms
 can occur between correlated compaction records. See [event semantics](event-ir.md#usage).
 
+Codex incoming agent messages now have expandable Markdown communication cards,
+including in paginated history. Cards expose the recorded turn-trigger flag,
+link verified senders within the same task tree, and label encrypted bodies as
+unavailable. See [communication semantics](event-ir.md#agent-communication).
+
 Implemented CLI:
 
 ```sh
@@ -690,12 +695,18 @@ cross-provider, or non-child targets remain visible but are not navigable.
 Opening that card materializes the verified child in the sidebar and selects its
 independent timeline. Child searches are not yet included in root search, and
 historical headers or activity cards do not claim live subagent status.
+Communication cards also resolve senders within the same canonical relation
+tree, including parent and sibling senders. A path must match uniquely; explicit
+session IDs must agree with any supplied path. Summary pages contain presence
+flags only; message expansion and inspector content load the readable body.
 
 Codex normalization follows the first session header's `history_mode`. Legacy
 rollouts keep their response-item and legacy-event projection, while paginated
 rollouts use canonical `item_started`/`item_completed` records and suppress
 duplicate raw response records. Raw reasoning remains authoritative so its
-encrypted content is retained. Every current Codex turn-item and extension kind
+encrypted content is retained. Incoming `agent_message` response records are
+also preserved because they have no canonical completed-item duplicate.
+Every current Codex turn-item and extension kind
 has an explicit disposition; malformed and future shapes remain visible as
 subtype-specific unknown events.
 
@@ -979,8 +990,12 @@ Current browser keys:
   parent history, while resume markers never hide their own earlier turns.
 - Codex `response_item.agent_message` and legacy
   `inter_agent_communication` records map to `agent_activity` with
-  provider-supplied author and recipient paths. Paths remain null when the
-  record does not supply them.
+  validated author/recipient paths and optional typed `communication` content.
+  Readable text and encryption presence are separate; ciphertext stays native.
+  Only an immediately adjacent metadata marker contributes `trigger_turn` to a
+  response item, including the consumed first-owned-message child boundary.
+  Metadata remains independently preserved. Malformed identities or unsupported
+  content stay unknown.
 - Codex `world_state`, `turn_context`, `inter_agent_communication_metadata`,
   and rollback records are metadata, not conversation replies.
   `token_count` emits replaceable usage snapshots with consecutive identical

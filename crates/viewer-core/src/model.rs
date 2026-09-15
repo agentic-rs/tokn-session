@@ -429,8 +429,8 @@ pub struct TrajectoryCardSummary {
 
 /// Bounded presentation metadata for one historical agent-activity record.
 ///
-/// `target_agent_path` is descriptive only. Navigation is exposed exclusively
-/// through a verified direct-child [`SessionSummary`] in `target`.
+/// Target navigation uses a verified direct child. Communication sender
+/// navigation uses a unique canonical session in the current task tree.
 #[derive(Clone, Debug, Serialize)]
 pub struct AgentActivityCardSummary {
   pub kind: String,
@@ -438,6 +438,18 @@ pub struct AgentActivityCardSummary {
   pub target_session_id: Option<String>,
   pub target_agent_path: Option<String>,
   pub target: Option<SessionSummary>,
+  pub actor_session_id: Option<String>,
+  pub actor_agent_path: Option<String>,
+  pub actor: Option<SessionSummary>,
+  pub communication: Option<AgentCommunicationCardSummary>,
+}
+
+/// Readable message bodies stay in lazy event detail, never in timeline pages.
+#[derive(Clone, Debug, Serialize)]
+pub struct AgentCommunicationCardSummary {
+  pub has_text: bool,
+  pub has_encrypted_content: bool,
+  pub trigger_turn: Option<bool>,
 }
 
 /// Source-neutral token accounting for a usage event.
