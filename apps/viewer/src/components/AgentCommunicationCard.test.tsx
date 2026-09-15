@@ -82,6 +82,36 @@ describe("agent communication cards", () => {
     expect(screen.queryByText("No readable message body was recorded.")).not.toBeInTheDocument();
   });
 
+  it("keeps the loaded message mounted during refresh and retryable errors", () => {
+    const onRetry = vi.fn();
+    const { rerender } = render(card({ is_expanded: true, detail: detail() }));
+    const heading = screen.getByRole("heading", { name: "Review result" });
+
+    rerender(card({ is_expanded: true, detail: detail(), detail_loading: true }));
+    expect(screen.getByRole("heading", { name: "Review result" })).toBe(heading);
+    expect(heading.closest(".communication-card")).toHaveAttribute("aria-busy", "true");
+    expect(screen.queryByText("Loading message…")).not.toBeInTheDocument();
+
+    rerender(card({ is_expanded: true, detail: detail(), detail_error: "Connection lost",
+      on_retry_detail: onRetry }));
+    expect(screen.getByRole("heading", { name: "Review result" })).toBe(heading);
+    expect(screen.getByRole("alert")).toHaveTextContent("Could not refresh: Connection lost");
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(onRetry).toHaveBeenCalledOnce();
+
+    rerender(card({ is_expanded: true, detail: detail(), detail_loading: true }));
+    expect(screen.getByRole("heading", { name: "Review result" })).toBe(heading);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("does not retain another event's body when a detail request fails", () => {
+    render(card({ is_expanded: true, detail: detail({ event_key: "event.v1.previous" }),
+      detail_error: "Connection lost" }));
+    expect(screen.queryByRole("heading", { name: "Review result" })).not.toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("Message unavailable");
+    expect(screen.queryByText(/Could not refresh/)).not.toBeInTheDocument();
+  });
+
   it("renders readable content and an encrypted notice for mixed content", () => {
     render(card({ is_expanded: true, event: communication({
       communication: { has_text: true, has_encrypted_content: true, trigger_turn: null },

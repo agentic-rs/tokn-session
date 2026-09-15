@@ -33,6 +33,7 @@ import {
   type SessionIndexProgress,
   type SessionSummary,
   type SourceError,
+  type TrajectoryEventPageResponse,
   type TrajectoryEventPageState,
   type TrajectoryPageLoadDirection,
   type ViewerProvider,
@@ -194,6 +195,7 @@ export function useViewerState() {
   const eventsRequest = useRef(0);
   const followingLive = useRef(true);
   const pendingLiveReset = useRef(false);
+  const uncommittedLiveReset = useRef(false);
   const liveRefresh = useRef(false);
   const eventRefreshInFlight = useRef(false);
   const liveUpdateQueued = useRef(false);
@@ -228,9 +230,13 @@ export function useViewerState() {
   const detailGeneration = useRef(0);
   const [detailRevision, setDetailRevision] = useState(0);
   const [expandedEventKey, setExpandedEventKey] = useState<string | null>(null);
+  const expandedEventKeyRef = useRef<string | null>(null);
+  const manualExpansion = useRef(false);
+  const expansionRevision = useRef(0);
   const workingTrajectory = useRef<string | null>(null);
   const [expandedDetail, setExpandedDetail] = useState<EventDetail | null>(null);
   const [expandedDetailOwnerKey, setExpandedDetailOwnerKey] = useState<string | null>(null);
+  const expandedDetailOwnerKeyRef = useRef<string | null>(null);
   const [expandedDetailLoading, setExpandedDetailLoading] = useState(false);
   const [expandedDetailError, setExpandedDetailError] = useState<string | null>(null);
   const [expandedDetailAttempt, setExpandedDetailAttempt] = useState(0);
@@ -242,12 +248,18 @@ export function useViewerState() {
   const [expandedTrajectoryDetailOwnerKey, setExpandedTrajectoryDetailOwnerKey] = useState<
     string | null
   >(null);
+  const expandedTrajectoryDetailOwnerKeyRef = useRef<string | null>(null);
   const [expandedTrajectoryDetailLoading, setExpandedTrajectoryDetailLoading] = useState(false);
   const [expandedTrajectoryDetailError, setExpandedTrajectoryDetailError] = useState<string | null>(
     null,
   );
   const [expandedTrajectoryDetailAttempt, setExpandedTrajectoryDetailAttempt] = useState(0);
   const expandedTrajectoryDetailRequest = useRef(0);
+
+  const applyExpandedEventKey = useCallback((key: string | null) => {
+    expandedEventKeyRef.current = key;
+    setExpandedEventKey(key);
+  }, []);
 
   const applySessionIndexProgress = useCallback(
     (next: SessionIndexProgress, source: "event" | "snapshot" | "retry") => {
@@ -421,26 +433,33 @@ export function useViewerState() {
     return request;
   }, []);
 
-  const invalidateEventDetails = useCallback(() => {
+  const invalidateEventDetails = useCallback((retainVisible: boolean) => {
     detailGeneration.current += 1;
     detailCache.current.clear();
     detailLoads.current.clear();
     detailRequest.current += 1;
     expandedDetailRequest.current += 1;
     expandedTrajectoryDetailRequest.current += 1;
-    detailOwnerKeyRef.current = null;
-    setDetailOwnerKey(null);
-    setDetail(null);
-    setDetailLoading(false);
     setDetailError(null);
-    setExpandedDetailOwnerKey(null);
-    setExpandedDetail(null);
-    setExpandedDetailLoading(false);
     setExpandedDetailError(null);
-    setExpandedTrajectoryDetailOwnerKey(null);
-    setExpandedTrajectoryDetail(null);
-    setExpandedTrajectoryDetailLoading(false);
     setExpandedTrajectoryDetailError(null);
+    // Appends retain event identities. Keep already displayed content while
+    // the cache and requests refresh, so detail cards do not shrink to loaders.
+    // Replacement generations can reuse source positions for different events.
+    if (!retainVisible) {
+      detailOwnerKeyRef.current = null;
+      setDetailOwnerKey(null);
+      setDetail(null);
+      setDetailLoading(false);
+      expandedDetailOwnerKeyRef.current = null;
+      setExpandedDetailOwnerKey(null);
+      setExpandedDetail(null);
+      setExpandedDetailLoading(false);
+      expandedTrajectoryDetailOwnerKeyRef.current = null;
+      setExpandedTrajectoryDetailOwnerKey(null);
+      setExpandedTrajectoryDetail(null);
+      setExpandedTrajectoryDetailLoading(false);
+    }
     setDetailRevision((revision) => revision + 1);
   }, []);
 
@@ -468,18 +487,41 @@ export function useViewerState() {
     setTrajectoryPages(next);
     expandedTrajectoryDetailRequest.current += 1;
     setExpandedTrajectoryEvent(null);
+    expandedTrajectoryDetailOwnerKeyRef.current = null;
     setExpandedTrajectoryDetailOwnerKey(null);
     setExpandedTrajectoryDetail(null);
     setExpandedTrajectoryDetailLoading(false);
     setExpandedTrajectoryDetailError(null);
   }, []);
 
+  const invalidateTrajectoryPages = useCallback((reload: boolean) => {
+    trajectoryPageGeneration.current += 1;
+    trajectoryPageRequests.current.clear();
+    const retained = new Map([...trajectoryPagesRef.current].map(([sessionKey, pages]) => [
+      sessionKey,
+      new Map([...pages].map(([key, page]) => [key, {
+        ...page,
+        has_loaded: reload ? false : page.has_loaded,
+        is_loading: false,
+        is_loading_older: false,
+        is_loading_newer: false,
+      }])),
+    ]));
+    // Cancelled requests cannot clear their own loading flags. Keep rows usable
+    // if the parent refresh fails, without accepting obsolete child responses.
+    trajectoryPagesRef.current = retained;
+    setTrajectoryPages(retained);
+  }, []);
+
   const showLiveActivity = useCallback(() => {
     followingLive.current = true;
+    manualExpansion.current = false;
+    expansionRevision.current += 1;
+    if (workingTrajectory.current) applyExpandedEventKey(workingTrajectory.current);
     liveRefresh.current = true;
     setPendingLiveActivity(false);
     setEventsAttempt((attempt) => attempt + 1);
-  }, []);
+  }, [applyExpandedEventKey]);
 
   const setFollowingLive = useCallback((following: boolean) => {
     followingLive.current = following;
@@ -490,6 +532,7 @@ export function useViewerState() {
     workingTrajectory.current = null;
     liveUpdateQueued.current = false;
     pendingLiveReset.current = false;
+    uncommittedLiveReset.current = false;
     setPendingLiveActivity(false);
   }, [selectedSessionKey]);
 
@@ -522,9 +565,22 @@ export function useViewerState() {
     const previous = workingTrajectory.current;
     if (active !== previous) {
       workingTrajectory.current = active;
-      setExpandedEventKey((current) => active ?? (current === previous ? null : current));
+      if (followingLive.current) {
+        // Only the turn that was working can finish automatically. A finished
+        // turn reopened by the reader must survive newer activity unchanged.
+        const expanded = expandedEventKeyRef.current;
+        const finished = previous !== null && expanded === previous
+          && events.find((event) => event.event_key === previous)?.trajectory?.status === "complete";
+        if (finished) {
+          manualExpansion.current = false;
+          applyExpandedEventKey(active);
+        } else if (active && !expanded) {
+          manualExpansion.current = false;
+          applyExpandedEventKey(active);
+        }
+      }
     }
-  }, [events, eventsOwnerKey, selectedSessionKey]);
+  }, [applyExpandedEventKey, events, eventsOwnerKey, selectedSessionKey]);
 
   const requestTrajectoryEventPage = useCallback(
     (
@@ -690,13 +746,16 @@ export function useViewerState() {
     setTotalEvents(null);
     setHistoryStatus(null);
     setEventsError(null);
-    setExpandedEventKey(null);
+    manualExpansion.current = false;
+    expansionRevision.current += 1;
+    applyExpandedEventKey(null);
+    expandedDetailOwnerKeyRef.current = null;
     setExpandedDetailOwnerKey(null);
     setExpandedDetail(null);
     setExpandedDetailLoading(false);
     setExpandedDetailError(null);
     applyEventSelection(null, false);
-  }, [applyEventSelection, clearTrajectoryPages]);
+  }, [applyEventSelection, applyExpandedEventKey, clearTrajectoryPages]);
 
   const closeInspector = useCallback(() => {
     const trigger = inspectorTriggerRef.current;
@@ -952,20 +1011,14 @@ export function useViewerState() {
     // reached a committed React render.
     setAcceptedInitialEventPage(null);
     const ownsSession = eventsOwnerKeyRef.current === selectedSessionKey;
-    const isLiveRefresh = liveRefresh.current && ownsSession;
+    // A failed or superseded replacement keeps its reset semantics until commit.
+    const reset = pendingLiveReset.current || uncommittedLiveReset.current;
+    const isLiveRefresh = (liveRefresh.current || reset) && ownsSession;
     liveRefresh.current = false;
-    const reset = pendingLiveReset.current;
     pendingLiveReset.current = false;
-    if (!isLiveRefresh || reset) clearTrajectoryPages();
-    else {
-      trajectoryPageGeneration.current += 1;
-      trajectoryPageRequests.current.clear();
-    }
-    if (reset) {
-      workingTrajectory.current = null;
-      setExpandedEventKey(null);
-      applyEventSelection(null, false);
-    }
+    uncommittedLiveReset.current = reset;
+    if (!isLiveRefresh) clearTrajectoryPages();
+    else invalidateTrajectoryPages(false);
     if (!ownsSession) {
       eventsOwnerKeyRef.current = selectedSessionKey;
       setEventsOwnerKey(selectedSessionKey);
@@ -993,6 +1046,7 @@ export function useViewerState() {
 
     setEventsLoading(true);
     eventRefreshInFlight.current = true;
+    const refreshExpansionRevision = expansionRevision.current;
     const page = isLiveRefresh
       ? refreshEventWindow(selectedSessionKey, eventsRef.current, EVENT_PAGE_SIZE, loadEventPage, () => eventsRequest.current === requestId, reset)
       : loadEventPage({
@@ -1001,23 +1055,81 @@ export function useViewerState() {
       limit: EVENT_PAGE_SIZE,
     });
     void page
-      .then((response) => {
+      .then(async (response) => {
         if (eventsRequest.current !== requestId) {
           return;
         }
-        invalidateEventDetails();
+        const active = [...response.events].reverse().find((event) => event.trajectory?.status === "working");
+        let replacement: { trajectory_key: string; page: TrajectoryEventPageResponse } | null = null;
+        let finishedExpandedTurn = false;
+        while (isLiveRefresh && reset) {
+          const revision = expansionRevision.current;
+          const expanded = eventsRef.current.find((event) => event.event_key === expandedEventKeyRef.current);
+          // Disclosure state can stay open for a surviving trajectory slot.
+          // Its old child rows and detail ownership are never reused on reset.
+          const retained = expanded?.type === "trajectory"
+            ? response.events.find((event) => event.event_key === expanded.event_key
+              && event.type === "trajectory" && event.provider === expanded.provider)
+            : undefined;
+          finishedExpandedTurn = followingLive.current && expanded?.event_key === workingTrajectory.current
+            && expanded?.trajectory?.status === "working" && retained?.trajectory?.status === "complete";
+          const autoOpen = followingLive.current && (!manualExpansion.current
+            || (revision === refreshExpansionRevision && active?.event_key !== workingTrajectory.current));
+          const target = (finishedExpandedTurn ? undefined : retained) ?? (autoOpen ? active : undefined);
+          replacement = null;
+          if (!target) break;
+          const selectionIsCurrent = () => expansionRevision.current === revision
+            && (target === retained || followingLive.current);
+          // Keep the complete old view mounted until the replacement turn is
+          // ready. Clearing it first collapses the conversation, then expands
+          // it again with only the latest 40 rows. Carry the loaded count into
+          // the replacement, without trusting identities from an old generation.
+          const previous = trajectoryPagesRef.current.get(selectedSessionKey)
+            ?.get(expanded?.event_key ?? workingTrajectory.current ?? "");
+          let refreshed: TrajectoryEventPageResponse;
+          try {
+            refreshed = await refreshTrajectoryWindow({
+              session_key: selectedSessionKey,
+              trajectory_key: target.event_key,
+              direction: target.trajectory?.status === "working" || previous?.next_cursor === null
+                ? "backward" : "forward",
+              limit: TRAJECTORY_EVENT_PAGE_SIZE,
+            }, previous?.events ?? [], loadTrajectoryEventPage,
+            () => eventsRequest.current === requestId && selectionIsCurrent(), true);
+          } catch (error: unknown) {
+            if (eventsRequest.current !== requestId) return;
+            if (!selectionIsCurrent()) continue;
+            throw error;
+          }
+          if (eventsRequest.current !== requestId) return;
+          // A disclosure click during loading wins over the staged choice.
+          if (!selectionIsCurrent()) continue;
+          replacement = { trajectory_key: target.event_key, page: refreshed };
+          break;
+        }
+        if (reset) {
+          // Publish the replacement as one React update. Old source positions
+          // cannot continue to own expanded detail or Inspector selection.
+          uncommittedLiveReset.current = false;
+          clearTrajectoryPages();
+          applyEventSelection(null, false);
+          workingTrajectory.current = active?.event_key ?? null;
+          if (finishedExpandedTurn) manualExpansion.current = false;
+          applyExpandedEventKey(replacement?.trajectory_key ?? null);
+          if (replacement) {
+            const ready = replacement;
+            updateTrajectoryPage(selectedSessionKey, ready.trajectory_key, () => ({
+              ...emptyTrajectoryEventPageState(),
+              ...ready.page,
+              has_loaded: true,
+            }));
+          }
+        }
+        invalidateEventDetails(isLiveRefresh && !reset);
         if (isLiveRefresh && !reset) {
           // Invalidate in-flight child reads, but retain their displayed rows
           // until a fresh bounded child page arrives (no loading flicker).
-          trajectoryPageGeneration.current += 1;
-          trajectoryPageRequests.current.clear();
-          const retained = new Map(trajectoryPagesRef.current);
-          const pages = retained.get(selectedSessionKey);
-          if (pages) retained.set(selectedSessionKey, new Map([...pages].map(([key, value]) => [key, {
-            ...value, has_loaded: false, is_loading: false, is_loading_older: false, is_loading_newer: false,
-          }])));
-          trajectoryPagesRef.current = retained;
-          setTrajectoryPages(retained);
+          invalidateTrajectoryPages(true);
         }
         setEvents(response.events);
         setOlderCursor(response.previous_cursor);
@@ -1055,10 +1167,13 @@ export function useViewerState() {
       });
   }, [
     applyEventSelection,
+    applyExpandedEventKey,
     clearTrajectoryPages,
     eventsAttempt,
     invalidateEventDetails,
+    invalidateTrajectoryPages,
     selectedSessionKey,
+    updateTrajectoryPage,
   ]);
 
   useEffect(() => {
@@ -1105,17 +1220,18 @@ export function useViewerState() {
 
   useEffect(() => {
     const requestId = ++detailRequest.current;
-    setDetail(null);
     setDetailError(null);
 
     if (!inspectorOpen || !selectedSessionKey || !selectedEventKey) {
       detailOwnerKeyRef.current = null;
       setDetailOwnerKey(null);
+      setDetail(null);
       setDetailLoading(false);
       return;
     }
 
     const cacheKey = `${selectedSessionKey}:${selectedEventKey}`;
+    if (detailOwnerKeyRef.current !== cacheKey) setDetail(null);
     detailOwnerKeyRef.current = cacheKey;
     setDetailOwnerKey(cacheKey);
     const cached = readCachedDetail(detailCache.current, cacheKey);
@@ -1154,17 +1270,20 @@ export function useViewerState() {
 
   useEffect(() => {
     const requestId = ++expandedDetailRequest.current;
-    setExpandedDetail(null);
     setExpandedDetailError(null);
 
     const expandedEvent = events.find((event) => event.event_key === expandedEventKey);
     if (!selectedSessionKey || !expandedEventKey || !expandedEventNeedsDetail(expandedEvent)) {
+      expandedDetailOwnerKeyRef.current = null;
       setExpandedDetailOwnerKey(null);
+      setExpandedDetail(null);
       setExpandedDetailLoading(false);
       return;
     }
 
     const cacheKey = `${selectedSessionKey}:${expandedEventKey}`;
+    if (expandedDetailOwnerKeyRef.current !== cacheKey) setExpandedDetail(null);
+    expandedDetailOwnerKeyRef.current = cacheKey;
     setExpandedDetailOwnerKey(cacheKey);
     const cached = readCachedDetail(detailCache.current, cacheKey);
     if (cached) {
@@ -1218,11 +1337,12 @@ export function useViewerState() {
 
   useEffect(() => {
     const requestId = ++expandedTrajectoryDetailRequest.current;
-    setExpandedTrajectoryDetail(null);
     setExpandedTrajectoryDetailError(null);
 
     if (!selectedSessionKey || !expandedTrajectoryEvent) {
+      expandedTrajectoryDetailOwnerKeyRef.current = null;
       setExpandedTrajectoryDetailOwnerKey(null);
+      setExpandedTrajectoryDetail(null);
       setExpandedTrajectoryDetailLoading(false);
       return;
     }
@@ -1231,12 +1351,16 @@ export function useViewerState() {
       ?.get(expandedTrajectoryEvent.trajectory_key)
       ?.events.find((event) => event.event_key === expandedTrajectoryEvent.event_key);
     if (!expandedEventNeedsDetail(childEvent)) {
+      expandedTrajectoryDetailOwnerKeyRef.current = null;
       setExpandedTrajectoryDetailOwnerKey(null);
+      setExpandedTrajectoryDetail(null);
       setExpandedTrajectoryDetailLoading(false);
       return;
     }
 
     const cacheKey = `${selectedSessionKey}:${expandedTrajectoryEvent.event_key}`;
+    if (expandedTrajectoryDetailOwnerKeyRef.current !== cacheKey) setExpandedTrajectoryDetail(null);
+    expandedTrajectoryDetailOwnerKeyRef.current = cacheKey;
     setExpandedTrajectoryDetailOwnerKey(cacheKey);
     const cached = readCachedDetail(detailCache.current, cacheKey);
     if (cached) {
@@ -1379,8 +1503,10 @@ export function useViewerState() {
   }, [applyEventSelection]);
 
   const toggleEventExpanded = useCallback((eventKey: string) => {
-    setExpandedEventKey((current) => current === eventKey ? null : eventKey);
-  }, []);
+    manualExpansion.current = true;
+    expansionRevision.current += 1;
+    applyExpandedEventKey(expandedEventKeyRef.current === eventKey ? null : eventKey);
+  }, [applyExpandedEventKey]);
 
   const toggleTrajectoryEventExpanded = useCallback((trajectoryKey: string, eventKey: string) => {
     setExpandedTrajectoryEvent((current) => (
@@ -1503,7 +1629,7 @@ export function useViewerState() {
         if (eventsRequest.current !== requestGeneration) {
           return;
         }
-        invalidateEventDetails();
+        invalidateEventDetails(true);
         setEvents((current) => mergeEvents(current, response.events, "before"));
         setOlderCursor(response.previous_cursor);
         setTotalEvents(response.total_events);
@@ -1542,7 +1668,7 @@ export function useViewerState() {
         if (eventsRequest.current !== requestGeneration) {
           return;
         }
-        invalidateEventDetails();
+        invalidateEventDetails(true);
         setEvents((current) => mergeEvents(current, response.events, "after"));
         setNewerCursor(response.next_cursor);
         setTotalEvents(response.total_events);

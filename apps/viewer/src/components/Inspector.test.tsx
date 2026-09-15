@@ -36,6 +36,21 @@ const DETAIL: EventDetail = {
 };
 
 describe("Inspector Markdown routing", () => {
+  it("keeps visible detail mounted during refresh and refresh failure", () => {
+    const props = {
+      detail: DETAIL, error: null, event: EVENT, is_loading: false, is_open: true,
+      on_close: vi.fn(), on_retry: vi.fn(),
+    };
+    const { rerender } = render(<Inspector {...props} />);
+    const content = screen.getByRole("heading", { name: "Full result" });
+    rerender(<Inspector {...props} is_loading />);
+    expect(screen.getByRole("heading", { name: "Full result" })).toBe(content);
+    expect(screen.queryByText("Loading event detail…")).not.toBeInTheDocument();
+    rerender(<Inspector {...props} error="temporary failure" />);
+    expect(screen.getByRole("heading", { name: "Full result" })).toBe(content);
+    expect(screen.getByRole("alert")).toHaveTextContent("Could not refresh detail");
+  });
+
   it("renders readable message detail as Markdown in the Content tab", () => {
     render(
       <Inspector

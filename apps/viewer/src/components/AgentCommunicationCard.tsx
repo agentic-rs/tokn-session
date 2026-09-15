@@ -2,6 +2,7 @@ import type { EventDetail, EventSummary } from "../lib/types";
 import { readableEventContent } from "../lib/state";
 import type { TechnicalCardHeading } from "./CardPresentation";
 import { MarkdownContent } from "./MarkdownContent";
+import { DetailRefreshError } from "./DetailRefreshError";
 
 export function isAgentCommunication(event: EventSummary): boolean {
   return event.type === "agent_activity" && event.agent_activity?.communication != null;
@@ -49,13 +50,14 @@ export function AgentCommunicationCard({
   const detailTruncated = typeof detailEvent === "object" && detailEvent !== null
     && !Array.isArray(detailEvent) && detailEvent.truncated === true;
   return (
-    <div className="communication-card">
-      {needsDetail && (is_loading || (!detailMatches && !error)) ? (
+    <div aria-busy={is_loading} className="communication-card">
+      {needsDetail && detailMatches ? <DetailRefreshError error={error} on_retry={on_retry} /> : null}
+      {needsDetail && !detailMatches && (is_loading || !error) ? (
         <div className="communication-card__state" role="status">
           <span className="inline-spinner" aria-hidden="true" />
           Loading message…
         </div>
-      ) : needsDetail && error ? (
+      ) : needsDetail && !detailMatches && error ? (
         <div className="communication-card__error" role="alert">
           <span>
             <strong>Message unavailable</strong>

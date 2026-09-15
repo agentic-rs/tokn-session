@@ -1,6 +1,7 @@
 import type { EventDetail, EventSummary } from "../lib/types";
 import { MarkdownContent } from "./MarkdownContent";
 import { readableEventContent } from "../lib/state";
+import { DetailRefreshError } from "./DetailRefreshError";
 
 const SCOPE_LABELS: Record<string, string> = {
   context_before: "Context before",
@@ -18,7 +19,7 @@ export function CompactionCard({ event, detail, error, is_loading, on_retry }: {
   const card = event.compaction;
   const summary = readableEventContent(event, detail)?.sections[0]?.text;
   return (
-    <div className="compaction-card">
+    <div aria-busy={is_loading} className="compaction-card">
       {card?.trigger ? <p>Trigger: {card.trigger}</p> : null}
       {card?.reason ? <p>{card.reason}</p> : null}
       {card?.measurements.map((item) => (
@@ -27,14 +28,18 @@ export function CompactionCard({ event, detail, error, is_loading, on_retry }: {
           {item.estimated === true ? " (estimated)" : ""}
         </p>
       ))}
-      {is_loading ? <p role="status">Loading compaction summary…</p>
+      {summary ? (
+        <>
+          <DetailRefreshError error={error} on_retry={on_retry} />
+          <MarkdownContent content={summary} />
+        </>
+      ) : is_loading ? <p role="status">Loading compaction summary…</p>
         : error ? (
           <div role="alert">
             <p>Compaction summary unavailable: {error}</p>
             <button className="text-button" onClick={on_retry} type="button">Try again</button>
           </div>
-        ) : summary ? <MarkdownContent content={summary} />
-          : <p>{card?.summary_opaque
+        ) : <p>{card?.summary_opaque
             ? "The provider stored an opaque compaction summary."
             : card?.has_summary ? "Expand to load the compaction summary."
               : "No readable summary was recorded."}</p>}
