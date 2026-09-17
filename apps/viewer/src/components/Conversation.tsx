@@ -1,4 +1,6 @@
+import { useState } from "react";
 import { useTimelineScroll } from "../lib/useTimelineScroll";
+import { isBookkeepingEvent } from "../lib/eventFilter";
 import type {
   EventDetail,
   EventSummary,
@@ -103,6 +105,9 @@ export function Conversation({
   on_retry,
   on_retry_expanded_detail,
 }: ConversationProps) {
+  const [hideLifecycle, setHideLifecycle] = useState(false);
+  const visibleEvents = hideLifecycle ? events.filter((event) => !isBookkeepingEvent(event)) : events;
+  const hiddenCount = events.length - visibleEvents.length;
   const scroll = useTimelineScroll({
     session_key: session?.session_key ?? null,
     initial_page_loaded,
@@ -172,6 +177,18 @@ export function Conversation({
             <p>Read-only, across every known provider</p>
           </div>
         )}
+        <button
+          aria-pressed={hideLifecycle}
+          className="conversation__filter"
+          disabled={!session}
+          onClick={() => setHideLifecycle((hidden) => !hidden)}
+          title={hideLifecycle
+            ? "Show lifecycle events and mid-turn usage again."
+            : "Hide routine lifecycle, session, configuration, and metadata events without content, plus mid-turn usage. Keep end-of-turn usage and meaningful activity."}
+          type="button"
+        >
+          {hideLifecycle ? "Show lifecycle" : "Hide lifecycle"}
+        </button>
         <button
           aria-label={inspector_open ? "Close event inspector" : "Open event inspector"}
           aria-pressed={inspector_open}
@@ -270,10 +287,18 @@ export function Conversation({
               </div>
             )}
 
-            {events.map((event) => (
+            {hiddenCount > 0 ? (
+              <p className="event-filter-notice" role="status">
+                {visibleEvents.length === 0 ? "No events match this filter in the loaded range. " : ""}
+                {hiddenCount} {hiddenCount === 1 ? "event hidden" : "events hidden"} in this loaded range.
+              </p>
+            ) : null}
+
+            {visibleEvents.map((event) => (
               <div data-event-key={event.event_key} data-scroll-key={event.event_key} key={`${session.session_key}:${event.event_key}`}>
               <EventCard
                 session_key={session.session_key}
+                hide_lifecycle={hideLifecycle}
                 button_id={eventButtonId(event.event_key)}
                 event={event}
                 detail={event.event_key === expanded_event_key ? expanded_detail : null}

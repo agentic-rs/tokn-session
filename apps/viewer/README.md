@@ -111,6 +111,16 @@ while their **Inspect** action opens the full inspector. Messages and reasoning
 have a readable **Content** view, while **Normalized** and **Native** expose the
 debugging representations.
 
+**Hide lifecycle** is a quick filter for routine lifecycle and bookkeeping
+rows without message content, including session settings, delivery markers, and
+successful turn completion. It applies to the conversation and expanded work
+sections, hiding intermediate usage while keeping the final accounting for each
+usage kind. Errors, messages, tools, agent communications, and unfamiliar events
+remain visible. All events are shown initially; the active button reads
+**Show lifecycle**, which restores the hidden rows.
+Counts and pagination still describe the complete history, and hidden counts
+refer only to loaded rows.
+
 User prompts and final assistant replies remain in the outer conversation.
 Contiguous stretches of intermediate assistant progress and non-message work
 are grouped into a compact work trajectory item, keeping the

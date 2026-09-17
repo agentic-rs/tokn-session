@@ -1121,6 +1121,30 @@ button:disabled {
   flex: 1;
 }
 
+.conversation__filter {
+  flex: 0 0 auto;
+  padding: 6px 8px;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.conversation__filter:hover,
+.conversation__filter[aria-pressed="true"] {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.event-filter-notice {
+  margin: 9px 0;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
 .conversation__identity h2 {
   max-width: min(630px, 58vw);
   font-size: 14px;

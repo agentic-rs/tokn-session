@@ -30,9 +30,11 @@ import { CompactionCard } from "./CompactionCard";
 import { UsageCard, usageHeading } from "./UsageCard";
 import { AgentCommunicationCard, agentCommunicationHeading, isAgentCommunication } from "./AgentCommunicationCard";
 import { DetailRefreshError } from "./DetailRefreshError";
+import { isBookkeepingEvent } from "../lib/eventFilter";
 
 interface EventCardProps {
   session_key?: string;
+  hide_lifecycle?: boolean;
   event: EventSummary;
   button_id: string;
   is_selected: boolean;
@@ -449,6 +451,7 @@ function AgentActivityBody({
 
 function TrajectorySection({
   session_key,
+  hide_lifecycle,
   button_id,
   event,
   is_expanded,
@@ -469,6 +472,7 @@ function TrajectorySection({
   expanded_child_event_key,
 }: {
   session_key?: string;
+  hide_lifecycle: boolean;
   button_id: string;
   event: EventSummary;
   is_expanded: boolean;
@@ -492,6 +496,10 @@ function TrajectorySection({
   const regionId = `${button_id}-details`;
   const labelId = `${button_id}-label`;
   const isLoadingPage = page?.is_loading_older || page?.is_loading_newer;
+  const visibleEvents = hide_lifecycle
+    ? page?.events.filter((event) => !isBookkeepingEvent(event)) ?? []
+    : page?.events ?? [];
+  const hiddenCount = (page?.events.length ?? 0) - visibleEvents.length;
   return (
     <section className="trajectory-section" data-selected={is_selected}>
       <div className="trajectory-section__header">
@@ -564,12 +572,20 @@ function TrajectorySection({
                 </button>
               ) : null}
 
-              {page.events.length > 0 ? (
+              {hiddenCount > 0 ? (
+                <p className="event-filter-notice" role="status">
+                  {visibleEvents.length === 0 ? "No events match this filter in the loaded turn range. " : ""}
+                  {hiddenCount} {hiddenCount === 1 ? "event hidden" : "events hidden"} in this loaded turn range.
+                </p>
+              ) : null}
+
+              {visibleEvents.length > 0 ? (
                 <div aria-label="Events in this turn" className="trajectory-section__events" role="list">
-                  {page.events.map((childEvent) => (
+                  {visibleEvents.map((childEvent) => (
                     <div data-scroll-key={`${event.event_key}/${childEvent.event_key}`} key={childEvent.event_key} role="listitem">
                       <EventCard
                         session_key={session_key}
+                        hide_lifecycle={hide_lifecycle}
                         button_id={eventButtonId(childEvent.event_key)}
                         detail={childEvent.event_key === expanded_child_event_key
                           ? expanded_child_detail
@@ -593,7 +609,7 @@ function TrajectorySection({
                     </div>
                   ))}
                 </div>
-              ) : !page.error ? (
+              ) : page.events.length === 0 && !page.error ? (
                 <p className="trajectory-section__empty" role="status">No events in this turn.</p>
               ) : null}
 
@@ -610,7 +626,7 @@ function TrajectorySection({
 
               {page.total_events !== null && page.events.length < page.total_events ? (
                 <p className="trajectory-section__count" role="status">
-                  Showing {page.events.length} of {page.total_events} events.
+                  {hide_lifecycle ? "Loaded" : "Showing"} {page.events.length} of {page.total_events} events.
                 </p>
               ) : null}
             </>
@@ -702,6 +718,7 @@ function ToolOutput({
 
 export function EventCard({
   session_key,
+  hide_lifecycle = false,
   event,
   button_id,
   is_selected,
@@ -734,6 +751,7 @@ export function EventCard({
     return (
       <TrajectorySection
         session_key={session_key}
+        hide_lifecycle={hide_lifecycle}
         button_id={button_id}
         event={event}
         expanded_child_detail={trajectory_expanded_detail ?? null}

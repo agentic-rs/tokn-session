@@ -371,6 +371,10 @@ pub struct EventSummary {
   pub summary: String,
   pub summary_truncated: bool,
   pub is_hidden: bool,
+  /// A routine lifecycle/configuration row or intermediate usage record that
+  /// can be hidden without loading detail. Final accounting, content, unknown
+  /// diagnostics, and exceptional lifecycle outcomes remain visible.
+  pub is_bookkeeping: bool,
   pub is_error: Option<bool>,
   pub tool: Option<ToolCardSummary>,
   pub usage: Option<UsageCardSummary>,

@@ -343,6 +343,8 @@ export interface EventSummary {
   summary_truncated: boolean;
   is_hidden: boolean;
   is_error: boolean | null;
+  /** Explicit backend classification; absent on older servers. */
+  is_bookkeeping?: boolean;
   /** Optional while the viewer remains compatible with older backends. */
   agent_activity?: AgentActivityCardSummary | null;
   /** Present only for a projected whole-turn timeline entry. */

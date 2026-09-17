@@ -33,7 +33,9 @@ use crate::repository::{NativeRepository, SessionBodyIndexing, ViewerRepository}
 
 mod agent_activity;
 mod compaction;
+mod event_filter;
 mod trajectory_state;
+mod usage_filter;
 
 use agent_activity::{ActivityTargets, agent_activity_card_summary};
 
@@ -2633,9 +2635,10 @@ impl ViewerService {
     let delegation_targets = has_targeted_agent_activity
       .then(|| self.delegation_targets_for_parent(&locator))
       .unwrap_or_default();
+    let intermediate_usage = usage_filter::intermediate_usage(&loaded.events);
     let events = timeline[start..end]
       .iter()
-      .map(|entry| timeline_entry_event_summary(entry, &loaded.events, &delegation_targets))
+      .map(|entry| timeline_entry_event_summary(entry, &loaded.events, &delegation_targets, &intermediate_usage))
       .collect();
 
     Ok(EventPage {
@@ -2696,9 +2699,10 @@ impl ViewerService {
     let delegation_targets = has_targeted_agent_activity
       .then(|| self.delegation_targets_for_parent(&locator))
       .unwrap_or_default();
+    let intermediate_usage = usage_filter::intermediate_usage(&loaded.events);
     let events = trajectory.entries[start..end]
       .iter()
-      .map(|entry| timeline_entry_event_summary(entry, &loaded.events, &delegation_targets))
+      .map(|entry| timeline_entry_event_summary(entry, &loaded.events, &delegation_targets, &intermediate_usage))
       .collect();
 
     Ok(TrajectoryEventPage {
@@ -4147,6 +4151,7 @@ fn timeline_entry_event_summary(
   entry: &TimelineEntry,
   events: &[AgentEvent],
   delegation_targets: &ActivityTargets,
+  intermediate_usage: &HashSet<usize>,
 ) -> EventSummary {
   match entry {
     TimelineEntry::Event { source_event_index } => event_summary_with_delegation_targets(
@@ -4154,6 +4159,7 @@ fn timeline_entry_event_summary(
       *source_event_index,
       &events[*source_event_index],
       delegation_targets,
+      intermediate_usage,
     ),
     TimelineEntry::ToolOperation {
       source_event_index,
@@ -4183,6 +4189,7 @@ fn trajectory_event_summary(trajectory: &Trajectory, events: &[AgentEvent]) -> E
     summary,
     summary_truncated: false,
     is_hidden: false,
+    is_bookkeeping: false,
     is_error: (card.error_count > 0).then_some(true),
     tool: None,
     usage: None,
@@ -4370,7 +4377,13 @@ fn requested_trajectory_offset(
 
 #[cfg(test)]
 fn event_summary(events: &[AgentEvent], index: usize, event: &AgentEvent) -> EventSummary {
-  event_summary_with_delegation_targets(events, index, event, &ActivityTargets::default())
+  event_summary_with_delegation_targets(
+    events,
+    index,
+    event,
+    &ActivityTargets::default(),
+    &usage_filter::intermediate_usage(events),
+  )
 }
 
 fn event_summary_with_delegation_targets(
@@ -4378,6 +4391,7 @@ fn event_summary_with_delegation_targets(
   index: usize,
   event: &AgentEvent,
   delegation_targets: &ActivityTargets,
+  intermediate_usage: &HashSet<usize>,
 ) -> EventSummary {
   let projected = if matches!(event, AgentEvent::Compaction(_)) {
     compaction::for_source(events, index).map(|operation| AgentEvent::Compaction(operation.event))
@@ -4434,6 +4448,7 @@ fn event_summary_with_delegation_targets(
     summary,
     summary_truncated,
     is_hidden: hidden,
+    is_bookkeeping: !hidden && (event_filter::is_bookkeeping(event) || intermediate_usage.contains(&index)),
     is_error: error_for_event(event),
     tool,
     usage,
@@ -4474,6 +4489,7 @@ fn tool_operation_event_summary(source_event_index: usize, operation: &ToolOpera
     summary,
     summary_truncated,
     is_hidden: false,
+    is_bookkeeping: false,
     // Preserve an unspecified provider error state. A failed assembled
     // operation is the only case where we need to synthesize `true`.
     is_error: operation
@@ -5305,6 +5321,8 @@ fn truncate_with_flag(value: String, max_chars: usize) -> (String, bool) {
 #[cfg(test)]
 mod tests {
   mod communications;
+  mod event_filter;
+  mod usage_filter;
   use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
   use std::path::PathBuf;
   use std::sync::Mutex;
@@ -9867,7 +9885,8 @@ mod tests {
       .iter()
       .find(|entry| matches!(entry, TimelineEntry::ToolOperation { .. }))
       .expect("assembled tool operation should stay inside the trajectory");
-    let operation = timeline_entry_event_summary(operation_entry, &events, &ActivityTargets::default());
+    let operation =
+      timeline_entry_event_summary(operation_entry, &events, &ActivityTargets::default(), &HashSet::new());
     let operation_tool = operation.tool.as_ref().unwrap();
 
     let page = service_with_session(loaded_session(events))
