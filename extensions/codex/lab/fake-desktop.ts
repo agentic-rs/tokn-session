@@ -340,8 +340,10 @@ function isStartTurnRequest(value: unknown): value is CodexDesktopStartTurnReque
     && typeof value.requestId === "string"
     && isRecord(value.params)
     && typeof value.params.conversationId === "string"
-    && isRecord(value.params.turnStartParams)
-    && Array.isArray(value.params.turnStartParams.input);
+    && isRecord(value.params.turnStart)
+    && isRecord(value.params.turnStart.request)
+    && value.params.turnStart.request.threadId === value.params.conversationId
+    && Array.isArray(value.params.turnStart.request.input);
 }
 
 function isUpdateThreadSettingsRequest(

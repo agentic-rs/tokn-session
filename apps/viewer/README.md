@@ -95,7 +95,8 @@ closing the viewer.
 - Other providers and the desktop External snapshot connection show why input
   is unavailable. To message another machine, connect to its viewer API.
 
-The footer reports acceptance or failure. The conversation displays the message
+The footer reports acceptance or failure, including the backend's failure
+reason. The conversation displays the message
 when the provider records it. If delivery cannot be confirmed, the draft stays
 locked until **Edit message** is chosen after checking the conversation. Messages
 are never retried automatically. Input is limited to 16,384 characters; Pi also

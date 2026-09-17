@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getSessionInputStatus, submitSessionInput } from "./tauri";
+import { errorMessage } from "./state";
 import type { SessionInputStatus } from "./types";
 
 const DEFAULT_MAX_LENGTH = 16_384;
@@ -39,10 +40,13 @@ export function useSessionInput(session_key: string | null) {
     let availability: SessionInputStatus;
     try {
       availability = await getSessionInputStatus({ session_key: key });
-    } catch {
+    } catch (error) {
       availability = {
         available: false,
-        message: "Message input is unavailable on this connection. Retry to check availability.",
+        message: withDetail(
+          "Message input is unavailable on this connection. Retry to check availability.",
+          errorMessage(error),
+        ),
         max_length: DEFAULT_MAX_LENGTH,
       };
     }
@@ -74,8 +78,18 @@ export function useSessionInput(session_key: string | null) {
       || Array.from(current.draft).length > current.availability.max_length) return;
     const text = current.draft;
     update(key, (value) => ({ ...value, sending: true, notice: null }));
+    let requestId: string;
     try {
-      const requestId = newRequestId();
+      requestId = newRequestId();
+    } catch (error) {
+      // Preparing an ID cannot deliver anything, so the draft remains editable.
+      update(key, (value) => ({
+        ...value, sending: false,
+        notice: withDetail("Message was not sent. Could not prepare the message.", errorMessage(error)),
+      }));
+      return;
+    }
+    try {
       const result = await submitSessionInput({ session_key: key, request_id: requestId, text });
       const matchingResponse = result.request_id === requestId;
       if (matchingResponse && result.status === "accepted") {
@@ -88,12 +102,16 @@ export function useSessionInput(session_key: string | null) {
         update(key, (value) => ({ ...value, sending: false, notice: result.message || "Message was not sent. Try again." }));
       } else {
         update(key, (value) => ({
-          ...value, sending: false, delivery_uncertain: true, notice: UNCONFIRMED_MESSAGE,
+          ...value, sending: false, delivery_uncertain: true,
+          notice: withDetail(UNCONFIRMED_MESSAGE, matchingResponse
+            ? result.message
+            : "The server response did not match this message."),
         }));
       }
-    } catch {
+    } catch (error) {
       update(key, (value) => ({
-        ...value, sending: false, delivery_uncertain: true, notice: UNCONFIRMED_MESSAGE,
+        ...value, sending: false, delivery_uncertain: true,
+        notice: withDetail(UNCONFIRMED_MESSAGE, errorMessage(error)),
       }));
     }
   }
@@ -116,6 +134,11 @@ export function useSessionInput(session_key: string | null) {
     },
     send,
   };
+}
+
+function withDetail(message: string, detail: string): string {
+  const reason = detail.trim();
+  return reason && reason !== message ? `${message} Reason: ${reason}` : message;
 }
 
 function newRequestId(): string {

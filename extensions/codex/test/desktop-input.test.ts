@@ -77,10 +77,15 @@ describe("Codex desktop input experiment", () => {
     });
     expect(owner.last_start_turn?.params).toMatchObject({
       conversationId: "thread-lab-1",
-      turnStartParams: {
-        input: [{ type: "text", text: "hello from Terminal Pet" }]
+      turnStart: {
+        request: {
+          threadId: "thread-lab-1",
+          input: [{ type: "text", text: "hello from Terminal Pet" }]
+        },
+        context: { inheritThreadSettings: true }
       }
     });
+    expect(owner.last_start_turn?.version).toBe(2);
   });
 
   test("forwards model and reasoning effort overrides", async () => {
@@ -106,10 +111,14 @@ describe("Codex desktop input experiment", () => {
         effort: "low"
       }
     });
-    expect(owner.last_start_turn?.params.turnStartParams).toEqual({
-      input: [{ type: "text", text: "use luna" }],
-      clientUserMessageId: expect.any(String),
-      additionalContext: null
+    expect(owner.last_start_turn?.params.turnStart).toEqual({
+      request: {
+        threadId: "thread-lab-settings",
+        input: [{ type: "text", text: "use luna" }],
+        clientUserMessageId: expect.any(String),
+        additionalContext: null
+      },
+      context: { inheritThreadSettings: true }
     });
   });
 

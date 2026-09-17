@@ -85,7 +85,8 @@ where
     write_frame(&mut stream, &success(&request, json!({"clientId": "viewer-client"}))).await;
     handler(stream).await;
   });
-  let client = DesktopClient::connect(&endpoint, REQUEST_TIMEOUT).await.unwrap();
+  let mut client = DesktopClient::connect(&endpoint, REQUEST_TIMEOUT).await.unwrap();
+  client.request_timeout = SUBMISSION_TIMEOUT;
   (client, server)
 }
 
@@ -95,21 +96,25 @@ async fn sends_one_message_to_the_owner_and_declines_discovery() {
   let (mut client, server) = initialized_client(|mut stream| async move {
     let request = read_frame(&mut stream).await.unwrap();
     assert_eq!(request["method"], START_TURN_METHOD);
-    assert_eq!(request["version"], 1);
+    assert_eq!(request["version"], 2);
     assert_eq!(request["sourceClientId"], "viewer-client");
     assert_eq!(
       request["params"],
       json!({
         "conversationId": "session-123",
-        "turnStartParams": {
-          "input": [{ "type": "text", "text": "First line\n第二行" }],
-          "clientUserMessageId": "viewer-request-123",
-          "additionalContext": null
+        "turnStart": {
+          "request": {
+            "threadId": "session-123",
+            "input": [{ "type": "text", "text": "First line\n第二行" }],
+            "clientUserMessageId": "viewer-request-123",
+            "additionalContext": null
+          },
+          "context": { "inheritThreadSettings": true }
         }
       })
     );
     assert_ne!(request["requestId"], "viewer-request-123");
-    assert_eq!(request["timeoutMs"], 5000);
+    assert_eq!(request["timeoutMs"], 20_000);
     let discovery = encode_frame(&json!({
       "type": "client-discovery-request", "requestId": "discovery-123", "request": request
     }))
@@ -170,7 +175,7 @@ async fn missing_owner_is_a_definite_non_delivery() {
   .await;
   let error = client.submit("session", "id", "hello").await.unwrap_err();
   assert!(!error.may_have_been_sent);
-  assert!(error.message.contains("not open in Codex Desktop"));
+  assert!(error.message.contains("No compatible Codex Desktop owner"));
   server.await.unwrap();
 }
 
@@ -192,6 +197,52 @@ async fn owner_errors_are_not_proof_of_non_delivery() {
   let error = client.submit("session", "id", "hello").await.unwrap_err();
   assert!(error.may_have_been_sent);
   assert!(error.message.contains("owner failed"));
+  server.await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(any(unix, windows))]
+async fn unsupported_versions_and_methods_are_definite_rejections() {
+  for error in ["request-version-mismatch", "no-handler-for-request"] {
+    let (mut client, server) = initialized_client(move |mut stream| async move {
+      let request = read_frame(&mut stream).await.unwrap();
+      write_frame(
+        &mut stream,
+        &json!({
+          "type": "response", "requestId": request["requestId"], "resultType": "error", "error": error
+        }),
+      )
+      .await;
+      let mut byte = [0];
+      assert_eq!(
+        stream.read(&mut byte).await.unwrap(),
+        0,
+        "must not retry another protocol version"
+      );
+    })
+    .await;
+    let result = client.submit("session", "id", "hello").await.unwrap_err();
+    assert!(!result.may_have_been_sent);
+    assert!(result.message.contains(error));
+    drop(client);
+    server.await.unwrap();
+  }
+}
+
+#[tokio::test]
+#[cfg(any(unix, windows))]
+async fn success_without_an_optional_result_still_confirms_admission() {
+  let (mut client, server) = initialized_client(|mut stream| async move {
+    let request = read_frame(&mut stream).await.unwrap();
+    let mut response = success(&request, Value::Null);
+    response.as_object_mut().unwrap().remove("result");
+    write_frame(&mut stream, &response).await;
+  })
+  .await;
+  assert!(matches!(
+    client.submit("session", "id", "hello").await.unwrap(),
+    Admission::Accepted
+  ));
   server.await.unwrap();
 }
 

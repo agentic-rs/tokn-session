@@ -384,8 +384,11 @@ process when the bridge is unavailable.
 length-prefixed JSON IPC router. The client requires an explicit IPC endpoint:
 a Unix socket on macOS/Unix or a local Windows named pipe. Platform discovery
 maps `$CODEX_HOME/ipc/ipc.sock` on Unix and `\\.\pipe\codex-ipc` on Windows.
-The client sends the observed version-1 `thread-follower-start-turn` request
-using the rollout thread id as `conversationId`. An isolated fake desktop
+The client sends the observed version-2 `thread-follower-start-turn` request
+(Desktop build 26.901.41123), using the rollout thread id as `conversationId`
+and `turnStart.request.threadId`. The version-1 `turnStartParams` shape no longer
+matches that build. Requests allow the router's ten-second owner-discovery
+window to complete. An isolated fake desktop
 router exercises client initialization, owner discovery, forwarding, and the
 successful response path over the native transport on Linux, macOS, and Windows
 CI. Fake-router error responses are tested on Unix only because Bun 1.3.13 does
@@ -432,7 +435,8 @@ queueing busy follow-ups. Other providers, Codex subagents, and External snapsho
 mode are unavailable. Catalog membership and a fresh source header validate
 every target. Availability checks do not submit input. Drafts stay in memory
 per session; Cmd/Ctrl+Enter sends. Admission clears the draft, while uncertain
-delivery retains it and requires explicit editing before another send. There
+delivery retains it and requires explicit editing before another send; the
+footer preserves backend and connection diagnostics alongside that notice. There
 is no optimistic transcript or automatic retry. The bounded in-memory request
 cache deduplicates UUIDs and guards the resolved runtime owner against parallel
 sends, including when the HTTP caller disconnects. Limits are 16,384 Unicode

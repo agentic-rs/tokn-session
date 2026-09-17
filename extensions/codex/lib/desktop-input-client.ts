@@ -20,7 +20,8 @@ import {
   type CodexDesktopSuccessResponse,
 } from "./ipc-protocol";
 
-const DEFAULT_TIMEOUT_MS = 5_000;
+// Desktop's router can spend ten seconds discovering a compatible owner.
+const DEFAULT_TIMEOUT_MS = 20_000;
 const INITIAL_CLIENT_ID = "initializing-client";
 
 interface PendingRequest {
@@ -107,10 +108,14 @@ export class CodexDesktopInputClient {
       method: "thread-follower-start-turn",
       params: {
         conversationId: normalizedConversationId,
-        turnStartParams: {
-          input: [{ type: "text", text: normalizedPrompt }],
-          clientUserMessageId: randomUUID(),
-          additionalContext: null
+        turnStart: {
+          request: {
+            threadId: normalizedConversationId,
+            input: [{ type: "text", text: normalizedPrompt }],
+            clientUserMessageId: randomUUID(),
+            additionalContext: null
+          },
+          context: { inheritThreadSettings: true }
         }
       },
       timeoutMs: this.#timeoutMs

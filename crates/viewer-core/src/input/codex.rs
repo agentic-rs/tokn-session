@@ -15,6 +15,10 @@ use super::{Admission, DeliveryError, InputTarget};
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+// The router can spend ten seconds discovering an owner before forwarding.
+// Keep this below the browser's 30-second request deadline, including the
+// separate five-second connection/initialization budget.
+const SUBMISSION_TIMEOUT: Duration = Duration::from_secs(20);
 const START_TURN_METHOD: &str = "thread-follower-start-turn";
 
 trait IpcStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -33,6 +37,7 @@ pub(super) async fn status(_target: &InputTarget) -> Result<String, DeliveryErro
 
 pub(super) async fn submit(target: &InputTarget, request_id: &str, text: &str) -> Result<Admission, DeliveryError> {
   let mut client = DesktopClient::connect(&desktop_endpoint()?, REQUEST_TIMEOUT).await?;
+  client.request_timeout = SUBMISSION_TIMEOUT;
   client.submit(&target.session_id, request_id, text).await
 }
 
@@ -54,9 +59,17 @@ fn desktop_endpoint() -> Result<PathBuf, DeliveryError> {
 
 impl DesktopClient {
   async fn connect(endpoint: &std::path::Path, request_timeout: Duration) -> Result<Self, DeliveryError> {
-    let stream = timeout(request_timeout, connect_stream(endpoint))
+    timeout(request_timeout, Self::connect_and_initialize(endpoint, request_timeout))
       .await
       .map_err(|_| DeliveryError::not_sent("Connecting to Codex Desktop timed out."))?
+  }
+
+  async fn connect_and_initialize(
+    endpoint: &std::path::Path,
+    request_timeout: Duration,
+  ) -> Result<Self, DeliveryError> {
+    let stream = connect_stream(endpoint)
+      .await
       .map_err(|error| DeliveryError::not_sent(format!("Codex Desktop is unavailable: {error}")))?;
     let mut client = Self {
       stream,
@@ -104,14 +117,20 @@ impl DesktopClient {
           "type": "request",
           "requestId": wire_request_id,
           "sourceClientId": self.client_id,
-          "version": 1,
+          // Version 2 observed in Codex Desktop 26.901.41123. Both the
+          // operation envelope and the nested thread ID are required.
+          "version": 2,
           "method": START_TURN_METHOD,
           "params": {
             "conversationId": session_id,
-            "turnStartParams": {
-              "input": [{ "type": "text", "text": text }],
-              "clientUserMessageId": request_id,
-              "additionalContext": null
+            "turnStart": {
+              "request": {
+                "threadId": session_id,
+                "input": [{ "type": "text", "text": text }],
+                "clientUserMessageId": request_id,
+                "additionalContext": null
+              },
+              "context": { "inheritThreadSettings": true }
             }
           },
           "timeoutMs": self.request_timeout.as_millis() as u64
@@ -185,8 +204,7 @@ impl DesktopClient {
     match response.get("resultType").and_then(Value::as_str) {
       Some("success")
         if response.get("method").and_then(Value::as_str) == Some(method)
-          && response.get("handledByClientId").and_then(nonempty_string).is_some()
-          && response.get("result").is_some() =>
+          && response.get("handledByClientId").and_then(nonempty_string).is_some() =>
       {
         Ok(response)
       }
@@ -199,11 +217,16 @@ impl DesktopClient {
         };
         if error == "no-client-found" || error.starts_with("no-client-found:") {
           return Err(DeliveryError::not_sent(
-            "This session is not open in Codex Desktop. Open it there, then send the message again.",
+            "No compatible Codex Desktop owner found. Open this session in a current Codex Desktop build, then send again.",
           ));
         }
-        // An owner can report an error after beginning its work. Only the
-        // router's explicit missing-owner response proves non-delivery.
+        if matches!(error, "request-version-mismatch" | "no-handler-for-request") {
+          return Err(DeliveryError::not_sent(format!(
+            "Codex Desktop does not support this message request ({error}). Update Codex Desktop before trying again."
+          )));
+        }
+        // Other owner errors can occur after beginning work. They cannot
+        // establish non-delivery, so never retry or change transports here.
         Err(delivery_failure(
           may_deliver_message,
           format!("Codex Desktop rejected the request: {error}"),

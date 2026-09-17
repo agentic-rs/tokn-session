@@ -35,7 +35,10 @@ beforeEach(() => {
     request_id: request.request_id, status: "accepted", message: "Message sent.",
   }));
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 describe("SessionComposer", () => {
   it("shows no input and makes no availability request without a selected session", () => {
@@ -62,7 +65,7 @@ describe("SessionComposer", () => {
   it("handles an older or disconnected server without enabling sends", async () => {
     vi.mocked(getSessionInputStatus).mockRejectedValue(new Error("Unknown command"));
     render(<SessionComposer session={SESSION} />);
-    await screen.findByText("Message input is unavailable on this connection. Retry to check availability.");
+    await screen.findByText("Message input is unavailable on this connection. Retry to check availability. Reason: Unknown command");
     expect(textbox()).toBeDisabled();
     expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
   });
@@ -160,7 +163,9 @@ describe("SessionComposer", () => {
     await ready();
     draft("Possibly sent");
     send();
-    await screen.findByText("Delivery not confirmed. Check the conversation before sending again.");
+    const notice = await screen.findByText(/^Delivery not confirmed\. Check the conversation before sending again\./);
+    if (status === "network") expect(notice).toHaveTextContent("Reason: Connection lost");
+    if (status === "mismatched") expect(notice).toHaveTextContent("Reason: The server response did not match this message.");
     expect(textbox()).toHaveValue("Possibly sent");
     expect(textbox()).toBeDisabled();
     fireEvent.submit(screen.getByRole("form"));
@@ -173,6 +178,45 @@ describe("SessionComposer", () => {
     const requests = vi.mocked(submitSessionInput).mock.calls;
     expect(requests).toHaveLength(2);
     expect(requests[1][0].request_id).not.toBe(requests[0][0].request_id);
+  });
+
+  it.each(["unknown", "pending"] as const)("preserves backend diagnostics for %s delivery", async (status) => {
+    vi.mocked(submitSessionInput).mockImplementation(async (request) => ({
+      request_id: request.request_id, status, message: "Codex did not acknowledge the message before the connection closed.",
+    }));
+    render(<SessionComposer session={SESSION} />);
+    await ready();
+    draft("Keep this draft");
+    send();
+    await screen.findByText("Delivery not confirmed. Check the conversation before sending again. Reason: Codex did not acknowledge the message before the connection closed.");
+    expect(textbox()).toHaveValue("Keep this draft");
+    expect(textbox()).toBeDisabled();
+    expect(submitSessionInput).toHaveBeenCalledOnce();
+  });
+
+  it("preserves string errors from desktop command failures without retrying", async () => {
+    vi.mocked(submitSessionInput).mockRejectedValue("Session input task failed: connection reset");
+    render(<SessionComposer session={SESSION} />);
+    await ready();
+    draft("Still possibly sent");
+    send();
+    await screen.findByText("Delivery not confirmed. Check the conversation before sending again. Reason: Session input task failed: connection reset");
+    expect(textbox()).toBeDisabled();
+    expect(submitSessionInput).toHaveBeenCalledOnce();
+  });
+
+  it("reports a request-ID preparation failure as definitely unsent and keeps the draft editable", async () => {
+    vi.spyOn(crypto, "randomUUID").mockImplementation(() => { throw new Error("Random number generation is unavailable"); });
+    render(<SessionComposer session={SESSION} />);
+    await ready();
+    draft("Not submitted");
+    send();
+    await screen.findByText("Message was not sent. Could not prepare the message. Reason: Random number generation is unavailable");
+    expect(textbox()).toHaveValue("Not submitted");
+    expect(textbox()).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Send" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Edit message" })).not.toBeInTheDocument();
+    expect(submitSessionInput).not.toHaveBeenCalled();
   });
 
   it("keeps a definitely unsent message editable with the failure reason", async () => {
