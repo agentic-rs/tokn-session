@@ -33,6 +33,7 @@ use crate::repository::{NativeRepository, SessionBodyIndexing, ViewerRepository}
 
 mod agent_activity;
 mod compaction;
+mod event_filter;
 mod trajectory_state;
 
 use agent_activity::{ActivityTargets, agent_activity_card_summary};
@@ -4183,6 +4184,7 @@ fn trajectory_event_summary(trajectory: &Trajectory, events: &[AgentEvent]) -> E
     summary,
     summary_truncated: false,
     is_hidden: false,
+    is_bookkeeping: false,
     is_error: (card.error_count > 0).then_some(true),
     tool: None,
     usage: None,
@@ -4434,6 +4436,7 @@ fn event_summary_with_delegation_targets(
     summary,
     summary_truncated,
     is_hidden: hidden,
+    is_bookkeeping: !hidden && event_filter::is_bookkeeping(event),
     is_error: error_for_event(event),
     tool,
     usage,
@@ -4474,6 +4477,7 @@ fn tool_operation_event_summary(source_event_index: usize, operation: &ToolOpera
     summary,
     summary_truncated,
     is_hidden: false,
+    is_bookkeeping: false,
     // Preserve an unspecified provider error state. A failed assembled
     // operation is the only case where we need to synthesize `true`.
     is_error: operation
@@ -5305,6 +5309,7 @@ fn truncate_with_flag(value: String, max_chars: usize) -> (String, bool) {
 #[cfg(test)]
 mod tests {
   mod communications;
+  mod event_filter;
   use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
   use std::path::PathBuf;
   use std::sync::Mutex;

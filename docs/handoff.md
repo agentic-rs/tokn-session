@@ -446,6 +446,16 @@ provider-authoritative turn. Its identity uses the earliest normalized source
 event in the folded run, so it remains expandable when more work or a matching
 tool result is appended after the outer timeline loads.
 
+The conversation header's **Hide lifecycle** toggle filters rendered rows in
+both the main timeline and loaded trajectory pages. It defaults off and stays
+selected while switching sessions in the mounted viewer. Viewer-core supplies
+`EventSummary.is_bookkeeping` from validated event kinds and a conservative
+provider-record allowlist; missing flags from older backends keep rows visible.
+Usage and substantive content, unknowns, errors, and exceptional lifecycle
+outcomes remain visible. The filter never changes stored history, cursor
+windows, selection/detail ownership, or underlying totals. Filtered empty
+ranges retain their pagination controls; hidden counts cover loaded rows only.
+
 Visible user and assistant messages, expanded reasoning, and readable inspector
 content render GitHub-flavored Markdown. Raw HTML is disabled, images become
 inert placeholders, and links cannot navigate the WebView.
