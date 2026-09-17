@@ -44,29 +44,34 @@ function props(overrides: Partial<React.ComponentProps<typeof Conversation>> = {
 }
 
 function toggleFilter() {
-  fireEvent.click(screen.getByRole("button", { name: "Hide lifecycle" }));
+  fireEvent.click(screen.getByRole("button", { name: /^(Hide|Show) lifecycle$/ }));
 }
 
 describe("Conversation quick filter", () => {
-  it("defaults to all events and keeps usage, errors, unknowns, and meaningful lifecycle content", () => {
+  it("hides intermediate usage and routine lifecycle while keeping final usage, errors, unknowns, and meaningful outcomes", () => {
     render(<Conversation {...props({ events: [
       event("Turn started"), event("Context settings", { type: "metadata" }),
-      event("Usage", { type: "usage" }), event("Unknown provider event", { type: "unknown" }),
+      event("Mid-turn usage", { type: "usage" }), event("Final usage", { type: "usage", is_bookkeeping: false }),
+      event("Unknown provider event", { type: "unknown" }),
       event("Turn failed", { is_error: true }), event("Task outcome", { is_bookkeeping: false }),
     ] })} />);
     expect(screen.getByRole("button", { name: "Hide lifecycle" })).toHaveAttribute("aria-pressed", "false");
     expect(screen.getByRole("button", { name: "Turn started" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Mid-turn usage" })).toBeInTheDocument();
     toggleFilter();
-    expect(screen.getByRole("button", { name: "Hide lifecycle" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "Show lifecycle" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.queryByRole("button", { name: "Turn started" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Context settings" })).not.toBeInTheDocument();
-    for (const title of ["Usage", "Unknown provider event", "Turn failed", "Task outcome"]) {
+    expect(screen.queryByRole("button", { name: "Mid-turn usage" })).not.toBeInTheDocument();
+    for (const title of ["Final usage", "Unknown provider event", "Turn failed", "Task outcome"]) {
       expect(screen.getByRole("button", { name: title })).toBeInTheDocument();
     }
-    expect(screen.getByText("2 events hidden in this loaded range.")).toBeInTheDocument();
+    expect(screen.getByText("3 events hidden in this loaded range.")).toBeInTheDocument();
     expect(screen.getByText(/10 events/)).toBeInTheDocument();
     toggleFilter();
+    expect(screen.getByRole("button", { name: "Hide lifecycle" })).toHaveAttribute("aria-pressed", "false");
     expect(screen.getByRole("button", { name: "Turn started" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Mid-turn usage" })).toBeInTheDocument();
     expect(screen.queryByText(/events hidden/)).not.toBeInTheDocument();
   });
 
@@ -106,7 +111,7 @@ describe("Conversation quick filter", () => {
     toggleFilter();
     rerender(<Conversation {...props({ session: { ...SESSION, session_key: "codex:next", session_id: "next" },
       events: [event("Second turn")] })} />);
-    expect(screen.getByRole("button", { name: "Hide lifecycle" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "Show lifecycle" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.queryByRole("button", { name: "Second turn" })).not.toBeInTheDocument();
     expect(screen.getByText(/1 event hidden in this loaded range/)).toBeInTheDocument();
   });
@@ -118,7 +123,8 @@ describe("Conversation quick filter", () => {
     } });
     const view = props({ events: [turn], expanded_event_key: turn.event_key,
       trajectory_pages: new Map([[SESSION.session_key, new Map([[turn.event_key, {
-        events: [event("Nested lifecycle"), event("Nested usage", { type: "usage" })],
+        events: [event("Nested lifecycle"), event("Nested mid-turn usage", { type: "usage" }),
+          event("Nested final usage", { type: "usage", is_bookkeeping: false })],
         next_cursor: null, previous_cursor: "earlier", total_events: 20, has_loaded: true,
         is_loading: false, is_loading_older: false, is_loading_newer: false,
         error: null, error_direction: null, error_cursor: null,
@@ -130,9 +136,10 @@ describe("Conversation quick filter", () => {
     expect(screen.getByRole("button", { name: "Worked for 1s" })).toBe(turnButton);
     expect(turnButton).toHaveAttribute("aria-expanded", "true");
     expect(screen.queryByRole("button", { name: "Nested lifecycle" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Nested usage" })).toBeInTheDocument();
-    expect(screen.getByText("1 event hidden in this loaded turn range.")).toBeInTheDocument();
-    expect(screen.getByText("Loaded 2 of 20 events.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Nested mid-turn usage" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Nested final usage" })).toBeInTheDocument();
+    expect(screen.getByText("2 events hidden in this loaded turn range.")).toBeInTheDocument();
+    expect(screen.getByText("Loaded 3 of 20 events.")).toBeInTheDocument();
     expect(view.on_trajectory_event_toggle).not.toHaveBeenCalled();
     expect(view.on_trajectory_load_older).not.toHaveBeenCalled();
     expect(view.on_follow_change).not.toHaveBeenCalled();

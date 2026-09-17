@@ -56,6 +56,34 @@ fn lifecycle_filter_preserves_every_exceptional_outcome_and_native_body() {
 }
 
 #[test]
+fn codex_finished_lifecycle_hides_the_response_echo_but_preserves_errors_and_unfamiliar_content() {
+  for native_type in ["turn_complete", "task_complete"] {
+    let AgentEvent::Lifecycle(mut lifecycle) = lifecycle_event() else {
+      unreachable!()
+    };
+    lifecycle.outcome = Some(LifecycleOutcome::Completed);
+    lifecycle.native = json!({"type":native_type,"last_agent_message":"final reply"});
+    assert!(bookkeeping(&AgentEvent::Lifecycle(lifecycle.clone())));
+
+    for native in [
+      json!({"type":native_type,"last_agent_message":"final reply","error":{"message":"failed"}}),
+      json!({"type":native_type,"last_agent_message":"final reply","payload":{"error":"failed"}}),
+      json!({"type":native_type,"last_agent_message":"final reply","text":"additional lifecycle text"}),
+      json!({"type":native_type,"last_agent_message":{"future":"response representation"}}),
+    ] {
+      lifecycle.native = native.clone();
+      assert!(!bookkeeping(&AgentEvent::Lifecycle(lifecycle.clone())), "{native}");
+    }
+    lifecycle.native = json!({"type":native_type,"last_agent_message":"final reply"});
+    lifecycle.provider = Provider::Dsh;
+    assert!(!bookkeeping(&AgentEvent::Lifecycle(lifecycle.clone())));
+    lifecycle.provider = Provider::Codex;
+    lifecycle.outcome = Some(LifecycleOutcome::Interrupted);
+    assert!(!bookkeeping(&AgentEvent::Lifecycle(lifecycle)));
+  }
+}
+
+#[test]
 fn metadata_filter_requires_a_known_provider_kind_and_record_contract() {
   let routine = [
     (Provider::Codex, MetadataKind::Configuration, "turn_context"),
@@ -282,12 +310,33 @@ fn actual_codex_records_keep_usage_and_content_while_projecting_routine_markers(
   assert_eq!(
     flags,
     [
-      true, true, true, true, true, false, true, false, true, false, false, false
+      true, true, true, true, true, false, true, false, true, false, true, false
     ]
   );
   assert!(matches!(&loaded.events[5], AgentEvent::Usage(_)));
   assert!(matches!(&loaded.events[7], AgentEvent::Metadata(event) if event.native_type.ends_with(".Plan")));
   assert!(matches!(&loaded.events[9], AgentEvent::Unknown(_)));
+  assert!(matches!(&loaded.events[10], AgentEvent::Lifecycle(event) if matches!(event.phase, Phase::Finished)));
+}
+
+#[test]
+fn actual_codex_finished_markers_hide_without_hiding_the_final_message() {
+  for native_type in ["turn_complete", "task_complete"] {
+    let loaded = load_codex(&[
+      json!({"type":"event_msg","payload":{"type":"turn_started","turn_id":"turn-1"}}),
+      json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"filter-session","turn_id":"turn-1","item":{"type":"AgentMessage","id":"message-1","phase":"final_answer","content":[{"type":"Text","text":"final reply"}]}}}),
+      json!({"type":"event_msg","payload":{"type":native_type,"turn_id":"turn-1","last_agent_message":"final reply"}}),
+    ]);
+    let final_message = loaded
+      .events
+      .iter()
+      .find(|event| matches!(event, AgentEvent::Message(_)))
+      .unwrap();
+    assert!(!bookkeeping(final_message));
+    let finished = loaded.events.last().unwrap();
+    assert!(matches!(finished, AgentEvent::Lifecycle(event) if matches!(event.phase, Phase::Finished)));
+    assert!(bookkeeping(finished));
+  }
 }
 
 #[test]
@@ -316,7 +365,7 @@ fn synthetic_rows_stay_visible_and_projection_keeps_raw_page_boundaries() {
     .iter()
     .find(|entry| matches!(entry, TimelineEntry::ToolOperation { .. }))
     .unwrap();
-  assert!(!timeline_entry_event_summary(tool, &events, &ActivityTargets::default()).is_bookkeeping);
+  assert!(!timeline_entry_event_summary(tool, &events, &ActivityTargets::default(), &HashSet::new()).is_bookkeeping);
 
   let service = service_with_session(loaded_session(vec![
     settings_event(),

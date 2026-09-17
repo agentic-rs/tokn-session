@@ -3,17 +3,25 @@
 //! source event keys, native inspection, or the normalized event stream.
 
 use serde_json::Value;
-use tokn_session_core::{AgentEvent, LifecycleOutcome, MetadataEvent, MetadataKind, Provider};
+use tokn_session_core::{AgentEvent, LifecycleOutcome, MetadataEvent, MetadataKind, Phase, Provider};
 
 pub(super) fn is_bookkeeping(event: &AgentEvent) -> bool {
   match event {
     AgentEvent::SessionStarted(_) | AgentEvent::ProviderChanged(_) | AgentEvent::SessionSettingsApplied(_) => true,
     AgentEvent::Lifecycle(event) => {
-      matches!(event.outcome, None | Some(LifecycleOutcome::Completed)) && !lifecycle_has_content(&event.native)
+      let has_completion_echo = matches!(event.provider, Provider::Codex)
+        && matches!(event.phase, Phase::Finished)
+        && matches!(event.outcome, Some(LifecycleOutcome::Completed))
+        && matches!(
+          event.native.get("type").and_then(Value::as_str),
+          Some("task_complete" | "turn_complete")
+        );
+      matches!(event.outcome, None | Some(LifecycleOutcome::Completed))
+        && !native_has_content(&event.native, has_completion_echo)
     }
     AgentEvent::Metadata(event) => routine_metadata(event),
-    // In particular, encrypted deliveries and empty-looking usage/tool rows
-    // still carry information. New event variants remain visible by default.
+    // Usage needs full-turn context and is classified separately. Encrypted
+    // deliveries, tools, and new event variants remain visible by default.
     _ => false,
   }
 }
@@ -41,21 +49,24 @@ fn routine_metadata(event: &MetadataEvent) -> bool {
       "event_msg.item_started.AgentMessage"
       | "event_msg.item_completed.AgentMessage"
       | "event_msg.item_started.SubAgentActivity",
-    ) => !lifecycle_has_content(&event.native),
+    ) => !native_has_content(&event.native, false),
     _ => false,
   }
 }
 
-fn lifecycle_has_content(value: &Value) -> bool {
+fn native_has_content(value: &Value, has_completion_echo: bool) -> bool {
   match value {
     Value::Object(object) => object.iter().any(|(key, value)| match key.as_str() {
       // Some provider completion records still report Completed while retaining
       // an error in their native payload. Preserve those even if is_error is false.
       "error" if !value.is_null() => true,
+      // Codex copies its final response into the turn-completion marker. This
+      // echo does not give the lifecycle card additional conversation content.
+      "last_agent_message" if has_completion_echo && matches!(value, Value::Null | Value::String(_)) => false,
       "text" | "last_agent_message" if meaningful_text(value) => true,
-      _ => lifecycle_has_content(value),
+      _ => native_has_content(value, false),
     }),
-    Value::Array(values) => values.iter().any(lifecycle_has_content),
+    Value::Array(values) => values.iter().any(|value| native_has_content(value, false)),
     _ => false,
   }
 }

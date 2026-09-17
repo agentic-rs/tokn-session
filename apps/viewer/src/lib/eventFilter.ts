@@ -9,9 +9,10 @@ export function isBookkeepingEvent(event: EventSummary): boolean {
     case "session_settings_applied":
     case "lifecycle":
     case "metadata":
+    case "usage":
       return true;
     default:
-      // Usage, content, outcomes, and unfamiliar provider events stay visible
+      // Content, outcomes, and unfamiliar provider events stay visible
       // even if an incompatible server accidentally classifies them otherwise.
       return false;
   }

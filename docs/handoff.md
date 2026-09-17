@@ -451,8 +451,13 @@ both the main timeline and loaded trajectory pages. It defaults off and stays
 selected while switching sessions in the mounted viewer. Viewer-core supplies
 `EventSummary.is_bookkeeping` from validated event kinds and a conservative
 provider-record allowlist; missing flags from older backends keep rows visible.
-Usage and substantive content, unknowns, errors, and exceptional lifecycle
-outcomes remain visible. The filter never changes stored history, cursor
+The active button reads **Show lifecycle**. Intermediate usage is classified
+against the full snapshot before paging, keeping the last accounting of each
+usage kind at a final reply or turn completion. Active-turn usage is hidden;
+orphan or conflicting-turn usage remains visible. Accounting scopes are never
+combined. Successful Codex completion markers can hide their final-message echo;
+substantive content, unknowns, errors, and exceptional lifecycle outcomes remain
+visible. The filter never changes stored history, cursor
 windows, selection/detail ownership, or underlying totals. Filtered empty
 ranges retain their pagination controls; hidden counts cover loaded rows only.
 

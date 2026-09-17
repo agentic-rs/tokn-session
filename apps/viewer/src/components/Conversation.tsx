@@ -182,10 +182,12 @@ export function Conversation({
           className="conversation__filter"
           disabled={!session}
           onClick={() => setHideLifecycle((hidden) => !hidden)}
-          title="Hide routine lifecycle, session, configuration, and metadata events without content. Keep usage and meaningful activity."
+          title={hideLifecycle
+            ? "Show lifecycle events and mid-turn usage again."
+            : "Hide routine lifecycle, session, configuration, and metadata events without content, plus mid-turn usage. Keep end-of-turn usage and meaningful activity."}
           type="button"
         >
-          Hide lifecycle
+          {hideLifecycle ? "Show lifecycle" : "Hide lifecycle"}
         </button>
         <button
           aria-label={inspector_open ? "Close event inspector" : "Open event inspector"}
