@@ -1,0 +1,291 @@
+//! Compatibility transport for the private Codex Desktop IPC router.
+//!
+//! Sending is deliberately limited to the owning Desktop process. In
+//! particular, an unavailable router never starts another Codex process.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use serde_json::{Value, json};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::timeout;
+use uuid::Uuid;
+
+use super::{Admission, DeliveryError, InputTarget};
+
+const MAX_FRAME_BYTES: usize = 1024 * 1024;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const START_TURN_METHOD: &str = "thread-follower-start-turn";
+
+trait IpcStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> IpcStream for T {}
+
+struct DesktopClient {
+  stream: Box<dyn IpcStream>,
+  client_id: String,
+  request_timeout: Duration,
+}
+
+pub(super) async fn status(_target: &InputTarget) -> Result<String, DeliveryError> {
+  DesktopClient::connect(&desktop_endpoint()?, REQUEST_TIMEOUT).await?;
+  Ok("Codex Desktop is available. Open this session in Codex Desktop to receive messages.".to_owned())
+}
+
+pub(super) async fn submit(target: &InputTarget, request_id: &str, text: &str) -> Result<Admission, DeliveryError> {
+  let mut client = DesktopClient::connect(&desktop_endpoint()?, REQUEST_TIMEOUT).await?;
+  client.submit(&target.session_id, request_id, text).await
+}
+
+fn desktop_endpoint() -> Result<PathBuf, DeliveryError> {
+  #[cfg(windows)]
+  {
+    Ok(PathBuf::from(r"\\.\pipe\codex-ipc"))
+  }
+  #[cfg(not(windows))]
+  {
+    let codex_home = std::env::var_os("CODEX_HOME")
+      .filter(|value| !value.is_empty())
+      .map(PathBuf::from)
+      .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+      .ok_or_else(|| DeliveryError::not_sent("Cannot locate the Codex Desktop IPC endpoint."))?;
+    Ok(codex_home.join("ipc").join("ipc.sock"))
+  }
+}
+
+impl DesktopClient {
+  async fn connect(endpoint: &std::path::Path, request_timeout: Duration) -> Result<Self, DeliveryError> {
+    let stream = timeout(request_timeout, connect_stream(endpoint))
+      .await
+      .map_err(|_| DeliveryError::not_sent("Connecting to Codex Desktop timed out."))?
+      .map_err(|error| DeliveryError::not_sent(format!("Codex Desktop is unavailable: {error}")))?;
+    let mut client = Self {
+      stream,
+      client_id: "initializing-client".to_owned(),
+      request_timeout,
+    };
+    let request_id = Uuid::new_v4().to_string();
+    let response = client
+      .request(
+        json!({
+          "type": "request",
+          "requestId": request_id,
+          "sourceClientId": client.client_id,
+          "version": 0,
+          "method": "initialize",
+          "params": { "clientType": "tokn-session-viewer" }
+        }),
+        &request_id,
+        "initialize",
+        false,
+      )
+      .await?;
+    client.client_id = response
+      .get("result")
+      .and_then(|result| result.get("clientId"))
+      .and_then(nonempty_string)
+      .ok_or_else(|| DeliveryError::not_sent("Codex Desktop returned an invalid initialization response."))?
+      .to_owned();
+    Ok(client)
+  }
+
+  async fn submit(&mut self, session_id: &str, request_id: &str, text: &str) -> Result<Admission, DeliveryError> {
+    if session_id.trim().is_empty() || request_id.trim().is_empty() || text.trim().is_empty() {
+      return Err(DeliveryError::not_sent(
+        "A session, request ID, and message are required.",
+      ));
+    }
+    // The wire request is unique for this connection. The user-message ID is
+    // stable across the viewer's delivery bookkeeping, not a promise that the
+    // private Desktop protocol can safely retry an ambiguous submission.
+    let wire_request_id = Uuid::new_v4().to_string();
+    self
+      .request(
+        json!({
+          "type": "request",
+          "requestId": wire_request_id,
+          "sourceClientId": self.client_id,
+          "version": 1,
+          "method": START_TURN_METHOD,
+          "params": {
+            "conversationId": session_id,
+            "turnStartParams": {
+              "input": [{ "type": "text", "text": text }],
+              "clientUserMessageId": request_id,
+              "additionalContext": null
+            }
+          },
+          "timeoutMs": self.request_timeout.as_millis() as u64
+        }),
+        &wire_request_id,
+        START_TURN_METHOD,
+        true,
+      )
+      .await?;
+    Ok(Admission::Accepted)
+  }
+
+  async fn request(
+    &mut self,
+    request: Value,
+    request_id: &str,
+    method: &str,
+    may_deliver_message: bool,
+  ) -> Result<Value, DeliveryError> {
+    // Serialization and the size check happen before any write. Once a write
+    // begins, even an I/O error cannot prove the message was not delivered.
+    let frame = encode_frame(&request).map_err(DeliveryError::not_sent)?;
+    let result = timeout(self.request_timeout, async {
+      self.stream.write_all(&frame).await.map_err(|error| error.to_string())?;
+      loop {
+        let response = read_frame(&mut self.stream).await?;
+        let object = response
+          .as_object()
+          .ok_or("Codex Desktop returned a non-object IPC frame.")?;
+        match object.get("type").and_then(Value::as_str) {
+          Some("client-discovery-request") => {
+            let discovery_id = object
+              .get("requestId")
+              .and_then(nonempty_string)
+              .ok_or("Codex Desktop sent an invalid client-discovery request.")?;
+            let discovery = encode_frame(&json!({
+              "type": "client-discovery-response",
+              "requestId": discovery_id,
+              "response": { "canHandle": false }
+            }))?;
+            self
+              .stream
+              .write_all(&discovery)
+              .await
+              .map_err(|error| error.to_string())?;
+          }
+          Some("response") => {
+            let response_id = object
+              .get("requestId")
+              .and_then(nonempty_string)
+              .ok_or("Codex Desktop returned a response without a request ID.")?;
+            if response_id == request_id {
+              return Ok::<Value, String>(response);
+            }
+          }
+          _ => {}
+        }
+      }
+    })
+    .await;
+    let response = match result {
+      Ok(Ok(response)) => response,
+      Ok(Err(error)) => return Err(delivery_failure(may_deliver_message, error)),
+      Err(_) => {
+        return Err(delivery_failure(
+          may_deliver_message,
+          format!("Codex Desktop {method} timed out."),
+        ));
+      }
+    };
+    match response.get("resultType").and_then(Value::as_str) {
+      Some("success")
+        if response.get("method").and_then(Value::as_str) == Some(method)
+          && response.get("handledByClientId").and_then(nonempty_string).is_some()
+          && response.get("result").is_some() =>
+      {
+        Ok(response)
+      }
+      Some("error") => {
+        let Some(error) = response.get("error").and_then(nonempty_string) else {
+          return Err(delivery_failure(
+            may_deliver_message,
+            "Codex Desktop returned an invalid error response.",
+          ));
+        };
+        if error == "no-client-found" || error.starts_with("no-client-found:") {
+          return Err(DeliveryError::not_sent(
+            "This session is not open in Codex Desktop. Open it there, then send the message again.",
+          ));
+        }
+        // An owner can report an error after beginning its work. Only the
+        // router's explicit missing-owner response proves non-delivery.
+        Err(delivery_failure(
+          may_deliver_message,
+          format!("Codex Desktop rejected the request: {error}"),
+        ))
+      }
+      _ => Err(delivery_failure(
+        may_deliver_message,
+        "Codex Desktop returned an incompatible IPC response.",
+      )),
+    }
+  }
+}
+
+fn delivery_failure(may_have_been_sent: bool, message: impl Into<String>) -> DeliveryError {
+  if may_have_been_sent {
+    DeliveryError::uncertain(message)
+  } else {
+    DeliveryError::not_sent(message)
+  }
+}
+
+fn nonempty_string(value: &Value) -> Option<&str> {
+  value.as_str().filter(|text| !text.trim().is_empty())
+}
+
+fn encode_frame(message: &Value) -> Result<Vec<u8>, String> {
+  let payload = serde_json::to_vec(message).map_err(|error| format!("Cannot encode Codex Desktop request: {error}"))?;
+  if payload.len() > MAX_FRAME_BYTES {
+    return Err("Codex Desktop IPC frame exceeds the size limit.".to_owned());
+  }
+  let mut frame = Vec::with_capacity(4 + payload.len());
+  frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+  frame.extend_from_slice(&payload);
+  Ok(frame)
+}
+
+async fn read_frame(stream: &mut (impl AsyncRead + Unpin)) -> Result<Value, String> {
+  let length = stream
+    .read_u32_le()
+    .await
+    .map_err(|error| format!("Codex Desktop IPC read failed: {error}"))? as usize;
+  if length == 0 || length > MAX_FRAME_BYTES {
+    return Err("Codex Desktop returned an invalid IPC frame size.".to_owned());
+  }
+  let mut payload = vec![0; length];
+  stream
+    .read_exact(&mut payload)
+    .await
+    .map_err(|error| format!("Codex Desktop IPC read failed: {error}"))?;
+  serde_json::from_slice(&payload).map_err(|error| format!("Codex Desktop returned invalid IPC JSON: {error}"))
+}
+
+async fn connect_stream(endpoint: &std::path::Path) -> std::io::Result<Box<dyn IpcStream>> {
+  #[cfg(unix)]
+  {
+    Ok(Box::new(tokio::net::UnixStream::connect(endpoint).await?))
+  }
+  #[cfg(windows)]
+  {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    loop {
+      match ClientOptions::new().open(endpoint) {
+        Ok(stream) => return Ok(Box::new(stream)),
+        Err(error) if error.raw_os_error() == Some(231) => {
+          // All pipe instances are busy. The caller's connection timeout
+          // bounds retries before a user-message write has been attempted.
+          tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(error) => return Err(error),
+      }
+    }
+  }
+  #[cfg(not(any(unix, windows)))]
+  {
+    let _ = endpoint;
+    Err(std::io::Error::new(
+      std::io::ErrorKind::Unsupported,
+      "Codex Desktop IPC is unavailable on this platform",
+    ))
+  }
+}
+
+#[cfg(test)]
+#[path = "codex_tests.rs"]
+mod tests;

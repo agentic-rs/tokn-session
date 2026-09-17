@@ -555,11 +555,11 @@ function normalizeContent(value: unknown): string | undefined {
   if (!isRecord(item) || item.type !== "text" || typeof item.text !== "string") {
     return undefined;
   }
-  const message = item.text.trim();
+  const message = item.text;
   if (
-    message.length === 0
+    message.trim().length === 0
     || message.length > MAX_MESSAGE_LENGTH
-    || /[\u0000-\u001f\u007f]/u.test(message)
+    || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(message)
   ) {
     return undefined;
   }

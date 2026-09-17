@@ -19,11 +19,13 @@ cargo run -p tokn-session-cli -- list --source workbuddy --limit 5
 
 ## Desktop viewer
 
-`apps/viewer` is a read-only Tauri app that presents root sessions from all
+`apps/viewer` is a Tauri and browser app that presents root sessions from all
 six providers in one searchable interface. It reuses the Rust session crates
 directly rather than parsing CLI output and safely renders conversational
 Markdown without allowing provider content to navigate the WebView. A local,
 metadata-only index keeps its sidebar current without writing provider data.
+Its message composer can send to a root Codex task in Codex Desktop or a live
+Pi session running the input bridge.
 
 ```sh
 cd apps/viewer

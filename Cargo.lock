@@ -4560,11 +4560,13 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "dirs",
+ "libc",
  "notify 7.0.0",
  "notify 8.2.0",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -4577,6 +4579,7 @@ dependencies = [
  "tokn-session-relay",
  "tokn-session-render",
  "tokn-session-workbuddy",
+ "uuid",
 ]
 
 [[package]]

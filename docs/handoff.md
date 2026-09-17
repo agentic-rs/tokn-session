@@ -416,13 +416,27 @@ the project.
 
 ## Desktop Session Viewer
 
-`apps/viewer` is a read-only Tauri 2/React desktop viewer for historical Pi,
+`apps/viewer` is a Tauri 2/React desktop and browser viewer for historical Pi,
 Codex, OpenCode, ZCode, WorkBuddy, and DSH sessions. It aggregates root sessions
 into one searchable, provider-filterable sidebar, lazily expands known
 subagents into a tree, renders the selected session's normalized events as a
 conversation, and keeps reasoning, tools, metadata, errors, and unknown events
-inspectable without adding a message composer. A failure in one provider is
+inspectable. A failure in one provider is
 reported without preventing the other providers from loading.
+
+The conversation footer sends multiline messages through native Rust live-input
+transports in `viewer-core`, shared by Tauri and authenticated HTTP commands.
+Root Codex tasks use the owning Desktop IPC client without a CLI fallback;
+Pi uses its exact live session's opt-in input bridge, starting idle turns or
+queueing busy follow-ups. Other providers, Codex subagents, and External snapshot
+mode are unavailable. Catalog membership and a fresh source header validate
+every target. Availability checks do not submit input. Drafts stay in memory
+per session; Cmd/Ctrl+Enter sends. Admission clears the draft, while uncertain
+delivery retains it and requires explicit editing before another send. There
+is no optimistic transcript or automatic retry. The bounded in-memory request
+cache deduplicates UUIDs and guards the resolved runtime owner against parallel
+sends, including when the HTTP caller disconnects. Limits are 16,384 Unicode
+characters and Pi's 32 KiB encoded frame. Markdown whitespace is preserved.
 
 The conversation keeps user prompts and final assistant replies visible. A
 contiguous stretch of intermediate assistant progress and non-message activity
@@ -1060,7 +1074,9 @@ OpenCode has the first live-output normalizer: `OpenCodeLiveNormalizer` parses `
   delivery acknowledgement; subscribers that are disconnected can miss events.
 - The terminal pet cannot distinguish every runtime state authoritatively until
   provider task lifecycle and interaction events are represented in `AgentEvent`.
-- The desktop viewer remains read-only. Without a Relay connection, selected
+- Viewer message input requires a live Codex Desktop owner or Pi bridge;
+  historical sessions are not resumed through a fallback process.
+  Without a Relay connection, selected
   timelines refresh from the durable index and historical source reads. Relay
   snapshot/follow supports all six providers; it is not an agent-control
   transport, and its unread tracking is not persisted yet.

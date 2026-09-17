@@ -19,6 +19,7 @@ import {
 import { InspectorIcon, PanelIcon } from "./Icons";
 import { EventCard } from "./EventCard";
 import { LoadingRows, StateView } from "./StateView";
+import { SessionComposer } from "./SessionComposer";
 
 interface ConversationProps {
   pending_live_activity?: boolean;
@@ -174,7 +175,7 @@ export function Conversation({
         ) : (
           <div className="conversation__identity conversation__identity--empty">
             <h2>Session viewer</h2>
-            <p>Read-only, across every known provider</p>
+            <p>Conversations across every known provider</p>
           </div>
         )}
         <button
@@ -364,6 +365,7 @@ export function Conversation({
           </div>
         ) : null}
       </div>
+      <SessionComposer session={session} />
     </main>
   );
 }

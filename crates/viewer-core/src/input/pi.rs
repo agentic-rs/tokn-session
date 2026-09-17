@@ -1,0 +1,679 @@
+use super::{Admission, DeliveryError, InputTarget};
+
+#[cfg(unix)]
+mod unix {
+  use std::fs::OpenOptions;
+  use std::io::Read;
+  use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+  use std::path::{Component, Path, PathBuf};
+  use std::time::Duration;
+
+  use serde::Deserialize;
+  use serde_json::{Value, json};
+  use sha2::{Digest, Sha256};
+  use tokio::io::{AsyncReadExt, AsyncWriteExt};
+  use tokio::net::UnixStream;
+
+  use super::{Admission, DeliveryError, InputTarget};
+  use crate::model::ViewerProvider;
+
+  const PROTOCOL: u64 = 1;
+  const MAX_FRAME_BYTES: usize = 32 * 1024;
+  const BRIDGE_TIMEOUT: Duration = Duration::from_secs(5);
+
+  #[derive(Debug, Deserialize)]
+  struct Descriptor {
+    protocol: u64,
+    provider: String,
+    transport: String,
+    session_id: String,
+    session_file: String,
+    instance_id: String,
+    socket_path: PathBuf,
+    pid: u64,
+    token: String,
+  }
+
+  pub(super) async fn status(target: &InputTarget) -> Result<String, DeliveryError> {
+    let descriptor = load_descriptor(target).await?;
+    query_status(&descriptor, BRIDGE_TIMEOUT).await
+  }
+
+  pub(super) async fn submit(target: &InputTarget, request_id: &str, text: &str) -> Result<Admission, DeliveryError> {
+    let descriptor = load_descriptor(target).await?;
+    submit_message(&descriptor, request_id, text, BRIDGE_TIMEOUT).await
+  }
+
+  // Node's path.resolve normalizes lexically without resolving symlinks. Using
+  // canonicalize here would hash a different path on systems where /var or /tmp
+  // is a symlink, and would no longer match the extension's capability record.
+  fn normalized_absolute(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+      return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+      match component {
+        Component::ParentDir => {
+          normalized.pop();
+        }
+        Component::CurDir => {}
+        other => normalized.push(other.as_os_str()),
+      }
+    }
+    Some(normalized)
+  }
+
+  fn runtime_directory() -> PathBuf {
+    if let Some(configured) = std::env::var_os("XDG_RUNTIME_DIR") {
+      if let Some(root) = normalized_absolute(Path::new(&configured)) {
+        return root.join("tokn-session/input");
+      }
+    }
+    // SAFETY: getuid has no preconditions or pointer arguments.
+    let uid = unsafe { libc::getuid() };
+    std::env::temp_dir().join(format!("tokn-session-input-{uid}"))
+  }
+
+  fn descriptor_path(session_file: &str, runtime: &Path) -> PathBuf {
+    let digest = Sha256::digest(session_file.as_bytes());
+    runtime.join("pi/sessions").join(format!("{digest:x}.json"))
+  }
+
+  async fn load_descriptor(target: &InputTarget) -> Result<Descriptor, DeliveryError> {
+    if target.provider != ViewerProvider::Pi {
+      return Err(DeliveryError::not_sent("Input requires a Pi session."));
+    }
+    let session_file = normalized_absolute(&target.session_file)
+      .and_then(|path| path.into_os_string().into_string().ok())
+      .ok_or_else(|| DeliveryError::not_sent("The Pi session file must have an absolute UTF-8 path."))?;
+    let path = descriptor_path(&session_file, &runtime_directory());
+    let session_id = target.session_id.clone();
+    tokio::task::spawn_blocking(move || read_descriptor(&path, &session_id, &session_file))
+      .await
+      .map_err(|_| DeliveryError::not_sent("The Pi input bridge descriptor could not be read."))?
+  }
+
+  fn read_descriptor(path: &Path, session_id: &str, session_file: &str) -> Result<Descriptor, DeliveryError> {
+    if !std::fs::metadata(session_file).is_ok_and(|metadata| metadata.is_file()) {
+      return Err(DeliveryError::not_sent("The observed Pi session file is unavailable."));
+    }
+    // Inspect the opened file, not a prior path stat. NOFOLLOW rejects symlinks;
+    // NONBLOCK prevents an invalid FIFO descriptor from blocking a worker.
+    let file = OpenOptions::new()
+      .read(true)
+      .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+      .open(path)
+      .map_err(|_| unavailable())?;
+    let metadata = file.metadata().map_err(|_| unavailable())?;
+    // SAFETY: getuid has no preconditions or pointer arguments.
+    let uid = unsafe { libc::getuid() };
+    if !metadata.is_file()
+      || metadata.len() > MAX_FRAME_BYTES as u64
+      || metadata.mode() & 0o077 != 0
+      || metadata.uid() != uid
+    {
+      return Err(DeliveryError::not_sent(
+        "The Pi input bridge descriptor is not a private, owned regular file.",
+      ));
+    }
+    let mut bytes = Vec::new();
+    file
+      .take((MAX_FRAME_BYTES + 1) as u64)
+      .read_to_end(&mut bytes)
+      .map_err(|_| unavailable())?;
+    if bytes.len() > MAX_FRAME_BYTES {
+      return Err(DeliveryError::not_sent("The Pi input bridge descriptor is too large."));
+    }
+    let descriptor: Descriptor = serde_json::from_slice(&bytes)
+      .map_err(|_| DeliveryError::not_sent("The Pi input bridge descriptor is invalid."))?;
+    if descriptor.protocol != PROTOCOL
+      || descriptor.provider != "pi"
+      || descriptor.transport != "unix"
+      || descriptor.session_id != session_id
+      || descriptor.session_file != session_file
+      || descriptor.instance_id.is_empty()
+      || !descriptor.socket_path.is_absolute()
+      || descriptor.pid == 0
+      || descriptor.token.is_empty()
+    {
+      return Err(DeliveryError::not_sent(
+        "The Pi input bridge descriptor does not match this session.",
+      ));
+    }
+    Ok(descriptor)
+  }
+
+  fn unavailable() -> DeliveryError {
+    DeliveryError::not_sent("Pi input is unavailable. Load the input bridge extension in the active Pi process.")
+  }
+
+  fn request(descriptor: &Descriptor, kind: &str, request_id: &str) -> Value {
+    json!({
+      "protocol": PROTOCOL,
+      "type": kind,
+      "request_id": request_id,
+      "token": descriptor.token,
+      "session_id": descriptor.session_id,
+      "session_file": descriptor.session_file,
+      "instance_id": descriptor.instance_id,
+    })
+  }
+
+  async fn query_status(descriptor: &Descriptor, timeout: Duration) -> Result<String, DeliveryError> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let response = exchange(descriptor, request(descriptor, "status", &request_id), false, timeout).await?;
+    validate_response(&response, &request_id, false)?;
+    if response["type"] != "ready"
+      || response["session_id"] != descriptor.session_id
+      || response["session_file"] != descriptor.session_file
+      || response["instance_id"] != descriptor.instance_id
+    {
+      return Err(DeliveryError::not_sent(
+        "The Pi input bridge returned a mismatched status.",
+      ));
+    }
+    match response["state"].as_str() {
+      Some("idle") => Ok("Pi is ready for a new message.".into()),
+      Some("busy") => Ok("Pi is busy; your message will be queued as a follow-up.".into()),
+      _ => Err(DeliveryError::not_sent(
+        "The Pi input bridge returned an invalid status.",
+      )),
+    }
+  }
+
+  async fn submit_message(
+    descriptor: &Descriptor,
+    request_id: &str,
+    text: &str,
+    timeout: Duration,
+  ) -> Result<Admission, DeliveryError> {
+    let mut request = request(descriptor, "submit", request_id);
+    request["delivery"] = json!("auto");
+    request["content"] = json!([{ "type": "text", "text": text }]);
+    let response = exchange(descriptor, request, true, timeout).await?;
+    validate_response(&response, request_id, true)?;
+    if response["type"] != "admitted"
+      || response["session_id"] != descriptor.session_id
+      || response["instance_id"] != descriptor.instance_id
+    {
+      return Err(DeliveryError::uncertain(
+        "The Pi input bridge returned a mismatched admission. Check the session before retrying.",
+      ));
+    }
+    match response["disposition"].as_str() {
+      Some("started") => Ok(Admission::Started),
+      Some("queued_follow_up") => Ok(Admission::QueuedFollowUp),
+      _ => Err(DeliveryError::uncertain(
+        "The Pi input bridge returned an unexpected admission. Check the session before retrying.",
+      )),
+    }
+  }
+
+  fn delivery_error(message: impl Into<String>, may_have_been_sent: bool) -> DeliveryError {
+    if may_have_been_sent {
+      DeliveryError::uncertain(message)
+    } else {
+      DeliveryError::not_sent(message)
+    }
+  }
+
+  fn validate_response(response: &Value, request_id: &str, submission: bool) -> Result<(), DeliveryError> {
+    if response["protocol"] != PROTOCOL || response["request_id"] != request_id {
+      return Err(delivery_error(
+        "The Pi input bridge returned an invalid or mismatched response.",
+        submission,
+      ));
+    }
+    if response["type"] != "error" {
+      return Ok(());
+    }
+    // These errors precede sendUserMessage. bridge_unavailable can instead be a
+    // throw from that call, so it cannot establish that input was never sent.
+    let rejected_before_send = matches!(
+      response["code"].as_str(),
+      Some(
+        "instance_mismatch"
+          | "invalid_request"
+          | "message_invalid"
+          | "request_conflict"
+          | "session_mismatch"
+          | "unauthorized"
+          | "unsupported"
+      )
+    );
+    let message = response["message"]
+      .as_str()
+      .filter(|text| !text.is_empty())
+      .unwrap_or("input was rejected");
+    let message = if response["code"] == "message_invalid" {
+      format!("Pi input bridge: {message}. For multiline messages, update the input bridge extension in Pi.")
+    } else {
+      format!("Pi input bridge: {message}")
+    };
+    Err(delivery_error(message, submission && !rejected_before_send))
+  }
+
+  async fn exchange(
+    descriptor: &Descriptor,
+    request: Value,
+    submission: bool,
+    timeout: Duration,
+  ) -> Result<Value, DeliveryError> {
+    let mut frame = serde_json::to_vec(&request)
+      .map_err(|_| DeliveryError::not_sent("The Pi input request could not be encoded."))?;
+    frame.push(b'\n');
+    if frame.len() > MAX_FRAME_BYTES {
+      return Err(DeliveryError::not_sent(
+        "This message exceeds the Pi input bridge's encoded request size limit.",
+      ));
+    }
+    let mut sending = false;
+    let response = tokio::time::timeout(timeout, async {
+      let mut stream = UnixStream::connect(&descriptor.socket_path)
+        .await
+        .map_err(|_| unavailable())?;
+      sending = true;
+      stream.write_all(&frame).await.map_err(|_| {
+        delivery_error(
+          "The connection to Pi failed while sending. Check the session before retrying.",
+          submission,
+        )
+      })?;
+      let mut response = Vec::new();
+      let mut buffer = [0_u8; 4096];
+      loop {
+        let count = stream.read(&mut buffer).await.map_err(|_| {
+          delivery_error(
+            "The Pi input bridge response could not be read. Check the session before retrying.",
+            submission,
+          )
+        })?;
+        if count == 0 {
+          return Err(delivery_error(
+            "Pi closed the connection without confirming delivery. Check the session before retrying.",
+            submission,
+          ));
+        }
+        let end = buffer[..count].iter().position(|byte| *byte == b'\n');
+        let line_bytes = end.unwrap_or(count);
+        if response.len() + line_bytes > MAX_FRAME_BYTES {
+          return Err(delivery_error("The Pi input bridge response is too large.", submission));
+        }
+        response.extend_from_slice(&buffer[..line_bytes]);
+        if end.is_some() {
+          return serde_json::from_slice(&response)
+            .map_err(|_| delivery_error("The Pi input bridge returned invalid JSON.", submission));
+        }
+      }
+    })
+    .await;
+    match response {
+      Ok(response) => response,
+      Err(_) => Err(delivery_error(
+        "The Pi input bridge timed out. Check the session before retrying.",
+        submission && sending,
+      )),
+    }
+  }
+
+  #[cfg(test)]
+  mod tests {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::net::UnixListener;
+    use tokio::task::JoinHandle;
+
+    use super::*;
+
+    struct Fixture {
+      root: TempDir,
+      value: Value,
+    }
+
+    impl Fixture {
+      fn new() -> Self {
+        // A short path also fits macOS's Unix socket pathname bound.
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let session_file = root.path().join("session.jsonl");
+        std::fs::write(&session_file, "{}\n").unwrap();
+        let value = json!({
+          "protocol": 1,
+          "provider": "pi",
+          "transport": "unix",
+          "session_id": "session-1",
+          "session_file": session_file,
+          "instance_id": "instance-1",
+          "socket_path": root.path().join("bridge.sock"),
+          "pid": 1234,
+          "token": "test-token",
+        });
+        let fixture = Self { root, value };
+        fixture.write_descriptor(&fixture.value);
+        fixture
+      }
+
+      fn path(&self) -> PathBuf {
+        self.root.path().join("descriptor.json")
+      }
+
+      fn write_descriptor(&self, value: &Value) {
+        std::fs::write(self.path(), serde_json::to_vec(value).unwrap()).unwrap();
+        std::fs::set_permissions(self.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+      }
+
+      fn descriptor(&self) -> Result<Descriptor, DeliveryError> {
+        read_descriptor(&self.path(), "session-1", self.value["session_file"].as_str().unwrap())
+      }
+
+      fn serve(&self, respond: impl FnOnce(&Value) -> Vec<u8> + Send + 'static) -> JoinHandle<Value> {
+        let listener = UnixListener::bind(self.value["socket_path"].as_str().unwrap()).unwrap();
+        tokio::spawn(async move {
+          let (stream, _) = listener.accept().await.unwrap();
+          let mut reader = BufReader::new(stream);
+          let mut line = String::new();
+          reader.read_line(&mut line).await.unwrap();
+          let request: Value = serde_json::from_str(&line).unwrap();
+          reader.get_mut().write_all(&respond(&request)).await.unwrap();
+          request
+        })
+      }
+    }
+
+    fn frame(value: Value) -> Vec<u8> {
+      let mut bytes = serde_json::to_vec(&value).unwrap();
+      bytes.push(b'\n');
+      bytes
+    }
+
+    fn admitted(request: &Value, disposition: &str) -> Value {
+      json!({
+        "protocol": 1,
+        "type": "admitted",
+        "request_id": request["request_id"],
+        "session_id": request["session_id"],
+        "instance_id": request["instance_id"],
+        "disposition": disposition,
+      })
+    }
+
+    #[test]
+    fn descriptor_hash_matches_node_resolve_without_resolving_symlinks() {
+      let path = normalized_absolute(Path::new("/sessions/./other/../session.jsonl")).unwrap();
+      assert_eq!(path, Path::new("/sessions/session.jsonl"));
+      assert_eq!(
+        normalized_absolute(Path::new("/../../session.jsonl")).unwrap(),
+        Path::new("/session.jsonl")
+      );
+      assert!(normalized_absolute(Path::new("session.jsonl")).is_none());
+      assert_eq!(
+        descriptor_path(path.to_str().unwrap(), Path::new("/runtime")),
+        Path::new("/runtime/pi/sessions/1901b3dd699c54c5834719e831b1338a21f29a5ad9fa6a61aeefb0a297f6d0f8.json"),
+      );
+    }
+
+    #[test]
+    fn descriptor_requires_matching_protocol_and_session_identity() {
+      let fixture = Fixture::new();
+      assert!(fixture.descriptor().is_ok());
+      for (field, value) in [
+        ("protocol", json!(2)),
+        ("provider", json!("codex")),
+        ("transport", json!("tcp")),
+        ("session_id", json!("other-session")),
+        ("session_file", json!("/other/session.jsonl")),
+        ("instance_id", json!("")),
+        ("socket_path", json!("relative.sock")),
+        ("pid", json!(0)),
+        ("token", json!("")),
+      ] {
+        let mut descriptor = fixture.value.clone();
+        descriptor[field] = value;
+        fixture.write_descriptor(&descriptor);
+        assert!(!fixture.descriptor().unwrap_err().may_have_been_sent, "{field}");
+      }
+    }
+
+    #[test]
+    fn descriptor_rejects_public_files_symlinks_and_oversized_content() {
+      let fixture = Fixture::new();
+      std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+      assert!(fixture.descriptor().unwrap_err().message.contains("private"));
+      fixture.write_descriptor(&fixture.value);
+      let alternate = fixture.root.path().join("alternate.json");
+      std::fs::rename(fixture.path(), &alternate).unwrap();
+      symlink(&alternate, fixture.path()).unwrap();
+      assert!(fixture.descriptor().is_err());
+      std::fs::remove_file(fixture.path()).unwrap();
+      std::fs::rename(alternate, fixture.path()).unwrap();
+      std::fs::write(fixture.path(), vec![b' '; MAX_FRAME_BYTES + 1]).unwrap();
+      assert!(fixture.descriptor().is_err());
+    }
+
+    #[test]
+    fn descriptor_requires_an_existing_session_file() {
+      let fixture = Fixture::new();
+      std::fs::remove_file(fixture.value["session_file"].as_str().unwrap()).unwrap();
+      assert!(
+        fixture
+          .descriptor()
+          .unwrap_err()
+          .message
+          .contains("session file is unavailable")
+      );
+    }
+
+    #[tokio::test]
+    async fn status_authenticates_and_reports_idle_or_busy() {
+      for state in ["idle", "busy"] {
+        let fixture = Fixture::new();
+        let server = fixture.serve(move |request| {
+          frame(json!({
+            "protocol": 1,
+            "type": "ready",
+            "request_id": request["request_id"],
+            "session_id": request["session_id"],
+            "session_file": request["session_file"],
+            "instance_id": request["instance_id"],
+            "state": state,
+          }))
+        });
+        let status = query_status(&fixture.descriptor().unwrap(), BRIDGE_TIMEOUT)
+          .await
+          .unwrap();
+        assert!(status.contains(if state == "idle" { "ready" } else { "follow-up" }));
+        let request = server.await.unwrap();
+        assert_eq!(request["type"], "status");
+        assert_eq!(request["token"], "test-token");
+      }
+    }
+
+    #[tokio::test]
+    async fn status_rejects_a_different_process_or_session() {
+      for field in [
+        "protocol",
+        "request_id",
+        "session_id",
+        "session_file",
+        "instance_id",
+        "state",
+      ] {
+        let fixture = Fixture::new();
+        let server = fixture.serve(move |request| {
+          let mut response = json!({
+            "protocol": 1,
+            "type": "ready",
+            "request_id": request["request_id"],
+            "session_id": request["session_id"],
+            "session_file": request["session_file"],
+            "instance_id": request["instance_id"],
+            "state": "idle",
+          });
+          response[field] = json!("mismatch");
+          frame(response)
+        });
+        let error = query_status(&fixture.descriptor().unwrap(), BRIDGE_TIMEOUT)
+          .await
+          .unwrap_err();
+        assert!(!error.may_have_been_sent);
+        server.await.unwrap();
+      }
+    }
+
+    #[tokio::test]
+    async fn submission_preserves_multiline_text_and_uses_auto_delivery() {
+      for disposition in ["started", "queued_follow_up"] {
+        let fixture = Fixture::new();
+        let server = fixture.serve(move |request| frame(admitted(request, disposition)));
+        let text = "Explain this:\n\tfirst line\r\n第二行";
+        let result = submit_message(&fixture.descriptor().unwrap(), "request-1", text, BRIDGE_TIMEOUT)
+          .await
+          .unwrap();
+        assert!(matches!(
+          (disposition, result),
+          ("started", Admission::Started) | ("queued_follow_up", Admission::QueuedFollowUp)
+        ));
+        let request = server.await.unwrap();
+        assert_eq!(request["protocol"], 1);
+        assert_eq!(request["type"], "submit");
+        assert_eq!(request["token"], "test-token");
+        assert_eq!(request["instance_id"], "instance-1");
+        assert_eq!(request["session_id"], "session-1");
+        assert_eq!(request["session_file"], fixture.value["session_file"]);
+        assert_eq!(request["request_id"], "request-1");
+        assert_eq!(request["delivery"], "auto");
+        assert_eq!(request["content"], json!([{ "type": "text", "text": text }]));
+      }
+    }
+
+    #[tokio::test]
+    async fn submission_distinguishes_rejection_from_uncertain_admission() {
+      for (code, uncertain) in [
+        ("unauthorized", false),
+        ("message_invalid", false),
+        ("bridge_unavailable", true),
+        ("future_error", true),
+      ] {
+        let fixture = Fixture::new();
+        let server = fixture.serve(move |request| {
+          frame(json!({
+            "protocol": 1,
+            "type": "error",
+            "request_id": request["request_id"],
+            "code": code,
+            "message": "Rejected",
+          }))
+        });
+        let error = submit_message(&fixture.descriptor().unwrap(), "request-1", "Hello", BRIDGE_TIMEOUT)
+          .await
+          .unwrap_err();
+        assert_eq!(error.may_have_been_sent, uncertain, "{code}");
+        if code == "message_invalid" {
+          assert!(error.message.contains("update the input bridge"));
+        }
+        server.await.unwrap();
+      }
+    }
+
+    #[tokio::test]
+    async fn mismatched_admissions_are_uncertain() {
+      for field in [
+        "protocol",
+        "type",
+        "request_id",
+        "session_id",
+        "instance_id",
+        "disposition",
+      ] {
+        let fixture = Fixture::new();
+        let server = fixture.serve(move |request| {
+          let mut response = admitted(request, "started");
+          response[field] = json!("mismatch");
+          frame(response)
+        });
+        assert!(
+          submit_message(&fixture.descriptor().unwrap(), "request-1", "Hello", BRIDGE_TIMEOUT)
+            .await
+            .unwrap_err()
+            .may_have_been_sent
+        );
+        server.await.unwrap();
+      }
+    }
+
+    #[tokio::test]
+    async fn invalid_or_missing_responses_are_uncertain_after_submission() {
+      for response in [b"invalid\n".to_vec(), Vec::new(), vec![b'a'; MAX_FRAME_BYTES + 1]] {
+        let fixture = Fixture::new();
+        let server = fixture.serve(move |_| response);
+        let error = submit_message(&fixture.descriptor().unwrap(), "request-1", "Hello", BRIDGE_TIMEOUT)
+          .await
+          .unwrap_err();
+        assert!(error.may_have_been_sent);
+        server.await.unwrap();
+      }
+    }
+
+    #[tokio::test]
+    async fn timeout_after_submission_is_uncertain_but_connect_failure_is_not() {
+      let fixture = Fixture::new();
+      let descriptor = fixture.descriptor().unwrap();
+      let error = submit_message(&descriptor, "request-1", "Hello", BRIDGE_TIMEOUT)
+        .await
+        .unwrap_err();
+      assert!(!error.may_have_been_sent);
+      let listener = UnixListener::bind(&descriptor.socket_path).unwrap();
+      let server = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        std::future::pending::<()>().await;
+      });
+      let error = submit_message(&descriptor, "request-1", "Hello", Duration::from_millis(50))
+        .await
+        .unwrap_err();
+      assert!(error.may_have_been_sent);
+      assert!(error.message.contains("timed out"));
+      server.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_encoded_request_is_rejected_before_connecting() {
+      let fixture = Fixture::new();
+      let error = submit_message(
+        &fixture.descriptor().unwrap(),
+        "request-1",
+        &"中".repeat(16 * 1024),
+        BRIDGE_TIMEOUT,
+      )
+      .await
+      .unwrap_err();
+      assert!(!error.may_have_been_sent);
+      assert!(error.message.contains("encoded request size limit"));
+    }
+  }
+}
+
+pub(super) async fn status(target: &InputTarget) -> Result<String, DeliveryError> {
+  #[cfg(unix)]
+  return unix::status(target).await;
+  #[cfg(not(unix))]
+  {
+    let _ = target;
+    Err(DeliveryError::not_sent(
+      "Pi input requires a Unix system with the Pi input bridge extension loaded.",
+    ))
+  }
+}
+
+pub(super) async fn submit(target: &InputTarget, request_id: &str, text: &str) -> Result<Admission, DeliveryError> {
+  #[cfg(unix)]
+  return unix::submit(target, request_id, text).await;
+  #[cfg(not(unix))]
+  {
+    let _ = (target, request_id, text);
+    Err(DeliveryError::not_sent(
+      "Pi input requires a Unix system with the Pi input bridge extension loaded.",
+    ))
+  }
+}

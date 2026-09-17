@@ -1,0 +1,129 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { getSessionInputStatus, submitSessionInput } from "./tauri";
+import type { SessionInputStatus } from "./types";
+
+const DEFAULT_MAX_LENGTH = 16_384;
+const UNCONFIRMED_MESSAGE = "Delivery not confirmed. Check the conversation before sending again.";
+
+interface InputState {
+  draft: string;
+  availability: SessionInputStatus | null;
+  checking: boolean;
+  check_id: number;
+  sending: boolean;
+  delivery_uncertain: boolean;
+  notice: string | null;
+}
+
+function emptyInput(): InputState {
+  return {
+    draft: "", availability: null, checking: true, check_id: 0,
+    sending: false, delivery_uncertain: false, notice: null,
+  };
+}
+
+/** Keep drafts and in-flight results attached to their original session. */
+export function useSessionInput(session_key: string | null) {
+  const states = useRef(new Map<string, InputState>());
+  const mounted = useRef(false);
+  const [, render] = useState(0);
+
+  const update = useCallback((key: string, apply: (state: InputState) => InputState) => {
+    states.current.set(key, apply(states.current.get(key) ?? emptyInput()));
+    if (mounted.current) render((revision) => revision + 1);
+  }, []);
+
+  const checkAvailability = useCallback(async (key: string) => {
+    const checkId = (states.current.get(key)?.check_id ?? 0) + 1;
+    update(key, (state) => ({ ...state, checking: true, check_id: checkId }));
+    let availability: SessionInputStatus;
+    try {
+      availability = await getSessionInputStatus({ session_key: key });
+    } catch {
+      availability = {
+        available: false,
+        message: "Message input is unavailable on this connection. Retry to check availability.",
+        max_length: DEFAULT_MAX_LENGTH,
+      };
+    }
+    update(key, (state) => state.check_id === checkId
+      ? { ...state, checking: false, availability }
+      : state);
+  }, [update]);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+
+  useEffect(() => {
+    if (session_key) void checkAvailability(session_key);
+  }, [session_key, checkAvailability]);
+
+  const state = (session_key && states.current.get(session_key)) || emptyInput();
+  const maxLength = state.availability?.max_length ?? DEFAULT_MAX_LENGTH;
+  const length = Array.from(state.draft).length;
+
+  async function send() {
+    if (!session_key) return;
+    const key = session_key;
+    // Read the ref, not the render snapshot: two clicks in one frame must send once.
+    const current = states.current.get(key);
+    if (!current || current.sending || current.delivery_uncertain || current.checking
+      || !current.availability?.available || !current.draft.trim()
+      || Array.from(current.draft).length > current.availability.max_length) return;
+    const text = current.draft;
+    update(key, (value) => ({ ...value, sending: true, notice: null }));
+    try {
+      const requestId = newRequestId();
+      const result = await submitSessionInput({ session_key: key, request_id: requestId, text });
+      const matchingResponse = result.request_id === requestId;
+      if (matchingResponse && result.status === "accepted") {
+        update(key, (value) => ({
+          ...value, sending: false,
+          draft: value.draft === text ? "" : value.draft,
+          notice: result.message || "Message sent.",
+        }));
+      } else if (matchingResponse && result.status === "not_sent") {
+        update(key, (value) => ({ ...value, sending: false, notice: result.message || "Message was not sent. Try again." }));
+      } else {
+        update(key, (value) => ({
+          ...value, sending: false, delivery_uncertain: true, notice: UNCONFIRMED_MESSAGE,
+        }));
+      }
+    } catch {
+      update(key, (value) => ({
+        ...value, sending: false, delivery_uncertain: true, notice: UNCONFIRMED_MESSAGE,
+      }));
+    }
+  }
+
+  return {
+    ...state,
+    max_length: maxLength,
+    length,
+    can_send: !!session_key && !state.checking && !!state.availability?.available
+      && !state.sending && !state.delivery_uncertain && !!state.draft.trim() && length <= maxLength,
+    setDraft(text: string) {
+      if (session_key) update(session_key, (value) => value.sending || value.delivery_uncertain
+        ? value : { ...value, draft: text, notice: null });
+    },
+    editMessage() {
+      if (session_key) update(session_key, (value) => ({ ...value, delivery_uncertain: false, notice: null }));
+    },
+    retryAvailability() {
+      if (session_key) void checkAvailability(session_key);
+    },
+    send,
+  };
+}
+
+function newRequestId(): string {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  // getRandomValues also works on a private-network HTTP viewer connection.
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
