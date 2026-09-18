@@ -54,6 +54,7 @@ function ViewerContent({ remote }: { remote: boolean }) {
           pending_live_activity={viewer.pendingLiveActivity}
           on_show_live_activity={viewer.showLiveActivity}
           on_follow_change={viewer.setFollowingLive}
+          on_input_accepted={viewer.refreshSessionAfterInput}
           error={viewer.eventsError}
           events={viewer.events}
           expanded_detail={viewer.expandedDetail}

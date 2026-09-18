@@ -384,8 +384,11 @@ process when the bridge is unavailable.
 length-prefixed JSON IPC router. The client requires an explicit IPC endpoint:
 a Unix socket on macOS/Unix or a local Windows named pipe. Platform discovery
 maps `$CODEX_HOME/ipc/ipc.sock` on Unix and `\\.\pipe\codex-ipc` on Windows.
-The client sends the observed version-1 `thread-follower-start-turn` request
-using the rollout thread id as `conversationId`. An isolated fake desktop
+The client sends the observed version-2 `thread-follower-start-turn` request
+(Desktop build 26.901.41123), using the rollout thread id as `conversationId`
+and `turnStart.request.threadId`. The version-1 `turnStartParams` shape no longer
+matches that build. Requests allow the router's ten-second owner-discovery
+window to complete. An isolated fake desktop
 router exercises client initialization, owner discovery, forwarding, and the
 successful response path over the native transport on Linux, macOS, and Windows
 CI. Fake-router error responses are tested on Unix only because Bun 1.3.13 does
@@ -393,9 +396,10 @@ not flush those server-side named-pipe responses on Windows. Its
 lab owner can forward accepted input to a standalone `codex app-server` under a
 temporary `CODEX_HOME`; the local smoke passes with `deepseek-v4-flash` at
 `http://localhost:4141/v1`. These are protocol and transport regression tests,
-not general compatibility guarantees for future Codex App builds. A live test
-against Codex Desktop successfully appended to an existing rollout through the
-real IPC endpoint. Model and effort overrides require a version-1
+not general compatibility guarantees for future Codex App builds. Real IPC
+delivery has been observed in persisted rollouts; that alone does not validate
+Desktop rendering, which also requires `text_elements` on text inputs.
+Model and effort overrides require a version-1
 `thread-follower-update-thread-settings` request before start-turn; inline
 start-turn fields are silently replaced by the owning window's current settings.
 The update is retained for subsequent turns. Terminal Pet uses the client for
@@ -416,13 +420,35 @@ the project.
 
 ## Desktop Session Viewer
 
-`apps/viewer` is a read-only Tauri 2/React desktop viewer for historical Pi,
+`apps/viewer` is a Tauri 2/React desktop and browser viewer for historical Pi,
 Codex, OpenCode, ZCode, WorkBuddy, and DSH sessions. It aggregates root sessions
 into one searchable, provider-filterable sidebar, lazily expands known
 subagents into a tree, renders the selected session's normalized events as a
 conversation, and keeps reasoning, tools, metadata, errors, and unknown events
-inspectable without adding a message composer. A failure in one provider is
+inspectable. A failure in one provider is
 reported without preventing the other providers from loading.
+
+The conversation footer sends multiline messages through native Rust live-input
+transports in `viewer-core`, shared by Tauri and authenticated HTTP commands.
+Root Codex tasks use the owning Desktop IPC client without a CLI fallback;
+text inputs include `text_elements: []`, which the Desktop renderer requires
+even though app-server accepts its omission. Without it, a turn can execute and
+persist successfully while its optimistic Desktop view crashes.
+Pi uses its exact live session's opt-in input bridge, starting idle turns or
+queueing busy follow-ups. Other providers, Codex subagents, and External snapshot
+mode are unavailable. Catalog membership and a fresh source header validate
+every target. Availability checks do not submit input. Drafts stay in memory
+per session; Cmd/Ctrl+Enter sends. Admission clears the draft, while uncertain
+delivery retains it and requires explicit editing before another send; the
+footer preserves backend and connection diagnostics alongside that notice. There
+is no optimistic transcript or automatic resend. Acceptance triggers bounded
+history refreshes immediately and at 1/3/8/20 seconds, covering delayed provider
+writes or missed live notifications while preserving loaded history and reading
+position. Refreshes coalesce with live reads and stop on session/machine changes.
+The bounded in-memory request cache deduplicates UUIDs and guards the resolved
+runtime owner against parallel
+sends, including when the HTTP caller disconnects. Limits are 16,384 Unicode
+characters and Pi's 32 KiB encoded frame. Markdown whitespace is preserved.
 
 The conversation keeps user prompts and final assistant replies visible. A
 contiguous stretch of intermediate assistant progress and non-message activity
@@ -1060,7 +1086,9 @@ OpenCode has the first live-output normalizer: `OpenCodeLiveNormalizer` parses `
   delivery acknowledgement; subscribers that are disconnected can miss events.
 - The terminal pet cannot distinguish every runtime state authoritatively until
   provider task lifecycle and interaction events are represented in `AgentEvent`.
-- The desktop viewer remains read-only. Without a Relay connection, selected
+- Viewer message input requires a live Codex Desktop owner or Pi bridge;
+  historical sessions are not resumed through a fallback process.
+  Without a Relay connection, selected
   timelines refresh from the durable index and historical source reads. Relay
   snapshot/follow supports all six providers; it is not an agent-control
   transport, and its unread tracking is not persisted yet.

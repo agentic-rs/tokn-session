@@ -34,6 +34,7 @@ use crate::repository::{NativeRepository, SessionBodyIndexing, ViewerRepository}
 mod agent_activity;
 mod compaction;
 mod event_filter;
+mod input;
 mod trajectory_state;
 mod usage_filter;
 
@@ -82,6 +83,7 @@ pub struct ViewerService {
   observed_index_data_version: Arc<Mutex<Option<i64>>>,
   failed_body_jobs: Arc<Mutex<HashMap<(SourceKey, String), FailedBodyJob>>>,
   loaded_session_cache: Arc<Mutex<Option<CachedSession>>>,
+  input_broker: crate::input::InputBroker,
 }
 
 /// The progress center must never need to touch provider storage. This store
@@ -653,6 +655,7 @@ impl ViewerService {
       observed_index_data_version: Arc::new(Mutex::new(observed_index_data_version)),
       failed_body_jobs: Arc::new(Mutex::new(HashMap::new())),
       loaded_session_cache: Arc::new(Mutex::new(None)),
+      input_broker: crate::input::InputBroker::default(),
     };
     // Existing durable rows should be reflected immediately when a viewer is
     // reopened. This is SQLite-only bookkeeping; the progress snapshot itself

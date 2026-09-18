@@ -19,11 +19,13 @@ import {
 import { InspectorIcon, PanelIcon } from "./Icons";
 import { EventCard } from "./EventCard";
 import { LoadingRows, StateView } from "./StateView";
+import { SessionComposer } from "./SessionComposer";
 
 interface ConversationProps {
   pending_live_activity?: boolean;
   on_show_live_activity?: () => void;
   on_follow_change?: (following: boolean) => void;
+  on_input_accepted?: (session_key: string) => void;
   session: SessionSummary | null;
   events: EventSummary[];
   selected_event_key: string | null;
@@ -67,6 +69,7 @@ export function Conversation({
   pending_live_activity = false,
   on_show_live_activity,
   on_follow_change,
+  on_input_accepted,
   session,
   events,
   selected_event_key,
@@ -174,7 +177,7 @@ export function Conversation({
         ) : (
           <div className="conversation__identity conversation__identity--empty">
             <h2>Session viewer</h2>
-            <p>Read-only, across every known provider</p>
+            <p>Conversations across every known provider</p>
           </div>
         )}
         <button
@@ -364,6 +367,7 @@ export function Conversation({
           </div>
         ) : null}
       </div>
+      <SessionComposer session={session} on_accepted={on_input_accepted} />
     </main>
   );
 }

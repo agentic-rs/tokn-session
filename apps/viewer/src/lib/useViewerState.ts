@@ -50,6 +50,7 @@ function useDebouncedValue<T>(value: T, delayMs: number): T {
 
 const DETAIL_CACHE_LIMIT = 50;
 const TRAJECTORY_EVENT_PAGE_SIZE = 40;
+const INPUT_REFRESH_DELAYS_MS = [1_000, 3_000, 8_000, 20_000];
 
 function compareDecimalRevisions(left: string, right: string): number {
   const normalizedLeft = left.replace(/^0+(?=\d)/, "");
@@ -199,6 +200,7 @@ export function useViewerState() {
   const liveRefresh = useRef(false);
   const eventRefreshInFlight = useRef(false);
   const liveUpdateQueued = useRef(false);
+  const inputRefreshTimers = useRef<number[]>([]);
   const eventsRef = useRef<EventSummary[]>([]);
   eventsRef.current = events;
   const [pendingLiveActivity, setPendingLiveActivity] = useState(false);
@@ -526,6 +528,30 @@ export function useViewerState() {
   const setFollowingLive = useCallback((following: boolean) => {
     followingLive.current = following;
   }, []);
+
+  const clearInputRefreshTimers = useCallback(() => {
+    for (const timer of inputRefreshTimers.current) window.clearTimeout(timer);
+    inputRefreshTimers.current = [];
+  }, []);
+
+  const refreshSessionAfterInput = useCallback((sessionKey: string) => {
+    if (selectedSessionKeyRef.current !== sessionKey) return;
+    clearInputRefreshTimers();
+    const refresh = () => {
+      if (selectedSessionKeyRef.current !== sessionKey) return;
+      // Use the normal live path so loaded history, reading position and open
+      // turns survive. The provider can acknowledge before persisting a message;
+      // bounded follow-up reads also cover delayed writes and missed signals.
+      liveRefresh.current = true;
+      setPendingLiveActivity(!followingLive.current);
+      if (eventRefreshInFlight.current) liveUpdateQueued.current = true;
+      else setEventsAttempt((attempt) => attempt + 1);
+    };
+    refresh();
+    inputRefreshTimers.current = INPUT_REFRESH_DELAYS_MS.map((delay) => window.setTimeout(refresh, delay));
+  }, [clearInputRefreshTimers]);
+
+  useEffect(() => clearInputRefreshTimers, [selectedSessionKey, clearInputRefreshTimers]);
 
   useEffect(() => {
     followingLive.current = true;
@@ -1757,6 +1783,7 @@ export function useViewerState() {
     retryEvents: () => setEventsAttempt((attempt) => attempt + 1),
     pendingLiveActivity,
     showLiveActivity,
+    refreshSessionAfterInput,
     setFollowingLive,
     loadOlderEvents,
     loadNewerEvents,

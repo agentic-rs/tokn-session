@@ -330,6 +330,41 @@ pub struct EventPageRequest {
   pub limit: Option<usize>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct SessionInputStatusRequest {
+  pub session_key: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionInputStatus {
+  pub available: bool,
+  pub message: String,
+  pub max_length: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct SubmitSessionInputRequest {
+  pub session_key: String,
+  pub request_id: String,
+  pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputDeliveryStatus {
+  Accepted,
+  NotSent,
+  Unknown,
+  Pending,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SubmitSessionInputResponse {
+  pub request_id: String,
+  pub status: InputDeliveryStatus,
+  pub message: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct EventPage {
   pub events: Vec<EventSummary>,

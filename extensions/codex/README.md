@@ -21,9 +21,21 @@ cd extensions/codex
 bun run check
 ```
 
-The currently observed desktop request is `thread-follower-start-turn` version
-1. Its payload maps the rollout thread id to `conversationId` and wraps the
-app-server-style text input in `turnStartParams`.
+The currently observed desktop request in build 26.901.41123 is
+`thread-follower-start-turn` version 2. Its payload uses the rollout thread id
+for both `conversationId` and `turnStart.request.threadId`, with text input and
+the client message id inside `turnStart.request`. The owner inherits its current
+thread settings. Version 1's `turnStartParams` shape is no longer compatible with
+this build. The viewer's native Rust sender uses the same version-2 contract.
+Text inputs include `text_elements: []` even without annotations. Desktop keeps
+the submitted input in its optimistic turn state and its renderer requires this
+array; omitting it can crash that conversation's UI even after the app server
+accepts and persists the message. The fake owner checks this rendering contract
+before acknowledging a turn.
+
+Start-turn requests allow time for the router's ten-second owner discovery
+window. A version rejection or missing owner is a definite non-delivery;
+disconnects and unacknowledged submissions must never be retried automatically.
 
 Optional model and reasoning-effort overrides use a separate version-1
 `thread-follower-update-thread-settings` request before start-turn. Codex App

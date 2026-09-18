@@ -1,11 +1,11 @@
 # Tokn Sessions Viewer
 
-The viewer is a read-only desktop and browser app for browsing historical Pi, Codex,
+The viewer is a desktop and browser app for browsing historical Pi, Codex,
 OpenCode, ZCode, WorkBuddy, and DeepSeek Harness (DSH) sessions in one place. It
 shows root sessions in a searchable, provider-filterable sidebar, expands their
 known subagents on demand, and renders each selected normalized event stream as
 a conversation with inspectable technical events.
-It does not create sessions, append messages, or modify provider data.
+Its composer sends messages to supported live sessions through their owning app.
 
 ## Relay lifetime and data modes
 
@@ -78,6 +78,32 @@ formatting boundaries can limit sentence context. The original session and
 Inspector data stay unchanged. Results are kept only in the mounted response
 card and discarded when its source changes or the card closes. Responses beyond
 the existing detail size limit report an error instead of translating a preview.
+
+## Sending messages
+
+Select a session and use **Message this session** below the conversation.
+**Send** or **⌘ / Ctrl + Enter** submits; Enter inserts a newline. Drafts stay
+with their session while switching conversations, and Markdown whitespace is
+preserved. Drafts are held in memory and cleared when changing machines or
+closing the viewer.
+
+- Root Codex tasks use Codex Desktop's local IPC. Desktop must be running and
+  own the selected task. Subagents receive messages through their parent task.
+- Pi requires the [input bridge](../../extensions/pi/README.md) in the live
+  process for that exact session. Idle input starts a turn; busy input queues a
+  follow-up.
+- Other providers and the desktop External snapshot connection show why input
+  is unavailable. To message another machine, connect to its viewer API.
+
+The footer reports acceptance or failure, including the backend's failure
+reason. After acceptance, the viewer refreshes history immediately and briefly
+checks for delayed writes, preserving loaded history and your reading position.
+The conversation displays the message when the provider records it. If delivery
+cannot be confirmed, the draft stays locked until **Edit message** is chosen
+after checking the conversation. Messages
+are never retried automatically. Input is limited to 16,384 characters; Pi also
+has a 32 KiB encoded-request limit. The viewer does not create sessions or fall
+back to a separate CLI process.
 
 ## Using the viewer
 
@@ -196,8 +222,8 @@ exists can become unread only after that body confirmation finds a new unhidden
 user message or final assistant reply. A dot on a collapsed parent can represent
 unread activity in a known subagent. The open timeline refreshes after successful
 body updates, including progress that does not qualify as unread activity.
-This version remains read-only: it has no composer and never mutates provider
-session files.
+The composer uses the owning runtime; the viewer never edits provider session
+files directly.
 
 ## Architecture
 

@@ -119,7 +119,7 @@ export class IsolatedCodexAppServer {
     }
     const response = await this.#request("turn/start", {
       threadId: this.#threadId,
-      input: [{ type: "text", text: prompt }],
+      input: [{ type: "text", text: prompt, text_elements: [] }],
       cwd: this.#cwd,
       approvalPolicy: "never",
       sandboxPolicy: {

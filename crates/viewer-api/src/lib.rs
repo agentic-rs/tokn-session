@@ -116,6 +116,37 @@ async fn command(
     .clone()
     .try_acquire_owned()
     .map_err(|_| error(StatusCode::TOO_MANY_REQUESTS, "Viewer is busy; retry shortly"))?;
+  // Live input uses bounded async sockets. Target validation is shared with
+  // desktop in viewer-core; dropping this HTTP request never resends input.
+  if matches!(command.as_str(), "get_session_input_status" | "submit_session_input") {
+    let _permit = permit;
+    let request = payload.get("request").cloned().unwrap_or_else(|| json!({}));
+    let response = match command.as_str() {
+      "get_session_input_status" => {
+        let request = serde_json::from_value(request).map_err(|e| error(StatusCode::BAD_REQUEST, e.to_string()))?;
+        serde_json::to_value(
+          state
+            .service
+            .get_session_input_status(request)
+            .await
+            .map_err(|e| error(StatusCode::BAD_REQUEST, e))?,
+        )
+      }
+      _ => {
+        let request = serde_json::from_value(request).map_err(|e| error(StatusCode::BAD_REQUEST, e.to_string()))?;
+        serde_json::to_value(
+          state
+            .service
+            .submit_session_input(request)
+            .await
+            .map_err(|e| error(StatusCode::BAD_REQUEST, e))?,
+        )
+      }
+    };
+    return response
+      .map(Json)
+      .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Could not encode input response"));
+  }
   // The permit lives with blocking work even when the HTTP caller disconnects.
   tokio::task::spawn_blocking(move || {
     let _permit = permit;

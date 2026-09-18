@@ -3,6 +3,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { EventSummary, SessionSummary } from "../lib/types";
 import { Conversation } from "./Conversation";
 
+vi.mock("./SessionComposer", () => ({ SessionComposer: () => null }));
+
 afterEach(cleanup);
 
 const SESSION: SessionSummary = {

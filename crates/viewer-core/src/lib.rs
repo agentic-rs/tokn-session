@@ -2,6 +2,7 @@
 //! this crate; Relay provides live-feed hints while core owns snapshots.
 mod index_queries;
 mod indexer;
+mod input;
 pub mod model;
 pub mod relay;
 mod repository;

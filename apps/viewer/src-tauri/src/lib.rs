@@ -71,6 +71,8 @@ pub fn run() {
       commands::events::acknowledge_session_attention,
       commands::indexing::get_session_index_progress,
       commands::indexing::retry_session_index,
+      commands::input::get_session_input_status,
+      commands::input::submit_session_input,
       commands::relay::get_relay_status,
       commands::relay::configure_relay,
       commands::translation::get_translation_status,
