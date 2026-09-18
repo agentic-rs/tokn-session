@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { chmod, lstat, unlink } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
+import { renderDesktopPlainText } from "./desktop-plain-text";
 
 import {
   ipcEndpointAddress,
@@ -211,6 +212,7 @@ export class FakeCodexDesktopOwner {
   #initializeReject: ((error: Error) => void) | undefined;
   last_start_turn: CodexDesktopStartTurnRequest | undefined;
   last_thread_settings: CodexDesktopUpdateThreadSettingsRequest | undefined;
+  last_rendered_input: string | undefined;
 
   private constructor(socket: Socket, options: FakeCodexDesktopOwnerOptions) {
     this.#socket = socket;
@@ -308,6 +310,7 @@ export class FakeCodexDesktopOwner {
     }
     this.last_start_turn = message;
     try {
+      this.last_rendered_input = renderDesktopPlainText(message.params.turnStart.request.input);
       const result = await this.#startTurn(message);
       this.#socket.write(encodeIpcFrame({
         type: "response",

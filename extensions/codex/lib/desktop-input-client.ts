@@ -111,7 +111,7 @@ export class CodexDesktopInputClient {
         turnStart: {
           request: {
             threadId: normalizedConversationId,
-            input: [{ type: "text", text: normalizedPrompt }],
+            input: [{ type: "text", text: normalizedPrompt, text_elements: [] }],
             clientUserMessageId: randomUUID(),
             additionalContext: null
           },

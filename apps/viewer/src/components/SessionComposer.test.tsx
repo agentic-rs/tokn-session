@@ -255,4 +255,50 @@ describe("SessionComposer", () => {
     await ready();
     expect(textbox()).toHaveValue("");
   });
+
+  it("uses the latest acceptance callback with the original target after switching sessions", async () => {
+    const pending = deferred<SubmitSessionInputResponse>();
+    vi.mocked(submitSessionInput).mockReturnValue(pending.promise);
+    const oldCallback = vi.fn();
+    const latestCallback = vi.fn();
+    const view = render(<SessionComposer session={SESSION} on_accepted={oldCallback} />);
+    await ready();
+    draft("First session message");
+    send();
+    view.rerender(<SessionComposer session={OTHER_SESSION} on_accepted={latestCallback} />);
+    await ready();
+    const request = vi.mocked(submitSessionInput).mock.calls[0][0];
+    await act(async () => pending.resolve({ request_id: request.request_id, status: "accepted", message: "Message sent." }));
+    expect(oldCallback).not.toHaveBeenCalled();
+    expect(latestCallback).toHaveBeenCalledExactlyOnceWith(SESSION.session_key);
+    expect(textbox()).toHaveValue("");
+    expect(submitSessionInput).toHaveBeenCalledOnce();
+  });
+
+  it("does not refresh an unmounted viewer when acceptance arrives later", async () => {
+    const pending = deferred<SubmitSessionInputResponse>();
+    vi.mocked(submitSessionInput).mockReturnValue(pending.promise);
+    const onAccepted = vi.fn();
+    const view = render(<SessionComposer session={SESSION} on_accepted={onAccepted} />);
+    await ready();
+    draft("Message");
+    send();
+    view.unmount();
+    const request = vi.mocked(submitSessionInput).mock.calls[0][0];
+    await act(async () => pending.resolve({ request_id: request.request_id, status: "accepted", message: "Message sent." }));
+    expect(onAccepted).not.toHaveBeenCalled();
+  });
+
+  it("keeps accepted delivery certain if the refresh callback fails", async () => {
+    const onAccepted = vi.fn().mockRejectedValue(new Error("Refresh failed"));
+    render(<SessionComposer session={SESSION} on_accepted={onAccepted} />);
+    await ready();
+    draft("Accepted message");
+    send();
+    await screen.findByText("Message sent. The conversation could not refresh.");
+    expect(textbox()).toHaveValue("");
+    expect(textbox()).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Edit message" })).not.toBeInTheDocument();
+    expect(submitSessionInput).toHaveBeenCalledOnce();
+  });
 });

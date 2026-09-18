@@ -24,9 +24,11 @@ function emptyInput(): InputState {
 }
 
 /** Keep drafts and in-flight results attached to their original session. */
-export function useSessionInput(session_key: string | null) {
+export function useSessionInput(session_key: string | null, on_accepted?: (session_key: string) => void) {
   const states = useRef(new Map<string, InputState>());
   const mounted = useRef(false);
+  const acceptedHandler = useRef(on_accepted);
+  acceptedHandler.current = on_accepted;
   const [, render] = useState(0);
 
   const update = useCallback((key: string, apply: (state: InputState) => InputState) => {
@@ -89,6 +91,7 @@ export function useSessionInput(session_key: string | null) {
       }));
       return;
     }
+    let accepted = false;
     try {
       const result = await submitSessionInput({ session_key: key, request_id: requestId, text });
       const matchingResponse = result.request_id === requestId;
@@ -98,6 +101,7 @@ export function useSessionInput(session_key: string | null) {
           draft: value.draft === text ? "" : value.draft,
           notice: result.message || "Message sent.",
         }));
+        accepted = true;
       } else if (matchingResponse && result.status === "not_sent") {
         update(key, (value) => ({ ...value, sending: false, notice: result.message || "Message was not sent. Try again." }));
       } else {
@@ -113,6 +117,14 @@ export function useSessionInput(session_key: string | null) {
         ...value, sending: false, delivery_uncertain: true,
         notice: withDetail(UNCONFIRMED_MESSAGE, errorMessage(error)),
       }));
+    }
+    // A refresh failure cannot change the provider's delivery acknowledgement.
+    if (accepted && mounted.current) {
+      try {
+        await acceptedHandler.current?.(key);
+      } catch {
+        update(key, (value) => ({ ...value, notice: "Message sent. The conversation could not refresh." }));
+      }
     }
   }
 

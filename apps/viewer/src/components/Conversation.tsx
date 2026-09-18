@@ -25,6 +25,7 @@ interface ConversationProps {
   pending_live_activity?: boolean;
   on_show_live_activity?: () => void;
   on_follow_change?: (following: boolean) => void;
+  on_input_accepted?: (session_key: string) => void;
   session: SessionSummary | null;
   events: EventSummary[];
   selected_event_key: string | null;
@@ -68,6 +69,7 @@ export function Conversation({
   pending_live_activity = false,
   on_show_live_activity,
   on_follow_change,
+  on_input_accepted,
   session,
   events,
   selected_event_key,
@@ -365,7 +367,7 @@ export function Conversation({
           </div>
         ) : null}
       </div>
-      <SessionComposer session={session} />
+      <SessionComposer session={session} on_accepted={on_input_accepted} />
     </main>
   );
 }

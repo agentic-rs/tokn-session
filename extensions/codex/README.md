@@ -27,6 +27,11 @@ for both `conversationId` and `turnStart.request.threadId`, with text input and
 the client message id inside `turnStart.request`. The owner inherits its current
 thread settings. Version 1's `turnStartParams` shape is no longer compatible with
 this build. The viewer's native Rust sender uses the same version-2 contract.
+Text inputs include `text_elements: []` even without annotations. Desktop keeps
+the submitted input in its optimistic turn state and its renderer requires this
+array; omitting it can crash that conversation's UI even after the app server
+accepts and persists the message. The fake owner checks this rendering contract
+before acknowledging a turn.
 
 Start-turn requests allow time for the router's ten-second owner discovery
 window. A version rejection or missing owner is a definite non-delivery;

@@ -6,6 +6,8 @@ export const CODEX_DESKTOP_MAX_FRAME_BYTES = 1024 * 1024;
 export interface CodexDesktopTextInput {
   type: "text";
   text: string;
+  // Required by Desktop's optimistic turn renderer, even for plain text.
+  text_elements: [];
 }
 
 export interface CodexDesktopTurnStartParams {

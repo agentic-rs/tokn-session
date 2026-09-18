@@ -96,9 +96,11 @@ closing the viewer.
   is unavailable. To message another machine, connect to its viewer API.
 
 The footer reports acceptance or failure, including the backend's failure
-reason. The conversation displays the message
-when the provider records it. If delivery cannot be confirmed, the draft stays
-locked until **Edit message** is chosen after checking the conversation. Messages
+reason. After acceptance, the viewer refreshes history immediately and briefly
+checks for delayed writes, preserving loaded history and your reading position.
+The conversation displays the message when the provider records it. If delivery
+cannot be confirmed, the draft stays locked until **Edit message** is chosen
+after checking the conversation. Messages
 are never retried automatically. Input is limited to 16,384 characters; Pi also
 has a 32 KiB encoded-request limit. The viewer does not create sessions or fall
 back to a separate CLI process.

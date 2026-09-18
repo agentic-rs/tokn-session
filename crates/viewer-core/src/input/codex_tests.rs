@@ -105,7 +105,7 @@ async fn sends_one_message_to_the_owner_and_declines_discovery() {
         "turnStart": {
           "request": {
             "threadId": "session-123",
-            "input": [{ "type": "text", "text": "First line\n第二行" }],
+            "input": [{ "type": "text", "text": "First line\n第二行", "text_elements": [] }],
             "clientUserMessageId": "viewer-request-123",
             "additionalContext": null
           },
@@ -143,6 +143,48 @@ async fn sends_one_message_to_the_owner_and_declines_discovery() {
     .await
     .unwrap();
   assert!(matches!(result, Admission::Accepted));
+  server.await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(any(unix, windows))]
+async fn submitted_text_satisfies_desktops_rendering_contract_before_normalization() {
+  // Desktop 26.901.41123 keeps request.input in the local turn and reads
+  // text_elements.length while projecting it. Unlike the app-server parser,
+  // this contract must reject an omitted annotation array instead of defaulting.
+  #[derive(serde::Deserialize)]
+  #[serde(tag = "type", rename_all = "snake_case")]
+  enum DesktopInput {
+    Text { text: String, text_elements: Vec<Value> },
+  }
+  for invalid in [
+    json!({ "type": "text", "text": "hello" }),
+    json!({ "type": "text", "text": "hello", "text_elements": null }),
+    json!({ "type": "text", "text": "hello", "text_elements": "" }),
+  ] {
+    assert!(serde_json::from_value::<DesktopInput>(invalid).is_err());
+  }
+  const TEXT: &str = "  **Hello**\n\n```ts\nconst text = '你好 👋';\n```\n";
+  let (mut client, server) = initialized_client(|mut stream| async move {
+    let request = read_frame(&mut stream).await.unwrap();
+    let input: Vec<DesktopInput> =
+      serde_json::from_value(request["params"]["turnStart"]["request"]["input"].clone()).unwrap();
+    let rendered = input
+      .into_iter()
+      .map(|DesktopInput::Text { text, text_elements }| {
+        assert!(text_elements.is_empty(), "plain text has no inline annotations");
+        text
+      })
+      .collect::<Vec<_>>()
+      .join("\n");
+    assert_eq!(rendered, TEXT);
+    write_frame(&mut stream, &success(&request, json!({}))).await;
+  })
+  .await;
+  assert!(matches!(
+    client.submit("session", "request", TEXT).await.unwrap(),
+    Admission::Accepted
+  ));
   server.await.unwrap();
 }
 

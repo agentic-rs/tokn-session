@@ -2,8 +2,11 @@ import { useId, useRef } from "react";
 import { useSessionInput } from "../lib/useSessionInput";
 import type { SessionSummary } from "../lib/types";
 
-export function SessionComposer({ session }: { session: SessionSummary | null }) {
-  const input = useSessionInput(session?.session_key ?? null);
+export function SessionComposer({ session, on_accepted }: {
+  session: SessionSummary | null;
+  on_accepted?: (session_key: string) => void;
+}) {
+  const input = useSessionInput(session?.session_key ?? null, on_accepted);
   const inputId = useId();
   const textarea = useRef<HTMLTextAreaElement>(null);
   if (!session) return null;

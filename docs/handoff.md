@@ -396,9 +396,10 @@ not flush those server-side named-pipe responses on Windows. Its
 lab owner can forward accepted input to a standalone `codex app-server` under a
 temporary `CODEX_HOME`; the local smoke passes with `deepseek-v4-flash` at
 `http://localhost:4141/v1`. These are protocol and transport regression tests,
-not general compatibility guarantees for future Codex App builds. A live test
-against Codex Desktop successfully appended to an existing rollout through the
-real IPC endpoint. Model and effort overrides require a version-1
+not general compatibility guarantees for future Codex App builds. Real IPC
+delivery has been observed in persisted rollouts; that alone does not validate
+Desktop rendering, which also requires `text_elements` on text inputs.
+Model and effort overrides require a version-1
 `thread-follower-update-thread-settings` request before start-turn; inline
 start-turn fields are silently replaced by the owning window's current settings.
 The update is retained for subsequent turns. Terminal Pet uses the client for
@@ -430,6 +431,9 @@ reported without preventing the other providers from loading.
 The conversation footer sends multiline messages through native Rust live-input
 transports in `viewer-core`, shared by Tauri and authenticated HTTP commands.
 Root Codex tasks use the owning Desktop IPC client without a CLI fallback;
+text inputs include `text_elements: []`, which the Desktop renderer requires
+even though app-server accepts its omission. Without it, a turn can execute and
+persist successfully while its optimistic Desktop view crashes.
 Pi uses its exact live session's opt-in input bridge, starting idle turns or
 queueing busy follow-ups. Other providers, Codex subagents, and External snapshot
 mode are unavailable. Catalog membership and a fresh source header validate
@@ -437,8 +441,12 @@ every target. Availability checks do not submit input. Drafts stay in memory
 per session; Cmd/Ctrl+Enter sends. Admission clears the draft, while uncertain
 delivery retains it and requires explicit editing before another send; the
 footer preserves backend and connection diagnostics alongside that notice. There
-is no optimistic transcript or automatic retry. The bounded in-memory request
-cache deduplicates UUIDs and guards the resolved runtime owner against parallel
+is no optimistic transcript or automatic resend. Acceptance triggers bounded
+history refreshes immediately and at 1/3/8/20 seconds, covering delayed provider
+writes or missed live notifications while preserving loaded history and reading
+position. Refreshes coalesce with live reads and stop on session/machine changes.
+The bounded in-memory request cache deduplicates UUIDs and guards the resolved
+runtime owner against parallel
 sends, including when the HTTP caller disconnects. Limits are 16,384 Unicode
 characters and Pi's 32 KiB encoded frame. Markdown whitespace is preserved.
 

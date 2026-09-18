@@ -126,7 +126,10 @@ impl DesktopClient {
             "turnStart": {
               "request": {
                 "threadId": session_id,
-                "input": [{ "type": "text", "text": text }],
+                // Desktop renders this input before the app server normalizes
+                // it. Its text renderer requires the annotation array even
+                // for plain text, or the owning conversation fails to render.
+                "input": [{ "type": "text", "text": text, "text_elements": [] }],
                 "clientUserMessageId": request_id,
                 "additionalContext": null
               },

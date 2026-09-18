@@ -1,10 +1,11 @@
 import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { useLayoutEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { eventButtonId } from "./state";
+import { EVENT_PAGE_SIZE, eventButtonId } from "./state";
 import {
   acknowledgeSessionAttention,
   getSessionIndexProgress,
+  getSessionInputStatus,
   listSessionChildren,
   listSessions,
   listenForSessionIndexChanges,
@@ -14,6 +15,7 @@ import {
   loadEventPage,
   loadTrajectoryEventPage,
   retrySessionIndex,
+  submitSessionInput,
 } from "./tauri";
 import type {
   EventDetail,
@@ -33,6 +35,8 @@ vi.mock("./tauri", () => ({
   listenForRelayChanges: vi.fn(() => Promise.resolve(vi.fn())),
   acknowledgeSessionAttention: vi.fn(() => Promise.resolve({ changed: false })),
   getSessionIndexProgress: vi.fn(() => new Promise(() => undefined)),
+  getSessionInputStatus: vi.fn(),
+  submitSessionInput: vi.fn(),
   listSessionChildren: vi.fn(() => new Promise(() => undefined)),
   listSessions: vi.fn(() => new Promise(() => undefined)),
   listenForSessionIndexChanges: vi.fn(() => Promise.resolve(vi.fn())),
@@ -47,6 +51,10 @@ beforeEach(() => {
   vi.mocked(listenForRelayChanges).mockReset().mockResolvedValue(vi.fn());
   vi.mocked(acknowledgeSessionAttention).mockReset().mockResolvedValue({ changed: false });
   vi.mocked(getSessionIndexProgress).mockReset().mockImplementation(() => new Promise(() => undefined));
+  vi.mocked(getSessionInputStatus).mockReset().mockResolvedValue({ available: true, message: "", max_length: 16_384 });
+  vi.mocked(submitSessionInput).mockReset().mockImplementation(async (request) => ({
+    request_id: request.request_id, status: "accepted", message: "Codex App accepted the message.",
+  }));
   vi.mocked(listSessionChildren).mockReset().mockImplementation(() => new Promise(() => undefined));
   vi.mocked(listSessions).mockReset().mockImplementation(() => new Promise(() => undefined));
   vi.mocked(listenForSessionIndexChanges).mockReset().mockResolvedValue(vi.fn());
@@ -61,6 +69,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -1049,6 +1058,118 @@ describe("useViewerState Relay updates", () => {
     expect(loadEventPage).toHaveBeenCalledOnce();
     unmount();
     expect(stop).toHaveBeenCalledOnce();
+  });
+});
+
+describe("useViewerState refresh after message input", () => {
+  it("refreshes after acceptance without a Relay notification and picks up delayed persistence without resending", async () => {
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const original = toolEventPage();
+    vi.mocked(loadEventPage).mockResolvedValue(original);
+    const { container } = render(<ViewerPage />);
+    fireEvent.click(await screen.findByRole("button", { name: /session live/ }));
+    const input = await screen.findByRole("textbox", { name: "Message this session" });
+    await waitFor(() => expect(input).toBeEnabled());
+    await screen.findByText("cargo test");
+    const timeline = container.querySelector<HTMLElement>(".conversation__timeline")!;
+    Object.defineProperties(timeline, { scrollHeight: { configurable: true, value: 1000 }, clientHeight: { configurable: true, value: 300 } });
+    timeline.scrollTop = 120;
+    fireEvent.wheel(timeline, { deltaY: -1 });
+    fireEvent.scroll(timeline);
+    vi.useFakeTimers();
+    fireEvent.change(input, { target: { value: "hello" } });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Send" })));
+    expect(loadEventPage).toHaveBeenCalledTimes(2);
+    expect(input).toHaveValue("");
+    expect(screen.queryByText("Response after sending")).not.toBeInTheDocument();
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
+    expect(loadEventPage).toHaveBeenCalledTimes(3);
+    const response = { ...reasoningEventPage().events[0], type: "message" as const,
+      role: "assistant" as const, summary: "Response after sending", reasoning: null };
+    vi.mocked(loadEventPage).mockResolvedValue({ ...original, events: [...original.events, response], total_events: 2 });
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(screen.getByText("Response after sending")).toBeInTheDocument();
+    expect(timeline.scrollTop).toBe(120);
+    await act(async () => vi.advanceTimersByTimeAsync(5_000));
+    await act(async () => vi.advanceTimersByTimeAsync(12_000));
+    expect(loadEventPage).toHaveBeenCalledTimes(6);
+    await act(async () => vi.advanceTimersByTimeAsync(60_000));
+    expect(loadEventPage).toHaveBeenCalledTimes(6);
+    expect(submitSessionInput).toHaveBeenCalledOnce();
+  });
+
+  it("retains loaded history and open turns while refreshing a reader above the latest event", async () => {
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const turn = trajectoryEventPage().events[0];
+    const older = { ...toolEventPage().events[0], event_key: "old-event" };
+    const initial = { ...trajectoryEventPage(), events: [older, turn], total_events: 2 };
+    vi.mocked(loadEventPage).mockResolvedValue(initial);
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValue(trajectoryChildPage());
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.events).toHaveLength(2));
+    act(() => result.current.toggleEventExpanded(turn.event_key));
+    await waitFor(() => expect(result.current.trajectoryPages.get("live")?.get(turn.event_key)?.has_loaded).toBe(true));
+    const next = { ...reasoningEventPage().events[0], event_key: "new-event" };
+    vi.mocked(loadEventPage).mockImplementation(async (request) => request.cursor === "older"
+      ? { ...initial, events: [older], previous_cursor: null, next_cursor: "newer", total_events: 3 }
+      : { ...initial, events: [turn, next], previous_cursor: "older", total_events: 3 });
+    act(() => { result.current.setFollowingLive(false); result.current.refreshSessionAfterInput("live"); });
+    await waitFor(() => expect(result.current.events).toEqual([older, turn, next]));
+    expect(result.current.expandedEventKey).toBe(turn.event_key);
+    expect(result.current.pendingLiveActivity).toBe(true);
+    expect(result.current.trajectoryPages.get("live")?.get(turn.event_key)?.events).toEqual(trajectoryChildPage().events);
+    expect(loadEventPage).toHaveBeenNthCalledWith(2, { session_key: "live", direction: "backward", limit: EVENT_PAGE_SIZE });
+    expect(loadEventPage).toHaveBeenNthCalledWith(3, { session_key: "live", cursor: "older", direction: "backward", limit: EVENT_PAGE_SIZE });
+  });
+
+  it("coalesces scheduled reads during an in-flight refresh", async () => {
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    vi.mocked(loadEventPage).mockResolvedValue(toolEventPage());
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.eventsLoading).toBe(false));
+    const pending = deferred<EventPageResponse>();
+    vi.mocked(loadEventPage).mockReturnValueOnce(pending.promise);
+    vi.useFakeTimers();
+    act(() => result.current.refreshSessionAfterInput("live"));
+    await act(async () => vi.advanceTimersByTimeAsync(3_000));
+    expect(loadEventPage).toHaveBeenCalledTimes(2);
+    await act(async () => pending.resolve(toolEventPage()));
+    expect(loadEventPage).toHaveBeenCalledTimes(3);
+  });
+
+  it("cancels delayed reads on session switches and ignores late acceptance for the previous target", async () => {
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live"), session("other")], next_cursor: null, source_errors: [], pending_providers: [] });
+    vi.mocked(loadEventPage).mockResolvedValue(toolEventPage());
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.eventsLoading).toBe(false));
+    vi.useFakeTimers();
+    await act(async () => result.current.refreshSessionAfterInput("live"));
+    expect(loadEventPage).toHaveBeenCalledTimes(2);
+    await act(async () => result.current.selectSession("other"));
+    expect(loadEventPage).toHaveBeenCalledTimes(3);
+    act(() => result.current.refreshSessionAfterInput("live"));
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(loadEventPage).toHaveBeenCalledTimes(3);
+    await act(async () => result.current.selectSession("live"));
+    expect(loadEventPage).toHaveBeenCalledTimes(4);
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(loadEventPage).toHaveBeenCalledTimes(4);
+  });
+
+  it("cancels delayed reads when the viewer unmounts to change machines", async () => {
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    vi.mocked(loadEventPage).mockResolvedValue(toolEventPage());
+    const { result, unmount } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.eventsLoading).toBe(false));
+    vi.useFakeTimers();
+    await act(async () => result.current.refreshSessionAfterInput("live"));
+    unmount();
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(loadEventPage).toHaveBeenCalledTimes(2);
   });
 });
 
