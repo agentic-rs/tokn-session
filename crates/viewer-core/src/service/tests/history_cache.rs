@@ -35,7 +35,11 @@ fn local_codex_cache_tracks_inherited_history_and_rejects_missing_prefixes() {
     session_id: "linked".into(),
   };
   let initial = service.load_verified(&locator).unwrap();
-  assert!(Arc::ptr_eq(&initial, &service.load_verified(&locator).unwrap()));
+  let discoveries = HISTORY_DEPENDENCY_DISCOVERIES.with(|count| count.get());
+  for _ in 0..100 {
+    assert!(Arc::ptr_eq(&initial, &service.load_verified(&locator).unwrap()));
+  }
+  assert_eq!(HISTORY_DEPENDENCY_DISCOVERIES.with(|count| count.get()), discoveries);
   assert!(initial.events.iter().any(|event| matches!(event,
     AgentEvent::Message(message) if message.text == "old hello"
   )));
@@ -46,6 +50,10 @@ fn local_codex_cache_tracks_inherited_history_and_rejects_missing_prefixes() {
     .set_modified(SystemTime::now() + std::time::Duration::from_secs(1))
     .unwrap();
   let updated = service.load_verified(&locator).unwrap();
+  assert_eq!(
+    HISTORY_DEPENDENCY_DISCOVERIES.with(|count| count.get()),
+    discoveries + 1
+  );
   assert!(!Arc::ptr_eq(&initial, &updated));
   assert!(updated.events.iter().any(|event| matches!(event,
     AgentEvent::Message(message) if message.text == "new hello"

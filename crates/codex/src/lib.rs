@@ -5,5 +5,5 @@ pub mod normalize;
 mod records;
 pub mod session_source;
 
-pub use history::{CodexHistorySegment, history_header};
+pub use history::{CodexHistoryReadStats, CodexHistoryReader, CodexHistorySegment, CodexHistoryUpdate, history_header};
 pub use session_source::CodexSessionSource;

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokn_session_codex::CodexSessionSource;
+use tokn_session_codex::{CodexHistoryReader, CodexSessionSource};
 use tokn_session_core::{AgentEvent, LoadedSessionRecords, SessionHistoryStatus};
 
 fn meta(id: &str, ordinal: u64, base: Option<Value>) -> Value {
@@ -246,4 +246,287 @@ fn incomplete_active_tail_is_deferred_and_corrupt_complete_tail_is_an_error() {
   bytes.push(b'\n');
   fs::write(&head, bytes).unwrap();
   assert!(source.load_session_records_path(&head, false, 1024 * 1024).is_err());
+}
+
+fn append(path: &Path, bytes: &[u8]) {
+  use std::io::Write;
+  fs::OpenOptions::new()
+    .append(true)
+    .open(path)
+    .unwrap()
+    .write_all(bytes)
+    .unwrap();
+}
+
+fn incremental_fixture(prefix_bytes: usize) -> (TempDir, CodexSessionSource, PathBuf) {
+  let root = TempDir::new().unwrap();
+  let source = CodexSessionSource::new(Some(root.path().into()));
+  let prefix = vec![meta("thread", 0, None), message("thread", 1, &"x".repeat(prefix_bytes))];
+  write(root.path(), "old.jsonl", &prefix);
+  let head = write(
+    root.path(),
+    "head.jsonl",
+    &[meta("thread", 2, Some(base("thread", &prefix)))],
+  );
+  (root, source, head)
+}
+
+#[test]
+fn incremental_work_depends_on_appended_bytes_not_inherited_history() {
+  for prefix_bytes in [64 * 1024, 1024 * 1024] {
+    let (_root, source, head) = incremental_fixture(prefix_bytes);
+    let mut reader = CodexHistoryReader::new(head.clone(), true, 32 * 1024 * 1024);
+    assert!(reader.poll(&source).unwrap().unwrap().reset);
+    let before = reader.stats();
+    for _ in 0..10 {
+      assert!(reader.poll(&source).unwrap().is_none());
+    }
+    assert_eq!(
+      reader.stats(),
+      before,
+      "unchanged reads must do no parsing or discovery"
+    );
+    let mut appended_bytes = 0;
+    for ordinal in 3..13 {
+      let row = format!("{}\n", message("thread", ordinal, "incremental"));
+      appended_bytes += row.len() as u64;
+      append(&head, row.as_bytes());
+      let update = reader.poll(&source).unwrap().unwrap();
+      assert!(!update.reset);
+      assert_eq!(update.records.len(), 1);
+    }
+    let after = reader.stats();
+    assert_eq!(after.source_bytes_read - before.source_bytes_read, appended_bytes);
+    assert_eq!(after.rows_parsed - before.rows_parsed, 10);
+    assert_eq!(after.lineage_resolutions, before.lineage_resolutions);
+    assert!(after.guard_bytes_read - before.guard_bytes_read < 50 * 1024);
+  }
+}
+
+#[test]
+fn incremental_reader_buffers_utf8_and_rebuilds_after_a_rejected_batch() {
+  let (_root, source, head) = incremental_fixture(32);
+  let mut reader = CodexHistoryReader::new(head.clone(), false, 1024 * 1024);
+  reader.poll(&source).unwrap();
+  let row = format!("{}\n", message("thread", 3, "中文"));
+  let split = row.find('中').unwrap() + 1;
+  append(&head, &row.as_bytes()[..split]);
+  assert!(reader.poll(&source).unwrap().is_none());
+  append(&head, &row.as_bytes()[split..]);
+  let update = reader.poll(&source).unwrap().unwrap();
+  assert!(!update.reset);
+  assert_eq!(update.reference.message_count, 2);
+
+  let good_prefix = fs::read(&head).unwrap();
+  append(
+    &head,
+    format!("{}\nnot json\n", message("thread", 4, "must survive retry")).as_bytes(),
+  );
+  assert!(reader.poll(&source).is_err());
+  assert!(reader.poll(&source).is_err());
+  fs::write(&head, good_prefix).unwrap();
+  append(
+    &head,
+    format!("{}\n", message("thread", 4, "must survive retry")).as_bytes(),
+  );
+  let update = reader.poll(&source).unwrap().unwrap();
+  assert!(update.reset);
+  assert_eq!(update.reference.message_count, 3);
+  assert!(
+    update
+      .records
+      .iter()
+      .flat_map(|record| &record.events)
+      .any(|event| { matches!(event, AgentEvent::Message(message) if message.text == "must survive retry") })
+  );
+}
+
+#[test]
+fn incremental_reader_preserves_normalizer_state_between_batches() {
+  let (_root, source, head) = incremental_fixture(32);
+  let mut reader = CodexHistoryReader::new(head.clone(), false, 1024 * 1024);
+  reader.poll(&source).unwrap();
+  append(
+    &head,
+    format!(
+      "{}\n",
+      json!({
+        "type":"inter_agent_communication_metadata","ordinal":3,"payload":{"trigger_turn":true}
+      })
+    )
+    .as_bytes(),
+  );
+  reader.poll(&source).unwrap();
+  append(
+    &head,
+    format!(
+      "{}\n",
+      json!({
+        "type":"response_item","ordinal":4,"payload":{
+          "type":"agent_message","id":"message","author":"/root/worker","recipient":"/root",
+          "content":[{"type":"input_text","text":"next task"}]
+        }
+      })
+    )
+    .as_bytes(),
+  );
+  let update = reader.poll(&source).unwrap().unwrap();
+  assert!(!update.reset);
+  assert!(update.records.iter().flat_map(|record| &record.events).any(|event| {
+    matches!(event, AgentEvent::AgentActivity(activity)
+      if activity.communication.as_ref().is_some_and(|communication| communication.trigger_turn == Some(true)))
+  }));
+}
+
+#[test]
+fn incremental_reader_resets_for_replacement_truncation_and_rewrite_with_growth() {
+  let (root, source, head) = incremental_fixture(32);
+  let original = fs::read(&head).unwrap();
+  let mut reader = CodexHistoryReader::new(head.clone(), false, 1024 * 1024);
+  reader.poll(&source).unwrap();
+  let replacement = root.path().join("replacement");
+  fs::write(&replacement, &original).unwrap();
+  fs::rename(replacement, &head).unwrap();
+  assert!(reader.poll(&source).unwrap().unwrap().reset);
+  append(&head, format!("{}\n", message("thread", 3, "old message")).as_bytes());
+  assert!(!reader.poll(&source).unwrap().unwrap().reset);
+  fs::write(&head, &original).unwrap();
+  assert!(reader.poll(&source).unwrap().unwrap().reset);
+
+  // Changed ownership metadata at the beginning of a growing file must not
+  // continue using the old normalizer, even though its inode was retained.
+  let changed = String::from_utf8(original).unwrap().replace("/test", "/else");
+  fs::write(&head, format!("{changed}{}\n", message("thread", 3, "new message"))).unwrap();
+  let update = reader.poll(&source).unwrap().unwrap();
+  assert!(update.reset);
+  assert_eq!(update.reference.cwd.as_deref(), Some("/else"));
+  assert_eq!(update.reference.message_count, 2);
+
+  // A growing rewrite that keeps the owning metadata unchanged is detected
+  // by the bounded guard immediately before the old byte cursor.
+  let rewritten = fs::read_to_string(&head).unwrap().replace("new message", "edited text");
+  fs::write(&head, format!("{rewritten}{}\n", message("thread", 4, "appended"))).unwrap();
+  assert!(reader.poll(&source).unwrap().unwrap().reset);
+}
+
+#[test]
+fn incremental_reader_revalidates_when_source_roots_change() {
+  let (root, source, head) = incremental_fixture(32);
+  let mut reader = CodexHistoryReader::new(head, false, 1024 * 1024);
+  reader.poll(&source).unwrap();
+  let restricted = root.path().join("restricted");
+  fs::create_dir(&restricted).unwrap();
+  assert!(reader.poll(&CodexSessionSource::new(Some(restricted))).is_err());
+  assert!(reader.poll(&source).unwrap().unwrap().reset);
+}
+
+#[test]
+fn parent_appends_outside_the_cutoff_do_not_reparse_the_child() {
+  let (root, source, head) = incremental_fixture(32);
+  let parent = root.path().join("old.jsonl");
+  let mut reader = CodexHistoryReader::new(head, false, 1024 * 1024);
+  reader.poll(&source).unwrap();
+  let before = reader.stats();
+  append(
+    &parent,
+    format!("{}\n", message("thread", 2, "parent continues")).as_bytes(),
+  );
+  assert!(reader.poll(&source).unwrap().is_none());
+  let after = reader.stats();
+  assert_eq!(after.source_bytes_read, before.source_bytes_read);
+  assert_eq!(after.rows_parsed, before.rows_parsed);
+  assert_eq!(after.lineage_resolutions, before.lineage_resolutions);
+  assert!(after.guard_bytes_read > before.guard_bytes_read);
+  assert!(reader.poll(&source).unwrap().is_none());
+  assert_eq!(reader.stats(), after);
+
+  // A same-inode rewrite within the protected prefix plus growth is not an
+  // append. The saved bytes at the exclusive cutoff force a cold replacement.
+  let edited = fs::read_to_string(&parent)
+    .unwrap()
+    .replace(&"x".repeat(32), &"y".repeat(32));
+  fs::write(
+    &parent,
+    format!("{edited}{}\n", message("thread", 3, "later parent work")),
+  )
+  .unwrap();
+  let update = reader.poll(&source).unwrap().unwrap();
+  assert!(update.reset);
+  assert_eq!(update.reference.message_count, 1);
+  assert!(
+    update
+      .records
+      .iter()
+      .flat_map(|record| &record.events)
+      .any(|event| { matches!(event, AgentEvent::Message(message) if message.text == "y".repeat(32)) })
+  );
+}
+
+#[test]
+fn fragmented_long_rows_are_parsed_only_after_their_newline_arrives() {
+  let (_root, source, head) = incremental_fixture(32);
+  let mut reader = CodexHistoryReader::new(head.clone(), false, 4 * 1024 * 1024);
+  reader.poll(&source).unwrap();
+  let before = reader.stats();
+  let row = format!("{}\n", message("thread", 3, &"x".repeat(1024 * 1024)));
+  let mut updates = 0;
+  for chunk in row.as_bytes().chunks(4096) {
+    append(&head, chunk);
+    if let Some(update) = reader.poll(&source).unwrap() {
+      assert!(!update.reset);
+      assert_eq!(update.records.len(), 1);
+      updates += 1;
+    }
+  }
+  assert_eq!(updates, 1);
+  assert_eq!(reader.stats().rows_parsed - before.rows_parsed, 1);
+  assert_eq!(
+    reader.stats().source_bytes_read - before.source_bytes_read,
+    row.len() as u64
+  );
+}
+
+#[test]
+#[ignore = "manual comparison of full reloads and incremental appends at 1 and 10 MiB"]
+fn benchmark_linked_history_appends() {
+  use std::time::Instant;
+  for mib in [1, 10] {
+    let root = TempDir::new().unwrap();
+    let source = CodexSessionSource::new(Some(root.path().into()));
+    let mut prefix = vec![meta("thread", 0, None)];
+    for ordinal in 1..=mib * 256 {
+      prefix.push(message("thread", ordinal, &"x".repeat(4096)));
+    }
+    write(root.path(), "old.jsonl", &prefix);
+    let head_ordinal = prefix.len() as u64;
+    let head = write(
+      root.path(),
+      "head.jsonl",
+      &[meta("thread", head_ordinal, Some(base("thread", &prefix)))],
+    );
+    let mut reader = CodexHistoryReader::new(head.clone(), false, 32 * 1024 * 1024);
+    reader.poll(&source).unwrap();
+    let before = reader.stats();
+    let mut incremental = std::time::Duration::ZERO;
+    let mut reload = std::time::Duration::ZERO;
+    for ordinal in head_ordinal + 1..head_ordinal + 11 {
+      append(&head, format!("{}\n", message("thread", ordinal, "next")).as_bytes());
+      let started = Instant::now();
+      reader.poll(&source).unwrap();
+      incremental += started.elapsed();
+      let started = Instant::now();
+      source
+        .load_session_records_path(&head, false, 32 * 1024 * 1024)
+        .unwrap();
+      reload += started.elapsed();
+    }
+    let after = reader.stats();
+    println!(
+      "{mib} MiB, 10 appends: reload={reload:?}, incremental={incremental:?}, body_bytes={}, rows={}, guard_bytes={}, lineage_resolutions={}",
+      after.source_bytes_read - before.source_bytes_read,
+      after.rows_parsed - before.rows_parsed,
+      after.guard_bytes_read - before.guard_bytes_read,
+      after.lineage_resolutions - before.lineage_resolutions
+    );
+  }
 }

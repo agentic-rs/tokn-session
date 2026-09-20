@@ -140,6 +140,50 @@ fn linked_codex_prefix_edits_reset_and_missing_history_preserves_last_good_snaps
   assert_eq!(CodexHistoryFixture::messages(&reader), ["new hello", "new message"]);
 }
 
+#[test]
+fn linked_codex_failed_batch_does_not_advance_the_published_snapshot() {
+  use std::io::Write;
+  let fixture = CodexHistoryFixture::new();
+  let mut reader = fixture.reader(false);
+  let initial = reader.snapshot.clone();
+  let head = std::fs::read_to_string(&fixture.head_path).unwrap();
+  let good_row = CodexHistoryFixture::message(4, "survives retry");
+  let mut file = std::fs::OpenOptions::new()
+    .append(true)
+    .open(&fixture.head_path)
+    .unwrap();
+  writeln!(file, "{good_row}\nnot json").unwrap();
+  assert!(reader.poll().is_err());
+  assert!(reader.poll().is_err());
+  assert_eq!(reader.snapshot.revision, initial.revision);
+  assert_eq!(CodexHistoryFixture::messages(&reader), ["old hello", "new message"]);
+  std::fs::write(&fixture.head_path, format!("{head}{good_row}\n")).unwrap();
+  assert!(reader.poll().unwrap());
+  assert_ne!(reader.snapshot.generation, initial.generation);
+  assert_eq!(
+    CodexHistoryFixture::messages(&reader),
+    ["old hello", "new message", "survives retry"]
+  );
+}
+
+#[test]
+fn linked_codex_parent_growth_does_not_refresh_or_replace_the_child_snapshot() {
+  use std::io::Write;
+  let fixture = CodexHistoryFixture::new();
+  let mut reader = fixture.reader(false);
+  let initial = reader.snapshot.clone();
+  let mut parent = std::fs::OpenOptions::new()
+    .append(true)
+    .open(&fixture.base_path)
+    .unwrap();
+  writeln!(parent, "{}", CodexHistoryFixture::message(2, "later parent work")).unwrap();
+  assert!(!reader.poll().unwrap());
+  assert_eq!(reader.snapshot.generation, initial.generation);
+  assert_eq!(reader.snapshot.revision, initial.revision);
+  assert!(Arc::ptr_eq(&reader.snapshot.records[1], &initial.records[1]));
+  assert_eq!(CodexHistoryFixture::messages(&reader), ["old hello", "new message"]);
+}
+
 struct Fixture {
   directory: TempDir,
   path: PathBuf,

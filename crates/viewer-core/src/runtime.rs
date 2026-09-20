@@ -486,6 +486,10 @@ const INDEX_PENDING_BODY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const INDEX_CATALOG_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_CONSECUTIVE_CATALOG_RETRIES: u8 = 2;
 const MAX_CONSECUTIVE_CHANGED_FILE_RETRIES: u8 = 3;
+// Relay emits one hint per normalized record. Apply the same bounded batching
+// as filesystem writes so streaming events do not each start an index pass.
+const RELAY_INDEX_QUIET_PERIOD: Duration = Duration::from_millis(200);
+const RELAY_INDEX_MAX_BATCH_AGE: Duration = Duration::from_secs(1);
 
 fn retry_at_ms_after(delay: Duration) -> Option<i64> {
   SystemTime::now()
@@ -633,7 +637,86 @@ async fn wait_for_session_index_work(
   relay: &mut broadcast::Receiver<(ViewerProvider, PathBuf)>,
   delay: Duration,
 ) -> Option<SessionIndexWake> {
-  let signal = if let Some(file_watcher) = watcher.as_mut() {
+  let scheduled_deadline = tokio::time::Instant::now() + delay;
+  let mut batch_deadline = None;
+  let mut quiet_deadline = None;
+  let mut current = None;
+  loop {
+    let deadline = batch_deadline
+      .into_iter()
+      .chain(quiet_deadline)
+      .fold(scheduled_deadline, tokio::time::Instant::min);
+    let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let signal = next_session_index_signal(receiver, watcher, relay, wait).await;
+    match signal {
+      SessionIndexWaitSignal::TimedOut => break,
+      SessionIndexWaitSignal::Scheduler(Some(request)) => {
+        // Explicit retry requests and mandatory recovery never wait for a
+        // stream to become quiet.
+        merge_session_index_wake(&mut current, request);
+        break;
+      }
+      SessionIndexWaitSignal::Scheduler(None) => {
+        // Shutdown normally stops the runtime too. Avoid spinning if its
+        // sender disappears just before that happens.
+        if current.is_none() {
+          tokio::time::sleep(wait).await;
+        }
+        break;
+      }
+      SessionIndexWaitSignal::Relay(hint) => {
+        if matches!(hint, Err(broadcast::error::RecvError::Closed)) {
+          if current.is_none() {
+            tokio::time::sleep(wait).await;
+          }
+          break;
+        }
+        if let Some(wake) = index_wake_from_relay(hint) {
+          merge_session_index_wake(&mut current, wake);
+          let now = tokio::time::Instant::now();
+          batch_deadline.get_or_insert(now + RELAY_INDEX_MAX_BATCH_AGE);
+          quiet_deadline = Some(now + RELAY_INDEX_QUIET_PERIOD);
+        }
+      }
+      SessionIndexWaitSignal::Watcher(request) => {
+        let wake = index_wake_from_watcher(request, watcher);
+        merge_session_index_wake(&mut current, wake);
+        // A file watcher already debounced its batch. It can join a pending
+        // Relay batch, but does not restart that batch's quiet period.
+        if batch_deadline.is_none() || matches!(current, Some(SessionIndexWake::FullCatalog)) {
+          break;
+        }
+      }
+    }
+    // An always-ready Relay stream must still yield at the maximum batch age
+    // or a scheduled recovery deadline; select fairness is not a time bound.
+    if tokio::time::Instant::now() >= deadline {
+      break;
+    }
+  }
+  drain_session_index_wakes(receiver, &mut current);
+  // Drain only the batch already queued. New arrivals belong to the next
+  // bounded wait rather than extending a busy stream past its deadline.
+  for _ in 0..relay.len() {
+    let wake = match relay.try_recv() {
+      Ok(hint) => index_wake_from_relay(Ok(hint)),
+      Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+      Err(_) => break,
+    };
+    if let Some(wake) = wake {
+      merge_session_index_wake(&mut current, wake);
+    }
+  }
+  current
+}
+
+async fn next_session_index_signal(
+  receiver: &mut tokio::sync::mpsc::UnboundedReceiver<SessionIndexWake>,
+  watcher: &mut Option<SessionFileWatcher>,
+  relay: &mut broadcast::Receiver<(ViewerProvider, PathBuf)>,
+  delay: Duration,
+) -> SessionIndexWaitSignal {
+  if let Some(file_watcher) = watcher.as_mut() {
     tokio::select! {
       _ = tokio::time::sleep(delay) => SessionIndexWaitSignal::TimedOut,
       request = receiver.recv() => SessionIndexWaitSignal::Scheduler(request),
@@ -646,19 +729,15 @@ async fn wait_for_session_index_work(
       request = receiver.recv() => SessionIndexWaitSignal::Scheduler(request),
       hint = relay.recv() => SessionIndexWaitSignal::Relay(hint),
     }
-  };
+  }
+}
 
-  let mut current = match signal {
-    SessionIndexWaitSignal::TimedOut => return None,
-    SessionIndexWaitSignal::Scheduler(Some(request)) => Some(request),
-    SessionIndexWaitSignal::Scheduler(None) => {
-      // Shutdown normally stops the runtime too. Avoid spinning if its sender
-      // disappears just before that happens.
-      tokio::time::sleep(delay).await;
-      return None;
-    }
-    SessionIndexWaitSignal::Relay(hint) => index_wake_from_relay(hint),
-    SessionIndexWaitSignal::Watcher(Some(request)) => {
+fn index_wake_from_watcher(
+  request: Option<WatchRequest>,
+  watcher: &mut Option<SessionFileWatcher>,
+) -> SessionIndexWake {
+  match request {
+    Some(request) => {
       let backend_failed = watcher.as_mut().is_some_and(SessionFileWatcher::take_backend_failure);
       if backend_failed {
         // A single complete catalog reconciles anything lost with the failed
@@ -670,28 +749,16 @@ async fn wait_for_session_index_work(
       // The callback that won the select can be an ordinary file write while
       // a backend error is already queued behind it. Do not let that race
       // retire the watcher without the promised recovery catalog.
-      Some(watcher_wake_after_backend_failure(request, backend_failed))
+      watcher_wake_after_backend_failure(request, backend_failed)
     }
-    SessionIndexWaitSignal::Watcher(None) => {
+    None => {
       // A closed watcher callback channel cannot be trusted for subsequent
       // file updates. Disable it and use one complete catalog to reconcile
       // anything it may have missed; the slow recovery cadence remains safe.
       *watcher = None;
-      Some(SessionIndexWake::FullCatalog)
-    }
-  };
-  drain_session_index_wakes(receiver, &mut current);
-  loop {
-    let wake = match relay.try_recv() {
-      Ok(hint) => index_wake_from_relay(Ok(hint)),
-      Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
-      Err(_) => break,
-    };
-    if let Some(wake) = wake {
-      merge_session_index_wake(&mut current, wake);
+      SessionIndexWake::FullCatalog
     }
   }
-  current
 }
 
 fn session_index_path_for_home(home: &Path) -> PathBuf {
@@ -709,18 +776,105 @@ mod tests {
   use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
+    time::Duration,
   };
 
   use super::{
     IndexRefresh, SessionIndexWake, full_catalog_needs_prompt_retry, index_wake_from_relay,
     index_wake_from_watch_request, merge_session_index_wake, session_index_needs_retry, session_index_path_for_home,
-    watcher_wake_after_backend_failure,
+    wait_for_session_index_work, watcher_wake_after_backend_failure,
   };
   use crate::{model::ViewerProvider, watcher::WatchRequest};
 
   #[test]
   fn lagged_relay_hints_do_not_force_a_global_catalog() {
     assert!(index_wake_from_relay(Err(tokio::sync::broadcast::error::RecvError::Lagged(500))).is_none());
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn relay_event_burst_produces_one_deduplicated_index_pass() {
+    let (_retry_tx, mut retry_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (relay_tx, mut relay_rx) = tokio::sync::broadcast::channel(256);
+    let paths = [
+      PathBuf::from("/sessions/first.jsonl"),
+      PathBuf::from("/sessions/second.jsonl"),
+    ];
+    let expected = BTreeSet::from(paths.clone());
+    let producer = tokio::spawn(async move {
+      for i in 0..40 {
+        relay_tx.send((ViewerProvider::Codex, paths[i % 2].clone())).unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      relay_tx
+    });
+    let started = tokio::time::Instant::now();
+    let mut watcher = None;
+    let wake = wait_for_session_index_work(&mut retry_rx, &mut watcher, &mut relay_rx, Duration::from_secs(5)).await;
+    let _relay_tx = producer.await.unwrap();
+    assert_eq!(
+      wake,
+      Some(SessionIndexWake::ChangedFiles(BTreeMap::from([(
+        ViewerProvider::Codex,
+        expected
+      )])))
+    );
+    assert_eq!(started.elapsed(), Duration::from_millis(395));
+    assert!(
+      wait_for_session_index_work(&mut retry_rx, &mut watcher, &mut relay_rx, Duration::from_millis(50))
+        .await
+        .is_none()
+    );
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn continuous_relay_hints_yield_at_the_maximum_batch_age() {
+    let (_retry_tx, mut retry_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (relay_tx, mut relay_rx) = tokio::sync::broadcast::channel(256);
+    let producer = tokio::spawn(async move {
+      loop {
+        relay_tx
+          .send((ViewerProvider::Codex, PathBuf::from("/sessions/active.jsonl")))
+          .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
+    });
+    let started = tokio::time::Instant::now();
+    let wake = wait_for_session_index_work(&mut retry_rx, &mut None, &mut relay_rx, Duration::from_secs(5)).await;
+    producer.abort();
+    assert!(matches!(wake, Some(SessionIndexWake::ChangedFiles(_))));
+    assert_eq!(started.elapsed(), Duration::from_secs(1));
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn relay_batch_does_not_postpone_a_scheduled_deadline() {
+    let (_retry_tx, mut retry_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (relay_tx, mut relay_rx) = tokio::sync::broadcast::channel(256);
+    relay_tx
+      .send((ViewerProvider::Codex, PathBuf::from("/sessions/active.jsonl")))
+      .unwrap();
+    let started = tokio::time::Instant::now();
+    let wake = wait_for_session_index_work(&mut retry_rx, &mut None, &mut relay_rx, Duration::from_millis(30)).await;
+    assert!(matches!(wake, Some(SessionIndexWake::ChangedFiles(_))));
+    assert_eq!(started.elapsed(), Duration::from_millis(30));
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn explicit_recovery_interrupts_and_subsumes_a_relay_batch() {
+    let (retry_tx, mut retry_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (relay_tx, mut relay_rx) = tokio::sync::broadcast::channel(256);
+    relay_tx
+      .send((ViewerProvider::Codex, PathBuf::from("/sessions/active.jsonl")))
+      .unwrap();
+    tokio::spawn(async move {
+      tokio::time::sleep(Duration::from_millis(20)).await;
+      retry_tx.send(SessionIndexWake::FullCatalog).unwrap();
+    });
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+      wait_for_session_index_work(&mut retry_rx, &mut None, &mut relay_rx, Duration::from_secs(5)).await,
+      Some(SessionIndexWake::FullCatalog)
+    );
+    assert_eq!(started.elapsed(), Duration::from_millis(20));
   }
 
   #[test]
