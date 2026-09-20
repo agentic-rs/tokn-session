@@ -99,6 +99,17 @@ DB/WAL snapshots and reuse unchanged records/checkpoints. Unrelated changes are
 silent; suffix appends preserve generations, while edits/deletions/reordering
 reset them. See [snapshot protocol](relay.md#local-snapshotfollow-service).
 
+Codex paginated rollouts can reference earlier physical files through
+`session_meta.history_base`, including after a native revert. CLI and viewer
+history assemble these bounded prefixes before the active segment, validating
+both byte and ordinal cutoffs so reverted turns stay excluded. Native discovery
+uses Desktop's current rollout path to avoid duplicate tasks; exported roots
+collapse only a uniquely verified continuation chain. Missing or ambiguous
+prefixes fail the read and preserve the last-good viewer snapshot. Linked
+histories reassemble on change and reconcile stable record IDs; unchanged polls
+check cached file revisions. Local caches include the inherited files. Plain
+rollouts retain incremental decoding; standalone Relay feeds remain per-file.
+
 Automatic and Local modes use durable index queries for lists, search, trees,
 and snapshot admission. The viewer-core indexer discovers provider headers and
 backfills bounded titles/previews and attention in the existing SQLite index.
@@ -1095,6 +1106,8 @@ OpenCode has the first live-output normalizer: `OpenCodeLiveNormalizer` parses `
 - Viewer session-file relocation is deliberately conservative. Repeated or
   overlapping moves can make the retired source ambiguous, in which case the
   later path is treated as a new row instead of transferring prior attention.
+  An already selected task is still tied to its physical path; after a native
+  revert creates another continuation, reselect its current catalog entry.
 
 ## Useful Smokes
 

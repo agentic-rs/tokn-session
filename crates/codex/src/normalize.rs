@@ -490,7 +490,7 @@ impl CodexNormalizer {
   }
 }
 
-fn requires_thread_spawn_boundary(item: &SessionMetaItem) -> bool {
+pub(crate) fn requires_thread_spawn_boundary(item: &SessionMetaItem) -> bool {
   item.source.as_ref().is_some_and(|source| match source {
     Value::Object(source) => source
       .get("subagent")

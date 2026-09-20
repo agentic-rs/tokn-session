@@ -3478,7 +3478,19 @@ fn attention_marker_count(marker: Option<&str>) -> Option<usize> {
 }
 
 fn source_revision(locator: &SessionLocator) -> Option<SourceRevision> {
-  source_revision_for(locator.provider, &locator.source_path)
+  let mut revision = source_revision_for(locator.provider, &locator.source_path)?;
+  if locator.provider == ViewerProvider::Codex {
+    // Local snapshots include immutable prefixes referenced by a resumed
+    // rollout. A changed or unavailable prefix must not hit the head-only
+    // cache and silently retain a transcript from a different source state.
+    let source = tokn_session_codex::CodexSessionSource::new(None);
+    for segment in source.history_segments(&locator.source_path).ok()? {
+      if segment.path != locator.source_path {
+        revision.files.push(Some(file_revision(&segment.path)?));
+      }
+    }
+  }
+  Some(revision)
 }
 
 fn source_revision_for(provider: ViewerProvider, source_path: &Path) -> Option<SourceRevision> {
@@ -5325,6 +5337,7 @@ fn truncate_with_flag(value: String, max_chars: usize) -> (String, bool) {
 mod tests {
   mod communications;
   mod event_filter;
+  mod history_cache;
   mod usage_filter;
   use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
   use std::path::PathBuf;
@@ -10026,7 +10039,11 @@ mod tests {
 
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("code-mode.jsonl");
-    std::fs::write(&source_path, "fixture\n").unwrap();
+    std::fs::write(
+      &source_path,
+      format!("{}\n", json!({"type": "session_meta", "payload": {"id": "fixture"}})),
+    )
+    .unwrap();
     let session_key = encode_session_key(&SessionLocator {
       version: 1,
       provider: ViewerProvider::Codex,
@@ -10514,7 +10531,11 @@ mod tests {
   fn page_and_detail_share_one_bounded_snapshot_until_the_source_changes() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("session.jsonl");
-    std::fs::write(&source_path, "initial").unwrap();
+    std::fs::write(
+      &source_path,
+      format!("{}\n", json!({"type": "session_meta", "payload": {"id": "fixture"}})),
+    )
+    .unwrap();
     let locator = SessionLocator {
       version: 1,
       provider: ViewerProvider::Codex,
@@ -10544,7 +10565,14 @@ mod tests {
       .unwrap();
     assert_eq!(loads.load(Ordering::SeqCst), 1);
 
-    std::fs::write(&source_path, "source revision changed").unwrap();
+    std::fs::write(
+      &source_path,
+      format!(
+        "{}\n",
+        json!({"type": "session_meta", "payload": {"id": "fixture", "cwd": "/changed"}})
+      ),
+    )
+    .unwrap();
     service
       .load_event_page(EventPageRequest {
         session_key,
@@ -11174,7 +11202,11 @@ mod tests {
 
   fn key_for_cached_source(directory: &tempfile::TempDir, session_id: &str) -> String {
     let source_path = directory.path().join(format!("{session_id}.jsonl"));
-    std::fs::write(&source_path, "fixture\n").unwrap();
+    std::fs::write(
+      &source_path,
+      format!("{}\n", json!({"type": "session_meta", "payload": {"id": session_id}})),
+    )
+    .unwrap();
     encode_session_key(&SessionLocator {
       version: 1,
       provider: ViewerProvider::Codex,

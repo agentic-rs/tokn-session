@@ -19,6 +19,11 @@ serde_json = "1"
 Deserialize one JSONL record at a time. The typed view is available through
 `item()`, while `native()` retains the complete decoded JSON value.
 
+`SessionMeta.history_base` exposes a paginated rollout's inherited history
+position: the owning thread ID, exclusive ordinal, and exclusive byte offset.
+The wire crate preserves this reference; `tokn-session-codex` resolves it into
+bounded physical history segments.
+
 ## Design
 
 - Preserve the complete native `RolloutLine` JSON value.

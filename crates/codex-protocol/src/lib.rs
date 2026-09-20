@@ -4,8 +4,9 @@ mod rollout;
 
 pub use rollout::{
   AdditionalToolsItem, AgentMessageItem, CompactedItem, ContentItem, CustomToolCallItem, CustomToolCallOutputItem,
-  EventMessage, FunctionCallItem, FunctionCallOutputItem, ImageGenerationCallItem, InterAgentCommunicationItem,
-  InterAgentCommunicationMetadataItem, LocalShellCallItem, MessageItem, ReasoningItem, ResponseControlItem,
-  ResponseItem, RolloutItem, RolloutLine, SessionGitInfo, SessionMetaItem, TokenUsageCounters, TokenUsageRecordItem,
-  ToolSearchCallItem, ToolSearchOutputItem, TurnContextItem, UnknownItem, WebSearchCallItem, WorldStateItem,
+  EventMessage, FunctionCallItem, FunctionCallOutputItem, HistoryPosition, ImageGenerationCallItem,
+  InterAgentCommunicationItem, InterAgentCommunicationMetadataItem, LocalShellCallItem, MessageItem, ReasoningItem,
+  ResponseControlItem, ResponseItem, RolloutItem, RolloutLine, SessionGitInfo, SessionMetaItem, TokenUsageCounters,
+  TokenUsageRecordItem, ToolSearchCallItem, ToolSearchOutputItem, TurnContextItem, UnknownItem, WebSearchCallItem,
+  WorldStateItem,
 };

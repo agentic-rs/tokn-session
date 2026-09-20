@@ -105,6 +105,11 @@ are never retried automatically. Input is limited to 16,384 characters; Pi also
 has a 32 KiB encoded-request limit. The viewer does not create sessions or fall
 back to a separate CLI process.
 
+Codex tasks that continue in a new rollout file retain their earlier messages
+in the viewer. The reader follows the saved history references and respects
+revert boundaries, so removed turns stay removed. If a referenced history file
+is unavailable, a read error preserves the last loaded conversation.
+
 ## Using the viewer
 
 For Relay-backed providers the sidebar reads Relay's metadata catalog. For

@@ -4571,6 +4571,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tokn-session-client",
+ "tokn-session-codex",
  "tokn-session-core",
  "tokn-session-dsh",
  "tokn-session-index",
