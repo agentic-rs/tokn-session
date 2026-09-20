@@ -15,6 +15,9 @@ const MAX_BACKGROUND_SESSIONS: usize = 2;
 const MEMORY_TARGET_BYTES: usize = 64 * 1024 * 1024;
 const VIEW_LEASE: Duration = Duration::from_secs(90);
 const PREFETCH_DEBOUNCE: Duration = Duration::from_millis(250);
+// A third streaming session must not repeatedly evict and reparse the other
+// two. Replace only settled, idle preloads and cool down attempts after eviction.
+const PREFETCH_IDLE_PERIOD: Duration = Duration::from_secs(30);
 const MAX_VIEWS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -64,6 +67,7 @@ pub(super) struct CachePolicy {
   views: HashMap<String, ViewLease>,
   pending: HashMap<SessionLocator, Instant>,
   versions: HashMap<SessionLocator, SourceVersion>,
+  attempts: HashMap<SessionLocator, Instant>,
 }
 
 impl CachePolicy {
@@ -76,9 +80,16 @@ impl CachePolicy {
   }
 
   fn expire(&mut self, now: Instant) {
+    let previous_count = self.views.len();
     self
       .views
       .retain(|_, view| now.saturating_duration_since(view.updated) < VIEW_LEASE);
+    if self.views.len() != previous_count {
+      self.prune_candidates();
+    }
+  }
+
+  fn prune_candidates(&mut self) {
     let eligible: HashSet<_> = self
       .views
       .values()
@@ -86,6 +97,18 @@ impl CachePolicy {
       .collect();
     self.pending.retain(|locator, _| eligible.contains(locator));
     self.versions.retain(|locator, _| eligible.contains(locator));
+    self.attempts.retain(|locator, _| eligible.contains(locator));
+  }
+
+  pub(super) fn can_prefetch(&self, locator: &SessionLocator, now: Instant) -> bool {
+    self
+      .attempts
+      .get(locator)
+      .is_none_or(|attempted| now.saturating_duration_since(*attempted) >= PREFETCH_IDLE_PERIOD)
+  }
+
+  pub(super) fn record_prefetch(&mut self, locator: &SessionLocator, now: Instant) {
+    self.attempts.insert(locator.clone(), now);
   }
 }
 
@@ -111,15 +134,11 @@ impl State {
     }
   }
 
-  fn victim(&self, background_only: bool, protected: Option<&SessionLocator>) -> Option<SessionLocator> {
+  fn victim(&self, protected: Option<&SessionLocator>) -> Option<SessionLocator> {
     self
       .sessions
       .iter()
-      .filter(|(key, session)| {
-        protected != Some(*key)
-          && !self.cache.selected(key)
-          && (!background_only || session.priority == SessionPriority::Background)
-      })
+      .filter(|(key, _)| protected != Some(*key) && !self.cache.selected(key))
       .min_by_key(|(_, session)| (session.priority, session.accessed))
       .map(|(key, _)| key.clone())
   }
@@ -144,7 +163,7 @@ impl State {
 
   pub(super) fn enforce_budget(&mut self, protected: Option<&SessionLocator>) {
     while self.estimated_bytes() > MEMORY_TARGET_BYTES || self.sessions.len() > MAX_SESSIONS {
-      let Some(victim) = self.victim(false, protected) else {
+      let Some(victim) = self.victim(protected) else {
         break;
       };
       self.evict(&victim);
@@ -162,13 +181,26 @@ impl State {
         .filter(|s| s.priority == SessionPriority::Background)
         .count();
       if backgrounds >= MAX_BACKGROUND_SESSIONS || self.sessions.len() >= MAX_SESSIONS {
-        let Some(victim) = self.victim(true, Some(locator)) else {
+        let now = Instant::now();
+        let victim = self
+          .sessions
+          .iter()
+          .filter(|(key, session)| {
+            *key != locator
+              && session.priority == SessionPriority::Background
+              && !self.cache.selected(key)
+              && session.loaded.is_some()
+              && now.saturating_duration_since(session.last_activity) >= PREFETCH_IDLE_PERIOD
+          })
+          .min_by_key(|(_, session)| session.last_activity)
+          .map(|(key, _)| key.clone());
+        let Some(victim) = victim else {
           return false;
         };
         self.evict(&victim);
       }
     } else if self.sessions.len() >= MAX_SESSIONS {
-      let Some(victim) = self.victim(false, Some(locator)) else {
+      let Some(victim) = self.victim(Some(locator)) else {
         return false;
       };
       self.evict(&victim);
@@ -216,6 +248,7 @@ impl ViewerRelay {
         updated: now,
       },
     );
+    state.cache.prune_candidates();
     state.expire_views(now);
     state.enforce_budget(None);
     drop(state);
@@ -244,7 +277,9 @@ impl ViewerRelay {
       .cloned()
       .collect();
     for locator in candidates {
-      if !state.sessions.contains_key(&locator) {
+      if let Some(session) = state.sessions.get_mut(&locator) {
+        session.last_activity = now;
+      } else if state.cache.can_prefetch(&locator, now) {
         state.cache.pending.insert(locator, now);
       }
     }
@@ -293,6 +328,7 @@ impl ViewerRelay {
       if state.epoch != epoch
         || !state.cache.eligible(&locator)
         || state.sessions.contains_key(&locator)
+        || !state.cache.can_prefetch(&locator, Instant::now())
         || state.cache.versions.get(&locator) == Some(&version)
       {
         return;
@@ -336,7 +372,31 @@ mod tests {
       cancel: CancellationToken::new(),
       priority,
       accessed,
+      last_activity: accessed,
     }
+  }
+
+  fn settled_background(accessed: Instant) -> CachedSession {
+    use tokn_session_core::{LoadedSession, SessionHistoryStatus, SessionRef};
+    let mut session = cached(SessionPriority::Background, accessed, 1);
+    session.loaded = Some(Arc::new(LoadedSession {
+      reference: SessionRef {
+        id: "cached".into(),
+        parent_session_id: None,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+        title: None,
+        preview: None,
+        path: PathBuf::from("/tmp/cached.jsonl"),
+        cwd: None,
+        timestamp: None,
+        message_count: 0,
+      },
+      events: Vec::new(),
+      history_status: SessionHistoryStatus::Complete,
+    }));
+    session
   }
 
   #[test]
@@ -375,12 +435,70 @@ mod tests {
     for id in 0..2 {
       state.sessions.insert(
         locator(&id.to_string()),
-        cached(SessionPriority::Background, now + Duration::from_secs(id), 1),
+        settled_background(now - PREFETCH_IDLE_PERIOD - Duration::from_secs(2 - id)),
       );
     }
     assert!(state.admit(&locator("new"), SessionPriority::Background));
     assert!(!state.sessions.contains_key(&locator("0")));
     assert!(state.sessions.contains_key(&locator("1")));
+  }
+
+  #[test]
+  fn streaming_candidates_keep_background_readers_instead_of_rotating_cold_loads() {
+    let manager = ViewerRelay::new();
+    let targets: Vec<_> = (0..3).map(|id| locator(&id.to_string())).collect();
+    manager.update_view("view", 1, None, targets.clone()).unwrap();
+    let old = Instant::now() - PREFETCH_IDLE_PERIOD - Duration::from_secs(1);
+    {
+      let mut state = manager.state.lock().unwrap();
+      state.sessions.insert(targets[0].clone(), settled_background(old));
+      // Even an unusually slow initial read must not be evicted by another preload.
+      state
+        .sessions
+        .insert(targets[1].clone(), cached(SessionPriority::Background, old, 1));
+    }
+    for _ in 0..100 {
+      for target in &targets {
+        manager.changed_source(target.provider, &target.source_path);
+      }
+      let mut state = manager.state.lock().unwrap();
+      assert!(!state.admit(&targets[2], SessionPriority::Background));
+      assert_eq!(state.sessions.len(), 2);
+      assert_eq!(state.sessions[&targets[0]].accessed, old);
+    }
+    let mut state = manager.state.lock().unwrap();
+    state.sessions.get_mut(&targets[0]).unwrap().last_activity = old;
+    assert!(state.admit(&targets[2], SessionPriority::Background));
+    assert!(
+      !state.sessions.contains_key(&targets[0]),
+      "settled idle preloads can be replaced"
+    );
+    assert!(
+      state.sessions.contains_key(&targets[1]),
+      "in-flight reader stays resident"
+    );
+  }
+
+  #[test]
+  fn evicted_preload_attempts_cool_down_and_expire_with_the_view_scope() {
+    let manager = ViewerRelay::new();
+    let target = locator("busy");
+    manager.update_view("view", 1, None, vec![target.clone()]).unwrap();
+    let now = Instant::now();
+    {
+      let mut state = manager.state.lock().unwrap();
+      state.cache.record_prefetch(&target, now);
+      assert!(!state.cache.can_prefetch(&target, now));
+      assert!(state.cache.can_prefetch(&target, now + PREFETCH_IDLE_PERIOD));
+      assert!(
+        state.admit(&target, SessionPriority::Explicit),
+        "explicit opening bypasses cooldown"
+      );
+    }
+    manager.changed_source(target.provider, &target.source_path);
+    assert!(manager.state.lock().unwrap().cache.pending.is_empty());
+    manager.update_view("view", 2, None, vec![]).unwrap();
+    assert!(manager.state.lock().unwrap().cache.attempts.is_empty());
   }
 
   #[test]
@@ -617,6 +735,74 @@ mod tests {
       .unwrap()
       .unwrap();
     assert_eq!(user_count(&reloaded), 3);
+    manager.shutdown().await;
+  }
+
+  #[tokio::test]
+  async fn reconnect_resumes_a_resident_preload_during_cooldown_and_retains_its_window() {
+    use std::io::Write;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("reconnect.jsonl");
+    write_turns(&path, "reconnect", 7);
+    let manager = embedded_manager(root.path()).await;
+    let mut target = locator("reconnect");
+    target.source_path = path.clone();
+    manager.update_view("view", 1, None, vec![target.clone()]).unwrap();
+    let mut changes = manager.changes.subscribe();
+    manager
+      .ensure_session(&target, SessionPriority::Background, None)
+      .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), changes.recv())
+      .await
+      .unwrap()
+      .unwrap();
+    let (initial, offset) = {
+      let mut state = manager.state.lock().unwrap();
+      let session = &state.sessions[&target];
+      let initial = session.loaded.clone().unwrap();
+      let offset = session.window.event_offset;
+      assert_eq!(user_count(&initial), 3);
+      assert!(offset > 0);
+      assert!(!state.cache.can_prefetch(&target, Instant::now()));
+      state.connection_cancel.cancel();
+      state.connection_cancel = state.cancel.child_token();
+      (initial, offset)
+    };
+    std::fs::OpenOptions::new()
+      .append(true)
+      .open(&path)
+      .unwrap()
+      .write_all(b"{\"type\":\"message\",\"id\":\"after-reconnect\",\"message\":{\"role\":\"user\",\"content\":\"next question\"}}\n")
+      .unwrap();
+    manager
+      .ensure_session(&target, SessionPriority::Background, None)
+      .unwrap();
+    {
+      let state = manager.state.lock().unwrap();
+      let session = &state.sessions[&target];
+      assert!(
+        !session.cancel.is_cancelled(),
+        "resident preload resumes before cooldown expires"
+      );
+      assert!(Arc::ptr_eq(session.loaded.as_ref().unwrap(), &initial));
+      assert_eq!(session.window.event_offset, offset);
+      assert_eq!(session.priority, SessionPriority::Background);
+      assert!(session.displayed.is_none());
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+      loop {
+        changes.recv().await.unwrap();
+        let state = manager.state.lock().unwrap();
+        let session = &state.sessions[&target];
+        if user_count(session.loaded.as_ref().unwrap()) == 4 {
+          assert_eq!(session.window.event_offset, offset);
+          assert!(session.displayed.is_none());
+          break;
+        }
+      }
+    })
+    .await
+    .unwrap();
     manager.shutdown().await;
   }
 

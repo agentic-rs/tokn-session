@@ -100,6 +100,51 @@ Use separate target directories when comparing separate source checkouts.
 Normal regression tests assert operation counts, state continuity, and reset
 behavior; they do not impose machine-dependent timing thresholds.
 
+## Follow-up profiling after session windows
+
+Two five-second samples on 2026-09-21, 102 seconds apart, both caught a
+worker in initial history journaling and another in a complete catalog scan.
+The running binary contained the LRU code. About 58% of the journal worker's
+samples were in fingerprint serialization/hashing; the rest were principally
+journal encoding/writes. Codex metadata SQLite reads and repeated sidebar
+relation/key construction also appeared. The Relay child was mostly sleeping.
+These are wall-stack samples: SQLite read waits are not CPU measurements, and
+they do not establish which notification triggered the full scan.
+
+The follow-up changes address repeated work at its source:
+
+- Three writing candidates cannot rotate through the two background slots on
+  every change. Loading/active preloads retain their slots; idle replacement
+  and per-session retry cooldowns use 30 seconds. Explicit access is immediate.
+- Normalized payloads are encoded once for journal writes and byte charging.
+  Append-only Codex/Pi readers no longer hash records they never compare;
+  mutable providers hash the same encoded payload that is written.
+- Embedded subscriptions own their server handlers. Initial loads share one
+  reservation per session without holding the global session lock during I/O.
+  The last subscriber cancels work; provider decodes check cancellation around
+  their blocking operation, while journaling also checks between records.
+- Sidebar requests coalesce index notifications into one trailing refresh,
+  including during pagination. Query changes still start immediately.
+- Routine source hints skip rebuilding candidate sets when no view expired.
+
+A manual debug benchmark alternates the previous triple-encoding algorithm
+and the updated path three times in one executable, using the same disk
+journal and index work. Median timings for 160 records with 64 KiB responses:
+
+| Journal workload | Previous encoding | Updated encoding |
+| --- | ---: | ---: |
+| 10 MiB initial load | 1.625 s | 342 ms |
+| Ten 64 KiB appends | 106 ms | 19.7 ms |
+
+This measures journal construction, not provider decoding, catalog scans, or
+whole-app CPU. The live development viewer restarted during implementation,
+so these results are not a controlled before/after process-CPU comparison.
+Run it with:
+
+```sh
+cargo test -p tokn-viewer-core benchmark_journal_initial_load_and_appends --lib -- --ignored --nocapture
+```
+
 ## Remaining work
 
 - Session residency and turn windows now bound retained histories; see

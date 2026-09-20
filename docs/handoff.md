@@ -104,6 +104,13 @@ Generation-scoped absolute keys keep prepends stable; legacy row APIs still
 load full history. See [session cache](viewer-session-cache.md) for policy,
 protocol details, and remaining transient-memory limits.
 
+Activity preloads keep their slots while loading or actively changing; only
+settled preloads idle for 30 seconds can be replaced by another background
+candidate. Per-session preload cooldowns also bound repeated work after
+eviction/failure. Explicit opening bypasses that cooldown. Sidebar catalog
+refreshes coalesce while a list/page request is in flight, with one trailing
+refresh; changing filters still starts the new query immediately.
+
 Metadata catalogs are shared; event snapshots load on demand. Concurrent clients
 reuse one JSONL normalizer per session. Appends decode new complete lines;
 replacement/truncation starts an atomic generation. OpenCode/ZCode reconcile raw

@@ -8,7 +8,9 @@ use std::{
 };
 
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 use tokn_session_core::{AgentEvent, LifecycleScope, NormalizedRecord, Phase, Provider, Role, ToolRecordKind};
+use tokn_session_relay::{RecordOperation, SessionContext};
 
 use crate::RelayRecord;
 
@@ -20,8 +22,10 @@ struct RecordIndex {
   length: usize,
   event_start: usize,
   events: usize,
-  fingerprint: [u8; 32],
+  fingerprint: Option<[u8; 32]>,
 }
+
+type EncodedRecord = (Vec<u8>, Option<[u8; 32]>);
 
 struct TurnIndex {
   start: usize,
@@ -89,14 +93,52 @@ impl History {
   }
 
   pub fn matches(&self, position: usize, record: &NormalizedRecord) -> Result<bool, String> {
+    if position >= self.length {
+      return Ok(false);
+    }
     let fingerprint = Self::fingerprint(record)?;
-    Ok(
-      position < self.length
-        && self.journal.lock().map_err(|e| e.to_string())?.index[position].fingerprint == fingerprint,
-    )
+    let stored = self.journal.lock().map_err(|e| e.to_string())?.index[position].fingerprint;
+    let stored = if let Some(stored) = stored {
+      stored
+    } else {
+      // Append-only readers never compare their history. If a caller does
+      // request comparison, populate the digest lazily from committed bytes.
+      let stored = Self::fingerprint(&self.read(position)?.0.record)?;
+      self.journal.lock().map_err(|e| e.to_string())?.index[position].fingerprint = Some(stored);
+      stored
+    };
+    Ok(stored == fingerprint)
   }
 
+  #[cfg(test)]
   pub fn append(&mut self, records: &[RelayRecord]) -> Result<(), String> {
+    self.append_cancellable(records, None)
+  }
+
+  pub fn append_cancellable(
+    &mut self,
+    records: &[RelayRecord],
+    cancel: Option<&CancellationToken>,
+  ) -> Result<(), String> {
+    self.append_with_limit(records, crate::service_protocol::MAX_SNAPSHOT_BYTES, cancel)
+  }
+
+  fn append_with_limit(
+    &mut self,
+    records: &[RelayRecord],
+    max_bytes: usize,
+    cancel: Option<&CancellationToken>,
+  ) -> Result<(), String> {
+    self.append_encoded(records, max_bytes, cancel, encode_record)
+  }
+
+  fn append_encoded(
+    &mut self,
+    records: &[RelayRecord],
+    max_bytes: usize,
+    cancel: Option<&CancellationToken>,
+    mut encode: impl FnMut(&RelayRecord) -> Result<EncodedRecord, String>,
+  ) -> Result<(), String> {
     let mut journal = self.journal.lock().map_err(|e| e.to_string())?;
     // Only the owner appends, and only at its last committed prefix.
     let mut additions = Vec::with_capacity(records.len());
@@ -104,18 +146,25 @@ impl History {
     let mut events = self.events;
     journal.file.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
     for record in records {
-      let bytes = serde_json::to_vec(record).map_err(|e| e.to_string())?;
+      check_cancelled(cancel)?;
+      // The same encoding is charged to the limit and persisted. No caller
+      // needs to serialize a record merely to determine its journal size.
+      let (bytes, fingerprint) = encode(record)?;
+      if (offset as usize).saturating_add(bytes.len()) > max_bytes {
+        return Err("Relay session exceeds the history journal size limit".into());
+      }
       journal.file.write_all(&bytes).map_err(|e| e.to_string())?;
       additions.push(RecordIndex {
         offset,
         length: bytes.len(),
         event_start: events,
         events: record.record.events.len(),
-        fingerprint: Self::fingerprint(&record.record)?,
+        fingerprint,
       });
       offset += bytes.len() as u64;
       events += record.record.events.len();
     }
+    check_cancelled(cancel)?;
     let mut event_position = self.events;
     for record in records {
       for event in &record.record.events {
@@ -261,6 +310,47 @@ impl History {
   pub fn iter(&self) -> impl Iterator<Item = RelayRecord> + '_ {
     (0..self.length).map(|position| self.read(position).unwrap().0)
   }
+}
+
+pub(crate) fn check_cancelled(cancel: Option<&CancellationToken>) -> Result<(), String> {
+  if cancel.is_some_and(CancellationToken::is_cancelled) {
+    Err("Session snapshot read cancelled".into())
+  } else {
+    Ok(())
+  }
+}
+
+/// Keep the private journal's flattened Relay encoding while serializing its
+/// large normalized payload only once. The small envelope contains no bodies.
+#[derive(serde::Serialize)]
+struct RecordEnvelope<'a> {
+  path: &'a std::path::Path,
+  topic: &'a str,
+  session: &'a SessionContext,
+  operation: RecordOperation,
+}
+
+fn encode_record(record: &RelayRecord) -> Result<EncodedRecord, String> {
+  if matches!(record.session.provider, Provider::Codex | Provider::Pi) {
+    // These readers detect replacement using source revisions/cursors, so
+    // computing a digest for every historical record performs unused work.
+    return Ok((serde_json::to_vec(record).map_err(|e| e.to_string())?, None));
+  }
+  let normalized = serde_json::to_vec(&record.record).map_err(|e| e.to_string())?;
+  let fingerprint = Sha256::digest(&normalized).into();
+  let mut bytes = serde_json::to_vec(&RecordEnvelope {
+    path: &record.path,
+    topic: &record.topic,
+    session: &record.session,
+    operation: record.operation,
+  })
+  .map_err(|e| e.to_string())?;
+  // Both encodings are nonempty JSON objects produced from known structs.
+  // Merge their members without parsing or encoding the payload again.
+  bytes.pop();
+  bytes.push(b',');
+  bytes.extend_from_slice(&normalized[1..]);
+  Ok((bytes, Some(fingerprint)))
 }
 
 impl Journal {
@@ -487,5 +577,140 @@ mod tests {
     assert_eq!(history.window_start(None, None), 350);
     assert_eq!(history.window_start(None, Some(350)), 50);
     assert_eq!(history.window_start(None, Some(50)), 0);
+  }
+
+  #[test]
+  fn journal_encoding_and_fingerprints_preserve_wire_bytes_and_ignore_context() {
+    for provider in [
+      Provider::Codex,
+      Provider::Pi,
+      Provider::OpenCode,
+      Provider::ZCode,
+      Provider::WorkBuddy,
+      Provider::Dsh,
+    ] {
+      for native in [None, Some(json!({"quoted": "\"汉字\n", "nested": [null, true, 42]}))] {
+        let mut record = turn(1);
+        record.session.provider = provider;
+        record.record.native = native;
+        record.path = "/tmp/汉字\".jsonl".into();
+        record.topic = "quoted\"topic".into();
+        let (encoded, fingerprint) = encode_record(&record).unwrap();
+        assert_eq!(encoded, serde_json::to_vec(&record).unwrap());
+        assert_eq!(
+          fingerprint.is_none(),
+          matches!(provider, Provider::Codex | Provider::Pi)
+        );
+        if let Some(fingerprint) = fingerprint {
+          assert_eq!(fingerprint, History::fingerprint(&record.record).unwrap());
+        }
+        let mut history = History::new().unwrap();
+        history.append(std::slice::from_ref(&record)).unwrap();
+        record.session.title = Some("metadata changed".into());
+        record.path = "/tmp/another.jsonl".into();
+        assert!(history.matches(0, &record.record).unwrap());
+        assert!(!history.matches(1, &record.record).unwrap());
+        record.record.record_id.push_str("-edited");
+        assert!(!history.matches(0, &record.record).unwrap());
+      }
+    }
+  }
+
+  #[test]
+  fn rejected_batch_preserves_committed_prefix_and_can_be_retried() {
+    let initial_record = turn(0);
+    let additions: Vec<_> = (1..5).map(turn).collect();
+    let mut history = History::new().unwrap();
+    history.append(&[initial_record]).unwrap();
+    let initial = history.clone();
+    let limit = history.bytes + serde_json::to_vec(&additions[0]).unwrap().len();
+    assert!(history.append_with_limit(&additions, limit, None).is_err());
+    assert_eq!(
+      (history.len(), history.events, history.bytes),
+      (initial.len(), initial.events, initial.bytes)
+    );
+    assert_eq!(history.window_start(None, None), 0);
+    assert!(history.read(1).is_err());
+    history.append(&additions).unwrap();
+    assert_eq!(history.len(), 5);
+    assert_eq!(history.events, 20);
+    assert_eq!(history.window_start(None, None), 8);
+    assert_eq!(history.read(4).unwrap().0.record.record_id, "row:4");
+    assert!(initial.read(1).is_err());
+    assert_eq!(initial.read(0).unwrap().0.record.record_id, "row:0");
+    assert_eq!(
+      history.bytes,
+      history
+        .iter()
+        .map(|record| serde_json::to_vec(&record).unwrap().len())
+        .sum::<usize>()
+    );
+  }
+
+  #[test]
+  fn cancelled_append_keeps_the_published_history_unchanged() {
+    let mut history = History::new().unwrap();
+    history.append(&[turn(0)]).unwrap();
+    let initial = history.clone();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    assert!(
+      history
+        .append_cancellable(&[turn(1)], Some(&cancel))
+        .unwrap_err()
+        .contains("cancelled")
+    );
+    assert_eq!(
+      (history.len(), history.events, history.bytes),
+      (initial.len(), initial.events, initial.bytes)
+    );
+    assert!(history.read(1).is_err());
+    history.append(&[turn(1)]).unwrap();
+    assert_eq!(history.read(1).unwrap().0.record.record_id, "row:1");
+  }
+
+  #[test]
+  #[ignore = "manual journal CPU benchmark"]
+  fn benchmark_journal_initial_load_and_appends() {
+    use std::{hint::black_box, time::Instant};
+    let records: Vec<_> = (0..160).map(turn).collect();
+    let append = |history: &mut History, records: &[RelayRecord], legacy: bool| {
+      if legacy {
+        // The previous source reader first encoded every record for charging,
+        // then the journal encoded it again plus a normalized-only digest.
+        let charged: usize = records
+          .iter()
+          .map(|record| serde_json::to_vec(record).unwrap().len())
+          .sum();
+        black_box(charged);
+        history
+          .append_encoded(records, crate::service_protocol::MAX_SNAPSHOT_BYTES, None, |record| {
+            let bytes = serde_json::to_vec(record).map_err(|e| e.to_string())?;
+            let fingerprint = History::fingerprint(&record.record)?;
+            Ok((bytes, Some(fingerprint)))
+          })
+          .unwrap();
+      } else {
+        history.append(records).unwrap();
+      }
+    };
+    for iteration in 0..3 {
+      for legacy in [true, false] {
+        let start = Instant::now();
+        let mut history = History::new().unwrap();
+        append(&mut history, &records, legacy);
+        black_box(history.bytes);
+        let initial = start.elapsed();
+        let start = Instant::now();
+        for record in &records[..10] {
+          append(&mut history, std::slice::from_ref(record), legacy);
+        }
+        black_box(history.bytes);
+        eprintln!(
+          "journal 10 MiB run={iteration} legacy={legacy} initial={initial:?}; ten 64 KiB appends={:?}",
+          start.elapsed()
+        );
+      }
+    }
   }
 }

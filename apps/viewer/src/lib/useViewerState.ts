@@ -170,6 +170,8 @@ export function useViewerState() {
   const [sessionsCursor, setSessionsCursor] = useState<string | null>(null);
   const [sessionsAttempt, setSessionsAttempt] = useState(0);
   const sessionsRequest = useRef(0);
+  const sessionListInFlight = useRef<number | null>(null);
+  const sessionListRefreshQueued = useRef(false);
   const previousSessionQueryKey = useRef<string | null>(null);
   const [sessionIndexListenerReady, setSessionIndexListenerReady] = useState(false);
   const [sessionIndexProgress, setSessionIndexProgress] = useState<SessionIndexProgress | null>(null);
@@ -178,6 +180,23 @@ export function useViewerState() {
   const [sessionIndexRetrying, setSessionIndexRetrying] = useState(false);
   const sessionIndexProgressRevision = useRef<string | null>(null);
   const sessionIndexRetryInFlight = useRef(false);
+
+  const finishSessionListRequest = useCallback((requestId: number) => {
+    if (sessionListInFlight.current !== requestId) return;
+    sessionListInFlight.current = null;
+    if (sessionListRefreshQueued.current) {
+      sessionListRefreshQueued.current = false;
+      setSessionsAttempt((attempt) => attempt + 1);
+    }
+  }, []);
+
+  useEffect(() => () => {
+    // Switching machines unmounts this hook. An old request must not start a
+    // queued catalog read against the newly selected transport.
+    sessionsRequest.current += 1;
+    sessionListInFlight.current = null;
+    sessionListRefreshQueued.current = false;
+  }, []);
 
   const [events, setEvents] = useState<EventSummary[]>([]);
   const [eventsOwnerKey, setEventsOwnerKey] = useState<string | null>(null);
@@ -955,8 +974,17 @@ export function useViewerState() {
     if (!sessionIndexListenerReady) {
       return;
     }
-    const requestId = ++sessionsRequest.current;
     const queryChanged = previousSessionQueryKey.current !== sessionQueryKey;
+    if (!queryChanged && sessionListInFlight.current === sessionsRequest.current) {
+      // Index and Relay notifications can outpace a catalog read. Keep its
+      // result useful and coalesce those notifications into one trailing
+      // refresh instead of starting concurrent reads that will be discarded.
+      sessionListRefreshQueued.current = true;
+      return;
+    }
+    const requestId = ++sessionsRequest.current;
+    sessionListInFlight.current = null;
+    sessionListRefreshQueued.current = false;
     previousSessionQueryKey.current = sessionQueryKey;
     setSessionsLoadingMore(false);
     if (enabledProviders.size === 0) {
@@ -973,6 +1001,7 @@ export function useViewerState() {
 
     setSessionsLoading(true);
     setSessionsError(null);
+    sessionListInFlight.current = requestId;
     void listSessions({
       query: {
         providers: PROVIDERS.filter((provider) => enabledProviders.has(provider)),
@@ -1020,12 +1049,14 @@ export function useViewerState() {
         if (sessionsRequest.current === requestId) {
           setSessionsLoading(false);
         }
+        finishSessionListRequest(requestId);
       });
   }, [
     applySessionSelection,
     clearSessionChildren,
     debouncedSearch,
     enabledProviders,
+    finishSessionListRequest,
     providerKey,
     sessionQueryKey,
     sessionIndexListenerReady,
@@ -1599,10 +1630,11 @@ export function useViewerState() {
   }, [closeInspector, inspectorOpen]);
 
   const loadMoreSessions = useCallback(() => {
-    if (!sessionsCursor || sessionsLoading || sessionsLoadingMore) {
+    if (!sessionsCursor || sessionsLoading || sessionsLoadingMore || sessionListInFlight.current !== null) {
       return;
     }
     const requestGeneration = sessionsRequest.current;
+    sessionListInFlight.current = requestGeneration;
     setSessionsLoadingMore(true);
     setSessionsError(null);
     void listSessions({
@@ -1631,8 +1663,9 @@ export function useViewerState() {
         if (sessionsRequest.current === requestGeneration) {
           setSessionsLoadingMore(false);
         }
+        finishSessionListRequest(requestGeneration);
       });
-  }, [debouncedSearch, enabledProviders, sessionsCursor, sessionsLoading, sessionsLoadingMore]);
+  }, [debouncedSearch, enabledProviders, finishSessionListRequest, sessionsCursor, sessionsLoading, sessionsLoadingMore]);
 
   const loadOlderEvents = useCallback(() => {
     if (

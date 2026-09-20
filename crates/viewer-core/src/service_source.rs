@@ -7,10 +7,14 @@ use std::{
   time::SystemTime,
 };
 
+use tokio_util::sync::CancellationToken;
 use tokn_session_core::{Provider, SessionHeader, SessionRef};
 use tokn_session_opencode::{CompactRecord, OpenCodeCompactCache, OpenCodeSessionSource};
 
-use crate::{service_history::History, service_protocol::CatalogEntry};
+use crate::{
+  service_history::{History, check_cancelled},
+  service_protocol::CatalogEntry,
+};
 use tokn_session_relay::{JsonlReader as FileState, RecordOperation, RelayRecord, SessionContext};
 
 #[cfg(test)]
@@ -46,14 +50,34 @@ pub(crate) struct SessionReader {
   database_reads: usize,
   native: bool,
   root: PathBuf,
-  bytes: usize,
   version: Vec<Option<FileVersion>>,
   codex_history: Option<tokn_session_codex::CodexHistoryReader>,
+  cancel: Option<CancellationToken>,
   pub snapshot: Snapshot,
 }
 
 impl SessionReader {
+  #[cfg(test)]
   pub fn new(entry: CatalogEntry, native: bool, root: PathBuf) -> Result<Self, String> {
+    Self::new_with_cancel(entry, native, root, None)
+  }
+
+  pub fn new_cancellable(
+    entry: CatalogEntry,
+    native: bool,
+    root: PathBuf,
+    cancel: CancellationToken,
+  ) -> Result<Self, String> {
+    Self::new_with_cancel(entry, native, root, Some(cancel))
+  }
+
+  fn new_with_cancel(
+    entry: CatalogEntry,
+    native: bool,
+    root: PathBuf,
+    cancel: Option<CancellationToken>,
+  ) -> Result<Self, String> {
+    check_cancelled(cancel.as_ref())?;
     let mut reader = Self {
       file: if matches!(entry.provider, Provider::Codex | Provider::Pi) {
         Some(FileState::for_snapshot(
@@ -72,9 +96,9 @@ impl SessionReader {
       database_reads: 0,
       native,
       root,
-      bytes: 0,
       version: Vec::new(),
       codex_history: None,
+      cancel,
       snapshot: Snapshot {
         generation: generation(),
         revision: 0,
@@ -88,6 +112,13 @@ impl SessionReader {
   }
 
   pub fn poll(&mut self) -> Result<bool, String> {
+    check_cancelled(self.cancel.as_ref())?;
+    let result = self.poll_source();
+    check_cancelled(self.cancel.as_ref())?;
+    result
+  }
+
+  fn poll_source(&mut self) -> Result<bool, String> {
     if self.codex_history.is_some() {
       return self.poll_codex_history();
     }
@@ -124,11 +155,22 @@ impl SessionReader {
     if matches!(self.snapshot.entry.provider, Provider::WorkBuddy | Provider::Dsh) {
       return self.poll_grouped_file(version);
     }
+    let result = self.poll_file(version);
+    if result.is_err() {
+      // Decoding may advance the source before a malformed batch or journal
+      // limit is rejected. Rebuild on retry without losing unpublished rows.
+      self.file = None;
+    }
+    result
+  }
+
+  fn poll_file(&mut self, version: Vec<Option<FileVersion>>) -> Result<bool, String> {
+    let path = &self.snapshot.entry.header.path;
     let was_grouped = self.file.is_none();
-    if was_grouped && self.snapshot.entry.provider == Provider::Codex {
+    if was_grouped && matches!(self.snapshot.entry.provider, Provider::Codex | Provider::Pi) {
       self.file = Some(FileState::for_snapshot(
         path.clone(),
-        Provider::Codex,
+        self.snapshot.entry.provider,
         self.native,
         &self.root,
       )?);
@@ -155,20 +197,12 @@ impl SessionReader {
     {
       return Err("Relay session identity changed; refresh the catalog".into());
     }
-    // Charge only new records. Appends never serialize historical records.
-    let mut bytes = if reset { 0 } else { self.bytes };
-    for record in &records {
-      bytes = bytes.saturating_add(serde_json::to_vec(record).map_err(|e| e.to_string())?.len());
-      if bytes > crate::service_protocol::MAX_SNAPSHOT_BYTES {
-        return Err("Relay session exceeds the history journal size limit".into());
-      }
-    }
-    self.version = version;
     if records.is_empty() && !reset {
+      self.version = version;
       return Ok(false);
     }
     self.commit_records(&records, reset)?;
-    self.bytes = bytes;
+    self.version = version;
     self.snapshot.revision += 1;
     self.snapshot.error = None;
     Ok(true)
@@ -180,7 +214,7 @@ impl SessionReader {
     } else {
       self.snapshot.records.clone()
     };
-    history.append(records)?;
+    history.append_cancellable(records, self.cancel.as_ref())?;
     self.snapshot.records = history;
     if reset {
       self.snapshot.generation = generation();
@@ -224,7 +258,6 @@ impl SessionReader {
       return Err("Relay session identity changed; refresh the catalog".into());
     }
     let context = SessionContext::from_session_ref(Provider::Codex, &update.reference);
-    let mut bytes = if update.reset { 0 } else { self.bytes };
     let mut records = Vec::with_capacity(update.records.len());
     for record in update.records {
       let record = RelayRecord {
@@ -234,10 +267,6 @@ impl SessionReader {
         operation: RecordOperation::Upsert,
         record,
       };
-      bytes = bytes.saturating_add(serde_json::to_vec(&record).map_err(|err| err.to_string())?.len());
-      if bytes > crate::service_protocol::MAX_SNAPSHOT_BYTES {
-        return Err("Relay session exceeds the history journal size limit".into());
-      }
       records.push(record);
     }
     self.commit_records(&records, update.reset)?;
@@ -247,7 +276,6 @@ impl SessionReader {
     self.snapshot.entry.header.parent_session_id = update.reference.parent_session_id;
     self.snapshot.revision += 1;
     self.snapshot.error = None;
-    self.bytes = bytes;
     self.file = None;
     Ok(true)
   }
@@ -322,7 +350,6 @@ impl SessionReader {
     }
     let context = SessionContext::from_session_ref(self.snapshot.entry.provider, &reference);
     let mut additions = Vec::new();
-    let mut bytes = if reset { 0 } else { self.bytes };
     for record in records.iter().skip(if reset { 0 } else { prefix }) {
       let normalized = match record {
         CompactRecord::Reused(previous) => self.snapshot.records.read(*previous)?.0.record,
@@ -339,17 +366,12 @@ impl SessionReader {
         operation: RecordOperation::Upsert,
         record: normalized,
       };
-      bytes = bytes.saturating_add(serde_json::to_vec(&record).map_err(|e| e.to_string())?.len());
-      if bytes > crate::service_protocol::MAX_SNAPSHOT_BYTES {
-        return Err("Relay session exceeds the history journal size limit".into());
-      }
       additions.push(record);
     }
     self.commit_records(&additions, reset)?;
     self.snapshot.entry.header = header;
     self.snapshot.revision += 1;
     self.snapshot.error = None;
-    self.bytes = bytes;
     self.version = version;
     Ok(true)
   }

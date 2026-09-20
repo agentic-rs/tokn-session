@@ -74,6 +74,7 @@ struct CachedSession {
   cancel: CancellationToken,
   priority: SessionPriority,
   accessed: Instant,
+  last_activity: Instant,
 }
 
 struct State {
@@ -396,7 +397,10 @@ impl ViewerRelay {
     if !should_start {
       return Ok(());
     }
-    if priority == SessionPriority::Background && !state.cache.eligible(locator) {
+    if priority == SessionPriority::Background
+      && (!state.cache.eligible(locator)
+        || (!state.sessions.contains_key(locator) && !state.cache.can_prefetch(locator, Instant::now())))
+    {
       return Ok(());
     }
     let entry =
@@ -439,6 +443,7 @@ impl ViewerRelay {
       cancel: cancel.clone(),
       priority,
       accessed: Instant::now(),
+      last_activity: Instant::now(),
     });
     session.cancel = cancel.clone();
     session.error = None;
@@ -447,6 +452,9 @@ impl ViewerRelay {
       session.accessed = Instant::now();
     }
     state.sessions.insert(locator.clone(), session);
+    if priority == SessionPriority::Background {
+      state.cache.record_prefetch(locator, Instant::now());
+    }
     let manager = self.clone();
     let connection = state.connection.clone().expect("active connection checked above");
     let epoch = state.epoch;
