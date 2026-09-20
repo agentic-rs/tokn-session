@@ -1,0 +1,117 @@
+# Viewer read performance
+
+## Investigation
+
+A five-second macOS stack sample of the running debug viewer on 2026-09-20
+showed catalog refreshes, SQLite row decoding, and metadata/key construction
+on active worker stacks. One process CPU reading was about 130%. The local
+index contained roughly 4,600 sessions. This reading includes a live workload;
+it is not an idle baseline or a release-build measurement.
+
+Two paths amplified small changes:
+
+- A changed-file notification loaded all indexed sessions, built catalog maps,
+  and opened the file's header before recognizing a duplicate revision.
+  Periodic scans of other providers also decoded unrelated Codex rows.
+- A linked Codex rollout rediscovered its lineage, read and normalized all
+  retained history, then serialized old and new records to compare them after
+  each append. Local cache hits rediscovered the same lineage too.
+
+Relay emits a hint per normalized record. Those hints previously bypassed the
+filesystem watcher's batching, multiplying the catalog work while streaming.
+
+## Current boundaries
+
+The durable index owns discovery and bounded presentation metadata. Known file
+updates query only their source and sole present session, check the file
+revision before opening the header, and use an indexed duplicate-identity
+lookup. Membership or identity uncertainty still requests a full catalog.
+Full provider scans retain that provider's tombstones for relocation but do
+not decode other providers. Revision/generation preconditions still protect
+concurrent writers.
+
+Relay hints share a 200 ms quiet window with a one-second maximum batch age.
+Explicit retry, recovery, and scheduled deadlines retain priority. This batches
+index work; it does not delay the authoritative snapshot reader's live feed.
+
+`CodexHistoryReader` owns the resolved physical history, normalizer, byte
+cursor, incomplete final row, and ordinal state. Cold reads verify inherited
+cutoffs. Successful warm reads return an append delta; resets return a complete
+replacement. The viewer retains historical record allocations and serializes
+only new records. Errors discard the reader's tentative state while the viewer
+keeps its last published snapshot, so retries cannot skip a rejected batch.
+An inherited parent can keep appending beyond the saved cutoff without
+rebuilding the child; the reader checks the unchanged bounded prefix guards.
+
+Local snapshot cache hits stat their already resolved files. They do not scan
+directories or parse headers. Changed or missing dependencies force a fresh
+read. A cached lineage stays bound to those physical files until invalidation;
+new competing candidates are detected on the next discovery.
+
+## Append-only contract
+
+Native Codex JSONL growth is treated as append-only within one physical file.
+Replacement, truncation, same-size edits, changed history configuration, and
+changed header/tail guards invalidate the reader. Inherited references remain
+bounded by their saved exclusive byte and ordinal cutoffs. Partial final rows
+are buffered until a newline arrives.
+
+The reader compares the complete owning metadata header and a bounded tail
+guard without reparsing history. These guards catch common rewrite-and-grow
+cases, but cannot prove that arbitrary middle bytes were not edited while the
+file grew. Detecting every such edit requires rereading the prefix or a stronger
+provider revision protocol. This tradeoff is explicit rather than claiming
+metadata alone proves immutability.
+
+Append-only source records also do not imply immutable rendered cards. Tool
+results, compaction pairs, and terminal usage can revise earlier projections.
+Any future projection cache must preserve those dependencies.
+
+## Measurements
+
+Reproducible manual debug benchmarks use temporary fixtures and do not write
+provider sessions. The catalog comparison ran the same fixture on merged
+commit `110c509` and the updated code. Linked history compares ten complete
+reloads with ten warm reader polls in the same executable.
+The catalog fixture uses an in-memory SQLite index; real disk commits add I/O
+latency beyond the measured lookup and metadata work.
+
+| Workload | Before | After |
+| --- | ---: | ---: |
+| 5,001 sessions; 200 duplicate file hints | 6.75 s | 14 ms |
+| 5,001 sessions; 100 actual file appends | 3.19 s | 24 ms |
+| About 1 MiB inherited history; 10 appends | 137 ms | 0.97 ms |
+| About 10 MiB inherited history; 10 appends | 1.34 s | 2.16 ms |
+
+The catalog benchmark reduced header reads from 300 to 100. Warm history
+appends parsed exactly ten rows, read about 2 KiB of new body data, and performed
+zero lineage discoveries at both sizes. Header/tail guard bytes are counted
+separately. Unchanged polls parse no rows. These component timings do not imply
+the same proportional reduction in whole-app CPU.
+
+Run the manual benchmarks with:
+
+```sh
+cargo test -p tokn-viewer-core targeted_catalog_benchmark --lib -- --ignored --nocapture
+cargo test -p tokn-session-codex benchmark_linked_history_appends --test history -- --ignored --nocapture
+```
+
+Use separate target directories when comparing separate source checkouts.
+Normal regression tests assert operation counts, state continuity, and reset
+behavior; they do not impose machine-dependent timing thresholds.
+
+## Remaining work
+
+- Automatic mode still frames its in-process snapshot transport as JSON and
+  materializes a complete `LoadedSession` after each append. Shared immutable
+  chunks and a direct subscription could remove that copying.
+- Timeline projection and usage classification repeat across page/detail
+  requests. Cache by snapshot identity first; incremental projection needs
+  explicit dependencies for cards that can change after an append.
+- Local mode still reloads a changed conversation, and ordinary historical
+  Codex/Pi loads perform separate metadata/count and normalization passes.
+  A shared provider reader could serve both Local and Automatic modes.
+- Managed Relay normalizes full payloads that Automatic consumes as path hints.
+  A compact invalidation feed would avoid that duplicate work.
+- Sidebar relation rebuilding and unwatched-provider recovery scans remain
+  candidates for profiling after the current changes are loaded.

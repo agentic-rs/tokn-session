@@ -106,9 +106,12 @@ both byte and ordinal cutoffs so reverted turns stay excluded. Native discovery
 uses Desktop's current rollout path to avoid duplicate tasks; exported roots
 collapse only a uniquely verified continuation chain. Missing or ambiguous
 prefixes fail the read and preserve the last-good viewer snapshot. Linked
-histories reassemble on change and reconcile stable record IDs; unchanged polls
-check cached file revisions. Local caches include the inherited files. Plain
-rollouts retain incremental decoding; standalone Relay feeds remain per-file.
+histories now retain a normalizer and active byte cursor, returning only new
+complete rows on append. Replacement, truncation, same-size edits, and changed
+history guards rebuild atomically. Local cache hits stat resolved dependency
+paths instead of rediscovering history. Plain rollouts retain incremental
+decoding; standalone Relay feeds remain per-file. The native append-only
+assumption and measured limits are in [viewer performance](viewer-performance.md).
 
 Automatic and Local modes use durable index queries for lists, search, trees,
 and snapshot admission. The viewer-core indexer discovers provider headers and
@@ -117,6 +120,10 @@ After the first catalog, Codex and Pi recovery scans enumerate paths and compare
 stored file-revision cursors; unchanged rollouts reuse indexed headers, while
 only new or modified JSONL files are opened. This preserves changes made while
 the watcher was offline without repeating a cold header parse on API restart.
+Known-file notifications use indexed source/session lookups; duplicate revisions
+skip header reads. Provider-local scans exclude unrelated indexed sessions.
+Relay hints coalesce for 200 ms of quiet, capped at one second and scheduled
+deadlines, so streaming records do not each start a catalog pass.
 Codex/Pi body backfill scales its quiet-file delay with transcript size, up to
 five minutes, so a brief pause in an active session does not start a costly
 parse that will be discarded after the next append. JSONL bodies above 8 MiB

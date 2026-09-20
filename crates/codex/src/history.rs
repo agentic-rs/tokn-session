@@ -12,6 +12,9 @@ use crate::event::CodexLine;
 use crate::normalize::CodexNormalizer;
 use crate::session_source::inspect_session_header;
 
+mod reader;
+pub use reader::{CodexHistoryReadStats, CodexHistoryReader, CodexHistoryUpdate};
+
 const MAX_SEGMENTS: usize = 64;
 const MAX_HEADER_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -100,112 +103,13 @@ impl CodexSessionSource {
     include_native: bool,
     max_bytes: usize,
   ) -> Result<LoadedSessionRecords, String> {
-    let segments = self.history_segments(path)?;
-    let owner = history_header(path)?;
-    if segments
-      .last()
-      .is_none_or(|segment| segment.header_key != header_key(&owner))
-    {
-      return Err("Codex history changed while resolving its prefix".into());
-    }
-    let thread_spawn =
-      matches!(owner.item(), RolloutItem::SessionMeta(meta) if crate::normalize::requires_thread_spawn_boundary(meta));
-    let mut reference = inspect_session_header(path)?;
-    if owner.native()["payload"]["id"].as_str() != Some(reference.id.as_str()) {
-      return Err("Codex history owner changed while reading its metadata".into());
-    }
-    self.apply_indexed_metadata(std::slice::from_mut(&mut reference));
-    let mut normalizer = CodexNormalizer::new_historical();
-    let mut records = vec![NormalizedRecord {
-      record_id: format!("session:{}", reference.id),
-      native: include_native.then(|| owner.native().clone()),
-      events: normalizer.normalize(owner),
-    }];
-    let mut consumed = 0usize;
-    for segment in segments {
-      let file = File::open(&segment.path).map_err(|err| err.to_string())?;
-      let length = segment
-        .end_byte_offset
-        .unwrap_or(file.metadata().map_err(|err| err.to_string())?.len());
-      let remaining = max_bytes.saturating_sub(consumed);
-      if length > remaining as u64 {
-        return Err("Codex history exceeds the snapshot size limit".into());
-      }
-      let mut bytes = Vec::new();
-      file
-        .take(length)
-        .read_to_end(&mut bytes)
-        .map_err(|err| err.to_string())?;
-      if bytes.len() as u64 != length {
-        return Err("Codex history changed while reading its prefix".into());
-      }
-      consumed += bytes.len();
-      let complete = bytes
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index + 1);
-      if segment.end_byte_offset.is_some() && complete != bytes.len() {
-        return Err("invalid Codex history lineage: cutoff is not a complete record".into());
-      }
-      let mut offset = 0usize;
-      let mut expected_ordinal = None;
-      let mut inherited_parent = false;
-      let mut saw_header = false;
-      for row in bytes[..complete].split_inclusive(|byte| *byte == b'\n') {
-        let row_offset = offset;
-        offset += row.len();
-        if row.iter().all(u8::is_ascii_whitespace) {
-          continue;
-        }
-        let line: CodexLine = serde_json::from_slice(row).map_err(|err| {
-          format!(
-            "invalid Codex history at {} byte {row_offset}: {err}",
-            segment.path.display()
-          )
-        })?;
-        if segments_are_paginated(&line, expected_ordinal, segment.end_ordinal_exclusive)? {
-          expected_ordinal = line.ordinal().and_then(|ordinal| ordinal.checked_add(1));
-        }
-        if let RolloutItem::SessionMeta(meta) = line.item() {
-          if !saw_header {
-            if header_key(&line) != segment.header_key {
-              return Err("Codex history changed while reading its prefix".into());
-            }
-            saw_header = true;
-            inherited_parent = thread_spawn && meta.id.as_deref() != Some(reference.id.as_str());
-          }
-          continue;
-        }
-        let native = include_native.then(|| line.native().clone());
-        // A trigger in the referenced parent's own history does not begin the
-        // child's work. Same-thread continuation prefixes still pass through
-        // the child's historical boundary normalizer.
-        let events = if inherited_parent {
-          Vec::new()
-        } else {
-          normalizer.normalize(line)
-        };
-        reference.message_count += events
-          .iter()
-          .filter(|event| matches!(event, AgentEvent::Message(_)))
-          .count();
-        records.push(NormalizedRecord {
-          record_id: format!("segment:{}:{row_offset}", segment.path.display()),
-          native,
-          events,
-        });
-      }
-      if !saw_header {
-        return Err("Codex history metadata is not yet complete".into());
-      }
-      if segment.end_ordinal_exclusive.is_some() && expected_ordinal != segment.end_ordinal_exclusive {
-        return Err("invalid Codex history lineage: cutoff ordinal disagrees with its bytes".into());
-      }
-    }
+    let update = CodexHistoryReader::new(path.to_path_buf(), include_native, max_bytes)
+      .poll(self)?
+      .ok_or("Codex history produced no initial snapshot")?;
     Ok(LoadedSessionRecords {
-      reference,
-      records,
-      history_status: normalizer.history_status(),
+      reference: update.reference,
+      records: update.records,
+      history_status: update.history_status,
     })
   }
 }

@@ -189,6 +189,13 @@ ALTER TABLE sources
     CHECK(generation >= 0);
 "#;
 
+// File notifications need to detect another source claiming one session
+// identity without scanning every provider's catalog.
+const MIGRATION_006: &str = r#"
+CREATE INDEX sessions_by_identity
+  ON sessions(session_id, present, source_id);
+"#;
+
 struct Migration {
   version: i64,
   sql: &'static str,
@@ -214,6 +221,10 @@ const MIGRATIONS: &[Migration] = &[
   Migration {
     version: 5,
     sql: MIGRATION_005,
+  },
+  Migration {
+    version: 6,
+    sql: MIGRATION_006,
   },
 ];
 
@@ -964,6 +975,42 @@ impl SessionIndex {
     )
   }
 
+  /// Returns a source's sole present session, or `None` when its membership
+  /// is empty or ambiguous. Reads at most two rows regardless of catalog size.
+  pub fn unique_present_session_for_source(&self, key: &SourceKey) -> Result<Option<IndexedSession>> {
+    let connection = self.connection()?;
+    let sql = format!(
+      "SELECT {SESSION_COLUMNS}
+       FROM sessions AS session
+       INNER JOIN sources AS source ON source.id = session.source_id
+       WHERE source.provider = ?1 AND source.source_key = ?2 AND session.present = 1
+       LIMIT 2"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let mut sessions =
+      collect_rows(statement.query_map(params![key.provider, key.source_key], indexed_session_from_row)?)?;
+    Ok((sessions.len() == 1).then(|| sessions.remove(0)))
+  }
+
+  /// Checks whether another present source in the same provider claims this
+  /// identity. The identity index keeps ordinary file appends independent of
+  /// the number of unrelated sessions.
+  pub fn has_other_present_session_source(&self, key: &SessionKey) -> Result<bool> {
+    let connection = self.connection()?;
+    connection
+      .query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM sessions AS session
+           INNER JOIN sources AS source ON source.id = session.source_id
+           WHERE session.session_id = ?1 AND session.present = 1
+             AND source.provider = ?2 AND source.source_key != ?3
+         )",
+        params![key.session_id, key.provider, key.source_key],
+        |row| row.get(0),
+      )
+      .map_err(Into::into)
+  }
+
   /// Lists all currently present sessions in stable update order.
   pub fn list_present_sessions(&self) -> Result<Vec<IndexedSession>> {
     let connection = self.connection()?;
@@ -999,6 +1046,13 @@ impl SessionIndex {
   pub fn list_all_sessions(&self) -> Result<Vec<IndexedSession>> {
     let connection = self.connection()?;
     select_sessions(&connection, "", [])
+  }
+
+  /// Lists one provider's complete inventory, including tombstones needed
+  /// for relocation and attention recovery, in the usual stable update order.
+  pub fn list_all_sessions_for_provider(&self, provider: &str) -> Result<Vec<IndexedSession>> {
+    let connection = self.connection()?;
+    select_sessions(&connection, "WHERE source.provider = ?1", [provider])
   }
 
   /// Counts present, unbaselined sessions by provider for sources whose
@@ -1962,6 +2016,7 @@ mod tests {
         (3, migration_checksum(MIGRATION_003)),
         (4, migration_checksum(MIGRATION_004)),
         (5, migration_checksum(MIGRATION_005)),
+        (6, migration_checksum(MIGRATION_006)),
       ]
     );
   }
@@ -2102,7 +2157,7 @@ mod tests {
       .expect("migration query should run")
       .collect::<rusqlite::Result<Vec<_>>>()
       .expect("migration versions should decode");
-    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
   }
 
   #[test]
@@ -2179,6 +2234,89 @@ mod tests {
     assert_eq!(codex.len(), 1);
     assert_eq!(codex[0].key.provider, "codex");
     assert_eq!(codex[0].key.session_id, "codex-session");
+  }
+
+  #[test]
+  fn bounded_source_lookup_rejects_ambiguous_membership_and_ignores_tombstones() {
+    let index = SessionIndex::open_in_memory().unwrap();
+    let key = SourceKey::new(PROVIDER, SOURCE_KEY);
+    assert!(index.unique_present_session_for_source(&key).unwrap().is_none());
+    index
+      .replace_source(SourceReplacement::baseline(source("one", 1), vec![session("a", None)]))
+      .unwrap();
+    assert_eq!(
+      index
+        .unique_present_session_for_source(&key)
+        .unwrap()
+        .unwrap()
+        .key
+        .session_id,
+      "a"
+    );
+    index
+      .replace_source(SourceReplacement::baseline(
+        source("two", 2),
+        vec![session("a", None), session("b", None)],
+      ))
+      .unwrap();
+    assert!(index.unique_present_session_for_source(&key).unwrap().is_none());
+    index
+      .replace_source(SourceReplacement::baseline(
+        source("three", 3),
+        vec![session("b", None)],
+      ))
+      .unwrap();
+    assert_eq!(
+      index
+        .unique_present_session_for_source(&key)
+        .unwrap()
+        .unwrap()
+        .key
+        .session_id,
+      "b"
+    );
+    index
+      .replace_source(SourceReplacement::baseline(
+        source_for("pi", "other", "one", 4),
+        vec![session_for("pi", "other", "unrelated", None)],
+      ))
+      .unwrap();
+    let rows = index.list_all_sessions_for_provider(PROVIDER).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].key.session_id, "a");
+    assert!(!rows[0].present);
+    assert_eq!(rows[1].key.session_id, "b");
+    assert!(rows[1].present);
+  }
+
+  #[test]
+  fn duplicate_source_lookup_is_provider_scoped_and_ignores_tombstones() {
+    let index = SessionIndex::open_in_memory().unwrap();
+    let key = SessionKey::new(PROVIDER, SOURCE_KEY, "shared");
+    index
+      .replace_sources(&[
+        SourceReplacement::baseline(source("one", 1), vec![session("shared", None)]),
+        SourceReplacement::baseline(
+          source_for("pi", "other", "one", 1),
+          vec![session_for("pi", "other", "shared", None)],
+        ),
+      ])
+      .unwrap();
+    assert!(!index.has_other_present_session_source(&key).unwrap());
+    index
+      .replace_source(SourceReplacement::baseline(
+        source_for(PROVIDER, "other", "one", 1),
+        vec![session_for(PROVIDER, "other", "shared", None)],
+      ))
+      .unwrap();
+    assert!(index.has_other_present_session_source(&key).unwrap());
+    index
+      .replace_source(SourceReplacement::baseline(
+        source_for(PROVIDER, "other", "two", 2),
+        vec![],
+      ))
+      .unwrap();
+    assert!(!index.has_other_present_session_source(&key).unwrap());
   }
 
   #[test]

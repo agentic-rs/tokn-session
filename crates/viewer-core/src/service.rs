@@ -307,7 +307,21 @@ struct CachedSession {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceRevision {
+  paths: Vec<PathBuf>,
   files: Vec<Option<FileRevision>>,
+}
+
+impl SourceRevision {
+  /// A loaded snapshot already resolved its physical dependencies. Revalidate
+  /// those files without rediscovering and parsing the same history lineage
+  /// for every page or detail request.
+  fn is_current(&self) -> bool {
+    self
+      .paths
+      .iter()
+      .zip(&self.files)
+      .all(|(path, previous)| file_revision(path) == *previous)
+  }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1700,7 +1714,7 @@ impl ViewerService {
       .map_err(|error| format!("failed to read indexed {provider:?} sources: {error}"))?;
     let existing_sessions = self
       .session_index
-      .list_all_sessions()
+      .list_all_sessions_for_provider(provider.as_str())
       .map_err(|error| format!("failed to read indexed {provider:?} session metadata: {error}"))?;
     Ok(CatalogIndexSnapshot {
       provider_ready,
@@ -2064,38 +2078,20 @@ impl ViewerService {
       });
     }
 
-    let snapshot = self.catalog_index_snapshot(provider)?;
     // A targeted write can only refine an already complete provider catalog.
     // Publishing a partial initial catalog would make the sidebar look empty
     // or incomplete while a root is still being discovered.
-    if !snapshot.provider_ready {
+    if self
+      .session_index
+      .source_state(&index_catalog_source_key(provider))
+      .map_err(|error| format!("failed to read the {provider:?} index baseline: {error}"))?
+      .is_none()
+    {
       return Ok(ProviderIndexRefresh {
         retry_catalog_soon: true,
         ..Default::default()
       });
     }
-
-    let existing_by_source = snapshot
-      .existing_sources
-      .iter()
-      .map(|source| (source.key.source_key.clone(), source))
-      .collect::<HashMap<_, _>>();
-    let existing_by_session_key = snapshot
-      .existing_sessions
-      .iter()
-      .map(|session| (session.key.clone(), session))
-      .collect::<HashMap<_, _>>();
-    let present_sessions_by_source = snapshot
-      .existing_sessions
-      .iter()
-      .filter(|session| session.present && session.key.provider == provider.as_str())
-      .fold(
-        HashMap::<String, Vec<&IndexedSession>>::new(),
-        |mut grouped, session| {
-          grouped.entry(session.key.source_key.clone()).or_default().push(session);
-          grouped
-        },
-      );
 
     let mut replacements = Vec::new();
     let mut retry_catalog_soon = false;
@@ -2114,7 +2110,11 @@ impl ViewerService {
           continue;
         }
       };
-      let Some(previous) = existing_by_source.get(&source_key.source_key).copied() else {
+      let Some(previous) = self
+        .session_index
+        .source_state(&source_key)
+        .map_err(|error| format!("failed to read indexed {provider:?} source: {error}"))?
+      else {
         // A watcher can race initial discovery, a session move, or a previous
         // full scan. Do not turn an unfamiliar path into a new source here.
         retry_catalog_soon = true;
@@ -2124,17 +2124,17 @@ impl ViewerService {
         retry_catalog_soon = true;
         continue;
       }
-      let Some(existing_for_source) = present_sessions_by_source.get(&source_key.source_key) else {
-        retry_catalog_soon = true;
-        continue;
-      };
       // Codex and Pi JSONL sources each represent exactly one session. A
       // different cardinality means the path's old membership cannot safely
       // be replaced with one direct header read.
-      if existing_for_source.len() != 1 {
+      let Some(existing) = self
+        .session_index
+        .unique_present_session_for_source(&source_key)
+        .map_err(|error| format!("failed to read indexed {provider:?} session: {error}"))?
+      else {
         retry_catalog_soon = true;
         continue;
-      }
+      };
 
       let cursor = match source_cursor(provider, path) {
         Ok(cursor) => cursor,
@@ -2143,6 +2143,13 @@ impl ViewerService {
           continue;
         }
       };
+      // Native watching and Relay can report the same append independently.
+      // Once that revision is staged, its pending body state is already owned
+      // by the body queue; a duplicate hint needs neither a header read nor a
+      // catalog replacement.
+      if indexed_source_raw_cursor(&previous.cursor) == Some(cursor.as_str()) {
+        continue;
+      }
       let header = match self.repository.session_header_at_path(provider, path) {
         Ok(header) => header,
         Err(_) => {
@@ -2168,19 +2175,16 @@ impl ViewerService {
         source_key.source_key.clone(),
         header.id.clone(),
       );
-      let Some(existing) = existing_by_session_key.get(&session_key).copied() else {
+      if existing.key != session_key {
         // A changed session ID can be an archive/move sequence. Full catalog
         // owns the old-source tombstone and the new-source relocation state.
         retry_catalog_soon = true;
         continue;
-      };
-      if existing_for_source[0].key != session_key
-        || snapshot.existing_sessions.iter().any(|session| {
-          session.present
-            && session.key.provider == provider.as_str()
-            && session.key.session_id == header.id
-            && session.key.source_key != source_key.source_key
-        })
+      }
+      if self
+        .session_index
+        .has_other_present_session_source(&session_key)
+        .map_err(|error| format!("failed to check indexed {provider:?} session identity: {error}"))?
       {
         retry_catalog_soon = true;
         continue;
@@ -2191,7 +2195,7 @@ impl ViewerService {
       // catalog established when that raw header does not carry replacement
       // text; otherwise an ordinary append would briefly clear the sidebar
       // title/preview until the next recovery catalog.
-      let header = retain_targeted_catalog_presentation(provider, header, existing);
+      let header = retain_targeted_catalog_presentation(provider, header, &existing);
 
       // The header reader intentionally stops before the body, but we still
       // verify the file revision around it. A concurrent append retries this
@@ -2209,32 +2213,13 @@ impl ViewerService {
         continue;
       }
 
-      let source_changed = indexed_source_raw_cursor(&previous.cursor) != Some(cursor.as_str());
-      let body_pending = source_changed || !existing.attention_baselined;
-      let staged_cursor = if body_pending {
-        if !source_changed && pending_body_raw_cursor(&previous.cursor) == Some(cursor.as_str()) {
-          previous.cursor.clone()
-        } else {
-          pending_body_cursor(&cursor)
-        }
-      } else {
-        completed_body_cursor(&cursor)
-      };
-      let metadata = catalog_session_metadata(&source_key, header, Some(existing), true, source_changed)?;
-      let source_matches_catalog = indexed_source_matches_catalog(
-        std::slice::from_ref(&metadata),
-        &existing_by_session_key,
-        existing_for_source.len(),
-      );
-      if source_matches_catalog && previous.cursor == staged_cursor {
-        continue;
-      }
+      let metadata = catalog_session_metadata(&source_key, header, Some(&existing), true, true)?;
       replacements.push(
         SourceReplacement::new(
-          SourceState::new(source_key, staged_cursor, indexed_at_ms),
+          SourceState::new(source_key, pending_body_cursor(&cursor), indexed_at_ms),
           vec![metadata],
         )
-        .with_source_cursor_precondition(SourceCursorPrecondition::existing(previous)),
+        .with_source_cursor_precondition(SourceCursorPrecondition::existing(&previous)),
       );
     }
 
@@ -2484,7 +2469,7 @@ impl ViewerService {
 
     let existing_sessions = self
       .session_index
-      .list_all_sessions()
+      .list_all_sessions_for_provider(job.provider.as_str())
       .map_err(|error| format!("failed to read indexed body attention: {error}"))?;
     let existing_by_session_key = existing_sessions
       .iter()
@@ -2822,34 +2807,36 @@ impl ViewerService {
     if self.relay.covers(locator.provider) {
       return self.relay.load(locator);
     }
-    let revision_before = source_revision(locator);
-    if let Some(revision) = revision_before.as_ref() {
+    {
       let cache = self
         .loaded_session_cache
         .lock()
         .map_err(|_| "loaded session cache lock is poisoned".to_string())?;
       if let Some(cached) = cache
         .as_ref()
-        .filter(|cached| cached.locator == *locator && cached.source_revision == *revision)
+        .filter(|cached| cached.locator == *locator && cached.source_revision.is_current())
       {
         return Ok(Arc::clone(&cached.loaded));
       }
     }
 
+    let revision_before = source_revision(locator);
     let loaded = Arc::new(self.repository.load_session(locator)?);
     if loaded.reference.id != locator.session_id {
       return Err("session key no longer matches its source record".to_string());
     }
 
-    let revision_after = source_revision(locator);
+    // Routing changes also change the owning file revision. A second lineage
+    // discovery adds no protection once every resolved dependency is checked.
+    let stable_revision = revision_before.filter(SourceRevision::is_current);
     let mut cache = self
       .loaded_session_cache
       .lock()
       .map_err(|_| "loaded session cache lock is poisoned".to_string())?;
-    *cache = match (revision_before, revision_after) {
-      (Some(before), Some(after)) if before == after => Some(CachedSession {
+    *cache = match stable_revision {
+      Some(revision) => Some(CachedSession {
         locator: locator.clone(),
-        source_revision: after,
+        source_revision: revision,
         loaded: Arc::clone(&loaded),
       }),
       _ => None,
@@ -3477,6 +3464,11 @@ fn attention_marker_count(marker: Option<&str>) -> Option<usize> {
     .and_then(|count| count.parse::<usize>().ok())
 }
 
+#[cfg(test)]
+thread_local! {
+  static HISTORY_DEPENDENCY_DISCOVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn source_revision(locator: &SessionLocator) -> Option<SourceRevision> {
   let mut revision = source_revision_for(locator.provider, &locator.source_path)?;
   if locator.provider == ViewerProvider::Codex {
@@ -3484,9 +3476,12 @@ fn source_revision(locator: &SessionLocator) -> Option<SourceRevision> {
     // rollout. A changed or unavailable prefix must not hit the head-only
     // cache and silently retain a transcript from a different source state.
     let source = tokn_session_codex::CodexSessionSource::new(None);
+    #[cfg(test)]
+    HISTORY_DEPENDENCY_DISCOVERIES.with(|count| count.set(count.get() + 1));
     for segment in source.history_segments(&locator.source_path).ok()? {
       if segment.path != locator.source_path {
         revision.files.push(Some(file_revision(&segment.path)?));
+        revision.paths.push(segment.path);
       }
     }
   }
@@ -3506,7 +3501,7 @@ fn source_revision_for(provider: ViewerProvider, source_path: &Path) -> Option<S
   let primary = file_revision(&paths[0])?;
   let mut files = vec![Some(primary)];
   files.extend(paths[1..].iter().map(|path| file_revision(path)));
-  Some(SourceRevision { files })
+  Some(SourceRevision { paths, files })
 }
 
 fn source_cursor(provider: ViewerProvider, source_path: &Path) -> Result<String, String> {
@@ -5338,6 +5333,7 @@ mod tests {
   mod communications;
   mod event_filter;
   mod history_cache;
+  mod targeted_index;
   mod usage_filter;
   use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
   use std::path::PathBuf;
@@ -6131,6 +6127,7 @@ mod tests {
       .mutate_source_on_next_targeted_header
       .lock()
       .expect("fixture targeted-header mutation lock should not be poisoned") = Some(path.clone());
+    std::fs::write(&path, "fixture append before the racing header read").unwrap();
 
     let refresh = service
       .refresh_changed_file_catalogs(BTreeMap::from([(

@@ -47,7 +47,7 @@ pub(crate) struct SessionReader {
   root: PathBuf,
   bytes: usize,
   version: Vec<Option<FileVersion>>,
-  codex_history_paths: Vec<PathBuf>,
+  codex_history: Option<tokn_session_codex::CodexHistoryReader>,
   pub snapshot: Snapshot,
 }
 
@@ -72,7 +72,7 @@ impl SessionReader {
       root,
       bytes: 0,
       version: Vec::new(),
-      codex_history_paths: Vec::new(),
+      codex_history: None,
       snapshot: Snapshot {
         generation: generation(),
         revision: 0,
@@ -86,11 +86,11 @@ impl SessionReader {
   }
 
   pub fn poll(&mut self) -> Result<bool, String> {
+    if self.codex_history.is_some() {
+      return self.poll_codex_history();
+    }
     let path = &self.snapshot.entry.header.path;
     let mut version = versions(path, self.database.is_some());
-    for history_path in &self.codex_history_paths {
-      version.extend(versions(history_path, false));
-    }
     if self.snapshot.entry.provider == Provider::WorkBuddy {
       let database = tokn_session_workbuddy::WorkBuddySessionSource::new(Some(self.root.clone())).database_path()?;
       version.extend(versions(&database, true));
@@ -110,23 +110,14 @@ impl SessionReader {
     }
     if self.snapshot.entry.provider == Provider::Codex {
       let source = tokn_session_codex::CodexSessionSource::new(Some(self.root.clone()));
-      let history_paths = source
-        .history_segments(path)?
-        .into_iter()
-        .filter_map(|segment| (segment.path != *path).then_some(segment.path))
-        .collect::<Vec<_>>();
-      // Keep the active file first: replacement checks belong to the source
-      // selected by the viewer, while inherited files also invalidate reads.
-      version = versions(path, false);
-      for history_path in &history_paths {
-        version.extend(versions(history_path, false));
+      if source.history_segments(path)?.len() > 1 {
+        self.codex_history = Some(tokn_session_codex::CodexHistoryReader::new(
+          path.clone(),
+          self.native,
+          crate::service_protocol::MAX_SNAPSHOT_BYTES,
+        ));
+        return self.poll_codex_history();
       }
-      if !history_paths.is_empty() {
-        let changed = self.poll_grouped_file(version)?;
-        self.codex_history_paths = history_paths;
-        return Ok(changed);
-      }
-      self.codex_history_paths.clear();
     }
     if matches!(self.snapshot.entry.provider, Provider::WorkBuddy | Provider::Dsh) {
       return self.poll_grouped_file(version);
@@ -195,12 +186,62 @@ impl SessionReader {
     self.reconcile(loaded.reference, loaded.header, loaded.records, version, false)
   }
 
+  fn poll_codex_history(&mut self) -> Result<bool, String> {
+    let source = tokn_session_codex::CodexSessionSource::new(Some(self.root.clone()));
+    let Some(update) = self.codex_history.as_mut().unwrap().poll(&source)? else {
+      return Ok(false);
+    };
+    let result = self.commit_codex_history(update);
+    if result.is_err() {
+      // Publication limits/identity checks can fail after decoding. Rebuild on
+      // retry rather than losing this batch behind an advanced source cursor.
+      self.codex_history.as_mut().unwrap().invalidate();
+    }
+    result
+  }
+
+  fn commit_codex_history(&mut self, update: tokn_session_codex::CodexHistoryUpdate) -> Result<bool, String> {
+    if update.reference.id != self.snapshot.entry.header.id {
+      return Err("Relay session identity changed; refresh the catalog".into());
+    }
+    let context = SessionContext::from_session_ref(Provider::Codex, &update.reference);
+    let mut bytes = if update.reset { 0 } else { self.bytes };
+    let mut records = Vec::with_capacity(update.records.len());
+    for record in update.records {
+      let record = RelayRecord {
+        path: update.reference.path.clone(),
+        topic: format!("codex.{}", context.session_id),
+        session: context.clone(),
+        operation: RecordOperation::Upsert,
+        record,
+      };
+      bytes = bytes.saturating_add(serde_json::to_vec(&record).map_err(|err| err.to_string())?.len());
+      if bytes > crate::service_protocol::MAX_SNAPSHOT_BYTES {
+        return Err("Relay session exceeds the snapshot memory limit".into());
+      }
+      records.push(Arc::new(record));
+    }
+    if update.reset {
+      self.snapshot.generation = generation();
+      self.snapshot.records.clear();
+    }
+    self.snapshot.records.extend(records);
+    self.snapshot.entry.header.title = update.reference.title;
+    self.snapshot.entry.header.preview = update.reference.preview;
+    self.snapshot.entry.header.cwd = update.reference.cwd;
+    self.snapshot.entry.header.parent_session_id = update.reference.parent_session_id;
+    self.snapshot.revision += 1;
+    self.snapshot.error = None;
+    self.bytes = bytes;
+    self.file = None;
+    self.source_records.clear();
+    Ok(true)
+  }
+
   fn poll_grouped_file(&mut self, version: Vec<Option<FileVersion>>) -> Result<bool, String> {
     let entry = &self.snapshot.entry;
     let max_bytes = crate::service_protocol::MAX_SNAPSHOT_BYTES;
     let loaded = match entry.provider {
-      Provider::Codex => tokn_session_codex::CodexSessionSource::new(Some(self.root.clone()))
-        .load_session_records_path(&entry.header.path, self.native, max_bytes)?,
       Provider::WorkBuddy => tokn_session_workbuddy::WorkBuddySessionSource::new(Some(self.root.clone()))
         .load_session_records_path(&entry.header.path, self.native, max_bytes)?,
       Provider::Dsh => tokn_session_dsh::DshSessionSource::new(Some(self.root.clone())).load_session_records_path(
