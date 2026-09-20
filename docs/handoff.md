@@ -92,6 +92,18 @@ provider-normalization/feed component and never serves a web UI.
 
 ## Session snapshots
 
+The viewer now retains a three-user-turn initial history window in an
+eight-session LRU, with two lower-priority activity preloads scoped by each
+view's project/filter candidates. Explicit earlier loads and appended turns
+remain until session eviction. View leases protect selected sessions; a 64 MiB
+estimated byte target evicts unselected sessions. Older normalized records
+live in temporary disk journals with compact in-memory indexes, rather than
+full retained snapshots. Automatic and indexed Local share the window reader;
+Local starts no Relay child. External uses additive `follow_window` requests.
+Generation-scoped absolute keys keep prepends stable; legacy row APIs still
+load full history. See [session cache](viewer-session-cache.md) for policy,
+protocol details, and remaining transient-memory limits.
+
 Metadata catalogs are shared; event snapshots load on demand. Concurrent clients
 reuse one JSONL normalizer per session. Appends decode new complete lines;
 replacement/truncation starts an atomic generation. OpenCode/ZCode reconcile raw
@@ -146,7 +158,7 @@ explicit disabled choices to Local. Automatic uses provider-owned root
 resolution and environment overrides. Codex's explicitly resolved active/archive
 roots retain their home-owned title/preview metadata; unrelated explicit roots
 remain isolated from the active home's database and session-name index.
-Local clears Relay routing/snapshots and keeps the same durable indexer.
+Local uses embedded snapshots without the Relay feed and keeps the same durable indexer.
 Only External providers bypass the native index. Automatic timeline, trajectories,
 and Inspector share viewer-core snapshots; External uses received snapshots. Failures/child restarts retain last-good data; explicit
 mode/endpoint/native changes clear it. External services are never terminated.

@@ -78,6 +78,7 @@ impl ManagedChild {
         serde_json::from_slice(&self.line().await?).map_err(|e| format!("Invalid Relay record: {e}"))?;
       snapshots.invalidate().await;
       if let Some(provider) = super::viewer_provider(record.session.provider) {
+        manager.changed_session_source(provider, &record.path, Some(&record.session.session_id));
         let _ = manager.index_wakes.send((provider, record.path));
       }
     }
@@ -238,6 +239,7 @@ impl ViewerRelay {
       state.connection_cancel.cancel();
       state.active_endpoint = None;
       state.connection = None;
+      state.sessions.clear();
     }
     self.ready.notify_all();
     // The supervisor releases this only after closing stdin and reaping its child.

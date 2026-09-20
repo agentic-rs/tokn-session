@@ -60,15 +60,15 @@ impl CodexHistoryFixture {
     .unwrap()
   }
 
-  fn messages(reader: &SessionReader) -> Vec<&str> {
+  fn messages(reader: &SessionReader) -> Vec<String> {
     reader
       .snapshot
       .records
       .iter()
-      .flat_map(|record| &record.record.events)
+      .flat_map(|record| record.record.events)
       .filter_map(|event| {
         if let tokn_session_core::AgentEvent::Message(message) = event {
-          Some(message.text.as_str())
+          Some(message.text)
         } else {
           None
         }
@@ -109,13 +109,16 @@ fn linked_codex_history_survives_appends_and_buffers_partial_rows() {
     CodexHistoryFixture::messages(&reader),
     ["old hello", "new message", "next message"]
   );
-  assert!(Arc::ptr_eq(&initial.records[1], &reader.snapshot.records[1]));
+  assert!(initial.records.same_journal(&reader.snapshot.records));
   write!(file, "{}", CodexHistoryFixture::message(5, "partial message")).unwrap();
   assert!(!reader.poll().unwrap());
   writeln!(file).unwrap();
   assert!(reader.poll().unwrap());
   assert_eq!(reader.snapshot.generation, initial.generation);
-  assert_eq!(CodexHistoryFixture::messages(&reader).last(), Some(&"partial message"));
+  assert_eq!(
+    CodexHistoryFixture::messages(&reader).last(),
+    Some(&"partial message".to_owned())
+  );
 }
 
 #[test]
@@ -180,7 +183,7 @@ fn linked_codex_parent_growth_does_not_refresh_or_replace_the_child_snapshot() {
   assert!(!reader.poll().unwrap());
   assert_eq!(reader.snapshot.generation, initial.generation);
   assert_eq!(reader.snapshot.revision, initial.revision);
-  assert!(Arc::ptr_eq(&reader.snapshot.records[1], &initial.records[1]));
+  assert!(initial.records.same_journal(&reader.snapshot.records));
   assert_eq!(CodexHistoryFixture::messages(&reader), ["old hello", "new message"]);
 }
 
@@ -244,7 +247,9 @@ fn unrelated_writes_and_wal_checkpoint_do_not_publish_or_reset() {
   for native in [false, true] {
     let mut reader = fixture.reader(native);
     let initial = reader.snapshot.clone();
+    assert_eq!(reader.database_reads, 1);
     assert!(!reader.poll().unwrap());
+    assert_eq!(reader.database_reads, 1, "unchanged versions must not read SQLite rows");
     fixture
       .database
       .execute_batch("update session set time_updated = time_updated + 1 where id = 'other'")
@@ -257,7 +262,7 @@ fn unrelated_writes_and_wal_checkpoint_do_not_publish_or_reset() {
     assert!(!fixture.poll(&mut reader).unwrap());
     assert_eq!(reader.snapshot.generation, initial.generation);
     assert_eq!(reader.snapshot.revision, initial.revision);
-    assert!(Arc::ptr_eq(&initial.records[1], &reader.snapshot.records[1]));
+    assert!(initial.records.same_journal(&reader.snapshot.records));
   }
 }
 
@@ -279,7 +284,7 @@ fn append_keeps_generation_and_reuses_history_despite_session_timestamp_change()
   assert!(fixture.poll(&mut reader).unwrap());
   assert_eq!(reader.snapshot.generation, initial.generation);
   assert_eq!(reader.snapshot.records.len(), 3);
-  assert!(Arc::ptr_eq(&reader.snapshot.records[1], &initial.records[1]));
+  assert!(initial.records.same_journal(&reader.snapshot.records));
   assert_eq!(reader.snapshot.entry.header.timestamp.as_deref(), Some("1"));
   assert_eq!(reader.snapshot.entry.header.updated_at.as_deref(), Some("2"));
   assert!(!fixture.poll(&mut reader).unwrap());
@@ -326,8 +331,8 @@ fn edits_deletions_and_reordering_reset_even_without_timestamp_changes() {
     assert_ne!(reader.snapshot.generation, generation);
     let fresh = fixture.reader(false);
     assert_eq!(
-      serde_json::to_value(reader.snapshot.records.iter().map(|r| &r.record).collect::<Vec<_>>()).unwrap(),
-      serde_json::to_value(fresh.snapshot.records.iter().map(|r| &r.record).collect::<Vec<_>>()).unwrap()
+      serde_json::to_value(reader.snapshot.records.iter().map(|r| r.record).collect::<Vec<_>>()).unwrap(),
+      serde_json::to_value(fresh.snapshot.records.iter().map(|r| r.record).collect::<Vec<_>>()).unwrap()
     );
   }
 }
@@ -387,7 +392,7 @@ fn zcode_uses_its_identity_and_cached_sqlite_reconciliation() {
       .snapshot
       .records
       .iter()
-      .flat_map(|record| &record.record.events)
+      .flat_map(|record| record.record.events)
       .all(|event| serde_json::to_value(event).unwrap()["provider"] == "zcode")
   );
   let initial = reader.snapshot.generation.clone();
@@ -445,7 +450,7 @@ fn grouped_files_buffer_partial_rows_reset_edits_and_preserve_native() {
     assert!(reader.poll_grouped_file(versions(&path, false)).unwrap());
     assert_eq!(initial.generation, reader.snapshot.generation);
     assert_eq!(initial.records.len() + 1, reader.snapshot.records.len());
-    let ids: std::collections::HashSet<_> = reader.snapshot.records.iter().map(|r| &r.record.record_id).collect();
+    let ids: std::collections::HashSet<_> = reader.snapshot.records.iter().map(|r| r.record.record_id).collect();
     assert_eq!(
       ids.len(),
       reader.snapshot.records.len(),
@@ -487,7 +492,7 @@ fn assembled_dsh_output_resets_prior_stream_batches() {
     .snapshot
     .records
     .iter()
-    .flat_map(|record| &record.record.events)
+    .flat_map(|record| record.record.events)
     .collect();
   assert_eq!(
     serde_json::to_value(events).unwrap(),

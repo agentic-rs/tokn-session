@@ -130,6 +130,7 @@ Tauri adapter, normally `{"request":{...}}`. Commands without a request take
 - `list_sessions`, `list_session_children`
 - `load_event_page`, `load_trajectory_event_page`, `load_event_detail`
 - `acknowledge_session_attention`
+- `update_session_view`
 - `get_session_index_progress`, `retry_session_index`, `get_relay_status`
 - `get_session_input_status`, `submit_session_input`
 
@@ -138,6 +139,22 @@ history access. A syntactically valid key containing an arbitrary source path
 does not grant access. The API allows at most 16 concurrent command requests,
 32 SSE clients, and 1 MiB request bodies. Error responses contain `error`;
 invalid JSON/body-limit responses may be plain text.
+
+Modern viewers request `load_event_page` with `window_mode: "retained"` and
+`direction: "backward"` to receive the complete resident history window,
+initially three user turns. `window_mode: "earlier"` with its `previous_cursor`
+extends that window by three turns and returns the complete expanded window.
+`total_events` counts projected rows in this retained window; a non-null
+`previous_cursor` means older source history remains. Row pagination without
+`window_mode` preserves the full-history API. Window keys/cursors are opaque
+and generation-scoped; clients must not construct or modify them.
+
+`update_session_view` takes `view_id`, a monotonically increasing `revision`,
+an optional selected `session_key`, and up to 128 `candidate_session_keys` from
+the filtered sidebar. Renew every 30 seconds; send null selection and an empty
+candidate list to release. Leases expire after 90 seconds. This controls cache
+residency/preloading only and never marks messages read. See
+[session cache](viewer-session-cache.md) for the eviction and retention policy.
 
 `get_session_input_status` takes `{"request":{"session_key":"…"}}` and returns
 `available`, `message`, and `max_length`. `submit_session_input` additionally

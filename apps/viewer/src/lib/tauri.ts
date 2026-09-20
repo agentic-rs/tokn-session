@@ -1,4 +1,4 @@
-import { invoke, listen, type UnlistenFn } from "./transport";
+import { invoke, listen, type CommandInvoker, type UnlistenFn } from "./transport";
 import type {
   RelaySettings, RelayStatus, RelayChange,
   AcknowledgeSessionAttentionRequest,
@@ -12,6 +12,7 @@ import type {
   EventDetail,
   LoadEventPageRequest,
   LoadTrajectoryEventPageRequest,
+  SessionViewRequest,
   SessionIndexChangedEvent,
   SessionIndexProgress,
   SessionInputStatus,
@@ -65,6 +66,10 @@ export function listSessionChildren(
   request: ListSessionChildrenRequest,
 ): Promise<ListSessionChildrenResponse> {
   return invoke<ListSessionChildrenResponse>("list_session_children", { request });
+}
+
+export function updateSessionView(request: SessionViewRequest, send: CommandInvoker = invoke): Promise<void> {
+  return send<void>("update_session_view", { request });
 }
 
 export function loadEventPage(request: LoadEventPageRequest): Promise<EventPageResponse> {

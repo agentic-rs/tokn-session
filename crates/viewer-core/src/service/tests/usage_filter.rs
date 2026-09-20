@@ -184,6 +184,7 @@ fn usage_classification_spans_compaction_and_both_page_kinds() {
   let service = service_with_session(loaded_session(events));
   let page = service
     .load_event_page(EventPageRequest {
+      window_mode: None,
       session_key: session_key.clone(),
       cursor: None,
       offset: None,
@@ -209,6 +210,7 @@ fn usage_classification_spans_compaction_and_both_page_kinds() {
   assert_eq!(child_page.total_events, 2);
   let final_usage = service
     .load_event_page(EventPageRequest {
+      window_mode: None,
       session_key,
       cursor: None,
       offset: Some(4),

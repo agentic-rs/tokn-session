@@ -2,7 +2,7 @@ use tauri::State;
 
 use crate::model::{
   AcknowledgeSessionAttentionRequest, AcknowledgeSessionAttentionResponse, EventDetail, EventPage, EventPageRequest,
-  LoadEventDetailRequest, LoadTrajectoryEventPageRequest, TrajectoryEventPage,
+  LoadEventDetailRequest, LoadTrajectoryEventPageRequest, SessionViewRequest, TrajectoryEventPage,
 };
 use crate::service::ViewerService;
 
@@ -45,4 +45,12 @@ pub async fn acknowledge_session_attention(
   tauri::async_runtime::spawn_blocking(move || service.acknowledge_session_attention(request))
     .await
     .map_err(|error| format!("session attention acknowledgement task failed: {error}"))?
+}
+
+#[tauri::command]
+pub async fn update_session_view(state: State<'_, ViewerService>, request: SessionViewRequest) -> Result<(), String> {
+  let service = state.inner().clone();
+  tauri::async_runtime::spawn_blocking(move || service.update_session_view(request))
+    .await
+    .map_err(|error| format!("session view update task failed: {error}"))?
 }

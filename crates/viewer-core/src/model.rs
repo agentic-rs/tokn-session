@@ -323,11 +323,33 @@ pub enum PageDirection {
 #[derive(Clone, Debug, Deserialize)]
 pub struct EventPageRequest {
   pub session_key: String,
+  /// Retained windows are paged by user turns in the source cache. Omission
+  /// preserves the older row-based API for non-viewer consumers.
+  #[serde(default)]
+  pub window_mode: Option<HistoryWindowMode>,
   pub cursor: Option<String>,
   pub offset: Option<usize>,
   #[serde(default)]
   pub direction: PageDirection,
   pub limit: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryWindowMode {
+  Retained,
+  Earlier,
+}
+
+/// One desktop window/browser tab's short-lived cache lease. Candidates are
+/// already scoped by the sidebar's project and filters; they are not reads.
+#[derive(Clone, Debug, Deserialize)]
+pub struct SessionViewRequest {
+  pub view_id: String,
+  pub revision: u64,
+  pub session_key: Option<String>,
+  #[serde(default)]
+  pub candidate_session_keys: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -394,6 +416,10 @@ pub struct AcknowledgeSessionAttentionResponse {
 
 #[derive(Debug, Serialize)]
 pub struct EventSummary {
+  /// Positional presentation slot across generation replacement. Never use
+  /// this as a detail/cache identity; event_key owns that generation.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub slot_key: Option<String>,
   pub compaction: Option<CompactionCardSummary>,
   pub event_key: String,
   #[serde(rename = "type")]
@@ -728,7 +754,7 @@ fn decode_cursor(cursor: &str, prefix: &str) -> Result<usize, String> {
   usize::from_str_radix(encoded, 16).map_err(|_| "invalid pagination cursor".to_string())
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
   const HEX: &[u8; 16] = b"0123456789abcdef";
   let mut encoded = String::with_capacity(bytes.len() * 2);
   for byte in bytes {
@@ -738,7 +764,7 @@ fn hex_encode(bytes: &[u8]) -> String {
   encoded
 }
 
-fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
   if value.len() & 1 == 1 || value.len() / 2 > MAX_SESSION_KEY_BYTES {
     return Err("invalid session key encoding".to_string());
   }

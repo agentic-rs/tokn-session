@@ -1,3 +1,4 @@
+import { createUuid } from "./id";
 import { browserTranslationEngine } from "./browserTranslation";
 import { cancelTranslation, getTranslationStatus, translateText } from "./tauri";
 import { isDesktop } from "./transport";
@@ -32,7 +33,7 @@ const appleTranslationEngine: TranslationEngine = {
     return {
       async translate(texts) {
         if (disposed) throw new Error("Translation cancelled.");
-        const id = crypto.randomUUID();
+        const id = createUuid();
         request_id = id;
         try {
           const response = await translateText({ request_id: id, texts, target_language: "zh-Hans" });

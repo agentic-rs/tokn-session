@@ -7,10 +7,10 @@ use std::{
   time::SystemTime,
 };
 
-use tokn_session_core::{NormalizedRecord, Provider, SessionHeader, SessionRef};
-use tokn_session_opencode::{OpenCodeSessionCache, OpenCodeSessionSource};
+use tokn_session_core::{Provider, SessionHeader, SessionRef};
+use tokn_session_opencode::{CompactRecord, OpenCodeCompactCache, OpenCodeSessionSource};
 
-use crate::service_protocol::CatalogEntry;
+use crate::{service_history::History, service_protocol::CatalogEntry};
 use tokn_session_relay::{JsonlReader as FileState, RecordOperation, RelayRecord, SessionContext};
 
 #[cfg(test)]
@@ -20,7 +20,7 @@ mod tests;
 pub(crate) struct Snapshot {
   pub generation: String,
   pub revision: u64,
-  pub records: Vec<Arc<RelayRecord>>,
+  pub records: History,
   pub entry: CatalogEntry,
   pub error: Option<String>,
 }
@@ -41,8 +41,9 @@ fn generation() -> String {
 pub(crate) struct SessionReader {
   file: Option<FileState>,
   database: Option<OpenCodeSessionSource>,
-  database_cache: OpenCodeSessionCache,
-  source_records: Vec<Arc<NormalizedRecord>>,
+  database_cache: OpenCodeCompactCache,
+  #[cfg(test)]
+  database_reads: usize,
   native: bool,
   root: PathBuf,
   bytes: usize,
@@ -66,8 +67,9 @@ impl SessionReader {
       },
       database: matches!(entry.provider, Provider::OpenCode | Provider::ZCode)
         .then(|| tokn_session_relay::providers::database(entry.provider, Some(entry.header.path.clone()))),
-      database_cache: OpenCodeSessionCache::with_max_source_bytes(crate::service_protocol::MAX_SNAPSHOT_BYTES),
-      source_records: Vec::new(),
+      database_cache: OpenCodeCompactCache::with_max_source_bytes(crate::service_protocol::MAX_SNAPSHOT_BYTES),
+      #[cfg(test)]
+      database_reads: 0,
       native,
       root,
       bytes: 0,
@@ -76,7 +78,7 @@ impl SessionReader {
       snapshot: Snapshot {
         generation: generation(),
         revision: 0,
-        records: Vec::new(),
+        records: History::new()?,
         entry,
         error: None,
       },
@@ -158,32 +160,49 @@ impl SessionReader {
     for record in &records {
       bytes = bytes.saturating_add(serde_json::to_vec(record).map_err(|e| e.to_string())?.len());
       if bytes > crate::service_protocol::MAX_SNAPSHOT_BYTES {
-        return Err("Relay session exceeds the snapshot memory limit".into());
+        return Err("Relay session exceeds the history journal size limit".into());
       }
     }
     self.version = version;
     if records.is_empty() && !reset {
       return Ok(false);
     }
-    if reset {
-      self.snapshot.generation = generation();
-      self.snapshot.records.clear();
-    }
-    self.snapshot.records.extend(records.into_iter().map(Arc::new));
-    self.source_records.clear();
+    self.commit_records(&records, reset)?;
     self.bytes = bytes;
     self.snapshot.revision += 1;
     self.snapshot.error = None;
     Ok(true)
   }
 
+  fn commit_records(&mut self, records: &[RelayRecord], reset: bool) -> Result<(), String> {
+    let mut history = if reset {
+      History::new()?
+    } else {
+      self.snapshot.records.clone()
+    };
+    history.append(records)?;
+    self.snapshot.records = history;
+    if reset {
+      self.snapshot.generation = generation();
+    }
+    Ok(())
+  }
+
   fn poll_database(&mut self, version: Vec<Option<FileVersion>>) -> Result<bool, String> {
-    let loaded = self.database.as_ref().unwrap().load_session_records_cached_exact(
+    #[cfg(test)]
+    {
+      self.database_reads += 1;
+    }
+    let loaded = self.database.as_ref().unwrap().load_session_records_compact_exact(
       &self.snapshot.entry.header.id,
       self.native,
       &mut self.database_cache,
     )?;
-    self.reconcile(loaded.reference, loaded.header, loaded.records, version, false)
+    let result = self.reconcile(loaded.reference, loaded.header, loaded.records, version, false);
+    if result.is_err() {
+      self.database_cache.invalidate();
+    }
+    result
   }
 
   fn poll_codex_history(&mut self) -> Result<bool, String> {
@@ -217,15 +236,11 @@ impl SessionReader {
       };
       bytes = bytes.saturating_add(serde_json::to_vec(&record).map_err(|err| err.to_string())?.len());
       if bytes > crate::service_protocol::MAX_SNAPSHOT_BYTES {
-        return Err("Relay session exceeds the snapshot memory limit".into());
+        return Err("Relay session exceeds the history journal size limit".into());
       }
-      records.push(Arc::new(record));
+      records.push(record);
     }
-    if update.reset {
-      self.snapshot.generation = generation();
-      self.snapshot.records.clear();
-    }
-    self.snapshot.records.extend(records);
+    self.commit_records(&records, update.reset)?;
     self.snapshot.entry.header.title = update.reference.title;
     self.snapshot.entry.header.preview = update.reference.preview;
     self.snapshot.entry.header.cwd = update.reference.cwd;
@@ -234,7 +249,6 @@ impl SessionReader {
     self.snapshot.error = None;
     self.bytes = bytes;
     self.file = None;
-    self.source_records.clear();
     Ok(true)
   }
 
@@ -262,7 +276,11 @@ impl SessionReader {
     let changed = self.reconcile(
       loaded.reference,
       header,
-      loaded.records.into_iter().map(Arc::new).collect(),
+      loaded
+        .records
+        .into_iter()
+        .map(|record| CompactRecord::Changed(Arc::new(record)))
+        .collect(),
       version,
       self.file.is_some(),
     )?;
@@ -274,18 +292,17 @@ impl SessionReader {
     &mut self,
     reference: SessionRef,
     header: SessionHeader,
-    records: Vec<Arc<NormalizedRecord>>,
+    records: Vec<CompactRecord>,
     version: Vec<Option<FileVersion>>,
     force_reset: bool,
   ) -> Result<bool, String> {
     let mut prefix = 0;
-    for (old, new) in self.source_records.iter().zip(&records) {
-      // Unchanged rows retain their allocation. Changed raw JSON can still
-      // produce identical output (e.g. unknown fields with native disabled).
-      if !Arc::ptr_eq(old, new)
-        && serde_json::to_value(old.as_ref()).map_err(|e| e.to_string())?
-          != serde_json::to_value(new.as_ref()).map_err(|e| e.to_string())?
-      {
+    for (position, record) in records.iter().enumerate().take(self.snapshot.records.len()) {
+      let unchanged = match record {
+        CompactRecord::Reused(previous) => *previous == position,
+        CompactRecord::Changed(record) => self.snapshot.records.matches(position, record)?,
+      };
+      if !unchanged {
         break;
       }
       prefix += 1;
@@ -295,12 +312,11 @@ impl SessionReader {
       != version.first().and_then(Option::as_ref).map(|v| v.identity);
     #[cfg(not(unix))]
     let replaced = false;
-    let reset = force_reset || replaced || prefix < self.source_records.len();
+    let reset = force_reset || replaced || prefix < self.snapshot.records.len();
     let header_changed = header != self.snapshot.entry.header;
     let changed =
-      reset || records.len() != self.source_records.len() || header_changed || self.snapshot.error.is_some();
+      reset || records.len() != self.snapshot.records.len() || header_changed || self.snapshot.error.is_some();
     if !changed {
-      self.source_records = records;
       self.version = version;
       return Ok(false);
     }
@@ -308,6 +324,10 @@ impl SessionReader {
     let mut additions = Vec::new();
     let mut bytes = if reset { 0 } else { self.bytes };
     for record in records.iter().skip(if reset { 0 } else { prefix }) {
+      let normalized = match record {
+        CompactRecord::Reused(previous) => self.snapshot.records.read(*previous)?.0.record,
+        CompactRecord::Changed(record) => record.as_ref().clone(),
+      };
       let record = RelayRecord {
         path: reference.path.clone(),
         topic: format!(
@@ -317,23 +337,18 @@ impl SessionReader {
         ),
         session: context.clone(),
         operation: RecordOperation::Upsert,
-        record: record.as_ref().clone(),
+        record: normalized,
       };
       bytes = bytes.saturating_add(serde_json::to_vec(&record).map_err(|e| e.to_string())?.len());
       if bytes > crate::service_protocol::MAX_SNAPSHOT_BYTES {
-        return Err("Relay session exceeds the snapshot memory limit".into());
+        return Err("Relay session exceeds the history journal size limit".into());
       }
-      additions.push(Arc::new(record));
+      additions.push(record);
     }
-    if reset {
-      self.snapshot.generation = generation();
-      self.snapshot.records.clear();
-    }
-    self.snapshot.records.extend(additions);
+    self.commit_records(&additions, reset)?;
     self.snapshot.entry.header = header;
     self.snapshot.revision += 1;
     self.snapshot.error = None;
-    self.source_records = records;
     self.bytes = bytes;
     self.version = version;
     Ok(true)

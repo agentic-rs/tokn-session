@@ -7,6 +7,7 @@ edition.workspace = true
 serde.workspace = true
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde_json.workspace = true
+sha2 = "0.10"
 tokn-opencode-protocol.workspace = true
 tokn-session-core.workspace = true
 

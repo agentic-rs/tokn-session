@@ -102,7 +102,7 @@ describe("Conversation quick filter", () => {
     expect(view.on_follow_change).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Close event inspector" }));
     expect(view.on_inspector_toggle).toHaveBeenCalledOnce();
-    fireEvent.click(screen.getByRole("button", { name: "Load earlier events" }));
+    fireEvent.click(screen.getByRole("button", { name: "Load earlier turns" }));
     fireEvent.click(screen.getByRole("button", { name: "Load newer events" }));
     expect(view.on_load_older).toHaveBeenCalledOnce();
     expect(view.on_load_newer).toHaveBeenCalledOnce();

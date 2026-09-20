@@ -195,6 +195,7 @@ fn dispatch(service: &ViewerService, command: &str, payload: Value) -> Result<Va
     "list_sessions" => call!(list_sessions),
     "list_session_children" => call!(list_session_children),
     "load_event_page" => call!(load_event_page),
+    "update_session_view" => call!(update_session_view),
     "load_event_detail" => call!(load_event_detail),
     "load_trajectory_event_page" => call!(load_trajectory_event_page),
     "acknowledge_session_attention" => call!(acknowledge_session_attention),
@@ -343,6 +344,38 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn session_view_rejects_undiscovered_selected_and_candidate_keys() {
+    let root = tempfile::tempdir().unwrap();
+    let service = ViewerService::native(root.path().join("index.sqlite")).unwrap();
+    let (events, _) = broadcast::channel(16);
+    let app = router(service, events, None, vec![], CancellationToken::new());
+    for (selected, candidates) in [
+      (json!("../../private-file"), json!([])),
+      (Value::Null, json!(["../../private-file"])),
+    ] {
+      let response = app
+        .clone()
+        .oneshot(
+          Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/update_session_view")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+              json!({"request":{
+                "view_id":"test-view", "revision":1,
+                "session_key":selected, "candidate_session_keys":candidates
+              }})
+              .to_string(),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+      assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+  }
+
+  #[tokio::test]
   async fn http_matches_core_and_sse_reports_live_updates() {
     use http_body_util::BodyExt;
     use tokn_session_relay::{ProviderRoot, RelayConfig};
@@ -415,6 +448,24 @@ mod tests {
       direct
     );
     let key = direct["sessions"][0]["session_key"].as_str().unwrap();
+    for request in [
+      json!({"view_id":"remote-view", "revision":1, "session_key":key, "candidate_session_keys":[key]}),
+      json!({"view_id":"remote-view", "revision":2, "session_key":null, "candidate_session_keys":[]}),
+    ] {
+      let response = app
+        .clone()
+        .oneshot(
+          Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/update_session_view")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"request":request}).to_string()))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+      assert_eq!(response.status(), StatusCode::OK);
+    }
     let response = app
       .clone()
       .oneshot(

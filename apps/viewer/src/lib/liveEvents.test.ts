@@ -8,20 +8,12 @@ const page = (keys: string[], previous_cursor: string | null): EventPageResponse
 });
 
 describe("live event windows", () => {
-  it("refreshes earlier loaded rows as well as the latest page", async () => {
-    const load = vi.fn().mockResolvedValueOnce(page(["e", "f"], "older-4"))
-      .mockResolvedValueOnce(page(["c", "d"], "older-2"))
-      .mockResolvedValueOnce(page(["a", "b"], null));
-    const result = await refreshEventWindow("session", [event("b"), event("c"), event("d")], 2, load, () => true, false);
+  it("refreshes the complete retained window once, even with earlier history available", async () => {
+    const load = vi.fn().mockResolvedValue(page(["a", "b", "c", "d", "e", "f"], "earlier-turns"));
+    const result = await refreshEventWindow("session", load);
     expect(result.events.map((e) => e.summary)).toEqual(["a", "b", "c", "d", "e", "f"].map((key) => `updated ${key}`));
-    expect(result.previous_cursor).toBeNull();
-    expect(load).toHaveBeenNthCalledWith(2, { session_key: "session", cursor: "older-4", direction: "backward", limit: 2 });
-  });
-
-  it("stops paging an obsolete selection", async () => {
-    const load = vi.fn().mockResolvedValue(page(["e", "f"], "older"));
-    await refreshEventWindow("session", [event("a")], 2, load, () => false, false);
-    expect(load).toHaveBeenCalledOnce();
+    expect(result.previous_cursor).toBe("earlier-turns");
+    expect(load).toHaveBeenCalledExactlyOnceWith({ session_key: "session", window_mode: "retained" });
   });
 
   it("refreshes the loaded child window starting with the latest active work", async () => {

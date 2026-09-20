@@ -126,7 +126,7 @@ export function Conversation({
   const childDetail = session?.is_subagent ? subagentDetail(session) : null;
   const countLabel = total_events !== null || session?.event_count !== null
     ? knownCount !== null
-      ? `${knownCount} events`
+      ? `${knownCount} events${has_older ? " loaded" : ""}`
       : "Event count unavailable"
     : session?.message_count !== null
       ? `${knownCount} messages`
@@ -280,7 +280,7 @@ export function Conversation({
                 onClick={loadOlder}
                 type="button"
               >
-                {is_loading_older ? "Loading earlier events…" : "Load earlier events"}
+                {is_loading_older ? "Loading earlier turns…" : "Load earlier turns"}
               </button>
             ) : (
               <div className="timeline-boundary">

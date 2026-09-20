@@ -140,6 +140,7 @@ mod tests {
     let get = |events: Vec<AgentEvent>| {
       service_with_session(loaded_session(events))
         .load_event_page(EventPageRequest {
+          window_mode: None,
           session_key: key_for("fixture"),
           cursor: None,
           offset: None,
