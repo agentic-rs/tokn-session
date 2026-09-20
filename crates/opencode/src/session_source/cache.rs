@@ -5,6 +5,9 @@ use std::{collections::HashMap, sync::Arc};
 
 use super::*;
 
+mod compact;
+pub use compact::{CompactRecord, CompactSessionRecords, OpenCodeCompactCache};
+
 #[cfg(test)]
 mod tests;
 
@@ -45,57 +48,9 @@ impl OpenCodeSessionCache {
     session_id: &str,
     native: bool,
   ) -> Result<CachedSessionRecords, String> {
-    let mut database = connect_database(&path)?;
-    let transaction = database
-      .transaction()
-      .map_err(|e| format!("failed to start session snapshot: {e}"))?;
-    let capabilities = OpenCodeCapabilities::detect(&transaction)?;
-    let session = load_session_row(&transaction, capabilities, session_id, source.flavor.name())?
-      .ok_or_else(|| format!("no {} session found for `{session_id}`", source.flavor.name()))?;
+    let (session, raw) = read_snapshot_rows(source, &path, session_id, self.max_source_bytes)?;
     let identity = (path.clone(), source.flavor.provider(), session_id.to_owned(), native);
     let compatible = self.identity.as_ref() == Some(&identity);
-    let mut budget = SourceBudget {
-      bytes: 0,
-      limit: self.max_source_bytes,
-    };
-    let session_json = serde_json::to_string(&session).map_err(|e| e.to_string())?;
-    budget.add(session_json.len())?;
-    let mut raw = vec![RawRecord {
-      id: format!("session:{session_id}"),
-      time: session.time_created,
-      data: session_json,
-      kind: RawKind::Session,
-      parts: Vec::new(),
-    }];
-    let mut timeline = read_message_rows(&transaction, session_id, &mut budget)?;
-    if matches!(source.flavor, SessionDatabaseFlavor::ZCode) && capabilities.has_session_entry {
-      let mut statement = transaction
-        .prepare("select id, type, time_created, data from session_entry where session_id = ?1")
-        .map_err(|e| e.to_string())?;
-      let rows = statement
-        .query_map([session_id], |row| {
-          Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<i64>>(2)?,
-            row.get::<_, String>(3)?,
-          ))
-        })
-        .map_err(|e| e.to_string())?;
-      for row in rows {
-        let (id, kind, time, data) = row.map_err(|e| e.to_string())?;
-        budget.add(id.len().saturating_add(kind.len()).saturating_add(data.len()))?;
-        timeline.push(RawRecord {
-          id: format!("entry:{id}"),
-          kind: RawKind::Entry(kind),
-          time,
-          data,
-          parts: Vec::new(),
-        });
-      }
-    }
-    timeline.sort_by(|a, b| a.time.cmp(&b.time).then_with(|| a.source_id().cmp(b.source_id())));
-    raw.extend(timeline);
     let mut normalizer = OpenCodeNormalizer::with_provider(session_id.to_owned(), source.flavor.provider());
     let mut rows = HashMap::new();
     let mut records = Vec::with_capacity(raw.len());
@@ -161,9 +116,6 @@ impl OpenCodeSessionCache {
       records.push(cached.record.clone());
       rows.insert(cached.raw.id.clone(), cached);
     }
-    transaction
-      .commit()
-      .map_err(|e| format!("failed to finish session snapshot: {e}"))?;
     let created_at = timestamp(session.time_created);
     let updated_at_ms = session.time_updated.or(session.time_created);
     let title = native_title(session.title);
@@ -368,4 +320,65 @@ fn read_message_rows(
     }
   }
   Ok(messages)
+}
+
+fn read_snapshot_rows(
+  source: &OpenCodeSessionSource,
+  path: &Path,
+  session_id: &str,
+  max_source_bytes: Option<usize>,
+) -> Result<(OpenCodeSessionRow, Vec<RawRecord>), String> {
+  let mut database = connect_database(&path)?;
+  let transaction = database
+    .transaction()
+    .map_err(|e| format!("failed to start session snapshot: {e}"))?;
+  let capabilities = OpenCodeCapabilities::detect(&transaction)?;
+  let session = load_session_row(&transaction, capabilities, session_id, source.flavor.name())?
+    .ok_or_else(|| format!("no {} session found for `{session_id}`", source.flavor.name()))?;
+  let mut budget = SourceBudget {
+    bytes: 0,
+    limit: max_source_bytes,
+  };
+  let session_json = serde_json::to_string(&session).map_err(|e| e.to_string())?;
+  budget.add(session_json.len())?;
+  let mut raw = vec![RawRecord {
+    id: format!("session:{session_id}"),
+    time: session.time_created,
+    data: session_json,
+    kind: RawKind::Session,
+    parts: Vec::new(),
+  }];
+  let mut timeline = read_message_rows(&transaction, session_id, &mut budget)?;
+  if matches!(source.flavor, SessionDatabaseFlavor::ZCode) && capabilities.has_session_entry {
+    let mut statement = transaction
+      .prepare("select id, type, time_created, data from session_entry where session_id = ?1")
+      .map_err(|e| e.to_string())?;
+    let rows = statement
+      .query_map([session_id], |row| {
+        Ok((
+          row.get::<_, String>(0)?,
+          row.get::<_, String>(1)?,
+          row.get::<_, Option<i64>>(2)?,
+          row.get::<_, String>(3)?,
+        ))
+      })
+      .map_err(|e| e.to_string())?;
+    for row in rows {
+      let (id, kind, time, data) = row.map_err(|e| e.to_string())?;
+      budget.add(id.len().saturating_add(kind.len()).saturating_add(data.len()))?;
+      timeline.push(RawRecord {
+        id: format!("entry:{id}"),
+        kind: RawKind::Entry(kind),
+        time,
+        data,
+        parts: Vec::new(),
+      });
+    }
+  }
+  timeline.sort_by(|a, b| a.time.cmp(&b.time).then_with(|| a.source_id().cmp(b.source_id())));
+  raw.extend(timeline);
+  transaction
+    .commit()
+    .map_err(|e| format!("failed to finish session snapshot: {e}"))?;
+  Ok((session, raw))
 }

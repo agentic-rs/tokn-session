@@ -356,6 +356,8 @@ export interface TrajectoryCardSummary {
 
 export interface EventSummary {
   event_key: string;
+  /** Stable source slot, used only to restore disclosure after a generation reset. */
+  slot_key?: string | null;
   type: EventType | string;
   provider: ViewerProvider;
   timestamp: string | null;
@@ -399,6 +401,15 @@ export interface LoadEventPageRequest {
   offset?: number;
   direction?: EventPageDirection;
   limit?: number;
+  /** Retain complete user turns until this session is evicted. */
+  window_mode?: "retained" | "earlier";
+}
+
+export interface SessionViewRequest {
+  view_id: string;
+  session_key: string | null;
+  candidate_session_keys: string[];
+  revision: number;
 }
 
 export interface AcknowledgeSessionAttentionRequest {

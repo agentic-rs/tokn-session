@@ -1,12 +1,13 @@
 //! Viewer Relay adapter. Covered providers never fall back to local
 //! body reads while a Relay catalog is authoritative, including reconnects.
+mod cache;
 mod managed;
 mod settings;
 pub use settings::{RelayMode, RelaySettings};
 use std::{
   collections::HashMap,
   path::PathBuf,
-  sync::{Arc, Condvar, Mutex},
+  sync::{Arc, Condvar, Mutex, Weak},
   time::{Duration, Instant},
 };
 
@@ -14,8 +15,9 @@ use crate::{
   service_client::{Connection, RelaySubscription, load_catalog_from},
   service_protocol::CatalogEntry,
 };
+use cache::{CachePolicy, SessionPriority};
 use serde::Serialize;
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 use tokio_util::sync::CancellationToken;
 use tokn_session_core::{LoadedSession, Provider, SessionHeader};
 
@@ -36,6 +38,28 @@ pub struct RelayChange {
   pub reset: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WindowInfo {
+  pub event_offset: usize,
+  pub has_earlier: bool,
+  pub generation: String,
+}
+
+struct PreviousSubscription(Option<CancellationToken>);
+
+impl Drop for PreviousSubscription {
+  fn drop(&mut self) {
+    if let Some(cancel) = self.0.take() {
+      cancel.cancel();
+    }
+  }
+}
+
+struct SnapshotIdentity {
+  loaded: Weak<LoadedSession>,
+  window: WindowInfo,
+}
+
 struct CachedSession {
   loaded: Option<Arc<LoadedSession>>,
   native: Vec<Option<Arc<serde_json::Value>>>,
@@ -43,7 +67,12 @@ struct CachedSession {
   displayed_native: Vec<Option<Arc<serde_json::Value>>>,
   error: Option<String>,
   generation: String,
+  window: WindowInfo,
+  estimated_bytes: usize,
+  displayed_bytes: usize,
+  identities: Vec<SnapshotIdentity>,
   cancel: CancellationToken,
+  priority: SessionPriority,
   accessed: Instant,
 }
 
@@ -60,6 +89,7 @@ struct State {
   providers: Vec<ViewerProvider>,
   entries: Option<Vec<CatalogEntry>>,
   sessions: HashMap<SessionLocator, CachedSession>,
+  cache: CachePolicy,
 }
 
 pub struct ViewerRelay {
@@ -69,6 +99,7 @@ pub struct ViewerRelay {
   managed_lock: tokio::sync::Mutex<()>,
   state: Mutex<State>,
   ready: Condvar,
+  prefetch_wake: Notify,
   pub changes: broadcast::Sender<RelayChange>,
 }
 
@@ -96,8 +127,10 @@ impl ViewerRelay {
         providers: Vec::new(),
         entries: None,
         sessions: HashMap::new(),
+        cache: CachePolicy::default(),
       }),
       ready: Condvar::new(),
+      prefetch_wake: Notify::new(),
       changes: broadcast::channel(128).0,
     })
   }
@@ -125,7 +158,7 @@ impl ViewerRelay {
     settings.validate()?;
     // Prepare the core reader before publishing Automatic mode. No provider
     // history is read here, and feed startup must not gate snapshot requests.
-    let snapshots = if settings.mode == RelayMode::Automatic && self.index.is_some() {
+    let snapshots = if settings.mode != RelayMode::External && self.index.is_some() {
       Some(self.snapshot_service(settings.include_native)?)
     } else {
       None
@@ -144,13 +177,13 @@ impl ViewerRelay {
         state.providers.clear();
         state.sessions.clear();
       }
-      if settings.mode != RelayMode::Local && state.entries.is_none() {
+      if (settings.mode != RelayMode::Local || snapshots.is_some()) && state.entries.is_none() {
         state.providers = tokn_session_relay::PROVIDERS
           .into_iter()
           .filter_map(viewer_provider)
           .collect();
       }
-      if settings.mode == RelayMode::Local {
+      if settings.mode == RelayMode::Local && snapshots.is_none() {
         state.providers.clear();
       }
       state.epoch += 1;
@@ -171,6 +204,11 @@ impl ViewerRelay {
       (state.epoch, state.cancel.clone(), reset)
     };
     self.notify(None, reset);
+    let maintenance = self.clone();
+    let maintenance_cancel = cancel.clone();
+    tokio::spawn(async move {
+      maintenance.cache_loop(epoch, maintenance_cancel).await;
+    });
     match settings.mode {
       RelayMode::Automatic => {
         let manager = self.clone();
@@ -229,6 +267,7 @@ impl ViewerRelay {
         _ = cancel.cancelled() => return,
         result = load_catalog_from(&connection) => result,
       };
+      let mut changed_sources = Vec::new();
       let (changed, first_catalog, resume) = {
         let mut state = self.state.lock().unwrap();
         if state.epoch != epoch || cancel.is_cancelled() {
@@ -245,6 +284,25 @@ impl ViewerRelay {
             // Catalog failures keep the last complete catalog rather than
             // presenting partial discovery as authoritative deletion.
             if catalog.warnings.is_empty() || state.entries.is_none() {
+              if let Some(previous) = &state.entries {
+                let previous: HashMap<_, _> = previous.iter().map(|entry| (&entry.key, entry)).collect();
+                changed_sources.extend(
+                  catalog
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                      previous.get(&entry.key).is_none_or(|old| {
+                        old.header.updated_at != entry.header.updated_at
+                          || old.header.updated_at_ms != entry.header.updated_at_ms
+                          || old.header.path != entry.header.path
+                      })
+                    })
+                    .filter_map(|entry| {
+                      viewer_provider(entry.provider)
+                        .map(|provider| (provider, entry.header.path.clone(), entry.header.id.clone()))
+                    }),
+                );
+              }
               state.entries = Some(catalog.entries);
             }
             state.error = (!catalog.warnings.is_empty()).then(|| catalog.warnings.join("; "));
@@ -273,13 +331,19 @@ impl ViewerRelay {
         )
       };
       self.ready.notify_all();
+      for (provider, path, session_id) in changed_sources {
+        self.changed_session_source(provider, &path, Some(&session_id));
+      }
       if changed {
         self.notify(None, first_catalog);
       }
       for locator in resume {
         let manager = self.clone();
         tokio::task::spawn_blocking(move || {
-          let _ = manager.load(&locator);
+          let priority = manager.state.lock().unwrap().sessions.get(&locator).map(|s| s.priority);
+          if let Some(priority) = priority {
+            let _ = manager.ensure_session(&locator, priority, None);
+          }
         });
       }
       tokio::select! { _ = cancel.cancelled() => return, _ = tokio::time::sleep(Duration::from_secs(3)) => {} }
@@ -313,12 +377,30 @@ impl ViewerRelay {
       .collect()
   }
 
-  pub(crate) fn load(self: &Arc<Self>, locator: &SessionLocator) -> Result<Arc<LoadedSession>, String> {
+  fn ensure_session(
+    self: &Arc<Self>,
+    locator: &SessionLocator,
+    priority: SessionPriority,
+    before_event: Option<usize>,
+  ) -> Result<(), String> {
     let mut state = self.state.lock().unwrap();
-    let should_start =
-      state.active_endpoint.is_some() && state.sessions.get(locator).is_none_or(|s| s.cancel.is_cancelled());
-    if should_start {
-      let entry = if let (RelayMode::Automatic, Some(index)) = (state.settings.mode, self.index.as_ref()) {
+    state.expire_views(Instant::now());
+    if priority == SessionPriority::Explicit
+      && let Some(session) = state.sessions.get_mut(locator)
+    {
+      session.priority = priority;
+      session.accessed = Instant::now();
+    }
+    let should_start = state.connection.is_some()
+      && (before_event.is_some() || state.sessions.get(locator).is_none_or(|s| s.cancel.is_cancelled()));
+    if !should_start {
+      return Ok(());
+    }
+    if priority == SessionPriority::Background && !state.cache.eligible(locator) {
+      return Ok(());
+    }
+    let entry =
+      if let (RelayMode::Automatic | RelayMode::Local, Some(index)) = (state.settings.mode, self.index.as_ref()) {
         crate::index_queries::snapshot_entry(index, locator)?
       } else {
         state
@@ -330,46 +412,73 @@ impl ViewerRelay {
           .cloned()
       }
       .ok_or("Session is no longer in the index")?;
-      if !state.sessions.contains_key(locator)
-        && state.sessions.len() >= 8
-        && let Some(key) = state
-          .sessions
-          .iter()
-          .min_by_key(|(_, session)| session.accessed)
-          .map(|(key, _)| key.clone())
-      {
-        if let Some(old) = state.sessions.remove(&key) {
-          old.cancel.cancel();
-        }
-      }
-      let cancel = state.connection_cancel.child_token();
-      let mut old = state.sessions.remove(locator);
-      state.sessions.insert(
-        locator.clone(),
-        CachedSession {
-          loaded: old.as_ref().and_then(|s| s.loaded.clone()),
-          native: old.as_mut().map(|s| std::mem::take(&mut s.native)).unwrap_or_default(),
-          displayed: old.as_ref().and_then(|s| s.displayed.clone()),
-          displayed_native: old
-            .as_mut()
-            .map(|s| std::mem::take(&mut s.displayed_native))
-            .unwrap_or_default(),
-          error: None,
-          generation: old.map(|s| s.generation).unwrap_or_default(),
-          cancel: cancel.clone(),
-          accessed: Instant::now(),
-        },
-      );
-      let manager = self.clone();
-      let connection = state.connection.clone().expect("active connection checked above");
-      let epoch = state.epoch;
-      let locator = locator.clone();
-      tokio::task::spawn(async move {
-        manager
-          .session_loop(connection, entry.key, locator, epoch, cancel)
-          .await;
-      });
+    if !state.sessions.contains_key(locator) && !state.admit(locator, priority) {
+      return if priority == SessionPriority::Background {
+        Ok(())
+      } else {
+        Err("All cached sessions are currently open; close a viewer before opening another session".into())
+      };
     }
+    let cancel = state.connection_cancel.child_token();
+    let old = state.sessions.remove(locator);
+    let retain_from = old
+      .as_ref()
+      .and_then(|session| session.loaded.as_ref().map(|_| session.window.event_offset));
+    let previous_cancel = old.as_ref().map(|s| s.cancel.clone());
+    let mut session = old.unwrap_or_else(|| CachedSession {
+      loaded: None,
+      native: Vec::new(),
+      displayed: None,
+      displayed_native: Vec::new(),
+      error: None,
+      generation: String::new(),
+      window: WindowInfo::default(),
+      estimated_bytes: 0,
+      displayed_bytes: 0,
+      identities: Vec::new(),
+      cancel: cancel.clone(),
+      priority,
+      accessed: Instant::now(),
+    });
+    session.cancel = cancel.clone();
+    session.error = None;
+    if priority == SessionPriority::Explicit {
+      session.priority = priority;
+      session.accessed = Instant::now();
+    }
+    state.sessions.insert(locator.clone(), session);
+    let manager = self.clone();
+    let connection = state.connection.clone().expect("active connection checked above");
+    let epoch = state.epoch;
+    let locator = locator.clone();
+    tokio::task::spawn(async move {
+      manager
+        .session_loop(
+          connection,
+          entry.key,
+          locator,
+          epoch,
+          cancel,
+          retain_from,
+          before_event,
+          previous_cancel,
+        )
+        .await;
+    });
+    Ok(())
+  }
+
+  pub(crate) fn load(self: &Arc<Self>, locator: &SessionLocator) -> Result<Arc<LoadedSession>, String> {
+    self.ensure_session(locator, SessionPriority::Explicit, None)?;
+    self.wait_for_snapshot(locator, None)
+  }
+
+  fn wait_for_snapshot(
+    &self,
+    locator: &SessionLocator,
+    before_event: Option<usize>,
+  ) -> Result<Arc<LoadedSession>, String> {
+    let mut state = self.state.lock().unwrap();
     let deadline = Instant::now() + Duration::from_secs(12);
     let epoch = state.epoch;
     loop {
@@ -381,12 +490,17 @@ impl ViewerRelay {
         .clone()
         .unwrap_or_else(|| "Waiting for Relay; retry once it is live".into());
       let session = state.sessions.get_mut(locator).ok_or_else(|| unavailable.clone())?;
-      session.accessed = Instant::now();
-      if session.displayed.is_none() {
+      let expanded = before_event.is_some_and(|before| {
+        session.loaded.is_some() && (session.window.event_offset < before || !session.window.has_earlier)
+      });
+      if session.displayed.is_none() || expanded {
         session.displayed = session.loaded.clone();
         session.displayed_native = session.native.clone();
+        session.displayed_bytes = session.estimated_bytes;
       }
-      if let Some(loaded) = &session.displayed {
+      if (before_event.is_none() || expanded)
+        && let Some(loaded) = &session.displayed
+      {
         return Ok(loaded.clone());
       }
       if let Some(error) = &session.error {
@@ -403,6 +517,36 @@ impl ViewerRelay {
     }
   }
 
+  pub(crate) fn load_earlier(
+    self: &Arc<Self>,
+    locator: &SessionLocator,
+    before_event: usize,
+  ) -> Result<Arc<LoadedSession>, String> {
+    self.load(locator)?;
+    {
+      let state = self.state.lock().unwrap();
+      let session = state.sessions.get(locator).ok_or("Session unloaded; reopen it")?;
+      if !session.window.has_earlier || session.window.event_offset < before_event {
+        drop(state);
+        return self.advance(locator);
+      }
+    }
+    self.ensure_session(locator, SessionPriority::Explicit, Some(before_event))?;
+    self.wait_for_snapshot(locator, Some(before_event))
+  }
+
+  pub(crate) fn window_info(&self, locator: &SessionLocator, loaded: &Arc<LoadedSession>) -> Option<WindowInfo> {
+    let state = self.state.lock().ok()?;
+    let session = state.sessions.get(locator)?;
+    session.identities.iter().find_map(|identity| {
+      identity
+        .loaded
+        .upgrade()
+        .filter(|image| Arc::ptr_eq(image, loaded))
+        .map(|_| identity.window.clone())
+    })
+  }
+
   async fn session_loop(
     self: Arc<Self>,
     connection: Connection,
@@ -410,15 +554,31 @@ impl ViewerRelay {
     locator: SessionLocator,
     epoch: u64,
     cancel: CancellationToken,
+    retain_from: Option<usize>,
+    before_event: Option<usize>,
+    previous_cancel: Option<CancellationToken>,
   ) {
+    let mut previous_cancel = PreviousSubscription(previous_cancel);
     loop {
       let result = tokio::select! {
         _ = cancel.cancelled() => return,
-        result = self.consume_session(&connection, &key, &locator, epoch, &cancel) => result,
+        result = self.consume_session(&connection, &key, &locator, epoch, &cancel, retain_from, before_event, &mut previous_cancel.0) => result,
       };
       if let Err(error) = result {
         let mut state = self.state.lock().unwrap();
         if state.epoch != epoch || cancel.is_cancelled() {
+          return;
+        }
+        if state
+          .sessions
+          .get(&locator)
+          .is_some_and(|session| session.priority == SessionPriority::Background)
+        {
+          // Advisory preloads must not turn a corrupt background file into a
+          // retry loop or a global connection error. A changed source may retry.
+          state.sessions.remove(&locator);
+          cancel.cancel();
+          self.ready.notify_all();
           return;
         }
         if let Some(session) = state.sessions.get_mut(&locator) {
@@ -438,8 +598,19 @@ impl ViewerRelay {
     locator: &SessionLocator,
     epoch: u64,
     cancel: &CancellationToken,
+    retain_from: Option<usize>,
+    before_event: Option<usize>,
+    previous_cancel: &mut Option<CancellationToken>,
   ) -> Result<(), String> {
-    let mut subscription = RelaySubscription::connect_from(connection, key).await?;
+    let retain_from = self
+      .state
+      .lock()
+      .unwrap()
+      .sessions
+      .get(locator)
+      .and_then(|s| s.loaded.as_ref().map(|_| s.window.event_offset))
+      .or(retain_from);
+    let mut subscription = RelaySubscription::connect_window_from(connection, key, retain_from, before_event).await?;
     loop {
       let snapshot = subscription.next_snapshot().await?;
       let reset = {
@@ -451,10 +622,27 @@ impl ViewerRelay {
           return Ok(());
         };
         let reset = !session.generation.is_empty() && session.generation != snapshot.generation;
-        session.generation = snapshot.generation;
-        session.loaded = Some(Arc::new(snapshot.loaded));
+        let first_explicit = session.loaded.is_none() && session.priority == SessionPriority::Explicit;
+        session.generation = snapshot.generation.clone();
+        session.window = WindowInfo {
+          event_offset: snapshot.event_offset,
+          has_earlier: snapshot.has_earlier,
+          generation: snapshot.generation,
+        };
+        session.estimated_bytes = snapshot.estimated_bytes;
+        let loaded = Arc::new(snapshot.loaded);
+        session.identities.retain(|identity| identity.loaded.strong_count() > 0);
+        session.identities.push(SnapshotIdentity {
+          loaded: Arc::downgrade(&loaded),
+          window: session.window.clone(),
+        });
+        session.loaded = Some(loaded);
         session.native = snapshot.native;
         session.error = None;
+        if let Some(previous) = previous_cancel.take() {
+          previous.cancel();
+        }
+        state.enforce_budget(first_explicit.then_some(locator));
         reset
       };
       self.ready.notify_all();
@@ -491,6 +679,7 @@ impl ViewerRelay {
       .ok_or("Relay connection changed; reload the session")?;
     session.displayed = session.loaded.clone();
     session.displayed_native = session.native.clone();
+    session.displayed_bytes = session.estimated_bytes;
     session
       .displayed
       .clone()

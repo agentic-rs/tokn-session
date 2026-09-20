@@ -31,7 +31,14 @@ pub struct Request {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
   Catalog,
-  Follow { session_key: String },
+  Follow {
+    session_key: String,
+  },
+  FollowWindow {
+    session_key: String,
+    retain_from: Option<usize>,
+    before_event: Option<usize>,
+  },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -53,6 +60,10 @@ pub enum Frame {
     revision: String,
     reset: bool,
     header: SessionHeader,
+  },
+  Window {
+    event_offset: usize,
+    has_earlier: bool,
   },
   Record {
     record: Box<RelayRecord>,

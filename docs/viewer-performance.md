@@ -102,15 +102,20 @@ behavior; they do not impose machine-dependent timing thresholds.
 
 ## Remaining work
 
+- Session residency and turn windows now bound retained histories; see
+  [session cache](viewer-session-cache.md). Payloads outside the retained window
+  live in temporary disk journals. Initial/replacement parsing can still have
+  full-source transient allocations, and the selected-session memory target is
+  soft so explicitly loaded history does not disappear.
 - Automatic mode still frames its in-process snapshot transport as JSON and
-  materializes a complete `LoadedSession` after each append. Shared immutable
+  materializes the retained window as `LoadedSession` after each append. Shared immutable
   chunks and a direct subscription could remove that copying.
 - Timeline projection and usage classification repeat across page/detail
   requests. Cache by snapshot identity first; incremental projection needs
   explicit dependencies for cards that can change after an append.
-- Local mode still reloads a changed conversation, and ordinary historical
-  Codex/Pi loads perform separate metadata/count and normalization passes.
-  A shared provider reader could serve both Local and Automatic modes.
+- Indexed Local and Automatic now share the windowed provider reader. Ordinary
+  standalone historical Codex/Pi loads still perform separate metadata/count
+  and normalization passes.
 - Managed Relay normalizes full payloads that Automatic consumes as path hints.
   A compact invalidation feed would avoid that duplicate work.
 - Sidebar relation rebuilding and unwatched-provider recovery scans remain

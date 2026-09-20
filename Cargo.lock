@@ -4453,6 +4453,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokn-opencode-protocol",
  "tokn-session-core",

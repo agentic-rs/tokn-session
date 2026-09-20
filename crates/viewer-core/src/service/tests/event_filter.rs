@@ -373,6 +373,7 @@ fn synthetic_rows_stay_visible_and_projection_keeps_raw_page_boundaries() {
   ]));
   let page = service
     .load_event_page(EventPageRequest {
+      window_mode: None,
       session_key: key_for("fixture"),
       cursor: None,
       offset: None,

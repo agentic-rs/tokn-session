@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { refreshEventWindow, refreshTrajectoryWindow } from "./liveEvents";
+import { useSessionView } from "./useSessionView";
 import {
   acknowledgeSessionAttention,
   getSessionIndexProgress,
@@ -921,6 +922,7 @@ export function useViewerState() {
       ?? (selectedSessionMetadata?.session_key === selectedSessionKey ? selectedSessionMetadata : null),
     [selectedSessionKey, selectedSessionMetadata, sessionChildren, sessions],
   );
+  useSessionView(selectedSessionKey, selectedSession, sessions, sessionChildren);
 
   const openRelatedSession = useCallback((sourceSessionKey: string, target: SessionSummary) => {
     // The target came from an activity event in this exact source timeline.
@@ -1074,11 +1076,10 @@ export function useViewerState() {
     eventRefreshInFlight.current = true;
     const refreshExpansionRevision = expansionRevision.current;
     const page = isLiveRefresh
-      ? refreshEventWindow(selectedSessionKey, eventsRef.current, EVENT_PAGE_SIZE, loadEventPage, () => eventsRequest.current === requestId, reset)
+      ? refreshEventWindow(selectedSessionKey, loadEventPage)
       : loadEventPage({
       session_key: selectedSessionKey,
-      direction: "backward",
-      limit: EVENT_PAGE_SIZE,
+      window_mode: "retained",
     });
     void page
       .then(async (response) => {
@@ -1094,7 +1095,7 @@ export function useViewerState() {
           // Disclosure state can stay open for a surviving trajectory slot.
           // Its old child rows and detail ownership are never reused on reset.
           const retained = expanded?.type === "trajectory"
-            ? response.events.find((event) => event.event_key === expanded.event_key
+            ? response.events.find((event) => (event.slot_key ?? event.event_key) === (expanded.slot_key ?? expanded.event_key)
               && event.type === "trajectory" && event.provider === expanded.provider)
             : undefined;
           finishedExpandedTurn = followingLive.current && expanded?.event_key === workingTrajectory.current
@@ -1639,26 +1640,29 @@ export function useViewerState() {
       || eventsOwnerKeyRef.current !== selectedSessionKey
       || !olderCursor
       || olderLoading
+      || eventRefreshInFlight.current
     ) {
       return;
     }
     const requestGeneration = eventsRequest.current;
+    eventRefreshInFlight.current = true;
     setOlderLoading(true);
     setEventsError(null);
     void loadEventPage({
       session_key: selectedSessionKey,
       cursor: olderCursor,
-      direction: "backward",
-      limit: EVENT_PAGE_SIZE,
+      window_mode: "earlier",
     })
       .then((response) => {
         if (eventsRequest.current !== requestGeneration) {
           return;
         }
         invalidateEventDetails(true);
-        setEvents((current) => mergeEvents(current, response.events, "before"));
+        setEvents(response.events);
         setOlderCursor(response.previous_cursor);
+        setNewerCursor(response.next_cursor);
         setTotalEvents(response.total_events);
+        setHistoryStatus(response.history_status);
       })
       .catch((error: unknown) => {
         if (eventsRequest.current === requestGeneration) {
@@ -1667,7 +1671,13 @@ export function useViewerState() {
       })
       .finally(() => {
         if (eventsRequest.current === requestGeneration) {
+          eventRefreshInFlight.current = false;
           setOlderLoading(false);
+          if (liveUpdateQueued.current) {
+            liveUpdateQueued.current = false;
+            liveRefresh.current = true;
+            setEventsAttempt((attempt) => attempt + 1);
+          }
         }
       });
   }, [invalidateEventDetails, olderCursor, olderLoading, selectedSessionKey]);

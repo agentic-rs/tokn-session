@@ -37,6 +37,7 @@ mod event_filter;
 mod input;
 mod trajectory_state;
 mod usage_filter;
+mod windows;
 
 use agent_activity::{ActivityTargets, agent_activity_card_summary};
 
@@ -303,6 +304,7 @@ struct CachedSession {
   locator: SessionLocator,
   source_revision: SourceRevision,
   loaded: Arc<LoadedSession>,
+  retained_start: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1218,6 +1220,12 @@ impl ViewerService {
   /// keys contain source paths, so only the committed catalog grants access.
   pub fn validate_session_key(&self, key: &str) -> Result<(), String> {
     let locator = decode_session_key(key)?;
+    if !self.relay.external_catalog_covers(locator.provider) {
+      return crate::index_queries::snapshot_entry(&self.session_index, &locator)?
+        .filter(|entry| entry.header.path == locator.source_path && entry.header.id == locator.session_id)
+        .map(|_| ())
+        .ok_or_else(|| "Session is not in this machine's catalog".into());
+    }
     let inventory = self
       .indexed_session_inventory(locator.provider)?
       .ok_or("Session catalog is not ready")?;
@@ -1861,6 +1869,9 @@ impl ViewerService {
       let source_key = SourceKey::new(provider.as_str(), source_key_string);
       let source_headers = canonical_session_headers(source_headers);
       let source_changed = previous.and_then(|state| indexed_source_raw_cursor(&state.cursor)) != Some(cursor.as_str());
+      if provider_ready && previous.is_some() && source_changed {
+        self.relay.changed_source(provider, source_path);
+      }
       let source_has_pending_session = source_headers.iter().any(|header| {
         let key = IndexedSessionKey::new(
           source_key.provider.clone(),
@@ -2256,6 +2267,11 @@ impl ViewerService {
     &self,
     changed_paths: BTreeMap<ViewerProvider, BTreeSet<PathBuf>>,
   ) -> Result<IndexRefresh, String> {
+    for (provider, paths) in &changed_paths {
+      for path in paths {
+        self.relay.changed_source(*provider, path);
+      }
+    }
     let providers = ViewerProvider::ALL
       .into_iter()
       .filter(|provider| changed_paths.get(provider).is_some_and(|paths| !paths.is_empty()))
@@ -2598,6 +2614,9 @@ impl ViewerService {
   }
 
   pub fn load_event_page(&self, request: EventPageRequest) -> Result<EventPage, String> {
+    if request.window_mode.is_some() {
+      return self.load_retained_event_page(request);
+    }
     let limit = bounded_limit(request.limit)?;
     let locator = decode_session_key(&request.session_key)?;
     // Capture before parsing the provider source. A later index refresh can
@@ -2609,7 +2628,19 @@ impl ViewerService {
     } else {
       self.load_verified(&locator)?
     };
+    // Preserve the original full-history row API for older clients. Modern
+    // viewers explicitly request retained turn windows above.
+    let loaded = if self
+      .relay
+      .window_info(&locator, &loaded)
+      .is_some_and(|info| info.has_earlier)
+    {
+      self.relay.load_earlier(&locator, 0)?
+    } else {
+      loaded
+    };
     let timeline = timeline_entries(&loaded.events);
+    let identity = self.window_identity(&locator, &loaded, false)?;
     let total_events = timeline.len();
     let requested = requested_offset(request.cursor.as_deref(), request.offset, decode_event_cursor)?;
     let boundary = requested.unwrap_or(match request.direction {
@@ -2626,7 +2657,14 @@ impl ViewerService {
     let intermediate_usage = usage_filter::intermediate_usage(&loaded.events);
     let events = timeline[start..end]
       .iter()
-      .map(|entry| timeline_entry_event_summary(entry, &loaded.events, &delegation_targets, &intermediate_usage))
+      .map(|entry| {
+        identity.summary(timeline_entry_event_summary(
+          entry,
+          &loaded.events,
+          &delegation_targets,
+          &intermediate_usage,
+        ))
+      })
       .collect();
 
     Ok(EventPage {
@@ -2670,12 +2708,19 @@ impl ViewerService {
   ) -> Result<TrajectoryEventPage, String> {
     let limit = bounded_limit(request.limit)?;
     let locator = decode_session_key(&request.session_key)?;
-    let start_source_event_index = decode_trajectory_key(&request.trajectory_key)?;
     let loaded = self.load_verified(&locator)?;
+    let identity = self.window_identity(&locator, &loaded, request.trajectory_key.starts_with("window.v1."))?;
+    let local_key = identity.local_key(&request.trajectory_key)?;
+    let start_source_event_index = decode_trajectory_key(&local_key)?;
+    let cursor = request
+      .cursor
+      .as_deref()
+      .map(|value| identity.local_key(value))
+      .transpose()?;
     let trajectory = trajectory_for_start(&loaded.events, start_source_event_index)
       .ok_or_else(|| "trajectory key is outside the session".to_string())?;
     let total_events = trajectory.entries.len();
-    let requested = requested_trajectory_offset(request.cursor.as_deref(), request.offset, start_source_event_index)?;
+    let requested = requested_trajectory_offset(cursor.as_deref(), request.offset, start_source_event_index)?;
     let boundary = requested.unwrap_or(match request.direction {
       PageDirection::Forward => 0,
       PageDirection::Backward => total_events,
@@ -2690,13 +2735,22 @@ impl ViewerService {
     let intermediate_usage = usage_filter::intermediate_usage(&loaded.events);
     let events = trajectory.entries[start..end]
       .iter()
-      .map(|entry| timeline_entry_event_summary(entry, &loaded.events, &delegation_targets, &intermediate_usage))
+      .map(|entry| {
+        identity.summary(timeline_entry_event_summary(
+          entry,
+          &loaded.events,
+          &delegation_targets,
+          &intermediate_usage,
+        ))
+      })
       .collect();
 
     Ok(TrajectoryEventPage {
       events,
-      next_cursor: (end < total_events).then(|| encode_trajectory_event_cursor(start_source_event_index, end)),
-      previous_cursor: (start > 0).then(|| encode_trajectory_event_cursor(start_source_event_index, start)),
+      next_cursor: (end < total_events)
+        .then(|| identity.key(&encode_trajectory_event_cursor(start_source_event_index, end))),
+      previous_cursor: (start > 0)
+        .then(|| identity.key(&encode_trajectory_event_cursor(start_source_event_index, start))),
       total_events,
     })
   }
@@ -2704,20 +2758,30 @@ impl ViewerService {
   pub fn load_event_detail(&self, request: LoadEventDetailRequest) -> Result<EventDetail, String> {
     let locator = decode_session_key(&request.session_key)?;
     let loaded = self.load_verified(&locator)?;
-    if request.event_key.starts_with("trajectory.v1.") {
-      let start_source_event_index = decode_trajectory_key(&request.event_key)?;
+    let identity = self.window_identity(&locator, &loaded, request.event_key.starts_with("window.v1."))?;
+    let local_key = identity.local_key(&request.event_key)?;
+    let (detail, native_envelope) = self.load_event_detail_local(&locator, &loaded, local_key)?;
+    Ok(identity.detail(detail, native_envelope))
+  }
+
+  fn load_event_detail_local(
+    &self,
+    locator: &SessionLocator,
+    loaded: &Arc<LoadedSession>,
+    event_key: String,
+  ) -> Result<(EventDetail, bool), String> {
+    if event_key.starts_with("trajectory.v1.") {
+      let start_source_event_index = decode_trajectory_key(&event_key)?;
       let trajectory = trajectory_for_start(&loaded.events, start_source_event_index)
         .ok_or_else(|| "trajectory key is outside the session".to_string())?;
-      let mut detail = trajectory_detail(request.event_key, &trajectory, &loaded.events)?;
-      if let Some(native) =
-        self.relay_native_detail(&locator, &loaded, &trajectory_source_event_indices(&trajectory))?
-      {
+      let mut detail = trajectory_detail(event_key, &trajectory, &loaded.events)?;
+      if let Some(native) = self.relay_native_detail(locator, loaded, &trajectory_source_event_indices(&trajectory))? {
         detail.native = Some(native);
       }
-      return Ok(detail);
+      return Ok((detail, true));
     }
 
-    let source_event_index = decode_event_key(&request.event_key)?;
+    let source_event_index = decode_event_key(&event_key)?;
     if let Some(operation) = compaction::for_source(&loaded.events, source_event_index) {
       let mut detail = event_detail(
         encode_event_key(source_event_index),
@@ -2725,10 +2789,12 @@ impl ViewerService {
         &loaded.events,
         source_event_index,
       )?;
-      if let Some(native) = self.relay_native_detail(&locator, &loaded, &operation.source_event_indices)? {
+      let mut native_envelope = false;
+      if let Some(native) = self.relay_native_detail(locator, loaded, &operation.source_event_indices)? {
         detail.native = Some(native);
+        native_envelope = true;
       }
-      return Ok(detail);
+      return Ok((detail, native_envelope));
     }
     let entry = base_timeline_entry_for_source(&loaded.events, source_event_index)
       .ok_or_else(|| "event key is outside the session".to_string())?;
@@ -2745,21 +2811,21 @@ impl ViewerService {
         if self.relay.covers(locator.provider)
           && !matches!(event, AgentEvent::Reasoning(reasoning) if reasoning.redacted == Some(true))
         {
-          if let Some(native) = self.relay.native(&locator, source_event_index, &loaded) {
+          if let Some(native) = self.relay.native(locator, source_event_index, loaded) {
             detail.native = Some(bounded_detail_value(native, "native")?);
           }
         }
-        Ok(detail)
+        Ok((detail, false))
       }
       TimelineEntry::ToolOperation {
         source_event_index,
         operation,
       } => {
         let mut detail = tool_operation_detail(encode_event_key(source_event_index), &operation, &loaded.events)?;
-        if let Some(native) = self.relay_native_detail(&locator, &loaded, &operation.source_event_indices)? {
+        if let Some(native) = self.relay_native_detail(locator, loaded, &operation.source_event_indices)? {
           detail.native = Some(native);
         }
-        Ok(detail)
+        Ok((detail, true))
       }
       TimelineEntry::Trajectory { .. } => unreachable!("base timeline never contains trajectories"),
     }
@@ -2838,6 +2904,7 @@ impl ViewerService {
         locator: locator.clone(),
         source_revision: revision,
         loaded: Arc::clone(&loaded),
+        retained_start: None,
       }),
       _ => None,
     };
@@ -4189,6 +4256,7 @@ fn trajectory_event_summary(trajectory: &Trajectory, events: &[AgentEvent]) -> E
   let summary = trajectory_summary(&card);
 
   EventSummary {
+    slot_key: None,
     event_key: encode_trajectory_key(trajectory.start_source_event_index),
     event_type: "trajectory".to_string(),
     provider,
@@ -4448,6 +4516,7 @@ fn event_summary_with_delegation_targets(
     })
     .flatten();
   EventSummary {
+    slot_key: None,
     event_key: encode_event_key(index),
     event_type: normalized_event_type(event).to_string(),
     provider: provider_for_event(event),
@@ -4483,6 +4552,7 @@ fn tool_operation_event_summary(source_event_index: usize, operation: &ToolOpera
   let (summary, summary_truncated) =
     truncate_with_flag(tool_operation_summary(operation, &tool), MAX_TECHNICAL_SUMMARY_CHARS);
   EventSummary {
+    slot_key: None,
     event_key: encode_event_key(source_event_index),
     event_type: "tool_call".to_string(),
     provider: viewer_provider(operation.provider),
@@ -7144,6 +7214,7 @@ mod tests {
 
     let page = service
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: unread.sessions[0].session_key.clone(),
         cursor: None,
         offset: None,
@@ -8444,6 +8515,7 @@ mod tests {
 
     let page = service
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: parent_session_key,
         cursor: None,
         offset: None,
@@ -8563,6 +8635,7 @@ mod tests {
 
     let page = service
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key,
         cursor: None,
         offset: Some(1),
@@ -8640,6 +8713,7 @@ mod tests {
 
     let page = service_with_session(loaded_session(events))
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: key_for("fixture"),
         cursor: None,
         offset: None,
@@ -8707,6 +8781,7 @@ mod tests {
 
     let first = service
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: session_key.clone(),
         cursor: None,
         offset: None,
@@ -8770,6 +8845,7 @@ mod tests {
 
     let second = service
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key,
         cursor: first.next_cursor,
         offset: None,
@@ -8815,6 +8891,7 @@ mod tests {
     let service = service_with_session(loaded_session(events));
     let first = service
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: session_key.clone(),
         cursor: None,
         offset: None,
@@ -8838,6 +8915,7 @@ mod tests {
 
     let second = service
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key,
         cursor: first.next_cursor,
         offset: None,
@@ -8868,6 +8946,7 @@ mod tests {
     ];
     let page = service_with_session(loaded_session(events))
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: key_for("fixture"),
         cursor: None,
         offset: None,
@@ -8909,6 +8988,7 @@ mod tests {
     ];
     let page = service_with_session(loaded_session(events))
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: key_for("fixture"),
         cursor: None,
         offset: None,
@@ -8935,6 +9015,7 @@ mod tests {
       message_event("Answer"),
     ]))
     .load_event_page(EventPageRequest {
+      window_mode: None,
       session_key: key_for("fixture"),
       cursor: None,
       offset: None,
@@ -8957,6 +9038,7 @@ mod tests {
       usage_event(UsageKind::ModelCall, Provider::Codex),
     ]))
     .load_event_page(EventPageRequest {
+      window_mode: None,
       session_key: key_for("fixture"),
       cursor: None,
       offset: None,
@@ -8993,6 +9075,7 @@ mod tests {
     ];
     let page = service_with_session(loaded_session(events))
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: key_for("fixture"),
         cursor: None,
         offset: None,
@@ -9023,6 +9106,7 @@ mod tests {
     ];
     let page = service_with_session(loaded_session(events))
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: key_for("fixture"),
         cursor: None,
         offset: None,
@@ -9075,6 +9159,7 @@ mod tests {
 
     let first = service
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: session_key.clone(),
         cursor: None,
         offset: None,
@@ -9095,6 +9180,7 @@ mod tests {
 
     let second = service
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: session_key.clone(),
         cursor: first.next_cursor.clone(),
         offset: None,
@@ -9115,6 +9201,7 @@ mod tests {
 
     let third = service
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key,
         cursor: second.next_cursor.clone(),
         offset: None,
@@ -9179,6 +9266,7 @@ mod tests {
 
     let page = service_with_session(loaded_session(events))
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: key_for("fixture"),
         cursor: None,
         offset: None,
@@ -9221,6 +9309,7 @@ mod tests {
 
     let page = service_with_session(loaded_session(events))
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: key_for("fixture"),
         cursor: None,
         offset: None,
@@ -9274,6 +9363,7 @@ mod tests {
     let service = service_with_session(loaded_session(vec![invocation, result]));
     let page = service
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: session_key.clone(),
         cursor: None,
         offset: None,
@@ -9433,6 +9523,7 @@ mod tests {
 
     let outer = service
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: session_key.clone(),
         cursor: None,
         offset: None,
@@ -9665,6 +9756,7 @@ mod tests {
     let service = service_with_session(visible_session(5));
     let page = service
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: key_for("fixture"),
         cursor: None,
         offset: None,
@@ -9706,6 +9798,7 @@ mod tests {
     });
     let page = service_with_session(loaded_session(vec![tool]))
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: key_for("fixture"),
         cursor: None,
         offset: None,
@@ -9904,6 +9997,7 @@ mod tests {
 
     let page = service_with_session(loaded_session(events))
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: key_for("fixture"),
         cursor: None,
         offset: None,
@@ -10051,6 +10145,7 @@ mod tests {
     let service = service_with_session(loaded_session(vec![invocation, result]));
     let page = service
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: session_key.clone(),
         cursor: None,
         offset: None,
@@ -10270,6 +10365,7 @@ mod tests {
     let markdown = "# Result\n\n```rust\nfn main() {}\n```\n";
     let page = service_with_session(loaded_session(vec![message_event(markdown)]))
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: key_for("fixture"),
         cursor: None,
         offset: None,
@@ -10488,6 +10584,7 @@ mod tests {
     let full_text = "m".repeat(MAX_MESSAGE_SUMMARY_CHARS + 1);
     let page = service_with_session(loaded_session(vec![message_event(&full_text)]))
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: key_for("fixture"),
         cursor: None,
         offset: None,
@@ -10547,6 +10644,7 @@ mod tests {
 
     let page = service
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: session_key.clone(),
         cursor: None,
         offset: None,
@@ -10572,6 +10670,7 @@ mod tests {
     .unwrap();
     service
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key,
         cursor: None,
         offset: None,
@@ -10771,6 +10870,7 @@ mod tests {
     let session_key = key_for("fixture");
     let page = service
       .load_event_page(EventPageRequest {
+        window_mode: None,
         session_key: session_key.clone(),
         cursor: None,
         offset: None,

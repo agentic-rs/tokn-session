@@ -1,3 +1,4 @@
+import { createUuid } from "./id";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getSessionInputStatus, submitSessionInput } from "./tauri";
 import { errorMessage } from "./state";
@@ -82,7 +83,7 @@ export function useSessionInput(session_key: string | null, on_accepted?: (sessi
     update(key, (value) => ({ ...value, sending: true, notice: null }));
     let requestId: string;
     try {
-      requestId = newRequestId();
+      requestId = createUuid();
     } catch (error) {
       // Preparing an ID cannot deliver anything, so the draft remains editable.
       update(key, (value) => ({
@@ -151,14 +152,4 @@ export function useSessionInput(session_key: string | null, on_accepted?: (sessi
 function withDetail(message: string, detail: string): string {
   const reason = detail.trim();
   return reason && reason !== message ? `${message} Reason: ${reason}` : message;
-}
-
-function newRequestId(): string {
-  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
-  // getRandomValues also works on a private-network HTTP viewer connection.
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  bytes[6] = (bytes[6] & 0x0f) | 0x40;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }

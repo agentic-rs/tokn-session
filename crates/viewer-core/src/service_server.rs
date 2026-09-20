@@ -325,17 +325,44 @@ impl Service {
         }
         send(stream, Frame::CatalogEnd { warnings }).await
       }
-      Action::Follow { session_key } => {
+      action @ (Action::Follow { .. } | Action::FollowWindow { .. }) => {
+        let (session_key, window) = match action {
+          Action::Follow { session_key } => (session_key, None),
+          Action::FollowWindow {
+            session_key,
+            retain_from,
+            before_event,
+          } => (session_key, Some((retain_from, before_event))),
+          _ => unreachable!(),
+        };
         let session = self.follow(&session_key).await?;
         let mut changes = session.current.subscribe();
         let mut previous_generation = String::new();
         let mut previous_length = 0;
+        let mut event_offset = 0;
+        let mut retained_turns = 0;
+        let mut retained_events = 0;
         loop {
           let snapshot = changes.borrow_and_update().clone();
           if let Some(error) = &snapshot.error {
             return Err(error.clone());
           }
-          let reset = previous_generation != snapshot.generation;
+          let generation_changed = previous_generation != snapshot.generation;
+          let previous_offset = event_offset;
+          if let Some((retain_from, before_event)) = window {
+            event_offset = if previous_generation.is_empty() {
+              snapshot.records.window_start(retain_from, before_event)
+            } else if generation_changed {
+              if event_offset == 0 {
+                0
+              } else {
+                snapshot.records.replacement_start(retained_turns, retained_events)
+              }
+            } else {
+              snapshot.records.context_start(event_offset)
+            };
+          }
+          let reset = generation_changed || event_offset != previous_offset;
           send(
             stream,
             Frame::Begin {
@@ -346,14 +373,57 @@ impl Service {
             },
           )
           .await?;
-          for record in &snapshot.records[if reset { 0 } else { previous_length }..] {
+          if window.is_some() {
             send(
               stream,
-              Frame::Record {
-                record: Box::new(record.as_ref().clone()),
+              Frame::Window {
+                event_offset,
+                has_earlier: event_offset > 0,
               },
             )
             .await?;
+          }
+          let mut position = if reset {
+            if window.is_some() {
+              snapshot.records.record_at_event(event_offset)
+            } else {
+              0
+            }
+          } else {
+            previous_length
+          };
+          while position < snapshot.records.len() {
+            let history = snapshot.records.clone();
+            let end = (position + 32).min(history.len());
+            let records = tokio::task::spawn_blocking(move || {
+              (position..end)
+                .map(|index| history.read(index))
+                .collect::<Result<Vec<_>, String>>()
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            for (mut record, start) in records {
+              if start < event_offset {
+                // A redacted sibling may be trimmed out of this window, but
+                // its shared native payload must remain withheld.
+                if record.record.events.iter().any(|event| {
+                  matches!(event,
+                  tokn_session_core::AgentEvent::Reasoning(reasoning) if reasoning.redacted == Some(true))
+                }) {
+                  record.record.native = None;
+                }
+                let skip = (event_offset - start).min(record.record.events.len());
+                record.record.events.drain(..skip);
+              }
+              send(
+                stream,
+                Frame::Record {
+                  record: Box::new(record),
+                },
+              )
+              .await?;
+            }
+            position = end;
           }
           send(
             stream,
@@ -365,6 +435,8 @@ impl Service {
           .await?;
           previous_generation = snapshot.generation.clone();
           previous_length = snapshot.records.len();
+          retained_turns = snapshot.records.retained_turns(event_offset);
+          retained_events = snapshot.records.events.saturating_sub(event_offset);
           loop {
             tokio::select! {
               result = changes.changed() => { result.map_err(|_| "Relay session reader stopped")?; break; }

@@ -2,7 +2,9 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 mod cache;
-pub use cache::{CachedSessionRecords, OpenCodeSessionCache};
+pub use cache::{
+  CachedSessionRecords, CompactRecord, CompactSessionRecords, OpenCodeCompactCache, OpenCodeSessionCache,
+};
 
 use crate::normalize::OpenCodeNormalizer;
 use crate::row::{OpenCodeMessageRow, OpenCodePartRow, OpenCodeSessionEntryRow, OpenCodeSessionRow};
@@ -181,6 +183,17 @@ impl OpenCodeSessionSource {
     include_native: bool,
     cache: &mut OpenCodeSessionCache,
   ) -> Result<CachedSessionRecords, String> {
+    cache.load(self, self.database_path()?, session_id, include_native)
+  }
+
+  /// Compare raw row fingerprints and normalization checkpoints, returning
+  /// previous-image row positions instead of keeping historical bodies in RAM.
+  pub fn load_session_records_compact_exact(
+    &self,
+    session_id: &str,
+    include_native: bool,
+    cache: &mut OpenCodeCompactCache,
+  ) -> Result<CompactSessionRecords, String> {
     cache.load(self, self.database_path()?, session_id, include_native)
   }
 

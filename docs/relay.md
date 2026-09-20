@@ -116,7 +116,8 @@ overrides, shared with the viewer's automatic Relay:
 
 The snapshot polling interval is 500ms
 for active sessions; the shared metadata catalog is cached for two seconds.
-`snapshot` always supplies complete history; replay-window flags apply only to live feeds.
+Legacy `follow` supplies complete history; `follow_window` supplies a retained
+turn window. Replay-window CLI flags apply only to live feeds.
 It does not start a PUB socket: pets can continue using an independently
 configured `zeromq` process on port 5556, without changing their wire format.
 
@@ -128,6 +129,16 @@ The server answers `hello` with its version, providers and native capability.
 Catalog responses contain `header` frames followed by `catalog_end`, including
 discovery warnings. Follow requests accept only keys from the discovered
 catalog, never arbitrary paths.
+
+The additive `follow_window` action takes the same `session_key`, optional
+`retain_from` absolute normalized-event position, and optional `before_event`
+for loading three earlier user turns. With both absent it starts at the latest
+three user turns. Each transaction includes one `window` frame after `begin`,
+containing `event_offset` and `has_earlier`, before any records. Clients retain
+that start across appends. A late tool/compaction dependency can widen the
+window with an atomic reset within the same source generation. An older
+server that does not support this action fails explicitly; it does not silently
+fall back to loading full history. See [session cache](viewer-session-cache.md).
 
 Catalog discovery returns lightweight headers immediately. A shared background
 cache backfills Pi's latest `session_info` name and first user preview, plus
@@ -149,7 +160,7 @@ The first transaction has `reset: true`. Subsequent JSONL transactions append
 new records in the same generation. File replacement, truncation and detected
 same-length rewrites start a fresh generation and replace the entire snapshot.
 OpenCode/ZCode DB/WAL changes reconcile raw rows in one read transaction. Unchanged
-message records reuse decoded data and normalization checkpoints; changes to
+message records reuse disk-journal positions and compact normalization checkpoints; changes to
 model state recompute dependent records until the state converges. SQLite rows
 are still scanned because timestamps/counts cannot reliably identify edits.
 Unrelated writes and WAL checkpoints publish nothing when the session is
@@ -165,18 +176,20 @@ the generation; edited/deleted records reset it. Appending an assembled DSH
 message can suppress earlier stream/usage records, which requires a reset.
 DSH's 128 MiB limit applies to both the stored file and decoded source bytes.
 
-Full event snapshots are loaded on demand. Concurrent subscribers share one reader
-and normalizer per session; complete appended JSONL lines decode only once.
+Event histories are loaded on demand into temporary disk journals with compact
+in-memory indexes. Concurrent subscribers share one reader and normalizer per
+session; complete appended JSONL lines decode only once.
 An idle session is released after its last subscriber leaves. Source errors,
 invalid frames and interrupted transactions never commit partial data.
 Slow clients are disconnected and reconnect to a complete snapshot; there is
-no durable event journal or resume-after-restart cursor. Heartbeats are sent
+no durable event journal or resume-after-restart cursor. Disposable journal
+files close when the last reference to that history leaves. Heartbeats are sent
 every two seconds. Coalesced notifications include every intervening append.
 
 Limits: numeric loopback addresses only (no remote authentication), 64 client
 connections, 16 active sessions, 8 MiB per wire frame, 128 MiB serialized
-records per snapshot, 128 MiB per JSONL source and 128 MiB of raw OpenCode
-session-row payloads per cached reader. These are payload limits,
+records per history journal/window, 128 MiB per JSONL source and 128 MiB of raw
+OpenCode session-row payloads per scan. These are payload limits,
 not exact process-RAM caps; decoded objects and snapshots add overhead. Large
 sessions fail explicitly rather than silently returning partial history.
 Any local process can connect; `--native` may expose sensitive provider data.

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { parseEvent, RemoteClient, selectMachine, invoke } from "./transport";
+import { parseEvent, RemoteClient, selectMachine, invoke, captureTransport } from "./transport";
 
 const clients: RemoteClient[] = [];
 afterEach(() => { for (const client of clients) client.close(); clients.length = 0; selectMachine(); vi.unstubAllGlobals(); vi.useRealTimers(); });
@@ -33,6 +33,22 @@ describe("remote viewer transport", () => {
     await rejected;
     expect(signal?.aborted).toBe(true);
     expect(fetcher.mock.calls[0][1]).toMatchObject({ headers: { Authorization: "Bearer secret" }, credentials: "omit", redirect: "error" });
+  });
+  it("releases a captured view on its original machine before clearing its credentials", async () => {
+    const fetcher = vi.fn().mockImplementation(() => Promise.resolve(Response.json(null)));
+    vi.stubGlobal("fetch", fetcher);
+    const old = client();
+    selectMachine(old);
+    const captured = captureTransport();
+    captured.on_close(() => { void captured.release("update_session_view", { request: { view_id: "view", session_key: null } }); });
+    const next = new RemoteClient("http://next:5558", "next-secret");
+    clients.push(next);
+    selectMachine(next);
+    expect(fetcher).toHaveBeenCalledExactlyOnceWith("http://machine:5558/api/v1/update_session_view", expect.objectContaining({
+      headers: { Authorization: "Bearer secret", "Content-Type": "application/json" }, keepalive: true,
+    }));
+    await expect(captured.invoke("load_event_page", {})).rejects.toThrow("Machine disconnected");
+    expect(fetcher).toHaveBeenCalledOnce();
   });
   it("shares one stream, waits for readiness, and refreshes after reconnect", async () => {
     vi.useFakeTimers();

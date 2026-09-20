@@ -9,6 +9,7 @@ mod repository;
 pub mod runtime;
 pub mod service;
 pub mod service_client;
+mod service_history;
 mod service_metadata;
 pub mod service_protocol;
 pub mod service_server;

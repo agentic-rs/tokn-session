@@ -1,4 +1,5 @@
 export type UnlistenFn = () => void;
+export type CommandInvoker = <T>(command: string, payload?: Record<string, unknown>) => Promise<T>;
 type Handler = (event: { payload: unknown }) => void;
 export type ConnectionState = "connecting" | "connected" | "reconnecting";
 export const isDesktop = () => "__TAURI_INTERNALS__" in window;
@@ -11,6 +12,7 @@ export class RemoteClient {
   private requests = new Set<AbortController>();
   private started?: Promise<void>;
   private closed = false;
+  private closeHandlers = new Set<() => void>();
   private onState: (state: ConnectionState) => void = () => {};
 
   constructor(readonly endpoint: string, private token: string) {}
@@ -127,7 +129,28 @@ export class RemoteClient {
     }
     if (!connected) failed(new Error("Machine disconnected"));
   }
+  onClose(handler: () => void): UnlistenFn {
+    if (this.closed) return () => {};
+    this.closeHandlers.add(handler);
+    return () => { this.closeHandlers.delete(handler); };
+  }
+  // Release a view even as the selected machine aborts its ordinary requests.
+  // fetch captures the old endpoint and credentials before close clears them.
+  async release(command: string, payload?: Record<string, unknown>): Promise<void> {
+    if (this.closed) return;
+    await fetch(`${this.endpoint}/api/v1/${command}`, {
+      method: "POST",
+      headers: { ...this.headers(), "Content-Type": "application/json" },
+      body: JSON.stringify(payload ?? {}),
+      credentials: "omit",
+      redirect: "error",
+      keepalive: true,
+    });
+  }
   close() {
+    if (this.closed) return;
+    for (const handler of this.closeHandlers) handler();
+    this.closeHandlers.clear();
     this.closed = true;
     this.lifetime.abort();
     for (const request of this.requests) request.abort();
@@ -160,4 +183,25 @@ export async function listen<T>(event: string, handler: (event: { payload: T }) 
   if (isDesktop()) return (await import("@tauri-apps/api/event")).listen<T>(event, handler);
   if (!selected) throw new Error("Connect to a machine first");
   return selected.listen<T>(event, handler);
+}
+
+/** Capture one machine so deferred updates and cleanup cannot target its successor. */
+export function captureTransport(): {
+  invoke: CommandInvoker;
+  release: (command: string, payload?: Record<string, unknown>) => Promise<void>;
+  on_close: (handler: () => void) => UnlistenFn;
+} {
+  if (isDesktop()) {
+    const local: CommandInvoker = async <T>(command: string, payload?: Record<string, unknown>) =>
+      (await import("@tauri-apps/api/core")).invoke<T>(command, payload);
+    return { invoke: local, release: local, on_close: () => () => {} };
+  }
+  const client = selected;
+  const send: CommandInvoker = <T>(command: string, payload?: Record<string, unknown>) =>
+    client ? client.invoke<T>(command, payload) : Promise.reject(new Error("Connect to a machine first"));
+  return {
+    invoke: send,
+    release: (command, payload) => client?.release(command, payload) ?? Promise.resolve(),
+    on_close: (handler) => client?.onClose(handler) ?? (() => {}),
+  };
 }

@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { useLayoutEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { EVENT_PAGE_SIZE, eventButtonId } from "./state";
+import { eventButtonId } from "./state";
 import {
   acknowledgeSessionAttention,
   getSessionIndexProgress,
@@ -16,6 +16,7 @@ import {
   loadTrajectoryEventPage,
   retrySessionIndex,
   submitSessionInput,
+  updateSessionView,
 } from "./tauri";
 import type {
   EventDetail,
@@ -32,6 +33,7 @@ import { ViewerPage } from "../pages/ViewerPage";
 vi.mock("../components/RelayConnection", () => ({ RelayConnection: () => null }));
 
 vi.mock("./tauri", () => ({
+  updateSessionView: vi.fn(() => Promise.resolve()),
   listenForRelayChanges: vi.fn(() => Promise.resolve(vi.fn())),
   acknowledgeSessionAttention: vi.fn(() => Promise.resolve({ changed: false })),
   getSessionIndexProgress: vi.fn(() => new Promise(() => undefined)),
@@ -48,6 +50,7 @@ vi.mock("./tauri", () => ({
 }));
 
 beforeEach(() => {
+  vi.mocked(updateSessionView).mockReset().mockResolvedValue(undefined);
   vi.mocked(listenForRelayChanges).mockReset().mockResolvedValue(vi.fn());
   vi.mocked(acknowledgeSessionAttention).mockReset().mockResolvedValue({ changed: false });
   vi.mocked(getSessionIndexProgress).mockReset().mockImplementation(() => new Promise(() => undefined));
@@ -346,7 +349,94 @@ function ViewerPageCommitProbe() {
   );
 }
 
+describe("retained session turns", () => {
+  it("loads earlier turns as one retained window and restores them on returning to a cached session", async () => {
+    const sessions = [session("a"), session("b")];
+    vi.mocked(listSessions).mockResolvedValue({ sessions, next_cursor: null, source_errors: [], pending_providers: [] });
+    const row = toolEventPage().events[0];
+    const recent = { ...toolEventPage(), events: [{ ...row, event_key: "recent", summary: "old output" }], previous_cursor: "earlier" };
+    const expanded = { ...recent, events: [{ ...row, event_key: "older" }, { ...row, event_key: "recent", summary: "updated output" }], previous_cursor: null, total_events: 2 };
+    let retained: EventPageResponse = recent;
+    vi.mocked(loadEventPage).mockImplementation(async (request) => {
+      if (request.session_key === "b") return toolEventPage();
+      if (request.window_mode === "earlier") retained = expanded;
+      return retained;
+    });
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "a");
+    await waitFor(() => expect(result.current.events).toEqual(recent.events));
+    act(() => result.current.loadOlderEvents());
+    await waitFor(() => expect(result.current.events).toEqual(expanded.events));
+    expect(loadEventPage).toHaveBeenLastCalledWith({ session_key: "a", cursor: "earlier", window_mode: "earlier" });
+    await selectListedSession(result, "b");
+    await waitFor(() => expect(result.current.events).toEqual(toolEventPage().events));
+    await selectListedSession(result, "a");
+    await waitFor(() => expect(result.current.events).toEqual(expanded.events));
+    expect(loadEventPage).toHaveBeenLastCalledWith({ session_key: "a", window_mode: "retained" });
+    expect(result.current.olderCursor).toBeNull();
+  });
+
+  it("waits for an earlier-window load before refreshing new live activity", async () => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("a")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const initial = { ...toolEventPage(), previous_cursor: "earlier" };
+    const expanded = { ...initial, events: [{ ...initial.events[0], event_key: "older" }, ...initial.events], previous_cursor: null };
+    const refreshed = { ...expanded, events: [...expanded.events, { ...initial.events[0], event_key: "latest" }] };
+    const earlier = deferred<EventPageResponse>();
+    vi.mocked(loadEventPage).mockResolvedValueOnce(initial).mockReturnValueOnce(earlier.promise).mockResolvedValueOnce(refreshed);
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "a");
+    await waitFor(() => expect(result.current.olderCursor).toBe("earlier"));
+    act(() => result.current.loadOlderEvents());
+    act(() => emit?.({ session_key: "a", reset: false }));
+    expect(loadEventPage).toHaveBeenCalledTimes(2);
+    await act(async () => { earlier.resolve(expanded); });
+    await waitFor(() => expect(result.current.events).toEqual(refreshed.events));
+    expect(loadEventPage).toHaveBeenLastCalledWith({ session_key: "a", window_mode: "retained" });
+    expect(result.current.olderLoading).toBe(false);
+  });
+
+  it("ignores an earlier-window result after the selected session changes", async () => {
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("a"), session("b")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const initial = { ...toolEventPage(), previous_cursor: "earlier" };
+    const earlier = deferred<EventPageResponse>();
+    vi.mocked(loadEventPage).mockResolvedValueOnce(initial).mockReturnValueOnce(earlier.promise).mockResolvedValueOnce(reasoningEventPage());
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "a");
+    await waitFor(() => expect(result.current.olderCursor).toBe("earlier"));
+    act(() => result.current.loadOlderEvents());
+    await selectListedSession(result, "b");
+    await waitFor(() => expect(result.current.events).toEqual(reasoningEventPage().events));
+    await act(async () => { earlier.resolve(initial); });
+    expect(result.current.events).toEqual(reasoningEventPage().events);
+    expect(result.current.eventsOwnerKey).toBe("b");
+    expect(result.current.olderLoading).toBe(false);
+  });
+});
+
 describe("useViewerState Relay updates", () => {
+  it("restores disclosure by stable slot while fetching details with the new generation key", async () => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const original = trajectoryEventPage();
+    original.events[0] = { ...original.events[0], event_key: "window.v1.old.trajectory.v1.1", slot_key: "trajectory.v1.1" };
+    vi.mocked(loadEventPage).mockResolvedValueOnce(original);
+    vi.mocked(loadTrajectoryEventPage).mockResolvedValue(trajectoryChildPage());
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(result.current.events).toEqual(original.events));
+    act(() => result.current.toggleEventExpanded(original.events[0].event_key));
+    await waitFor(() => expect(result.current.trajectoryPages.get("live")?.get(original.events[0].event_key)?.has_loaded).toBe(true));
+    const replacement = { ...original, events: [{ ...original.events[0], event_key: "window.v1.new.trajectory.v1.1" }] };
+    vi.mocked(loadEventPage).mockResolvedValueOnce(replacement);
+    act(() => emit?.({ session_key: "live", reset: true }));
+    await waitFor(() => expect(result.current.expandedEventKey).toBe(replacement.events[0].event_key));
+    expect(loadTrajectoryEventPage).toHaveBeenLastCalledWith(expect.objectContaining({ trajectory_key: replacement.events[0].event_key }));
+    expect(result.current.trajectoryPages.get("live")?.has(original.events[0].event_key)).toBe(false);
+  });
+
   it("replaces a reset timeline and its loaded child window together without collapsing to the latest 40", async () => {
     let emit: ((change: RelayChange) => void) | undefined;
     vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
@@ -1111,16 +1201,14 @@ describe("useViewerState refresh after message input", () => {
     act(() => result.current.toggleEventExpanded(turn.event_key));
     await waitFor(() => expect(result.current.trajectoryPages.get("live")?.get(turn.event_key)?.has_loaded).toBe(true));
     const next = { ...reasoningEventPage().events[0], event_key: "new-event" };
-    vi.mocked(loadEventPage).mockImplementation(async (request) => request.cursor === "older"
-      ? { ...initial, events: [older], previous_cursor: null, next_cursor: "newer", total_events: 3 }
-      : { ...initial, events: [turn, next], previous_cursor: "older", total_events: 3 });
+    vi.mocked(loadEventPage).mockResolvedValue({ ...initial, events: [older, turn, next], total_events: 3 });
     act(() => { result.current.setFollowingLive(false); result.current.refreshSessionAfterInput("live"); });
     await waitFor(() => expect(result.current.events).toEqual([older, turn, next]));
     expect(result.current.expandedEventKey).toBe(turn.event_key);
     expect(result.current.pendingLiveActivity).toBe(true);
     expect(result.current.trajectoryPages.get("live")?.get(turn.event_key)?.events).toEqual(trajectoryChildPage().events);
-    expect(loadEventPage).toHaveBeenNthCalledWith(2, { session_key: "live", direction: "backward", limit: EVENT_PAGE_SIZE });
-    expect(loadEventPage).toHaveBeenNthCalledWith(3, { session_key: "live", cursor: "older", direction: "backward", limit: EVENT_PAGE_SIZE });
+    expect(loadEventPage).toHaveBeenNthCalledWith(2, { session_key: "live", window_mode: "retained" });
+    expect(loadEventPage).toHaveBeenCalledTimes(2);
   });
 
   it("coalesces scheduled reads during an in-flight refresh", async () => {
@@ -1194,8 +1282,7 @@ describe("useViewerState session-index signalling", () => {
     await waitFor(() => {
       expect(loadEventPage).toHaveBeenCalledWith({
         session_key: indexedSession.session_key,
-        direction: "backward",
-        limit: 80,
+        window_mode: "retained",
       });
     });
   });
