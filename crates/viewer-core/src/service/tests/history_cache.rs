@@ -1,0 +1,55 @@
+use super::*;
+
+#[test]
+fn local_codex_cache_tracks_inherited_history_and_rejects_missing_prefixes() {
+  let directory = tempfile::tempdir().unwrap();
+  let base_path = directory.path().join("rollout-base-linked.jsonl");
+  let head_path = directory.path().join("rollout-head-linked.jsonl");
+  let base = format!(
+    "{}\n{}\n",
+    json!({"ordinal": 0, "type": "session_meta", "payload": {
+      "id": "linked", "history_mode": "paginated"
+    }}),
+    json!({"ordinal": 1, "type": "event_msg", "payload": {
+      "type": "item_completed", "thread_id": "linked", "turn_id": "turn-1",
+      "item": {"type": "UserMessage", "id": "message-1", "content": [{"type": "text", "text": "old hello"}]}
+    }})
+  );
+  std::fs::write(&base_path, &base).unwrap();
+  std::fs::write(
+    &head_path,
+    format!(
+      "{}\n",
+      json!({"ordinal": 2, "type": "session_meta", "payload": {
+        "id": "linked", "history_mode": "paginated",
+        "history_base": {"thread_id": "linked", "end_ordinal_exclusive": 2, "end_byte_offset": base.len()}
+      }})
+    ),
+  )
+  .unwrap();
+  let service = ViewerService::new(Arc::new(NativeRepository));
+  let locator = SessionLocator {
+    version: 1,
+    provider: ViewerProvider::Codex,
+    source_path: head_path,
+    session_id: "linked".into(),
+  };
+  let initial = service.load_verified(&locator).unwrap();
+  assert!(Arc::ptr_eq(&initial, &service.load_verified(&locator).unwrap()));
+  assert!(initial.events.iter().any(|event| matches!(event,
+    AgentEvent::Message(message) if message.text == "old hello"
+  )));
+
+  std::fs::write(&base_path, base.replace("old hello", "new hello")).unwrap();
+  std::fs::File::open(&base_path)
+    .unwrap()
+    .set_modified(SystemTime::now() + std::time::Duration::from_secs(1))
+    .unwrap();
+  let updated = service.load_verified(&locator).unwrap();
+  assert!(!Arc::ptr_eq(&initial, &updated));
+  assert!(updated.events.iter().any(|event| matches!(event,
+    AgentEvent::Message(message) if message.text == "new hello"
+  )));
+  std::fs::remove_file(&base_path).unwrap();
+  assert!(service.load_verified(&locator).is_err());
+}

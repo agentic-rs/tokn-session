@@ -163,6 +163,29 @@ export interface SessionListQuery {
   search?: string;
 }
 
+export interface SessionInputStatusRequest {
+  session_key: string;
+}
+
+export interface SessionInputStatus {
+  available: boolean;
+  message: string;
+  /** Maximum number of Unicode code points in one message. */
+  max_length: number;
+}
+
+export interface SubmitSessionInputRequest {
+  session_key: string;
+  request_id: string;
+  text: string;
+}
+
+export interface SubmitSessionInputResponse {
+  request_id: string;
+  status: "accepted" | "not_sent" | "unknown" | "pending";
+  message: string;
+}
+
 export interface ListSessionsRequest {
   query: SessionListQuery;
   cursor?: string;

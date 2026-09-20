@@ -160,7 +160,7 @@ describe("Pi input bridge", () => {
         disposition: "started"
       });
       expect(harness.messages).toEqual([{
-        message: "Continue the task",
+        message: "  Continue the task  ",
         options: undefined
       }]);
       expect(harness.getIdle()).toBe(false);
@@ -265,6 +265,48 @@ describe("Pi input bridge", () => {
           instance_id: "old-instance"
         })
       ).resolves.toMatchObject({ type: "error", code: "instance_mismatch" });
+    } finally {
+      await harness.bridge.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves multiline messages and rejects other control characters", async () => {
+    const root = await mkdtemp(join(tmpdir(), "tokn-pi-input-test-"));
+    const harness = await makeHarness(root);
+    const submit = {
+      protocol: 1,
+      type: "submit",
+      request_id: "multiline",
+      token: "test-token",
+      session_id: "session-1",
+      session_file: harness.descriptor.session_file,
+      instance_id: "instance-1",
+      delivery: "auto",
+      content: [{ type: "text", text: "    Explain this:\n\tfirst line\r\n第二行\n" }]
+    };
+    try {
+      await expect(request(harness.descriptor.socket_path, submit)).resolves.toMatchObject({
+        type: "admitted",
+        disposition: "started"
+      });
+      expect(harness.messages).toEqual([{
+        message: submit.content[0]!.text,
+        options: undefined
+      }]);
+      for (const character of ["\u0000", "\u0008", "\u000b", "\u000c", "\u000e", "\u001b", "\u001f", "\u007f"]) {
+        await expect(request(harness.descriptor.socket_path, {
+          ...submit,
+          request_id: `invalid-${character.charCodeAt(0)}`,
+          content: [{ type: "text", text: `before${character}after` }]
+        })).resolves.toMatchObject({ type: "error", code: "message_invalid" });
+      }
+      await expect(request(harness.descriptor.socket_path, {
+        ...submit,
+        request_id: "whitespace-only",
+        content: [{ type: "text", text: " \t\r\n" }]
+      })).resolves.toMatchObject({ type: "error", code: "message_invalid" });
+      expect(harness.messages).toHaveLength(1);
     } finally {
       await harness.bridge.stop();
       await rm(root, { recursive: true, force: true });

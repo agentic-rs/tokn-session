@@ -11,7 +11,7 @@ Browser → viewer-api (UI + HTTP/SSE) ──────┘ ↖ Relay live feed
 ```
 
 `viewer-core` owns index queries, history, paging, trajectories, native Inspector
-detail, and the indexer. Automatic and Local list/search/tree requests read the
+detail, live message delivery, and the indexer. Automatic and Local list/search/tree requests read the
 durable SQLite index; conversations load on demand. One indexer holds the
 database lease, while other API/desktop processes read updates and can take over. Relay owns provider live-feed
 normalization and its stdout/ZeroMQ/managed-stdio transports. In automatic mode,
@@ -116,6 +116,10 @@ Choose **Change machine** to close requests/subscriptions and clear the viewer
 before connecting elsewhere. Only one machine is selected at a time. The
 browser does not change the server's Relay configuration.
 
+The message composer sends through the API host's Codex Desktop or Pi input
+bridge. The same API token authorizes both history access and message submission.
+See [message input behavior](../apps/viewer/README.md#sending-messages).
+
 ## API contract
 
 `GET /api/v1/health` returns `{"version":1}`.
@@ -127,12 +131,25 @@ Tauri adapter, normally `{"request":{...}}`. Commands without a request take
 - `load_event_page`, `load_trajectory_event_page`, `load_event_detail`
 - `acknowledge_session_attention`
 - `get_session_index_progress`, `retry_session_index`, `get_relay_status`
+- `get_session_input_status`, `submit_session_input`
 
 Session keys are admitted against the server's index before any
 history access. A syntactically valid key containing an arbitrary source path
-does not grant access. The API allows at most 16 concurrent blocking requests,
+does not grant access. The API allows at most 16 concurrent command requests,
 32 SSE clients, and 1 MiB request bodies. Error responses contain `error`;
 invalid JSON/body-limit responses may be plain text.
+
+`get_session_input_status` takes `{"request":{"session_key":"…"}}` and returns
+`available`, `message`, and `max_length`. `submit_session_input` additionally
+takes a UUID `request_id` and the exact `text`. Its receipt contains
+`request_id`, `status` (`accepted`, `not_sent`, `unknown`, or `pending`), and
+`message`. Acceptance means the owning app admitted the input; history/SSE
+remains authoritative for the resulting conversation. The backend resolves
+the catalog key and rechecks its source header before contacting the runtime.
+It caches up to 1,024 recent receipts in memory and rejects concurrent sends
+to the same owner. Repeating an identical request returns its cached receipt;
+changing its target or text is rejected. A disconnected caller does not cancel
+delivery already in progress. Never automatically retry an unknown outcome.
 
 `GET /api/v1/events` is SSE with a `ready` handshake and 15-second heartbeats.
 Named events match Tauri: `relay-changed`, `relay-status`,

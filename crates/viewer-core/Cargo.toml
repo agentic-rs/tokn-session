@@ -9,9 +9,12 @@ chrono.workspace = true
 dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
 tokio = { workspace = true, features = ["process"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tokn-session-relay.workspace = true
+tokn-session-codex.workspace = true
 tokn-session-opencode.workspace = true
 tokn-session-client.workspace = true
 tokn-session-core.workspace = true
@@ -25,6 +28,8 @@ tokn-session-workbuddy.workspace = true
 # one descriptor per historical rollout. Relay retains its Kqueue backend.
 [target.'cfg(target_os = "macos")'.dependencies]
 notify_fsevent = { package = "notify", version = "7.0.0" }
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 notify.workspace = true
 

@@ -1,6 +1,25 @@
 use serde_json::{Value, json};
 use tokn_codex_protocol::{ResponseItem, RolloutItem, RolloutLine};
 
+#[test]
+fn history_base_is_typed_and_preserves_extensions() {
+  let native = json!({"type":"session_meta","ordinal":42,"payload":{
+    "id":"thread","history_mode":"paginated","history_base":{
+      "thread_id":"thread","end_ordinal_exclusive":42,"end_byte_offset":1234,"future":true
+    }
+  }});
+  let line: RolloutLine = serde_json::from_value(native.clone()).unwrap();
+  let RolloutItem::SessionMeta(meta) = line.item() else {
+    panic!("expected session metadata")
+  };
+  let base = meta.history_base.as_ref().unwrap();
+  assert_eq!(base.thread_id, "thread");
+  assert_eq!(base.end_ordinal_exclusive, 42);
+  assert_eq!(base.end_byte_offset, 1234);
+  assert_eq!(base.extra["future"], true);
+  assert_eq!(serde_json::to_value(line).unwrap(), native);
+}
+
 fn usage_counters() -> Value {
   json!({
     "input_tokens": 30,

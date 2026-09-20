@@ -79,7 +79,7 @@ try {
 }
 
 function textFromRequest(request: CodexDesktopStartTurnRequest): string {
-  const item = request.params.turnStartParams.input.find((input) => input.type === "text");
+  const item = request.params.turnStart.request.input.find((input) => input.type === "text");
   if (!item?.text) {
     throw new Error("desktop start-turn request omitted text input");
   }

@@ -47,6 +47,7 @@ pub(crate) struct SessionReader {
   root: PathBuf,
   bytes: usize,
   version: Vec<Option<FileVersion>>,
+  codex_history_paths: Vec<PathBuf>,
   pub snapshot: Snapshot,
 }
 
@@ -71,6 +72,7 @@ impl SessionReader {
       root,
       bytes: 0,
       version: Vec::new(),
+      codex_history_paths: Vec::new(),
       snapshot: Snapshot {
         generation: generation(),
         revision: 0,
@@ -86,6 +88,9 @@ impl SessionReader {
   pub fn poll(&mut self) -> Result<bool, String> {
     let path = &self.snapshot.entry.header.path;
     let mut version = versions(path, self.database.is_some());
+    for history_path in &self.codex_history_paths {
+      version.extend(versions(history_path, false));
+    }
     if self.snapshot.entry.provider == Provider::WorkBuddy {
       let database = tokn_session_workbuddy::WorkBuddySessionSource::new(Some(self.root.clone())).database_path()?;
       version.extend(versions(&database, true));
@@ -103,8 +108,37 @@ impl SessionReader {
     if self.database.is_some() {
       return self.poll_database(version);
     }
+    if self.snapshot.entry.provider == Provider::Codex {
+      let source = tokn_session_codex::CodexSessionSource::new(Some(self.root.clone()));
+      let history_paths = source
+        .history_segments(path)?
+        .into_iter()
+        .filter_map(|segment| (segment.path != *path).then_some(segment.path))
+        .collect::<Vec<_>>();
+      // Keep the active file first: replacement checks belong to the source
+      // selected by the viewer, while inherited files also invalidate reads.
+      version = versions(path, false);
+      for history_path in &history_paths {
+        version.extend(versions(history_path, false));
+      }
+      if !history_paths.is_empty() {
+        let changed = self.poll_grouped_file(version)?;
+        self.codex_history_paths = history_paths;
+        return Ok(changed);
+      }
+      self.codex_history_paths.clear();
+    }
     if matches!(self.snapshot.entry.provider, Provider::WorkBuddy | Provider::Dsh) {
       return self.poll_grouped_file(version);
+    }
+    let was_grouped = self.file.is_none();
+    if was_grouped && self.snapshot.entry.provider == Provider::Codex {
+      self.file = Some(FileState::for_snapshot(
+        path.clone(),
+        Provider::Codex,
+        self.native,
+        &self.root,
+      )?);
     }
     let (records, reset) = if let Some(file) = &mut self.file {
       // Same-length rewrites need a fresh reader; truncation/replacement is
@@ -118,7 +152,7 @@ impl SessionReader {
       if !update.warnings.is_empty() {
         return Err(update.warnings.join("; "));
       }
-      (update.records, reset || same_length_edit)
+      (update.records, reset || same_length_edit || was_grouped)
     } else {
       return Err("Provider does not support snapshot/follow".into());
     };
@@ -145,6 +179,7 @@ impl SessionReader {
       self.snapshot.records.clear();
     }
     self.snapshot.records.extend(records.into_iter().map(Arc::new));
+    self.source_records.clear();
     self.bytes = bytes;
     self.snapshot.revision += 1;
     self.snapshot.error = None;
@@ -157,13 +192,15 @@ impl SessionReader {
       self.native,
       &mut self.database_cache,
     )?;
-    self.reconcile(loaded.reference, loaded.header, loaded.records, version)
+    self.reconcile(loaded.reference, loaded.header, loaded.records, version, false)
   }
 
   fn poll_grouped_file(&mut self, version: Vec<Option<FileVersion>>) -> Result<bool, String> {
     let entry = &self.snapshot.entry;
     let max_bytes = crate::service_protocol::MAX_SNAPSHOT_BYTES;
     let loaded = match entry.provider {
+      Provider::Codex => tokn_session_codex::CodexSessionSource::new(Some(self.root.clone()))
+        .load_session_records_path(&entry.header.path, self.native, max_bytes)?,
       Provider::WorkBuddy => tokn_session_workbuddy::WorkBuddySessionSource::new(Some(self.root.clone()))
         .load_session_records_path(&entry.header.path, self.native, max_bytes)?,
       Provider::Dsh => tokn_session_dsh::DshSessionSource::new(Some(self.root.clone())).load_session_records_path(
@@ -181,12 +218,15 @@ impl SessionReader {
     header.preview = loaded.reference.preview.clone();
     header.cwd = loaded.reference.cwd.clone();
     header.parent_session_id = loaded.reference.parent_session_id.clone();
-    self.reconcile(
+    let changed = self.reconcile(
       loaded.reference,
       header,
       loaded.records.into_iter().map(Arc::new).collect(),
       version,
-    )
+      self.file.is_some(),
+    )?;
+    self.file = None;
+    Ok(changed)
   }
 
   fn reconcile(
@@ -195,6 +235,7 @@ impl SessionReader {
     header: SessionHeader,
     records: Vec<Arc<NormalizedRecord>>,
     version: Vec<Option<FileVersion>>,
+    force_reset: bool,
   ) -> Result<bool, String> {
     let mut prefix = 0;
     for (old, new) in self.source_records.iter().zip(&records) {
@@ -213,7 +254,7 @@ impl SessionReader {
       != version.first().and_then(Option::as_ref).map(|v| v.identity);
     #[cfg(not(unix))]
     let replaced = false;
-    let reset = replaced || prefix < self.source_records.len();
+    let reset = force_reset || replaced || prefix < self.source_records.len();
     let header_changed = header != self.snapshot.entry.header;
     let changed =
       reset || records.len() != self.source_records.len() || header_changed || self.snapshot.error.is_some();

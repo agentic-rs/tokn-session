@@ -11,6 +11,8 @@ use serde::Deserialize;
 use tokn_codex_protocol::{ContentItem, ResponseItem, RolloutItem};
 use tokn_session_core::{LoadedSession, SessionHeader, SessionHistoryStatus, SessionRef};
 
+mod catalog;
+
 const STATE_DB_FILENAME: &str = "state_5.sqlite";
 const SESSION_INDEX_FILENAME: &str = "session_index.jsonl";
 const PREVIEW_SCAN_LIMIT: usize = 210;
@@ -47,16 +49,22 @@ impl CodexSessionSource {
     self.roots()
   }
 
-  /// Enumerates persisted rollout paths without opening their contents.
+  /// Enumerates current rollout paths without scanning their bodies.
   ///
   /// Durable indexes use this to reconcile filesystem membership cheaply and
-  /// only reopen headers whose file revision changed.
+  /// only reopen headers whose file revision changed. Duplicate native paths
+  /// are resolved against Desktop's catalog and the selected owning header.
   pub fn session_paths(&self) -> Result<Vec<PathBuf>, String> {
     let mut paths = Vec::new();
     for root in self.session_roots()? {
       collect_jsonl_files(&root, &mut paths)?;
     }
     paths.sort();
+    if let Ok(home) = default_codex_home()
+      && owns_metadata_root(self.session_dir.as_deref(), &home)
+    {
+      catalog::retain_current_rollouts(&home, &mut paths);
+    }
     Ok(paths)
   }
 
@@ -128,6 +136,7 @@ impl CodexSessionSource {
         refs.push(reference);
       }
     }
+    catalog::retain_lineage_heads(self, &mut refs);
     refs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| b.path.cmp(&a.path)));
     Ok(refs)
   }
@@ -138,6 +147,12 @@ impl CodexSessionSource {
   }
 
   pub fn load_session_path(&self, path: &Path) -> Result<LoadedSession, String> {
+    if matches!(crate::history::history_header(path)?.item(), RolloutItem::SessionMeta(meta) if meta.history_base.is_some())
+    {
+      return self
+        .load_session_records_path(path, false, 128 * 1024 * 1024)
+        .map(Into::into);
+    }
     let mut reference = inspect_session(path)?;
     self.apply_indexed_metadata(std::slice::from_mut(&mut reference));
     let file = File::open(&path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
@@ -190,7 +205,7 @@ impl CodexSessionSource {
     Ok(vec![codex_home.join("sessions"), codex_home.join("archived_sessions")])
   }
 
-  fn apply_indexed_metadata(&self, references: &mut [SessionRef]) {
+  pub(crate) fn apply_indexed_metadata(&self, references: &mut [SessionRef]) {
     if references.is_empty() {
       return;
     }
@@ -210,6 +225,25 @@ impl CodexSessionSource {
       };
       apply_indexed_metadata_to_reference(reference, native);
     }
+  }
+
+  pub(crate) fn history_roots(&self, path: &Path) -> Result<Vec<PathBuf>, String> {
+    if let Ok(home) = default_codex_home()
+      && owns_metadata_root(self.session_dir.as_deref(), &home)
+    {
+      let roots = vec![home.join("sessions"), home.join("archived_sessions")];
+      let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+      if roots
+        .iter()
+        .any(|root| root.canonicalize().is_ok_and(|root| canonical.starts_with(root)))
+      {
+        return Ok(roots);
+      }
+    }
+    if let Some(root) = &self.session_dir {
+      return Ok(vec![root.clone()]);
+    }
+    Ok(vec![path.parent().unwrap_or(Path::new(".")).to_path_buf()])
   }
 }
 
@@ -539,7 +573,7 @@ fn inspect_session(path: &Path) -> Result<SessionRef, String> {
   Ok(reference)
 }
 
-fn inspect_session_header(path: &Path) -> Result<SessionRef, String> {
+pub(crate) fn inspect_session_header(path: &Path) -> Result<SessionRef, String> {
   let file = File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
   let reader = BufReader::new(file);
   let mut reference = SessionRef {

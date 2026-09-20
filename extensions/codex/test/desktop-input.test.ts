@@ -11,6 +11,7 @@ import {
 } from "../lib/ipc-endpoint";
 import { encodeIpcFrame, IpcFrameDecoder } from "../lib/ipc-protocol";
 import { FakeCodexDesktopOwner, FakeCodexDesktopRouter } from "../lab/fake-desktop";
+import { renderDesktopPlainText } from "../lab/desktop-plain-text";
 
 describe("Codex desktop IPC framing", () => {
   test("decodes split and coalesced frames", () => {
@@ -23,6 +24,18 @@ describe("Codex desktop IPC framing", () => {
       { sequence: 1 },
       { sequence: 2 }
     ]);
+  });
+});
+
+describe("Codex Desktop plain-text rendering contract", () => {
+  test("rejects missing or malformed annotations instead of relying on app-server defaults", () => {
+    for (const part of [
+      { type: "text", text: "hello" },
+      { type: "text", text: "hello", text_elements: null },
+      { type: "text", text: "hello", text_elements: "" }
+    ]) {
+      expect(() => renderDesktopPlainText([part])).toThrow("requires a text_elements array");
+    }
   });
 });
 
@@ -77,10 +90,26 @@ describe("Codex desktop input experiment", () => {
     });
     expect(owner.last_start_turn?.params).toMatchObject({
       conversationId: "thread-lab-1",
-      turnStartParams: {
-        input: [{ type: "text", text: "hello from Terminal Pet" }]
+      turnStart: {
+        request: {
+          threadId: "thread-lab-1",
+          input: [{ type: "text", text: "hello from Terminal Pet", text_elements: [] }]
+        },
+        context: { inheritThreadSettings: true }
       }
     });
+    expect(owner.last_start_turn?.version).toBe(2);
+    expect(owner.last_rendered_input).toBe("hello from Terminal Pet");
+  });
+
+  test("the owning window can project multiline Markdown and Unicode before app-server normalization", async () => {
+    const prompt = "**Hello**\n\n```ts\nconst text = '你好 👋';\n```";
+    owner = await FakeCodexDesktopOwner.connect({ endpoint, conversation_id: "thread-render" });
+    client = await CodexDesktopInputClient.connect({ endpoint, timeout_ms: 5_000 });
+
+    await client.startTurn("thread-render", prompt);
+
+    expect(owner.last_rendered_input).toBe(prompt);
   });
 
   test("forwards model and reasoning effort overrides", async () => {
@@ -106,10 +135,14 @@ describe("Codex desktop input experiment", () => {
         effort: "low"
       }
     });
-    expect(owner.last_start_turn?.params.turnStartParams).toEqual({
-      input: [{ type: "text", text: "use luna" }],
-      clientUserMessageId: expect.any(String),
-      additionalContext: null
+    expect(owner.last_start_turn?.params.turnStart).toEqual({
+      request: {
+        threadId: "thread-lab-settings",
+        input: [{ type: "text", text: "use luna", text_elements: [] }],
+        clientUserMessageId: expect.any(String),
+        additionalContext: null
+      },
+      context: { inheritThreadSettings: true }
     });
   });
 

@@ -61,6 +61,10 @@ turn immediately. While Pi is busy, `auto` and `follow_up` wait until the agent
 finishes its current work; `steer` is delivered at Pi's next safe steering
 boundary.
 
+Text may contain newlines, tabs, and carriage returns. Whitespace is preserved
+so multiline Markdown and indented code reach Pi unchanged; whitespace-only
+messages and other control characters are rejected.
+
 The bridge returns `ready`, `admitted`, or `error`. An `admitted` response has a
 `started`, `queued_follow_up`, or `queued_steer` disposition. It means the live
 Pi runtime accepted responsibility for the input, not that the user message is

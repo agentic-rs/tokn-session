@@ -116,11 +116,23 @@ pub struct SessionMetaItem {
   #[serde(default)]
   pub history_mode: Option<String>,
   #[serde(default)]
+  pub history_base: Option<HistoryPosition>,
+  #[serde(default)]
   pub parent_thread_id: Option<String>,
   #[serde(default)]
   pub source: Option<Value>,
   #[serde(default)]
   pub git: Option<SessionGitInfo>,
+  #[serde(flatten)]
+  pub extra: ExtraFields,
+}
+
+/// Exclusive physical prefix inherited from another rollout segment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoryPosition {
+  pub thread_id: String,
+  pub end_ordinal_exclusive: u64,
+  pub end_byte_offset: u64,
   #[serde(flatten)]
   pub extra: ExtraFields,
 }

@@ -1,14 +1,17 @@
-/** Private Codex App IPC contract observed in desktop build 26.727.51351. */
-export const CODEX_DESKTOP_START_TURN_VERSION = 1;
+/** Private Codex App IPC contract observed in desktop build 26.901.41123. */
+export const CODEX_DESKTOP_START_TURN_VERSION = 2;
 export const CODEX_DESKTOP_INITIALIZE_VERSION = 0;
 export const CODEX_DESKTOP_MAX_FRAME_BYTES = 1024 * 1024;
 
 export interface CodexDesktopTextInput {
   type: "text";
   text: string;
+  // Required by Desktop's optimistic turn renderer, even for plain text.
+  text_elements: [];
 }
 
 export interface CodexDesktopTurnStartParams {
+  threadId: string;
   input: CodexDesktopTextInput[];
   clientUserMessageId: string;
   additionalContext: null;
@@ -38,7 +41,10 @@ export interface CodexDesktopStartTurnRequest {
   method: "thread-follower-start-turn";
   params: {
     conversationId: string;
-    turnStartParams: CodexDesktopTurnStartParams;
+    turnStart: {
+      request: CodexDesktopTurnStartParams;
+      context: { inheritThreadSettings: true };
+    };
   };
   timeoutMs: number;
 }

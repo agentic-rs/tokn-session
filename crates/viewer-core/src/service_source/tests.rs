@@ -1,6 +1,145 @@
 use super::*;
 use tempfile::TempDir;
 
+struct CodexHistoryFixture {
+  directory: TempDir,
+  base_path: PathBuf,
+  head_path: PathBuf,
+  base: String,
+}
+
+impl CodexHistoryFixture {
+  fn new() -> Self {
+    let directory = TempDir::new().unwrap();
+    let base_path = directory.path().join("rollout-base-linked.jsonl");
+    let head_path = directory.path().join("rollout-head-linked.jsonl");
+    let base = format!(
+      "{}\n{}\n",
+      serde_json::json!({"ordinal": 0, "type": "session_meta", "payload": {
+        "id": "linked", "history_mode": "paginated", "cwd": "/tmp"
+      }}),
+      Self::message(1, "old hello")
+    );
+    std::fs::write(&base_path, &base).unwrap();
+    let head = format!(
+      "{}\n{}\n",
+      serde_json::json!({"ordinal": 2, "type": "session_meta", "payload": {
+        "id": "linked", "history_mode": "paginated", "cwd": "/tmp",
+        "history_base": {"thread_id": "linked", "end_ordinal_exclusive": 2, "end_byte_offset": base.len()}
+      }}),
+      Self::message(3, "new message")
+    );
+    std::fs::write(&head_path, head).unwrap();
+    Self {
+      directory,
+      base_path,
+      head_path,
+      base,
+    }
+  }
+
+  fn message(ordinal: u64, text: &str) -> String {
+    serde_json::json!({"ordinal": ordinal, "type": "event_msg", "payload": {
+      "type": "item_completed", "thread_id": "linked", "turn_id": format!("turn-{ordinal}"),
+      "item": {"type": "UserMessage", "id": format!("message-{ordinal}"),
+        "content": [{"type": "text", "text": text}]}
+    }})
+    .to_string()
+  }
+
+  fn reader(&self, native: bool) -> SessionReader {
+    SessionReader::new(
+      CatalogEntry {
+        key: "linked".into(),
+        provider: Provider::Codex,
+        header: serde_json::from_value(serde_json::json!({"id": "linked", "path": self.head_path})).unwrap(),
+      },
+      native,
+      self.directory.path().into(),
+    )
+    .unwrap()
+  }
+
+  fn messages(reader: &SessionReader) -> Vec<&str> {
+    reader
+      .snapshot
+      .records
+      .iter()
+      .flat_map(|record| &record.record.events)
+      .filter_map(|event| {
+        if let tokn_session_core::AgentEvent::Message(message) = event {
+          Some(message.text.as_str())
+        } else {
+          None
+        }
+      })
+      .collect()
+  }
+}
+
+#[test]
+fn linked_codex_history_survives_appends_and_buffers_partial_rows() {
+  use std::io::Write;
+  let fixture = CodexHistoryFixture::new();
+  let mut reader = fixture.reader(true);
+  assert_eq!(CodexHistoryFixture::messages(&reader), ["old hello", "new message"]);
+  assert!(
+    reader
+      .snapshot
+      .records
+      .iter()
+      .all(|record| record.path == fixture.head_path)
+  );
+  assert!(
+    reader
+      .snapshot
+      .records
+      .iter()
+      .all(|record| record.record.native.is_some())
+  );
+  let initial = reader.snapshot.clone();
+  let mut file = std::fs::OpenOptions::new()
+    .append(true)
+    .open(&fixture.head_path)
+    .unwrap();
+  writeln!(file, "{}", CodexHistoryFixture::message(4, "next message")).unwrap();
+  assert!(reader.poll().unwrap());
+  assert_eq!(reader.snapshot.generation, initial.generation);
+  assert_eq!(
+    CodexHistoryFixture::messages(&reader),
+    ["old hello", "new message", "next message"]
+  );
+  assert!(Arc::ptr_eq(&initial.records[1], &reader.snapshot.records[1]));
+  write!(file, "{}", CodexHistoryFixture::message(5, "partial message")).unwrap();
+  assert!(!reader.poll().unwrap());
+  writeln!(file).unwrap();
+  assert!(reader.poll().unwrap());
+  assert_eq!(reader.snapshot.generation, initial.generation);
+  assert_eq!(CodexHistoryFixture::messages(&reader).last(), Some(&"partial message"));
+}
+
+#[test]
+fn linked_codex_prefix_edits_reset_and_missing_history_preserves_last_good_snapshot() {
+  let fixture = CodexHistoryFixture::new();
+  let mut reader = fixture.reader(false);
+  let initial = reader.snapshot.clone();
+  std::fs::write(&fixture.base_path, fixture.base.replace("old hello", "new hello")).unwrap();
+  // File timestamps can otherwise coalesce writes on some test filesystems.
+  std::fs::File::open(&fixture.base_path)
+    .unwrap()
+    .set_modified(SystemTime::now() + std::time::Duration::from_secs(1))
+    .unwrap();
+  assert!(reader.poll().unwrap());
+  assert_ne!(reader.snapshot.generation, initial.generation);
+  assert_eq!(CodexHistoryFixture::messages(&reader), ["new hello", "new message"]);
+  let last_good = reader.snapshot.clone();
+  std::fs::remove_file(&fixture.base_path).unwrap();
+  assert!(reader.poll().is_err());
+  assert_eq!(reader.snapshot.generation, last_good.generation);
+  assert_eq!(reader.snapshot.revision, last_good.revision);
+  assert_eq!(CodexHistoryFixture::messages(&reader), ["new hello", "new message"]);
+}
+
 struct Fixture {
   directory: TempDir,
   path: PathBuf,

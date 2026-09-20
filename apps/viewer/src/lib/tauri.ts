@@ -14,11 +14,23 @@ import type {
   LoadTrajectoryEventPageRequest,
   SessionIndexChangedEvent,
   SessionIndexProgress,
+  SessionInputStatus,
+  SessionInputStatusRequest,
+  SubmitSessionInputRequest,
+  SubmitSessionInputResponse,
   TrajectoryEventPageResponse,
   TranslationStatus,
   TranslateTextRequest,
   TranslateTextResponse,
 } from "./types";
+
+export function getSessionInputStatus(request: SessionInputStatusRequest): Promise<SessionInputStatus> {
+  return invoke<SessionInputStatus>("get_session_input_status", { request });
+}
+
+export function submitSessionInput(request: SubmitSessionInputRequest): Promise<SubmitSessionInputResponse> {
+  return invoke<SubmitSessionInputResponse>("submit_session_input", { request });
+}
 
 export function getTranslationStatus(): Promise<TranslationStatus> {
   return invoke<TranslationStatus>("get_translation_status");
