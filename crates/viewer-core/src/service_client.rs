@@ -1,4 +1,9 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+  pin::Pin,
+  sync::Arc,
+  task::{Context, Poll},
+  time::Duration,
+};
 
 use tokio::net::TcpStream;
 use tokn_session_core::{AgentEvent, LoadedSession, Provider, SessionHistoryStatus, SessionRef};
@@ -14,6 +19,43 @@ pub struct RelayCatalog {
 
 trait SessionIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> SessionIo for T {}
+
+/// An embedded subscription owns its server handler, including queued initial
+/// work. Dropping the client releases its handler and any pending follow lease.
+struct EmbeddedIo {
+  stream: tokio::io::DuplexStream,
+  handler: tokio::task::AbortHandle,
+}
+
+impl Drop for EmbeddedIo {
+  fn drop(&mut self) {
+    self.handler.abort();
+  }
+}
+
+impl tokio::io::AsyncRead for EmbeddedIo {
+  fn poll_read(
+    mut self: Pin<&mut Self>,
+    context: &mut Context<'_>,
+    buffer: &mut tokio::io::ReadBuf<'_>,
+  ) -> Poll<std::io::Result<()>> {
+    Pin::new(&mut self.stream).poll_read(context, buffer)
+  }
+}
+
+impl tokio::io::AsyncWrite for EmbeddedIo {
+  fn poll_write(mut self: Pin<&mut Self>, context: &mut Context<'_>, buffer: &[u8]) -> Poll<std::io::Result<usize>> {
+    Pin::new(&mut self.stream).poll_write(context, buffer)
+  }
+
+  fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    Pin::new(&mut self.stream).poll_flush(context)
+  }
+
+  fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    Pin::new(&mut self.stream).poll_shutdown(context)
+  }
+}
 
 #[derive(Clone)]
 pub enum Connection {
@@ -32,12 +74,15 @@ async fn connect(connection: &Connection, action: Action) -> Result<(Box<dyn Ses
     Connection::Embedded(service) => {
       let (client, mut server) = tokio::io::duplex(64 * 1024);
       let service = service.clone();
-      tokio::spawn(async move {
+      let handler = tokio::spawn(async move {
         if let Err(message) = service.handle(&mut server).await {
           let _ = write_frame(&mut server, &Frame::Error { message }).await;
         }
       });
-      Box::new(client)
+      Box::new(EmbeddedIo {
+        stream: client,
+        handler: handler.abort_handle(),
+      })
     }
   };
   write_frame(

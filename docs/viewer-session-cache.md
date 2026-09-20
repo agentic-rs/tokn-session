@@ -11,7 +11,12 @@ and the selected session's full project directory. Debounced source changes can
 preload at most two candidates into spare cache space. Preloading neither
 selects the session nor acknowledges unread messages. It cannot evict an
 explicitly opened session to gain admission. Candidates outside the current
-scope are dropped. The cache also considers an estimated 64 MiB memory target;
+scope are dropped. A new preload can replace a background session only after
+its initial load completes and it has been idle for 30 seconds. A session also
+waits 30 seconds between preload attempts after eviction or failure. Activity
+updates this idle timer without changing user-access recency; three streaming
+candidates therefore cannot continuously evict and reload one another. Explicit
+opening bypasses the preload cooldown. The cache also considers an estimated 64 MiB memory target;
 currently selected sessions may exceed it. These are internal policy constants,
 not user settings or a strict process-RSS limit.
 
@@ -37,6 +42,13 @@ journal. Appends write only new records; old snapshots see their committed
 prefix. The last subscriber releasing a generation closes its temporary file.
 This is a disposable cache, not another durable copy of the session database.
 Original provider files remain authoritative.
+
+Initial loads reserve a slot per session, including while loading, and share
+one initializer among subscribers. Unrelated sessions do not wait on that
+initializer's I/O. Dropping an embedded subscription releases its handler;
+the last subscriber cancels the reader. Cancellation is cooperative around
+provider decoding and between journal records. Journal bytes also supply size
+accounting, and only mutable-source reconciliation computes eager fingerprints.
 
 Generation-scoped event keys use absolute source positions, so prepending
 history cannot renumber existing cards, details or translations. A separate

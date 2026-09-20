@@ -6,8 +6,9 @@ use std::{
 
 use tokio::{
   net::TcpListener,
-  sync::{Mutex, Semaphore, watch},
+  sync::{Mutex, OnceCell, Semaphore, watch},
 };
+use tokio_util::sync::CancellationToken;
 use tokn_session_client::AgentClient;
 use tokn_session_core::Provider;
 
@@ -19,7 +20,21 @@ use crate::{
 };
 
 struct FollowedSession {
-  current: watch::Sender<Arc<Snapshot>>,
+  current: OnceCell<watch::Sender<Arc<Snapshot>>>,
+  initialized: watch::Sender<Option<Result<(), String>>>,
+  cancel: CancellationToken,
+}
+
+impl FollowedSession {
+  fn snapshots(&self) -> &watch::Sender<Arc<Snapshot>> {
+    self.current.get().expect("follow waits for reader initialization")
+  }
+}
+
+impl Drop for FollowedSession {
+  fn drop(&mut self) {
+    self.cancel.cancel();
+  }
 }
 
 pub struct Service {
@@ -29,6 +44,8 @@ pub struct Service {
   sessions: Mutex<HashMap<String, Weak<FollowedSession>>>,
   catalog: Mutex<Option<(std::time::Instant, Arc<Vec<CatalogEntry>>, Vec<String>)>>,
   metadata: Arc<PresentationCache>,
+  #[cfg(test)]
+  load_gates: std::sync::Mutex<HashMap<String, Arc<tests::LoadGate>>>,
 }
 
 /// Serve independently configured local consumers. Session bodies are opened
@@ -101,6 +118,8 @@ impl Service {
       catalog: Mutex::new(None),
       metadata: Arc::new(PresentationCache::default()),
       wake: watch::channel(()).0,
+      #[cfg(test)]
+      load_gates: std::sync::Mutex::new(HashMap::new()),
     });
     let weak = Arc::downgrade(&service);
     if service.index.is_none() {
@@ -175,14 +194,77 @@ impl Service {
     Ok((Arc::new(self.metadata.decorate(&entries)), warnings))
   }
 
-  async fn follow(&self, key: &str) -> Result<Arc<FollowedSession>, String> {
-    let mut sessions = self.sessions.lock().await;
-    if let Some(session) = sessions.get(key).and_then(Weak::upgrade) {
-      return Ok(session);
+  async fn follow(self: &Arc<Self>, key: &str) -> Result<Arc<FollowedSession>, String> {
+    let session = {
+      let mut sessions = self.sessions.lock().await;
+      if let Some(session) = sessions.get(key).and_then(Weak::upgrade) {
+        session
+      } else {
+        sessions.retain(|_, value| value.strong_count() > 0);
+        if sessions.len() >= 16 {
+          return Err("Relay active-session limit reached; close an unused viewer session".into());
+        }
+        let session = Arc::new(FollowedSession {
+          current: OnceCell::new(),
+          initialized: watch::channel(None).0,
+          cancel: CancellationToken::new(),
+        });
+        // Reserve this key before any I/O. The weak entry counts in-flight
+        // loads toward the limit without making unused readers resident.
+        sessions.insert(key.to_owned(), Arc::downgrade(&session));
+        let service = self.clone();
+        let key = key.to_owned();
+        let worker = Arc::downgrade(&session);
+        let cancel = session.cancel.clone();
+        tokio::spawn(async move {
+          let result = tokio::select! {
+            _ = cancel.cancelled() => return,
+            result = service.initialize_reader(&key, &cancel) => result,
+          };
+          let Some(session) = worker.upgrade() else {
+            return;
+          };
+          match result {
+            Ok(reader) => {
+              session
+                .current
+                .set(watch::channel(Arc::new(reader.snapshot.clone())).0)
+                .unwrap_or_else(|_| unreachable!("one initializer per reserved session"));
+              session.initialized.send_replace(Some(Ok(())));
+              service.follow_reader(reader, worker, cancel);
+            }
+            Err(error) => {
+              session.initialized.send_replace(Some(Err(error)));
+            }
+          }
+        });
+        session
+      }
+    };
+    // Every caller owns the same reservation. Cancelling one waiter leaves
+    // other subscribers' initialization intact; the last drop cancels it.
+    let mut initialized = session.initialized.subscribe();
+    loop {
+      let result = initialized.borrow_and_update().clone();
+      if let Some(result) = result {
+        result?;
+        return Ok(session);
+      }
+      initialized
+        .changed()
+        .await
+        .map_err(|_| "Relay reader initialization stopped")?;
     }
-    sessions.retain(|_, value| value.strong_count() > 0);
-    if sessions.len() >= 16 {
-      return Err("Relay active-session limit reached; close an unused viewer session".into());
+  }
+
+  async fn initialize_reader(&self, key: &str, cancel: &CancellationToken) -> Result<SessionReader, String> {
+    #[cfg(test)]
+    {
+      let gate = self.load_gates.lock().unwrap().get(key).cloned();
+      if let Some(gate) = gate {
+        gate.entered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _permit = gate.release.acquire().await.map_err(|e| e.to_string())?;
+      }
     }
     let entry = if let Some(index) = &self.index {
       let index = index.clone();
@@ -209,15 +291,13 @@ impl Service {
       .ok_or("Relay provider is no longer configured")?
       .path
       .clone();
-    let reader = tokio::task::spawn_blocking(move || SessionReader::new(entry, native, root))
+    let cancel = cancel.clone();
+    tokio::task::spawn_blocking(move || SessionReader::new_cancellable(entry, native, root, cancel))
       .await
-      .map_err(|e| e.to_string())??;
-    let (current, _) = watch::channel(Arc::new(reader.snapshot.clone()));
-    let session = Arc::new(FollowedSession { current });
-    sessions.insert(key.to_owned(), Arc::downgrade(&session));
-    // The worker must not keep its own subscription alive. A weak handle also
-    // avoids racing a last-client strong-count check against a new follow.
-    let worker = Arc::downgrade(&session);
+      .map_err(|e| e.to_string())?
+  }
+
+  fn follow_reader(&self, reader: SessionReader, worker: Weak<FollowedSession>, cancel: CancellationToken) {
     let interval = self.config.poll_interval;
     let metadata = self.metadata.clone();
     let index = self.index.clone();
@@ -225,10 +305,11 @@ impl Service {
     tokio::spawn(async move {
       let mut reader = reader;
       loop {
-        tokio::select! { _ = tokio::time::sleep(interval) => {}, result = wake.changed() => { if result.is_err() { break; } } }
-        let Some(worker) = worker.upgrade() else {
-          break;
-        };
+        tokio::select! {
+          _ = cancel.cancelled() => break,
+          _ = tokio::time::sleep(interval) => {},
+          result = wake.changed() => { if result.is_err() { break; } }
+        }
         let metadata = metadata.clone();
         let index = index.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -266,34 +347,36 @@ impl Service {
           (reader, result)
         })
         .await;
+        let Some(worker) = worker.upgrade() else {
+          break;
+        };
         let (next, result) = match result {
           Ok(result) => result,
           Err(error) => {
-            let mut failed = worker.current.borrow().as_ref().clone();
+            let mut failed = worker.snapshots().borrow().as_ref().clone();
             failed.error = Some(format!("Relay session reader stopped: {error}"));
-            worker.current.send_replace(Arc::new(failed));
+            worker.snapshots().send_replace(Arc::new(failed));
             break;
           }
         };
         reader = next;
         match result {
           Ok(true) => {
-            worker.current.send_replace(Arc::new(reader.snapshot.clone()));
+            worker.snapshots().send_replace(Arc::new(reader.snapshot.clone()));
           }
           Ok(false) => {}
           Err(error) => {
             reader.snapshot.error = Some(error);
-            worker.current.send_replace(Arc::new(reader.snapshot.clone()));
+            worker.snapshots().send_replace(Arc::new(reader.snapshot.clone()));
             break;
           }
         }
       }
     });
-    Ok(session)
   }
 
   pub async fn handle(
-    &self,
+    self: &Arc<Self>,
     stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send),
   ) -> Result<(), String> {
     let request: Request = tokio::time::timeout(Duration::from_secs(10), read_frame(stream))
@@ -336,7 +419,7 @@ impl Service {
           _ => unreachable!(),
         };
         let session = self.follow(&session_key).await?;
-        let mut changes = session.current.subscribe();
+        let mut changes = session.snapshots().subscribe();
         let mut previous_generation = String::new();
         let mut previous_length = 0;
         let mut event_offset = 0;
@@ -453,4 +536,180 @@ async fn send(stream: &mut (impl tokio::io::AsyncWrite + Unpin), frame: Frame) -
   tokio::time::timeout(Duration::from_secs(10), write_frame(stream, &frame))
     .await
     .map_err(|_| "Relay subscriber is too slow; reconnect for a fresh snapshot")?
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::service_client::{Connection, RelaySubscription};
+  use std::sync::atomic::{AtomicUsize, Ordering};
+  use tokn_session_relay::ProviderRoot;
+
+  pub(super) struct LoadGate {
+    pub entered: AtomicUsize,
+    pub release: Semaphore,
+  }
+
+  impl LoadGate {
+    async fn wait_for_load(&self) {
+      tokio::time::timeout(Duration::from_secs(2), async {
+        while self.entered.load(Ordering::SeqCst) == 0 {
+          tokio::task::yield_now().await;
+        }
+      })
+      .await
+      .expect("reader should start");
+    }
+  }
+
+  fn gate(service: &Service, key: &str) -> Arc<LoadGate> {
+    let gate = Arc::new(LoadGate {
+      entered: AtomicUsize::new(0),
+      release: Semaphore::new(0),
+    });
+    service.load_gates.lock().unwrap().insert(key.into(), gate.clone());
+    gate
+  }
+
+  async fn fixture() -> (tempfile::TempDir, Arc<Service>, Vec<String>) {
+    let root = tempfile::TempDir::new().unwrap();
+    for id in ["slow", "fast"] {
+      std::fs::write(
+        root.path().join(format!("{id}.jsonl")),
+        format!(
+          "{{\"type\":\"session\",\"id\":\"{id}\",\"timestamp\":\"2026-01-01\",\"cwd\":\"/tmp\"}}\n\
+           {{\"type\":\"message\",\"id\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"hello\"}}}}\n"
+        ),
+      )
+      .unwrap();
+    }
+    let mut config = RelayConfig::new(vec![ProviderRoot::new(Provider::Pi, root.path().into())]);
+    config.poll_interval = Duration::from_secs(60);
+    let service = Service::new(config).unwrap();
+    let (catalog, _) = service.catalog().await.unwrap();
+    let keys = ["slow", "fast"]
+      .iter()
+      .map(|id| catalog.iter().find(|entry| entry.header.id == *id).unwrap().key.clone())
+      .collect();
+    (root, service, keys)
+  }
+
+  async fn session_cancel(service: &Service, key: &str) -> CancellationToken {
+    service.sessions.lock().await[key].upgrade().unwrap().cancel.clone()
+  }
+
+  #[tokio::test]
+  async fn unrelated_session_loads_do_not_wait_for_a_slow_initializer() {
+    let (_root, service, keys) = fixture().await;
+    let slow = gate(&service, &keys[0]);
+    let loader = service.clone();
+    let key = keys[0].clone();
+    let pending = tokio::spawn(async move { loader.follow(&key).await });
+    slow.wait_for_load().await;
+
+    let fast = tokio::time::timeout(Duration::from_secs(2), service.follow(&keys[1]))
+      .await
+      .expect("unrelated session must not wait for the slow reader")
+      .unwrap();
+    assert_eq!(fast.snapshots().borrow().entry.header.id, "fast");
+    assert_eq!(slow.entered.load(Ordering::SeqCst), 1);
+    pending.abort();
+    let _ = pending.await;
+  }
+
+  #[tokio::test]
+  async fn same_session_load_is_shared_when_one_initial_waiter_is_cancelled() {
+    let (_root, service, keys) = fixture().await;
+    let slow = gate(&service, &keys[0]);
+    let loader = service.clone();
+    let key = keys[0].clone();
+    let first = tokio::spawn(async move { loader.follow(&key).await });
+    slow.wait_for_load().await;
+    let cancel = session_cancel(&service, &keys[0]).await;
+    let loader = service.clone();
+    let key = keys[0].clone();
+    let second = tokio::spawn(async move { loader.follow(&key).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+      while service.sessions.lock().await[&keys[0]].strong_count() < 2 {
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .unwrap();
+    first.abort();
+    let _ = first.await;
+    assert!(!cancel.is_cancelled(), "remaining waiter must keep its initializer");
+    assert_eq!(slow.entered.load(Ordering::SeqCst), 1);
+
+    slow.release.add_permits(1);
+    let loaded = tokio::time::timeout(Duration::from_secs(2), second)
+      .await
+      .unwrap()
+      .unwrap()
+      .unwrap();
+    let shared = service.follow(&keys[0]).await.unwrap();
+    assert!(Arc::ptr_eq(&loaded, &shared));
+    assert_eq!(slow.entered.load(Ordering::SeqCst), 1);
+  }
+
+  #[tokio::test]
+  async fn dropping_embedded_subscription_cancels_its_queued_initial_load() {
+    let (_root, service, keys) = fixture().await;
+    let slow = gate(&service, &keys[0]);
+    let connection = Connection::Embedded(service.clone());
+    let client = RelaySubscription::connect_window_from(&connection, &keys[0], None, None)
+      .await
+      .unwrap();
+    slow.wait_for_load().await;
+    let cancel = session_cancel(&service, &keys[0]).await;
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(2), cancel.cancelled())
+      .await
+      .expect("client drop must release the handler and cancel the reader");
+    assert!(service.sessions.lock().await[&keys[0]].upgrade().is_none());
+
+    let mut fast = RelaySubscription::connect_window_from(&connection, &keys[1], None, None)
+      .await
+      .unwrap();
+    let loaded = tokio::time::timeout(Duration::from_secs(2), fast.next_snapshot())
+      .await
+      .expect("explicit follow should remain responsive")
+      .unwrap();
+    assert_eq!(loaded.loaded.reference.id, "fast");
+  }
+
+  #[tokio::test]
+  async fn pending_initializers_count_toward_the_limit_and_release_on_drop() {
+    let (_root, service, _) = fixture().await;
+    let mut pending = Vec::new();
+    for id in 0..16 {
+      let key = format!("blocked-{id}");
+      let blocked = gate(&service, &key);
+      let loader = service.clone();
+      pending.push(tokio::spawn(async move { loader.follow(&key).await }));
+      blocked.wait_for_load().await;
+    }
+    assert!(
+      service
+        .follow("overflow")
+        .await
+        .err()
+        .unwrap()
+        .contains("active-session limit")
+    );
+    let cancel = session_cancel(&service, "blocked-0").await;
+    pending.remove(0).abort();
+    tokio::time::timeout(Duration::from_secs(2), cancel.cancelled())
+      .await
+      .unwrap();
+    let replacement = gate(&service, "replacement");
+    let loader = service.clone();
+    pending.push(tokio::spawn(async move { loader.follow("replacement").await }));
+    replacement.wait_for_load().await;
+    assert_eq!(service.sessions.lock().await.len(), 16);
+    for task in pending {
+      task.abort();
+      let _ = task.await;
+    }
+  }
 }

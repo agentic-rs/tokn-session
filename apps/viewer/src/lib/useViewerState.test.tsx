@@ -21,6 +21,7 @@ import {
 import type {
   EventDetail,
   EventPageResponse,
+  ListSessionsResponse,
   SessionIndexChangedEvent,
   SessionIndexProgress,
   SessionSummary,
@@ -1528,6 +1529,125 @@ describe("useViewerState session-index signalling", () => {
     expect(loadEventPage).not.toHaveBeenCalled();
     unmount();
     expect(unlisten).toHaveBeenCalledOnce();
+  });
+
+  it("coalesces index and Relay changes into one trailing catalog read", async () => {
+    const first = deferred<ListSessionsResponse>();
+    const second = deferred<ListSessionsResponse>();
+    let emitIndexChange: ((change: SessionIndexChangedEvent) => void) | undefined;
+    let emitRelayChange: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForSessionIndexChanges).mockImplementation((handler) => {
+      emitIndexChange = handler;
+      return Promise.resolve(vi.fn());
+    });
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => {
+      emitRelayChange = handler;
+      return Promise.resolve(vi.fn());
+    });
+    vi.mocked(listSessions)
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    const { result } = renderHook(() => useViewerState());
+    await waitFor(() => expect(listSessions).toHaveBeenCalledOnce());
+
+    for (let index = 0; index < 5; index += 1) {
+      act(() => emitIndexChange?.({ changed: true, attention_session_keys: [] }));
+      act(() => emitRelayChange?.({ session_key: null, reset: false }));
+    }
+    expect(listSessions).toHaveBeenCalledOnce();
+    const initial = session("codex:first-result");
+    await act(async () => first.resolve({
+      sessions: [initial], next_cursor: null, source_errors: [], pending_providers: [],
+    }));
+    expect(result.current.sessions).toEqual([initial]);
+    expect(listSessions).toHaveBeenCalledTimes(2);
+
+    const latest = session("codex:latest-result");
+    await act(async () => second.resolve({
+      sessions: [latest], next_cursor: null, source_errors: [], pending_providers: [],
+    }));
+    expect(result.current.sessions).toEqual([latest]);
+    expect(result.current.sessionsLoading).toBe(false);
+    expect(listSessions).toHaveBeenCalledTimes(2);
+  });
+
+  it("starts a changed provider query immediately and ignores the superseded catalog", async () => {
+    const oldQuery = deferred<ListSessionsResponse>();
+    const newQuery = deferred<ListSessionsResponse>();
+    let emitIndexChange: ((change: SessionIndexChangedEvent) => void) | undefined;
+    vi.mocked(listenForSessionIndexChanges).mockImplementation((handler) => {
+      emitIndexChange = handler;
+      return Promise.resolve(vi.fn());
+    });
+    vi.mocked(listSessions)
+      .mockReturnValueOnce(oldQuery.promise)
+      .mockReturnValueOnce(newQuery.promise);
+    const { result } = renderHook(() => useViewerState());
+    await waitFor(() => expect(listSessions).toHaveBeenCalledOnce());
+    act(() => emitIndexChange?.({ changed: true, attention_session_keys: [] }));
+    act(() => result.current.toggleProvider("pi"));
+    expect(listSessions).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(listSessions).mock.calls[1]![0].query.providers).not.toContain("pi");
+
+    const current = session("codex:current-query");
+    await act(async () => newQuery.resolve({
+      sessions: [current], next_cursor: null, source_errors: [], pending_providers: [],
+    }));
+    await act(async () => oldQuery.resolve({
+      sessions: [session("codex:stale-query")], next_cursor: null, source_errors: [], pending_providers: [],
+    }));
+    expect(result.current.sessions).toEqual([current]);
+    expect(listSessions).toHaveBeenCalledTimes(2);
+  });
+
+  it("waits for pagination before a queued catalog refresh, including after a failure", async () => {
+    const more = deferred<ListSessionsResponse>();
+    let emitIndexChange: ((change: SessionIndexChangedEvent) => void) | undefined;
+    vi.mocked(listenForSessionIndexChanges).mockImplementation((handler) => {
+      emitIndexChange = handler;
+      return Promise.resolve(vi.fn());
+    });
+    const initial = session("codex:page-one");
+    vi.mocked(listSessions)
+      .mockResolvedValueOnce({
+        sessions: [initial], next_cursor: "sessions.v1.1", source_errors: [], pending_providers: [],
+      })
+      .mockReturnValueOnce(more.promise)
+      .mockResolvedValueOnce({
+        sessions: [initial], next_cursor: null, source_errors: [], pending_providers: [],
+      });
+    const { result } = renderHook(() => useViewerState());
+    await waitFor(() => expect(result.current.sessionsLoading).toBe(false));
+    act(() => result.current.loadMoreSessions());
+    expect(listSessions).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(listSessions).mock.calls[1]![0].cursor).toBe("sessions.v1.1");
+    for (let index = 0; index < 3; index += 1) {
+      act(() => emitIndexChange?.({ changed: true, attention_session_keys: [] }));
+    }
+    expect(listSessions).toHaveBeenCalledTimes(2);
+    await act(async () => more.reject(new Error("index temporarily unavailable")));
+    expect(listSessions).toHaveBeenCalledTimes(3);
+    expect(result.current.sessions).toEqual([initial]);
+    expect(result.current.sessionsLoadingMore).toBe(false);
+    expect(result.current.sessionsError).toBeNull();
+  });
+
+  it("drops queued catalog work when unmounting to change machines", async () => {
+    const pending = deferred<ListSessionsResponse>();
+    let emitIndexChange: ((change: SessionIndexChangedEvent) => void) | undefined;
+    vi.mocked(listenForSessionIndexChanges).mockImplementation((handler) => {
+      emitIndexChange = handler;
+      return Promise.resolve(vi.fn());
+    });
+    vi.mocked(listSessions).mockReturnValueOnce(pending.promise);
+    const { unmount } = renderHook(() => useViewerState());
+    await waitFor(() => expect(listSessions).toHaveBeenCalledOnce());
+    act(() => emitIndexChange?.({ changed: true, attention_session_keys: [] }));
+    unmount();
+    await act(async () => pending.resolve({
+      sessions: [], next_cursor: null, source_errors: [], pending_providers: [],
+    }));
+    expect(listSessions).toHaveBeenCalledOnce();
   });
 
   it("retains an explicitly selected child across a root catalog refresh", async () => {

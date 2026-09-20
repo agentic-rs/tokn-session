@@ -193,6 +193,70 @@ struct Fixture {
   database: rusqlite::Connection,
 }
 
+#[test]
+fn plain_codex_rejected_batch_retries_without_losing_or_duplicating_messages() {
+  use std::io::Write;
+  let directory = TempDir::new().unwrap();
+  let path = directory.path().join("rollout-plain.jsonl");
+  let message =
+    |text: &str| serde_json::json!({"type":"event_msg", "payload":{"type":"user_message", "message":text}}).to_string();
+  let initial = format!(
+    "{}\n{}\n",
+    serde_json::json!({"type":"session_meta", "payload":{"id":"linked", "cwd":"/tmp"}}),
+    message("initial message")
+  );
+  std::fs::write(&path, &initial).unwrap();
+  let entry = CatalogEntry {
+    key: "plain".into(),
+    provider: Provider::Codex,
+    header: serde_json::from_value(serde_json::json!({"id":"linked", "path":path})).unwrap(),
+  };
+  let mut reader = SessionReader::new(entry, false, directory.path().into()).unwrap();
+  let before = reader.snapshot.clone();
+  let good = message("recovered message");
+  writeln!(
+    std::fs::OpenOptions::new().append(true).open(&path).unwrap(),
+    "{good}\ninvalid"
+  )
+  .unwrap();
+  assert!(reader.poll().is_err());
+  assert!(reader.poll().is_err(), "retry must inspect the rejected batch again");
+  assert_eq!(reader.snapshot.revision, before.revision);
+  assert_eq!(CodexHistoryFixture::messages(&reader), ["initial message"]);
+  std::fs::write(&path, format!("{initial}{good}\n")).unwrap();
+  assert!(reader.poll().unwrap());
+  assert_eq!(
+    CodexHistoryFixture::messages(&reader),
+    ["initial message", "recovered message"]
+  );
+  assert!(!reader.poll().unwrap());
+}
+
+#[test]
+fn cancelled_reader_skips_initial_source_access_and_later_polls() {
+  let fixture = Fixture::new();
+  let entry = fixture.reader(false).snapshot.entry;
+  let cancelled = CancellationToken::new();
+  cancelled.cancel();
+  let mut missing = entry.clone();
+  missing.header.path = fixture.directory.path().join("missing.db");
+  let error = SessionReader::new_cancellable(missing, false, fixture.directory.path().into(), cancelled)
+    .err()
+    .unwrap();
+  assert!(
+    error.contains("cancelled"),
+    "cancellation wins over missing source: {error}"
+  );
+  let cancel = CancellationToken::new();
+  let mut reader =
+    SessionReader::new_cancellable(entry, false, fixture.directory.path().into(), cancel.clone()).unwrap();
+  let before = reader.snapshot.clone();
+  cancel.cancel();
+  assert!(reader.poll().unwrap_err().contains("cancelled"));
+  assert_eq!(reader.snapshot.revision, before.revision);
+  assert_eq!(reader.database_reads, 1);
+}
+
 impl Fixture {
   fn new() -> Self {
     let directory = TempDir::new().unwrap();
