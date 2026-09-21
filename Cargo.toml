@@ -18,6 +18,7 @@ members = [
   "crates/render",
   "crates/cli",
   "crates/relay",
+  "crates/hub",
   "crates/viewer-core",
   "crates/viewer-api",
 ]

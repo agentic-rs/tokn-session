@@ -1,5 +1,8 @@
 # Remote session viewer
 
+For one endpoint spanning multiple hosts, use the [Session Hub](hub.md).
+Each host retains this API on loopback and connects outward to the Hub.
+
 The same frontend runs in Tauri or a browser. Desktop calls `viewer-core`
 directly through Tauri commands. In browser mode, the Rust `viewer-api` hosts
 the compiled frontend and exposes the HTTP/SSE adapter over the same origin.

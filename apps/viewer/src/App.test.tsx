@@ -1,9 +1,10 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import App from "./App";
 import { RemoteClient } from "./lib/transport";
 import { StrictMode } from "react";
 vi.mock("./pages/ViewerPage", () => ({ ViewerPage: ({ remote }: { remote?: boolean }) => <div>{remote ? "Remote sessions" : "Desktop sessions"}</div> }));
+beforeEach(() => { vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 404 })); });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 it("automatically connects to its own origin and closes the abandoned StrictMode connection", async () => {
   const stale = new RemoteClient(window.location.origin, "login-secret");
@@ -31,7 +32,7 @@ it("reports connection failures, retries, and disconnects before switching machi
   const close = vi.spyOn(client, "close");
   vi.spyOn(RemoteClient, "connect").mockRejectedValueOnce(new Error("Invalid viewer API token")).mockResolvedValueOnce(client);
   render(<App />);
-  expect(screen.getByRole("textbox", { name: "Viewer address" })).toHaveValue(window.location.origin);
+  expect(await screen.findByRole("textbox", { name: "Viewer address" })).toHaveValue(window.location.origin);
   fireEvent.click(screen.getByRole("button", { name: "Connect" }));
   expect(RemoteClient.connect).toHaveBeenCalledWith(window.location.origin, "");
   expect(await screen.findByRole("alert")).toHaveTextContent("Invalid viewer API token");
@@ -41,4 +42,13 @@ it("reports connection failures, retries, and disconnects before switching machi
   await waitFor(() => expect(close).toHaveBeenCalled());
   expect(screen.getByRole("button", { name: "Connect" })).toBeInTheDocument();
   expect(screen.queryByText("Remote sessions")).not.toBeInTheDocument();
+});
+
+it("detects Hub login and offers retry for failed discovery without exposing direct login", async () => {
+  vi.mocked(fetch).mockRejectedValueOnce(new Error("Network unavailable")).mockResolvedValueOnce(Response.json({ configured: true, authenticated: false }));
+  render(<App />);
+  expect(await screen.findByRole("alert")).toHaveTextContent("Network unavailable");
+  expect(screen.queryByLabelText("Access token")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Retry connection" }));
+  expect(await screen.findByRole("button", { name: "Sign in with passkey" })).toBeInTheDocument();
 });

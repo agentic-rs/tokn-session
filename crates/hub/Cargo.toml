@@ -1,0 +1,36 @@
+[package]
+name = "tokn-session-hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-stream = "0.3"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+dirs.workspace = true
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+futures-util = { version = "0.3", features = ["sink"] }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+subtle = "2"
+tokio.workspace = true
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["fs"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+webauthn-rs = "0.5.5"
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"
+webauthn-authenticator-rs = { version = "0.5.5", default-features = false, features = ["softpasskey"] }

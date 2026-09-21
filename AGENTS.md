@@ -53,8 +53,9 @@ The core abstraction is `AgentEvent`: provider-native historical sessions and li
   OpenCode V1 wire decoder with ZCode-specific provider semantics.
 - `crates/workbuddy`: read-only WorkBuddy SQLite catalog and JSONL session source.
 - `crates/relay`: provider live feeds and stdout/ZeroMQ/managed-stdio transports.
+- `crates/hub`: passkey login, host enrollment, and authenticated outbound host tunnels.
 - `crates/viewer-core`: shared viewer domain, index scheduler, snapshot/follow readers, and Relay supervision.
-- `crates/viewer-api`: HTTP/SSE adapter for browser clients; never serves the web UI.
+- `crates/viewer-api`: HTTP/SSE adapter and optional static web UI host for browser clients.
 - `apps/viewer`: shared React UI; desktop uses viewer-core through Tauri, browser uses viewer-api.
 - `vendor/`: source-of-truth checkouts for upstream projects. Do not edit vendored code unless explicitly asked.
 

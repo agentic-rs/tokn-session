@@ -19,6 +19,19 @@ describe("remote viewer transport", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ version: 9 })));
     await expect(RemoteClient.connect("http://machine", "secret")).rejects.toThrow("unsupported");
   });
+  it("cancels pending host discovery when the Hub session ends", async () => {
+    let request_signal: AbortSignal | undefined;
+    vi.stubGlobal("fetch", vi.fn((_url: string, options: RequestInit) => new Promise((_resolve, reject) => {
+      request_signal = options.signal as AbortSignal;
+      request_signal.addEventListener("abort", () => reject(new Error("aborted")));
+    })));
+    const lifetime = new AbortController();
+    const connecting = RemoteClient.connect("https://hub.example/hosts/workstation", "secret", lifetime.signal);
+    const rejected = expect(connecting).rejects.toThrow("aborted");
+    lifetime.abort();
+    await rejected;
+    expect(request_signal?.aborted).toBe(true);
+  });
   it("uses bearer headers and aborts outstanding requests on machine switch", async () => {
     let signal: AbortSignal | undefined;
     const fetcher = vi.fn((_url: string, options: RequestInit) => new Promise((_resolve, reject) => {

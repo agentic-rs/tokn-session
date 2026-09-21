@@ -37,3 +37,11 @@ pnpm tauri dev
 See [apps/viewer/README.md](apps/viewer/README.md) for build instructions and
 architecture, and [docs/handoff.md](docs/handoff.md) for detailed current
 implementation status.
+
+## Remote hosts through a Hub
+
+`tokn-session-hub` provides one browser endpoint for several hosts, with passkey
+login, explicit host enrollment, and outbound connections to each host's
+`viewer-api`. Hosts allow viewing by default; agent input requires explicit
+control access. See [the Hub guide](docs/hub.md) for local setup, HTTPS
+configuration, and the trusted-Hub security model.

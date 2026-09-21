@@ -57,6 +57,20 @@ request, while ZCode/DSH expose explicit start/end observations. ZCode coverage
 is based on the installed 3.7.3 bundle and representative fixtures, not a real
 captured compaction. Upgrade strict `AgentEvent` consumers with the producer.
 
+## Session Hub
+
+`crates/hub` adds `tokn-session-hub serve` and `connect`: a single-owner,
+trusted gateway for multiple hosts. Passkeys authenticate the browser; generated
+Ed25519 identities authenticate outbound host tunnels. A generated bootstrap
+link enrolls the first passkey, and pairing-code comparison plus authenticated
+approval enrolls each host. The browser detects a Hub, lists/selects hosts, and
+reuses the viewer through `/hosts/<host_id>/api/v1`. Local Relay remains the
+provider feed. Viewing is the default; host control requires explicit approval
+and `--allow-control` on the connector. Logout/expiry and host revocation close
+active streams. Remote connections require HTTPS termination; the Hub can read
+traffic. See [hub.md](hub.md) for setup, identity storage, protocol boundaries,
+and current single-owner/recovery limits.
+
 ## Viewer core and remote API
 
 Desktop calls shared Rust `crates/viewer-core` directly through Tauri. The

@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import "./App.css";
 import { ViewerPage } from "./pages/ViewerPage";
 import { isDesktop, RemoteClient, selectMachine, type ConnectionState } from "./lib/transport";
+import { HubConnection } from "./components/HubConnection";
+import { detectHub, hubErrorMessage, type HubStatus } from "./lib/hub";
 
 function BrowserViewer({ initial_token }: { initial_token?: string }) {
   const [endpoint, setEndpoint] = useState(() => window.location.origin);
@@ -56,7 +58,32 @@ function BrowserViewer({ initial_token }: { initial_token?: string }) {
     </form>
   </main>;
 }
-function App({ initial_token }: { initial_token?: string }) {
-  return isDesktop() ? <ViewerPage /> : <BrowserViewer initial_token={initial_token} />;
+function BrowserGateway({ bootstrap_token }: { bootstrap_token?: string }) {
+  const [status, setStatus] = useState<HubStatus | null>();
+  const [error, setError] = useState<string>();
+  const [attempt, setAttempt] = useState(0);
+  useEffect(() => {
+    const controller = new AbortController();
+    let cancelled = false;
+    const timer = window.setTimeout(() => controller.abort(), 10_000);
+    setError(undefined);
+    void detectHub(controller.signal).then((next) => {
+      if (!cancelled) setStatus(next);
+    }).catch((error: unknown) => {
+      if (!cancelled) setError(controller.signal.aborted ? "The server did not respond. Try again." : hubErrorMessage(error));
+    }).finally(() => clearTimeout(timer));
+    return () => { cancelled = true; clearTimeout(timer); controller.abort(); };
+  }, [attempt]);
+  if (status === null) return <BrowserViewer />;
+  if (status) return <HubConnection initial_status={status} bootstrap_token={bootstrap_token} />;
+  return <main className="machine-connect"><form onSubmit={(event) => { event.preventDefault(); setAttempt((value) => value + 1); }}>
+    <h1>Session viewer</h1>
+    {error ? <><p role="alert">{error}</p><button>Retry connection</button></> : <p role="status">Connecting…</p>}
+  </form></main>;
+}
+
+function App({ initial_token, bootstrap_token }: { initial_token?: string; bootstrap_token?: string }) {
+  if (isDesktop()) return <ViewerPage />;
+  return initial_token ? <BrowserViewer initial_token={initial_token} /> : <BrowserGateway bootstrap_token={bootstrap_token} />;
 }
 export default App;
