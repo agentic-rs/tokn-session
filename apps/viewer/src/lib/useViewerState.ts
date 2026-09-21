@@ -1109,9 +1109,10 @@ export function useViewerState() {
     const page = isLiveRefresh
       ? refreshEventWindow(selectedSessionKey, loadEventPage)
       : loadEventPage({
-      session_key: selectedSessionKey,
-      window_mode: "retained",
-    });
+        session_key: selectedSessionKey,
+        window_mode: "retained",
+        direction: "backward",
+      });
     void page
       .then(async (response) => {
         if (eventsRequest.current !== requestId) {
@@ -1685,6 +1686,7 @@ export function useViewerState() {
       session_key: selectedSessionKey,
       cursor: olderCursor,
       window_mode: "earlier",
+      direction: "backward",
     })
       .then((response) => {
         if (eventsRequest.current !== requestGeneration) {

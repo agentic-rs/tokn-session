@@ -144,6 +144,8 @@ Modern viewers request `load_event_page` with `window_mode: "retained"` and
 `direction: "backward"` to receive the complete resident history window,
 initially three user turns. `window_mode: "earlier"` with its `previous_cursor`
 extends that window by three turns and returns the complete expanded window.
+Both window modes require explicit `direction: "backward"` and omit `offset`;
+omitting direction selects the legacy default `forward` and is rejected.
 `total_events` counts projected rows in this retained window; a non-null
 `previous_cursor` means older source history remains. Row pagination without
 `window_mode` preserves the full-history API. Window keys/cursors are opaque

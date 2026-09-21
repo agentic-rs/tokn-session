@@ -395,15 +395,26 @@ export interface CompactionCardSummary {
 
 export type EventPageDirection = "forward" | "backward";
 
-export interface LoadEventPageRequest {
+export type LoadEventPageRequest = {
   session_key: string;
+  limit?: number;
+} & ({
+  window_mode?: undefined;
   cursor?: string;
   offset?: number;
   direction?: EventPageDirection;
-  limit?: number;
+} | {
   /** Retain complete user turns until this session is evicted. */
-  window_mode?: "retained" | "earlier";
-}
+  window_mode: "retained";
+  direction: "backward";
+  cursor?: never;
+  offset?: never;
+} | {
+  window_mode: "earlier";
+  direction: "backward";
+  cursor: string;
+  offset?: never;
+});
 
 export interface SessionViewRequest {
   view_id: string;

@@ -103,6 +103,9 @@ Local starts no Relay child. External uses additive `follow_window` requests.
 Generation-scoped absolute keys keep prepends stable; legacy row APIs still
 load full history. See [session cache](viewer-session-cache.md) for policy,
 protocol details, and remaining transient-memory limits.
+Initial loads, live refreshes, and earlier-history requests explicitly send
+`direction: "backward"`; the TypeScript request union requires it for window
+modes. The Rust default remains `forward` for legacy row-pagination callers.
 
 Activity preloads keep their slots while loading or actively changing; only
 settled preloads idle for 30 seconds can be replaced by another background

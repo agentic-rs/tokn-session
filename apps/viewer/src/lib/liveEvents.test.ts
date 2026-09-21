@@ -13,7 +13,7 @@ describe("live event windows", () => {
     const result = await refreshEventWindow("session", load);
     expect(result.events.map((e) => e.summary)).toEqual(["a", "b", "c", "d", "e", "f"].map((key) => `updated ${key}`));
     expect(result.previous_cursor).toBe("earlier-turns");
-    expect(load).toHaveBeenCalledExactlyOnceWith({ session_key: "session", window_mode: "retained" });
+    expect(load).toHaveBeenCalledExactlyOnceWith({ session_key: "session", window_mode: "retained", direction: "backward" });
   });
 
   it("refreshes the loaded child window starting with the latest active work", async () => {

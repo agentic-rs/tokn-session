@@ -303,18 +303,20 @@ mod tests {
     let service = service.clone();
     let session_key = key.to_owned();
     tokio::task::spawn_blocking(move || {
-      service.load_event_page(EventPageRequest {
-        session_key,
-        window_mode: Some(if cursor.is_some() {
-          HistoryWindowMode::Earlier
+      // Exercise the JSON boundary used by desktop and HTTP clients, including
+      // direction: omitting it defaults to the legacy forward row API.
+      let request = serde_json::from_value(json!({
+        "session_key": session_key,
+        "window_mode": if cursor.is_some() {
+          "earlier"
         } else {
-          HistoryWindowMode::Retained
-        }),
-        cursor,
-        offset: None,
-        direction: PageDirection::Backward,
-        limit: None,
-      })
+          "retained"
+        },
+        "cursor": cursor,
+        "direction": "backward",
+      }))
+      .unwrap();
+      service.load_event_page(request)
     })
     .await
     .unwrap()

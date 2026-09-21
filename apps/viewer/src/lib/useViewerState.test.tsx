@@ -368,12 +368,12 @@ describe("retained session turns", () => {
     await waitFor(() => expect(result.current.events).toEqual(recent.events));
     act(() => result.current.loadOlderEvents());
     await waitFor(() => expect(result.current.events).toEqual(expanded.events));
-    expect(loadEventPage).toHaveBeenLastCalledWith({ session_key: "a", cursor: "earlier", window_mode: "earlier" });
+    expect(loadEventPage).toHaveBeenLastCalledWith({ session_key: "a", cursor: "earlier", window_mode: "earlier", direction: "backward" });
     await selectListedSession(result, "b");
     await waitFor(() => expect(result.current.events).toEqual(toolEventPage().events));
     await selectListedSession(result, "a");
     await waitFor(() => expect(result.current.events).toEqual(expanded.events));
-    expect(loadEventPage).toHaveBeenLastCalledWith({ session_key: "a", window_mode: "retained" });
+    expect(loadEventPage).toHaveBeenLastCalledWith({ session_key: "a", window_mode: "retained", direction: "backward" });
     expect(result.current.olderCursor).toBeNull();
   });
 
@@ -394,7 +394,7 @@ describe("retained session turns", () => {
     expect(loadEventPage).toHaveBeenCalledTimes(2);
     await act(async () => { earlier.resolve(expanded); });
     await waitFor(() => expect(result.current.events).toEqual(refreshed.events));
-    expect(loadEventPage).toHaveBeenLastCalledWith({ session_key: "a", window_mode: "retained" });
+    expect(loadEventPage).toHaveBeenLastCalledWith({ session_key: "a", window_mode: "retained", direction: "backward" });
     expect(result.current.olderLoading).toBe(false);
   });
 
@@ -1208,7 +1208,7 @@ describe("useViewerState refresh after message input", () => {
     expect(result.current.expandedEventKey).toBe(turn.event_key);
     expect(result.current.pendingLiveActivity).toBe(true);
     expect(result.current.trajectoryPages.get("live")?.get(turn.event_key)?.events).toEqual(trajectoryChildPage().events);
-    expect(loadEventPage).toHaveBeenNthCalledWith(2, { session_key: "live", window_mode: "retained" });
+    expect(loadEventPage).toHaveBeenNthCalledWith(2, { session_key: "live", window_mode: "retained", direction: "backward" });
     expect(loadEventPage).toHaveBeenCalledTimes(2);
   });
 
@@ -1283,7 +1283,7 @@ describe("useViewerState session-index signalling", () => {
     await waitFor(() => {
       expect(loadEventPage).toHaveBeenCalledWith({
         session_key: indexedSession.session_key,
-        window_mode: "retained",
+        window_mode: "retained", direction: "backward",
       });
     });
   });
