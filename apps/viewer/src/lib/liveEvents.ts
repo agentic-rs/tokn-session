@@ -7,7 +7,7 @@ export function refreshEventWindow(
   session_key: string,
   load: (request: LoadEventPageRequest) => Promise<EventPageResponse>,
 ): Promise<EventPageResponse> {
-  return load({ session_key, window_mode: "retained" });
+  return load({ session_key, window_mode: "retained", direction: "backward" });
 }
 
 export async function refreshTrajectoryWindow(
