@@ -151,6 +151,7 @@ function HubHosts({ session, initial_notice, on_authenticated, on_disconnected }
   }
 
   async function connectHost(host: HubHost) {
+    if (host.secure_only) return;
     setBusy(host.host_id);
     setError(undefined);
     selected.current = host.host_id;
@@ -195,7 +196,7 @@ function HubHosts({ session, initial_notice, on_authenticated, on_disconnected }
   return <main className="hub-home">
     <div className="hub-content">
       <header className="hub-header">
-        <div><p className="hub-eyebrow">Tokn Hub</p><h1>Your hosts</h1><p>Choose a host to browse its sessions.</p></div>
+        <div><p className="hub-eyebrow">Tokn Hub</p><h1>Your hosts</h1><p>Manage host connections and access.</p></div>
         <div className="hub-actions">
           <button disabled={!!busy} onClick={() => { void action("passkey", async () => {
             const next = await session.authenticate(true);
@@ -211,9 +212,11 @@ function HubHosts({ session, initial_notice, on_authenticated, on_disconnected }
       {loaded && hosts.length === 0 && <div className="hub-empty"><h2>No hosts connected yet</h2><p>Start a host connector and approve its pairing request below.</p></div>}
       <ul className="hub-hosts" aria-label="Enrolled hosts">
         {hosts.map((host) => <li key={host.host_id} className="hub-host">
-          <div className="hub-host-details"><h2>{host.name}</h2><p><span className={`hub-presence ${host.online ? "is-online" : ""}`}>{host.online ? "Online" : "Offline"}</span> · {host.access === "view" ? "View only" : "View and control"}</p><code>{host.host_id}</code></div>
+          <div className="hub-host-details"><h2>{host.name}</h2><p><span className={`hub-presence ${host.online ? "is-online" : ""}`}>{host.online ? "Online" : "Offline"}</span> · {host.secure_only ? "End-to-end encrypted" : host.access === "view" ? "View only" : "View and control"}</p><code>{host.host_id}</code>
+            {host.secure_only && <p>Open this host with your installed Tokn client and an owner-approved grant.</p>}
+          </div>
           <div className="hub-actions">
-            <button disabled={!host.online || !!busy} onClick={() => { void connectHost(host); }}>{busy === host.host_id ? "Connecting…" : `Open ${host.name}`}</button>
+            {!host.secure_only && <button disabled={!host.online || !!busy} onClick={() => { void connectHost(host); }}>{busy === host.host_id ? "Connecting…" : `Open ${host.name}`}</button>}
             {revoke_id === host.host_id
               ? <><span>Remove this host’s access?</span><button disabled={!!busy} onClick={() => { void action(`revoke:${host.host_id}`, async () => {
                 await session.request(`hosts/${encodeURIComponent(host.host_id)}`, "DELETE");

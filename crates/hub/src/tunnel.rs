@@ -31,6 +31,7 @@ pub struct HubTunnels {
   handshakes: Arc<Semaphore>,
   enrollments: Arc<Semaphore>,
   approved: Arc<Semaphore>,
+  secure_capacity: Arc<Semaphore>,
   shutdown: CancellationToken,
 }
 
@@ -61,8 +62,10 @@ struct Connection {
   capacity: Weak<OwnedSemaphorePermit>,
   outgoing: mpsc::Sender<Frame>,
   requests: Mutex<HashMap<u64, InFlight>>,
+  secure_channels: Mutex<HashMap<u64, mpsc::Sender<Bytes>>>,
   next_id: std::sync::atomic::AtomicU64,
   allow_control: bool,
+  secure_only: std::sync::atomic::AtomicBool,
   shutdown: CancellationToken,
 }
 
@@ -89,6 +92,33 @@ impl ProxyError {
 struct RequestGuard {
   connection: Arc<Connection>,
   request_id: u64,
+}
+
+struct SecureGuard {
+  connection: Arc<Connection>,
+  channel_id: u64,
+}
+
+impl Drop for SecureGuard {
+  fn drop(&mut self) {
+    if self
+      .connection
+      .secure_channels
+      .lock()
+      .unwrap()
+      .remove(&self.channel_id)
+      .is_some()
+      && self
+        .connection
+        .outgoing
+        .try_send(Frame::SecureClose {
+          channel_id: self.channel_id,
+        })
+        .is_err()
+    {
+      self.connection.shutdown.cancel();
+    }
+  }
 }
 
 impl Drop for RequestGuard {
@@ -129,6 +159,7 @@ impl HubTunnels {
       handshakes: Arc::new(Semaphore::new(handshakes)),
       enrollments: Arc::new(Semaphore::new(enrollments)),
       approved: Arc::new(Semaphore::new(approved)),
+      secure_capacity: Arc::new(Semaphore::new(128)),
       shutdown: CancellationToken::new(),
     }
   }
@@ -196,6 +227,24 @@ impl HubTunnels {
       .map(|connection| if connection.allow_control { "control" } else { "view" }.into())
   }
 
+  pub fn secure_only(&self, host_id: &str) -> bool {
+    self
+      .inner
+      .lock()
+      .unwrap()
+      .online
+      .get(host_id)
+      .is_some_and(|connection| connection.secure_only.load(std::sync::atomic::Ordering::Relaxed))
+  }
+
+  pub fn reserve_secure_channel(&self) -> Result<OwnedSemaphorePermit, String> {
+    self
+      .secure_capacity
+      .clone()
+      .try_acquire_owned()
+      .map_err(|_| "Hub secure channel capacity reached".into())
+  }
+
   pub fn shutdown(&self) {
     self.shutdown.cancel();
     let mut inner = self.inner.lock().unwrap();
@@ -240,8 +289,10 @@ impl HubTunnels {
         capacity: Arc::downgrade(&permit),
         outgoing,
         requests: Mutex::new(HashMap::new()),
+        secure_channels: Mutex::new(HashMap::new()),
         next_id: std::sync::atomic::AtomicU64::new(1),
         allow_control: allow_control && stored.access == "control",
+        secure_only: std::sync::atomic::AtomicBool::new(false),
         shutdown: self.shutdown.child_token(),
       });
       if let Some(previous) = inner.online.insert(record.host_id.clone(), connection.clone()) {
@@ -434,6 +485,12 @@ impl HubTunnels {
       .cloned()
       .filter(|connection| !connection.shutdown.is_cancelled())
       .ok_or_else(|| ProxyError::new(StatusCode::BAD_GATEWAY, "Host is offline"))?;
+    if connection.secure_only.load(std::sync::atomic::Ordering::Relaxed) {
+      return Err(ProxyError::new(
+        StatusCode::FORBIDDEN,
+        "This host requires the installed encrypted client",
+      ));
+    }
     if !protocol::allowed_route(method.as_str(), path, connection.allow_control) {
       return Err(ProxyError::new(
         StatusCode::FORBIDDEN,
@@ -525,10 +582,98 @@ impl HubTunnels {
       .body(Body::from_stream(stream))
       .map_err(|_| ProxyError::new(StatusCode::BAD_GATEWAY, "Invalid host response"))
   }
+
+  /// One native client socket carries one encrypted request or event stream.
+  /// Neither public metadata nor a Hub login grants authority at the host.
+  pub async fn handle_secure_socket(&self, host_id: &str, mut socket: WebSocket, _permit: OwnedSemaphorePermit) {
+    let connection = self.inner.lock().unwrap().online.get(host_id).cloned();
+    let Some(connection) = connection.filter(|connection| !connection.shutdown.is_cancelled()) else {
+      return;
+    };
+    let channel_id = connection.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Include handshake, headers and terminal records beyond the chunk window.
+    let (sender, mut received) = mpsc::channel(protocol::RESPONSE_WINDOW + 4);
+    {
+      let mut channels = connection.secure_channels.lock().unwrap();
+      if channels.len() >= protocol::MAX_REQUESTS {
+        return;
+      }
+      channels.insert(channel_id, sender);
+    }
+    let _guard = SecureGuard {
+      connection: connection.clone(),
+      channel_id,
+    };
+    let _ = async {
+      secure_enqueue(&connection, Frame::SecureOpen { channel_id }).await?;
+      let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+      let mut last_received = Instant::now();
+      loop {
+        tokio::select! {
+          biased;
+          _ = connection.shutdown.cancelled() => break,
+          record = received.recv() => {
+            let Some(record) = record else { break };
+            send_message(&mut socket, Message::Binary(record)).await?;
+          }
+          incoming = socket.recv() => {
+            last_received = Instant::now();
+            match incoming {
+              Some(Ok(Message::Binary(record))) if !record.is_empty() && record.len() <= protocol::MAX_SECURE_RECORD => {
+                secure_enqueue(&connection, Frame::SecureData { channel_id, data: protocol::encode(&record) }).await?;
+              }
+              Some(Ok(Message::Ping(data))) => send_message(&mut socket, Message::Pong(data)).await?,
+              Some(Ok(Message::Pong(_))) => {},
+              _ => break,
+            }
+          }
+          _ = heartbeat.tick() => {
+            if last_received.elapsed() > Duration::from_secs(45) { break; }
+            send_message(&mut socket, Message::Ping(Bytes::new())).await?;
+          }
+        }
+      }
+      Ok::<_, String>(())
+    }.await;
+  }
+}
+
+async fn secure_enqueue(connection: &Connection, frame: Frame) -> Result<(), String> {
+  tokio::time::timeout(IO_TIMEOUT, connection.outgoing.send(frame))
+    .await
+    .map_err(|_| "Secure tunnel stalled")?
+    .map_err(|_| "Secure tunnel closed".into())
 }
 
 impl Connection {
   fn receive(&self, frame: Frame) -> Result<(), String> {
+    match frame {
+      Frame::SecureOnly {} => {
+        self.secure_only.store(true, std::sync::atomic::Ordering::Relaxed);
+        return Ok(());
+      }
+      Frame::SecureData { channel_id, data } => {
+        let bytes = protocol::decode(&data, protocol::MAX_SECURE_RECORD)?;
+        if bytes.is_empty() {
+          return Err("Empty encrypted record".into());
+        }
+        let mut channels = self.secure_channels.lock().unwrap();
+        if let Some(channel) = channels.get(&channel_id) {
+          if channel.try_send(Bytes::from(bytes)).is_err() {
+            channels.remove(&channel_id);
+            if self.outgoing.try_send(Frame::SecureClose { channel_id }).is_err() {
+              self.shutdown.cancel();
+            }
+          }
+        }
+        return Ok(());
+      }
+      Frame::SecureClose { channel_id } => {
+        self.secure_channels.lock().unwrap().remove(&channel_id);
+        return Ok(());
+      }
+      _ => {}
+    }
     let mut requests = self.requests.lock().unwrap();
     match frame {
       Frame::Response {
@@ -588,6 +733,7 @@ impl Connection {
   }
 
   fn fail_all(&self, message: &str) {
+    self.secure_channels.lock().unwrap().clear();
     for (_, request) in self.requests.lock().unwrap().drain() {
       *request.failure.lock().unwrap() = Some(message.into());
       if let Some(headers) = request.headers {

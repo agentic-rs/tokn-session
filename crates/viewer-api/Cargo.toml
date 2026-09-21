@@ -10,6 +10,7 @@ async-stream = "0.3"
 clap = { version = "4", features = ["derive", "env"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 tokio.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
 tokn-viewer-core.workspace = true

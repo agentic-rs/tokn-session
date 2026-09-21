@@ -20,6 +20,8 @@ use tower_http::{
   services::{ServeDir, ServeFile},
 };
 
+mod shared;
+
 #[derive(Clone)]
 struct ApiState {
   service: ViewerService,
@@ -53,6 +55,10 @@ pub fn router(
   Router::new()
     .route("/api/v1/health", get(|| async { Json(json!({"version": 1})) }))
     .route("/api/v1/events", get(event_stream))
+    .route(
+      "/api/v1/shared",
+      post(shared::command).layer(DefaultBodyLimit::max(1024 * 1024 + 64 * 1024)),
+    )
     .route("/api/v1/{command}", post(command))
     .route("/api", any(api_not_found))
     .route("/api/{*path}", any(api_not_found))

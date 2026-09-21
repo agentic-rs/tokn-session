@@ -1,5 +1,10 @@
 # Session Hub
 
+For an untrusted VPS and recipient sharing, use [encrypted access](hub-e2ee.md).
+That mode uses an installed client, endpoint-held keys, and owner-signed grants.
+The setup below describes the explicit `--trusted-hub` compatibility mode and
+the passkey administration shared by both modes.
+
 `tokn-session-hub` gives a browser one endpoint for multiple hosts. The Hub
 authenticates its owner with passkeys, approves host identities, and forwards
 the existing viewer HTTP/SSE API through outbound host connections.
@@ -38,7 +43,7 @@ On each session host, run the existing API and a connector:
 ```sh
 cargo run -p tokn-viewer-api -- --api-only
 cargo run -p tokn-session-hub -- connect \
-  --hub http://localhost:5559 --insecure-loopback --name "My workstation"
+  --hub http://localhost:5559 --insecure-loopback --trusted-hub --name "My workstation"
 ```
 
 The connector prints a pairing code. In the Hub, compare the pending host's
@@ -78,7 +83,7 @@ On a remote host:
 
 ```sh
 cargo run -p tokn-session-hub -- connect \
-  --hub https://hub.example.com --name "Build server"
+  --hub https://hub.example.com --trusted-hub --name "Build server"
 ```
 
 Only the connector needs outbound connectivity. The local viewer API stays on
@@ -89,7 +94,8 @@ Redirects and environment proxies are disabled for local forwarding.
 
 This is a **trusted Hub**: it can read forwarded requests and responses. TLS
 protects the client-to-Hub and host-to-Hub connections; this version does not
-provide end-to-end encryption through an untrusted Hub. The implementation
+provide end-to-end encryption in this compatibility mode. Use the
+[encrypted client](hub-e2ee.md) for an untrusted Hub. The implementation
 creates no hosting resources or deployments.
 
 ## Identity and lifecycle

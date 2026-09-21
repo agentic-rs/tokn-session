@@ -40,8 +40,9 @@ implementation status.
 
 ## Remote hosts through a Hub
 
-`tokn-session-hub` provides one browser endpoint for several hosts, with passkey
-login, explicit host enrollment, and outbound connections to each host's
-`viewer-api`. Hosts allow viewing by default; agent input requires explicit
-control access. See [the Hub guide](docs/hub.md) for local setup, HTTPS
-configuration, and the trusted-Hub security model.
+`tokn-session-hub` connects several hosts through one endpoint. Passkeys manage
+host enrollment; an installed client provides end-to-end encryption with
+owner-signed grants for full-host or selected-session access. Hosts enforce
+permissions and revocation. See [encrypted access and sharing](docs/hub-e2ee.md)
+and [Hub setup](docs/hub.md). The older browser-through-Hub mode requires an
+explicit `--trusted-hub` option.

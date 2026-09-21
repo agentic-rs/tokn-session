@@ -2,6 +2,10 @@
 
 For one endpoint spanning multiple hosts, use the [Session Hub](hub.md).
 Each host retains this API on loopback and connects outward to the Hub.
+For an untrusted Hub, the [installed encrypted client](hub-e2ee.md) keeps
+decryption on the recipient's device. Its selected-session grants use the
+host-local `/api/v1/shared` adapter, behind this API's existing authentication;
+remote clients cannot call that adapter or supply their own sharing scope.
 
 The same frontend runs in Tauri or a browser. Desktop calls `viewer-core`
 directly through Tauri commands. In browser mode, the Rust `viewer-api` hosts

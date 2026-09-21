@@ -60,6 +60,20 @@ it("routes selected hosts through Hub, closes old sessions on switching, and sig
   expect(fetch).toHaveBeenCalledWith(`${window.location.origin}/hub/v1/auth/logout`, expect.objectContaining({ method: "POST", headers: expect.objectContaining({ Authorization: "Bearer owner-token" }) }));
 });
 
+it("directs encrypted hosts to the installed client without opening a plaintext viewer", async () => {
+  const original = vi.mocked(fetch).getMockImplementation()!;
+  vi.mocked(fetch).mockImplementation(async (input, init) => String(input).endsWith("/hosts")
+    ? Response.json({ hosts: [{ host_id: "protected", name: "Protected host", online: true, access: "view", secure_only: true }] })
+    : original(input, init));
+  vi.spyOn(RemoteClient, "connect");
+  render(<HubConnection initial_status={{ configured: true, authenticated: false }} />);
+  fireEvent.click(screen.getByRole("button", { name: "Sign in with passkey" }));
+  expect(await screen.findByText(/End-to-end encrypted/)).toBeInTheDocument();
+  expect(screen.getByText(/installed Tokn client/)).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Open Protected host" })).not.toBeInTheDocument();
+  expect(RemoteClient.connect).not.toHaveBeenCalled();
+});
+
 it("requires explicit approval of a displayed pairing code and confirmation before revocation", async () => {
   render(<HubConnection initial_status={{ configured: true, authenticated: false }} />);
   await signIn();

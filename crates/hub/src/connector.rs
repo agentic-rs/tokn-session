@@ -27,6 +27,16 @@ use url::{Host, Url};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+#[path = "connector_secure.rs"]
+mod secure_transport;
+
+#[derive(Clone)]
+pub struct SecureHostConfig {
+  pub noise_key_file: PathBuf,
+  pub owner_public_key: String,
+  pub revocations_file: Option<PathBuf>,
+}
+
 #[derive(Clone)]
 pub struct ConnectorConfig {
   pub hub_url: Url,
@@ -36,6 +46,7 @@ pub struct ConnectorConfig {
   pub local_token: Option<String>,
   pub allow_control: bool,
   pub insecure_loopback: bool,
+  pub secure: Option<SecureHostConfig>,
 }
 
 impl ConnectorConfig {
@@ -115,7 +126,27 @@ fn load_key(path: &Path) -> Result<SigningKey, String> {
       Ok(key)
     }
     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-      let metadata = fs::symlink_metadata(path).map_err(|e| format!("Could not inspect host key: {e}"))?;
+      let mut options = OpenOptions::new();
+      options.read(true);
+      #[cfg(unix)]
+      {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+      }
+      #[cfg(not(unix))]
+      if fs::symlink_metadata(path)
+        .map_err(|e| format!("Could not inspect host key: {e}"))?
+        .file_type()
+        .is_symlink()
+      {
+        return Err("Host key must not be a symlink".into());
+      }
+      let file = options
+        .open(path)
+        .map_err(|e| format!("Could not open host key: {e}"))?;
+      let metadata = file
+        .metadata()
+        .map_err(|e| format!("Could not inspect host key: {e}"))?;
       if !metadata.is_file() || metadata.len() > 4096 {
         return Err("Host key must be a small regular file, not a symlink".into());
       }
@@ -127,11 +158,7 @@ fn load_key(path: &Path) -> Result<SigningKey, String> {
         }
       }
       let mut data = Vec::new();
-      fs::File::open(path)
-        .map_err(|e| format!("Could not open host key: {e}"))?
-        .take(4097)
-        .read_to_end(&mut data)
-        .map_err(|e| e.to_string())?;
+      file.take(4097).read_to_end(&mut data).map_err(|e| e.to_string())?;
       let stored: KeyFile = serde_json::from_slice(&data).map_err(|_| "Invalid host key file")?;
       if stored.version != protocol::VERSION {
         return Err("Unsupported host key file version".into());
@@ -148,6 +175,12 @@ fn load_key(path: &Path) -> Result<SigningKey, String> {
 pub async fn run(config: ConnectorConfig, shutdown: CancellationToken) -> Result<(), String> {
   let endpoint = config.validate()?;
   let key = load_key(&config.key_file)?;
+  let secure = config
+    .secure
+    .as_ref()
+    .map(secure_transport::Host::load)
+    .transpose()?
+    .map(Arc::new);
   let client = reqwest::Client::builder()
     .no_proxy()
     .redirect(reqwest::redirect::Policy::none())
@@ -157,12 +190,15 @@ pub async fn run(config: ConnectorConfig, shutdown: CancellationToken) -> Result
     .build()
     .map_err(|e| e.to_string())?;
   eprintln!("Host identity: {}", protocol::host_id(key.verifying_key().as_bytes()));
+  if let Some(secure) = &secure {
+    eprintln!("Host encryption public key: {}", secure.public_key());
+  }
   let mut backoff = 1u64;
   loop {
     let started = Instant::now();
     let result = tokio::select! {
       _ = shutdown.cancelled() => return Ok(()),
-      result = connect_once(&config, &endpoint, &key, &client) => result,
+      result = connect_once(&config, &endpoint, &key, &client, secure.clone()) => result,
     };
     if let Err(error) = result {
       eprintln!("Hub connection ended: {error}");
@@ -184,6 +220,7 @@ async fn connect_once(
   endpoint: &Url,
   key: &SigningKey,
   client: &reqwest::Client,
+  secure: Option<Arc<secure_transport::Host>>,
 ) -> Result<(), String> {
   let ws_config = WebSocketConfig::default()
     .max_message_size(Some(protocol::MAX_FRAME))
@@ -200,6 +237,7 @@ async fn connect_once(
     .map_err(|_| "Hub authentication timed out")??;
   let (outgoing, mut outgoing_rx) = mpsc::channel::<Frame>(64);
   let mut requests = HashMap::new();
+  let mut secure_channels: HashMap<u64, (tokio::task::AbortHandle, mpsc::Sender<Vec<u8>>)> = HashMap::new();
   let mut tasks = JoinSet::new();
   let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
   let mut last_received = Instant::now();
@@ -221,9 +259,14 @@ async fn connect_once(
               Frame::Ready { host_id, allow_control } if !ready => {
                 if host_id != protocol::host_id(key.verifying_key().as_bytes()) { return Err("Hub returned an incorrect host identity".into()); }
                 ready = true;
+                if secure.is_some() { enqueue(&outgoing, Frame::SecureOnly {}).await?; }
                 eprintln!("Connected to Hub as {host_id} ({})", if config.allow_control && allow_control { "control enabled" } else { "view access" });
               }
               Frame::Request { request_id, method, path, body } if ready => {
+                if secure.is_some() {
+                  enqueue(&outgoing, Frame::Error { request_id, message: "This host requires end-to-end encrypted access".into() }).await?;
+                  continue;
+                }
                 if requests.contains_key(&request_id) { return Err("Hub reused an active request ID".into()); }
                 if requests.len() >= protocol::MAX_REQUESTS || !protocol::allowed_route(&method, &path, config.allow_control) {
                   enqueue(&outgoing, Frame::Error { request_id, message: "Host route is unavailable or request capacity reached".into() }).await?;
@@ -241,9 +284,39 @@ async fn connect_once(
                     tokio::time::timeout(Duration::from_secs(120), future).await.unwrap_or_else(|_| Err("Local API request timed out; delivery may be uncertain and will not be retried".into()))
                   };
                   if let Err(message) = result { let _ = enqueue(&outgoing, Frame::Error { request_id, message }).await; }
-                  request_id
+                  (request_id, false)
                 });
                 requests.insert(request_id, (abort, window));
+              }
+              Frame::SecureOpen { channel_id } if ready => {
+                if secure_channels.contains_key(&channel_id) { return Err("Hub reused an active secure channel".into()); }
+                let Some(secure) = secure.clone().filter(|_| secure_channels.len() < protocol::MAX_REQUESTS) else {
+                  enqueue(&outgoing, Frame::SecureClose { channel_id }).await?;
+                  continue;
+                };
+                let (incoming, received) = mpsc::channel(protocol::MAX_BODY / protocol::CHUNK_SIZE + 4);
+                let outgoing = outgoing.clone();
+                let config = config.clone();
+                let client = client.clone();
+                let host_id = protocol::host_id(key.verifying_key().as_bytes());
+                let abort = tasks.spawn(async move {
+                  let _ = secure_transport::run(&secure, &host_id, &config, &client, &outgoing, channel_id, received).await;
+                  let _ = enqueue(&outgoing, Frame::SecureClose { channel_id }).await;
+                  (channel_id, true)
+                });
+                secure_channels.insert(channel_id, (abort, incoming));
+              }
+              Frame::SecureData { channel_id, data } if ready => {
+                let record = protocol::decode(&data, protocol::MAX_SECURE_RECORD)?;
+                if let Some((_, incoming)) = secure_channels.get(&channel_id) {
+                  if record.is_empty() || incoming.try_send(record).is_err() {
+                    if let Some((task, _)) = secure_channels.remove(&channel_id) { task.abort(); }
+                    enqueue(&outgoing, Frame::SecureClose { channel_id }).await?;
+                  }
+                }
+              }
+              Frame::SecureClose { channel_id } if ready => {
+                if let Some((task, _)) = secure_channels.remove(&channel_id) { task.abort(); }
               }
               Frame::Cancel { request_id } if ready => {
                 if let Some((task, _)) = requests.remove(&request_id) { task.abort(); }
@@ -268,7 +341,9 @@ async fn connect_once(
         send(&mut socket, &frame).await?;
       }
       task = tasks.join_next(), if !tasks.is_empty() => {
-        if let Some(Ok(request_id)) = task { requests.remove(&request_id); }
+        if let Some(Ok((id, encrypted))) = task {
+          if encrypted { secure_channels.remove(&id); } else { requests.remove(&id); }
+        }
       }
       _ = heartbeat.tick() => {
         if last_received.elapsed() > Duration::from_secs(45) { return Err("Hub heartbeat timed out".into()); }
@@ -421,6 +496,7 @@ mod tests {
       local_token: None,
       allow_control: false,
       insecure_loopback: false,
+      secure: None,
     }
   }
 

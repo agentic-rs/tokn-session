@@ -85,6 +85,9 @@ pub struct ViewerService {
   failed_body_jobs: Arc<Mutex<HashMap<(SourceKey, String), FailedBodyJob>>>,
   loaded_session_cache: Arc<Mutex<Option<CachedSession>>>,
   input_broker: crate::input::InputBroker,
+  /// Per-request metadata projection. The adapter still owns grant verification,
+  /// command permissions, and stream lifetime; never install this on a worker.
+  session_scope: Option<Arc<HashSet<String>>>,
 }
 
 /// The progress center must never need to touch provider storage. This store
@@ -672,12 +675,55 @@ impl ViewerService {
       failed_body_jobs: Arc::new(Mutex::new(HashMap::new())),
       loaded_session_cache: Arc::new(Mutex::new(None)),
       input_broker: crate::input::InputBroker::default(),
+      session_scope: None,
     };
     // Existing durable rows should be reflected immediately when a viewer is
     // reopened. This is SQLite-only bookkeeping; the progress snapshot itself
     // remains a pure in-memory clone.
     service.refresh_index_progress_from_index();
     service
+  }
+
+  /// Project catalogs and navigation onto an explicit set of complete sessions.
+  /// Filtering precedes tree construction, search, attention, and pagination.
+  pub fn scoped_to_sessions(&self, session_keys: &[String]) -> Result<Self, String> {
+    if session_keys.is_empty() || session_keys.len() > 128 {
+      return Err("A session share requires 1–128 explicit session keys".into());
+    }
+    for key in session_keys {
+      if key.len() > 8192 {
+        return Err("Shared session key is too long".into());
+      }
+      decode_session_key(key)?;
+      self.check_session_scope(key)?;
+    }
+    let mut service = self.clone();
+    service.session_scope = Some(Arc::new(session_keys.iter().cloned().collect()));
+    Ok(service)
+  }
+
+  fn check_session_scope(&self, key: &str) -> Result<(), String> {
+    if self.session_scope.as_ref().is_some_and(|scope| !scope.contains(key)) {
+      return Err("Session is not included in this share".into());
+    }
+    Ok(())
+  }
+
+  fn scope_inventory(&self, provider: ViewerProvider, mut inventory: SessionHeaderInventory) -> SessionHeaderInventory {
+    if let Some(scope) = &self.session_scope {
+      inventory.headers.retain(|header| {
+        encode_session_key(&locator_for_header(provider, header)).is_ok_and(|key| scope.contains(&key))
+      });
+      let ids: HashSet<_> = inventory.headers.iter().map(|header| header.id.clone()).collect();
+      for header in &mut inventory.headers {
+        if header.parent_session_id.as_ref().is_some_and(|id| !ids.contains(id)) {
+          header.parent_session_id = None;
+        }
+      }
+      // Owner read state is neither inherited by guests nor affected by them.
+      inventory.direct_attention.clear();
+    }
+    inventory
   }
 
   /// Returns the latest in-memory index worker state without touching SQLite
@@ -1060,7 +1106,7 @@ impl ViewerService {
     let mut source_errors = std::mem::take(&mut inventories.source_errors);
 
     for provider in providers {
-      if let Some(message) = self.index_error_for(provider) {
+      if let Some(message) = self.index_error_for(provider).filter(|_| self.session_scope.is_none()) {
         record_source_error(&mut source_errors, provider, message);
       }
       let Some(inventory) = inventories.by_provider.remove(&provider) else {
@@ -1219,6 +1265,7 @@ impl ViewerService {
   /// Admission check for untrusted remote keys. Decoding alone is insufficient:
   /// keys contain source paths, so only the committed catalog grants access.
   pub fn validate_session_key(&self, key: &str) -> Result<(), String> {
+    self.check_session_scope(key)?;
     let locator = decode_session_key(key)?;
     if !self.relay.external_catalog_covers(locator.provider) {
       return crate::index_queries::snapshot_entry(&self.session_index, &locator)?
@@ -1245,9 +1292,14 @@ impl ViewerService {
   /// synchronously inspect provider storage on an IPC request.
   fn indexed_session_inventory(&self, provider: ViewerProvider) -> Result<Option<SessionHeaderInventory>, String> {
     if self.relay.external_catalog_covers(provider) {
-      return Ok(self.relay.has_catalog().then(|| SessionHeaderInventory {
-        headers: self.relay.headers(provider),
-        direct_attention: HashMap::new(),
+      return Ok(self.relay.has_catalog().then(|| {
+        self.scope_inventory(
+          provider,
+          SessionHeaderInventory {
+            headers: self.relay.headers(provider),
+            direct_attention: HashMap::new(),
+          },
+        )
       }));
     }
     let catalog = self
@@ -1275,7 +1327,7 @@ impl ViewerService {
         .insert(locator_for_header(provider, &header), session.has_unread());
       inventory.headers.push(header);
     }
-    Ok(Some(inventory))
+    Ok(Some(self.scope_inventory(provider, inventory)))
   }
 
   /// Reads all sidebar-visible metadata from the durable index in one snapshot.
@@ -1304,6 +1356,10 @@ impl ViewerService {
           }
           None => result.pending_providers.push(provider),
         }
+      }
+      if self.session_scope.is_some() {
+        result.pending_providers.clear();
+        result.source_errors.clear();
       }
       return Ok(result);
     }
@@ -1359,9 +1415,20 @@ impl ViewerService {
     }
 
     Ok(IndexedSessionInventories {
-      by_provider,
-      pending_providers,
-      source_errors,
+      by_provider: by_provider
+        .into_iter()
+        .map(|(provider, inventory)| (provider, self.scope_inventory(provider, inventory)))
+        .collect(),
+      pending_providers: if self.session_scope.is_some() {
+        Vec::new()
+      } else {
+        pending_providers
+      },
+      source_errors: if self.session_scope.is_some() {
+        Vec::new()
+      } else {
+        source_errors
+      },
     })
   }
 
@@ -1373,6 +1440,9 @@ impl ViewerService {
   }
 
   fn attention_revision_for_locator(&self, locator: &SessionLocator) -> Option<String> {
+    if self.session_scope.is_some() {
+      return None;
+    }
     if self.relay.external_catalog_covers(locator.provider) {
       return None;
     }
@@ -2614,6 +2684,7 @@ impl ViewerService {
   }
 
   pub fn load_event_page(&self, request: EventPageRequest) -> Result<EventPage, String> {
+    self.check_session_scope(&request.session_key)?;
     if request.window_mode.is_some() {
       return self.load_retained_event_page(request);
     }
@@ -2683,6 +2754,10 @@ impl ViewerService {
     &self,
     request: AcknowledgeSessionAttentionRequest,
   ) -> Result<AcknowledgeSessionAttentionResponse, String> {
+    self.check_session_scope(&request.session_key)?;
+    if self.session_scope.is_some() {
+      return Ok(AcknowledgeSessionAttentionResponse { changed: false });
+    }
     let locator = decode_session_key(&request.session_key)?;
     let attention_revision = request
       .attention_revision
@@ -2870,6 +2945,7 @@ impl ViewerService {
   }
 
   fn load_verified(&self, locator: &SessionLocator) -> Result<Arc<LoadedSession>, String> {
+    self.check_session_scope(&encode_session_key(locator)?)?;
     if self.relay.covers(locator.provider) {
       return self.relay.load(locator);
     }
@@ -8254,6 +8330,89 @@ mod tests {
     assert_eq!(grandchildren.sessions.len(), 1);
     assert_eq!(grandchildren.sessions[0].session_id, "grandchild");
     assert_eq!(grandchildren.sessions[0].child_count, 0);
+  }
+
+  #[test]
+  fn session_shares_filter_before_relations_search_and_pagination() {
+    let headers = vec![
+      session_header("hidden-root", None, "/hidden", "9000"),
+      session_header("shared-child", Some("hidden-root"), "/shared", "8000"),
+      session_header("hidden-child", Some("shared-child"), "/hidden", "7000"),
+      session_header("shared-root", None, "/shared", "6000"),
+    ];
+    let key = |header: &SessionHeader| encode_session_key(&locator_for_header(ViewerProvider::Codex, header)).unwrap();
+    let child_key = key(&headers[1]);
+    let root_key = key(&headers[3]);
+    let hidden_key = key(&headers[0]);
+    let service = service_with_indexed_headers(
+      Arc::new(FakeRepository {
+        listings: HashMap::new(),
+        loaded: Mutex::new(None),
+      }),
+      vec![(ViewerProvider::Codex, headers)],
+    );
+    service
+      .index_errors
+      .lock()
+      .unwrap()
+      .insert(ViewerProvider::Pi, "secret source path".into());
+    let shared = service.scoped_to_sessions(&[child_key.clone(), root_key]).unwrap();
+    let first = shared
+      .list_sessions(ListSessionsRequest {
+        limit: Some(1),
+        ..Default::default()
+      })
+      .unwrap();
+    assert_eq!(first.sessions.len(), 1);
+    assert_eq!(first.sessions[0].session_id, "shared-child");
+    assert_eq!(first.sessions[0].parent_session_id, None);
+    assert!(!first.sessions[0].is_subagent);
+    assert_eq!(first.sessions[0].child_count, 0);
+    assert!(!first.sessions[0].has_unread_descendant);
+    assert!(first.pending_providers.is_empty());
+    assert!(first.source_errors.is_empty());
+    let next = shared
+      .list_sessions(ListSessionsRequest {
+        cursor: first.next_cursor,
+        limit: Some(1),
+        ..Default::default()
+      })
+      .unwrap();
+    assert_eq!(next.sessions[0].session_id, "shared-root");
+    assert!(next.next_cursor.is_none());
+    let search = shared
+      .list_sessions(ListSessionsRequest {
+        query: SessionQuery {
+          search: Some("hidden".into()),
+          ..Default::default()
+        },
+        ..Default::default()
+      })
+      .unwrap();
+    assert!(search.sessions.is_empty());
+    assert!(search.next_cursor.is_none());
+    let children = shared
+      .list_session_children(ListSessionChildrenRequest {
+        parent_session_key: child_key.clone(),
+        cursor: None,
+        offset: None,
+        limit: None,
+      })
+      .unwrap();
+    assert!(children.sessions.is_empty());
+    assert!(shared.validate_session_key(&hidden_key).is_err());
+    assert!(shared.scoped_to_sessions(&[hidden_key.clone()]).is_err());
+    assert!(shared.load_verified(&decode_session_key(&hidden_key).unwrap()).is_err());
+    assert!(
+      shared
+        .delegation_targets_for_parent(&decode_session_key(&child_key).unwrap())
+        .direct_children
+        .is_empty()
+    );
+    assert_eq!(
+      service.list_sessions(ListSessionsRequest::default()).unwrap().sessions[0].session_id,
+      "hidden-root"
+    );
   }
 
   #[test]

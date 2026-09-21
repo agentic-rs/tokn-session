@@ -59,17 +59,20 @@ captured compaction. Upgrade strict `AgentEvent` consumers with the producer.
 
 ## Session Hub
 
-`crates/hub` adds `tokn-session-hub serve` and `connect`: a single-owner,
-trusted gateway for multiple hosts. Passkeys authenticate the browser; generated
-Ed25519 identities authenticate outbound host tunnels. A generated bootstrap
-link enrolls the first passkey, and pairing-code comparison plus authenticated
-approval enrolls each host. The browser detects a Hub, lists/selects hosts, and
-reuses the viewer through `/hosts/<host_id>/api/v1`. Local Relay remains the
-provider feed. Viewing is the default; host control requires explicit approval
-and `--allow-control` on the connector. Logout/expiry and host revocation close
-active streams. Remote connections require HTTPS termination; the Hub can read
-traffic. See [hub.md](hub.md) for setup, identity storage, protocol boundaries,
-and current single-owner/recovery limits.
+`crates/hub` provides passkey administration and outbound host enrollment, plus
+an E2EE native `client` that serves the locally installed viewer on loopback.
+Noise IK authenticates endpoint encryption keys; owner-signed, expiring grants
+bind a recipient to one host and all or selected sessions. The host pins the
+owner independently, enforces grants, rejects plaintext fallback, and rechecks
+configured local revocations during streams. The Hub relays ciphertext.
+Selected-session grants are read-only, scope catalogs before pagination/tree
+construction, isolate leases/read markers, and use five-second generic live
+refreshes. Whole-session sharing is not redaction; keys include source paths.
+Control requires an explicit all-session grant and connector `--allow-control`.
+Key/grant/revocation management uses CLI commands; one local client opens one
+grant and the host must stay online. `connect --trusted-hub` explicitly retains
+the older browser-through-Hub mode. See [encrypted access](hub-e2ee.md) and
+[Hub administration](hub.md). Remote connections require HTTPS termination.
 
 ## Viewer core and remote API
 

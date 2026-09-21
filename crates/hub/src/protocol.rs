@@ -9,10 +9,14 @@ pub const MAX_FRAME: usize = 2 * 1024 * 1024;
 pub const MAX_REQUESTS: usize = 32;
 pub const RESPONSE_WINDOW: usize = 8;
 pub const TUNNEL_PATH: &str = "/hub/v1/tunnel";
+pub const MAX_SECURE_RECORD: usize = 65_535;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Frame {
+  /// Advisory online capability, sent only on the authenticated host socket.
+  /// The connector independently rejects plaintext regardless of this flag.
+  SecureOnly {},
   Challenge {
     version: u32,
     nonce: String,
@@ -60,6 +64,17 @@ pub enum Frame {
   Window {
     request_id: u64,
     credits: usize,
+  },
+  /// Opaque, end-to-end authenticated channels. The Hub never parses records.
+  SecureOpen {
+    channel_id: u64,
+  },
+  SecureData {
+    channel_id: u64,
+    data: String,
+  },
+  SecureClose {
+    channel_id: u64,
   },
 }
 

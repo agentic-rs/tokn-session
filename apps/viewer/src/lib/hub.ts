@@ -8,6 +8,7 @@ export interface HubHost {
   name: string;
   online: boolean;
   access: "view" | "control";
+  secure_only?: boolean;
 }
 
 export interface HubEnrollment {

@@ -2,7 +2,7 @@ use super::*;
 use crate::connector::{self, ConnectorConfig};
 use axum::{
   Router,
-  extract::{State, WebSocketUpgrade},
+  extract::{Path, State, WebSocketUpgrade},
   routing::{get, post},
 };
 use ed25519_dalek::{Signer, SigningKey};
@@ -42,6 +42,23 @@ async fn hub(tunnels: HubTunnels) -> (url::Url, JoinHandle<()>) {
               tunnels.handle_socket(socket).await;
             })
         }),
+      )
+      .route(
+        "/hub/v1/secure/{host_id}",
+        get(
+          |State(tunnels): State<HubTunnels>, Path(host_id): Path<String>, ws: WebSocketUpgrade| async move {
+            let Ok(permit) = tunnels.reserve_secure_channel() else {
+              return Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .body(Body::empty())
+                .unwrap();
+            };
+            ws.max_message_size(protocol::MAX_SECURE_RECORD)
+              .on_upgrade(move |socket| async move {
+                tunnels.handle_secure_socket(&host_id, socket, permit).await;
+              })
+          },
+        ),
       )
       .with_state(tunnels),
   )
@@ -96,6 +113,7 @@ async fn enrollment_streaming_cancellation_reconnect_and_revocation() {
     local_token: None,
     allow_control: false,
     insecure_loopback: true,
+    secure: None,
   };
   let stop = CancellationToken::new();
   let task = tokio::spawn(connector::run(config.clone(), stop.clone()));
@@ -411,6 +429,7 @@ async fn accepted_agent_input_is_not_replayed_after_tunnel_reconnect() {
     local_token: None,
     allow_control: true,
     insecure_loopback: true,
+    secure: None,
   };
   let stop = CancellationToken::new();
   let connector_task = tokio::spawn(connector::run(config, stop.clone()));
@@ -468,4 +487,485 @@ async fn accepted_agent_input_is_not_replayed_after_tunnel_reconnect() {
   tunnels.shutdown();
   hub_task.abort();
   local_task.abort();
+}
+
+async fn next_binary(socket: &mut TestSocket) -> Option<Vec<u8>> {
+  tokio::time::timeout(Duration::from_secs(5), async {
+    loop {
+      match socket.next().await {
+        Some(Ok(ClientMessage::Binary(data))) => return Some(data.to_vec()),
+        Some(Ok(ClientMessage::Ping(data))) => {
+          let _ = socket.send(ClientMessage::Pong(data)).await;
+        }
+        Some(Ok(ClientMessage::Pong(_))) => {}
+        _ => return None,
+      }
+    }
+  })
+  .await
+  .expect("encrypted record timed out")
+}
+
+async fn encrypted_socket(
+  endpoint: &url::Url,
+  identity: &crate::secure::NoiseIdentity,
+  host_public_key: &str,
+) -> (TestSocket, crate::secure::SecureChannel) {
+  let (mut socket, _) = connect_async(endpoint.as_str()).await.unwrap();
+  let mut handshake = crate::secure::NoiseInitiator::new(identity, host_public_key).unwrap();
+  socket
+    .send(ClientMessage::Binary(handshake.start().unwrap().into()))
+    .await
+    .unwrap();
+  let reply = next_binary(&mut socket).await.unwrap();
+  (socket, handshake.finish(&reply).unwrap())
+}
+
+async fn send_inner(
+  socket: &mut TestSocket,
+  channel: &mut crate::secure::SecureChannel,
+  message: &crate::secure::InnerMessage,
+) {
+  socket
+    .send(ClientMessage::Binary(channel.encrypt(message).unwrap().into()))
+    .await
+    .unwrap();
+}
+
+async fn secure_request(
+  endpoint: &url::Url,
+  identity: &crate::secure::NoiseIdentity,
+  grant: &crate::secure::SignedGrant,
+  method: &str,
+  path: &str,
+  body: &[u8],
+) -> (TestSocket, crate::secure::SecureChannel) {
+  use crate::secure::InnerMessage;
+  let (mut socket, mut channel) = encrypted_socket(endpoint, identity, &grant.grant.host_public_key).await;
+  send_inner(
+    &mut socket,
+    &mut channel,
+    &InnerMessage::Request {
+      method: method.into(),
+      path: path.into(),
+      grant: grant.clone(),
+    },
+  )
+  .await;
+  for part in body.chunks(protocol::CHUNK_SIZE) {
+    send_inner(
+      &mut socket,
+      &mut channel,
+      &InnerMessage::RequestBody {
+        data: protocol::encode(part),
+      },
+    )
+    .await;
+  }
+  send_inner(&mut socket, &mut channel, &InnerMessage::RequestEnd {}).await;
+  (socket, channel)
+}
+
+#[tokio::test]
+async fn encrypted_transport_authenticates_grants_bounds_streams_and_rejects_plaintext() {
+  use crate::{
+    connector::SecureHostConfig,
+    secure::{GRANT_VERSION, Grant, GrantScope, InnerMessage, NoiseIdentity, OwnerIdentity},
+  };
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path().join("hub.sqlite")).unwrap();
+  let tunnels = HubTunnels::new(store);
+  let (hub_url, hub_task) = hub(tunnels.clone()).await;
+  let owner = OwnerIdentity::generate();
+  let recipient = NoiseIdentity::generate().unwrap();
+  let noise_file = directory.path().join("noise.json");
+  let host_identity = NoiseIdentity::load_or_create(&noise_file).unwrap();
+  let revoked_file = directory.path().join("revoked.json");
+  std::fs::write(&revoked_file, "[]").unwrap();
+  let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+  let health_calls = calls.clone();
+  let streaming = Arc::new(AtomicBool::new(false));
+  let stream_state = streaming.clone();
+  let local = Router::new()
+    .route(
+      "/api/v1/health",
+      get(move || {
+        health_calls.fetch_add(1, Ordering::SeqCst);
+        async { "{}" }
+      }),
+    )
+    .route("/api/v1/list_sessions", post(|body: Bytes| async { body }))
+    .route(
+      "/api/v1/shared",
+      post(|axum::Json(envelope): axum::Json<serde_json::Value>| async { axum::Json(envelope) }),
+    )
+    .route(
+      "/api/v1/events",
+      get(move || {
+        let streaming = stream_state.clone();
+        async move {
+          let stream = async_stream::stream! {
+            let _guard = StreamGuard(streaming.clone());
+            streaming.store(true, Ordering::SeqCst);
+            yield Ok::<_, io::Error>(Bytes::from_static(b"event: ready\ndata: {}\n\n"));
+            std::future::pending::<()>().await;
+          };
+          Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(stream))
+            .unwrap()
+        }
+      }),
+    );
+  let (local_url, local_task) = serve(local).await;
+  let config = ConnectorConfig {
+    hub_url: hub_url.clone(),
+    local_url,
+    key_file: directory.path().join("host.json"),
+    name: "Encrypted host".into(),
+    local_token: None,
+    allow_control: false,
+    insecure_loopback: true,
+    secure: Some(SecureHostConfig {
+      noise_key_file: noise_file,
+      owner_public_key: owner.public_key(),
+      revocations_file: Some(revoked_file.clone()),
+    }),
+  };
+  let stop = CancellationToken::new();
+  let connector = tokio::spawn(connector::run(config, stop.clone()));
+  wait_for(|| !tunnels.pending().is_empty()).await;
+  let record = tunnels.approve(&tunnels.pending()[0].pairing_code).unwrap();
+  wait_for(|| tunnels.online(&record.host_id)).await;
+  wait_for(|| tunnels.secure_only(&record.host_id)).await;
+  let grant = owner
+    .sign_grant(Grant {
+      version: GRANT_VERSION,
+      grant_id: "integration_grant".into(),
+      host_id: record.host_id.clone(),
+      host_public_key: host_identity.public_key(),
+      recipient_public_key: recipient.public_key(),
+      scope: GrantScope::All {},
+      allow_control: false,
+      expires_at: std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 300,
+    })
+    .unwrap();
+  let mut endpoint = hub_url;
+  endpoint.set_scheme("ws").unwrap();
+  endpoint.set_path(&format!("/hub/v1/secure/{}", record.host_id));
+
+  let error = tunnels
+    .proxy(&record.host_id, Method::GET, "/api/v1/health", Bytes::new())
+    .await
+    .err()
+    .unwrap();
+  assert_eq!(error.status, StatusCode::FORBIDDEN);
+  assert!(error.message.contains("encrypted client"));
+  assert_eq!(
+    calls.load(Ordering::SeqCst),
+    0,
+    "a malicious Hub cannot downgrade this host to plaintext"
+  );
+  // Bypass the Hub's advisory secure-only check: the host must still reject a
+  // plaintext request injected directly onto its authenticated tunnel.
+  let connection = tunnels.inner.lock().unwrap().online[&record.host_id].clone();
+  let (headers, ready) = oneshot::channel();
+  let (chunks, _) = mpsc::channel(1);
+  connection.requests.lock().unwrap().insert(
+    900,
+    InFlight {
+      headers: Some(headers),
+      chunks,
+      failure: Arc::new(Mutex::new(None)),
+    },
+  );
+  connection
+    .outgoing
+    .send(Frame::Request {
+      request_id: 900,
+      method: "GET".into(),
+      path: "/api/v1/health".into(),
+      body: String::new(),
+    })
+    .await
+    .unwrap();
+  let rejected = tokio::time::timeout(Duration::from_secs(2), ready)
+    .await
+    .unwrap()
+    .unwrap();
+  assert!(rejected.unwrap_err().contains("end-to-end"));
+  assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+  let attacker = NoiseIdentity::generate().unwrap();
+  let (mut socket, mut channel) = encrypted_socket(&endpoint, &attacker, &host_identity.public_key()).await;
+  send_inner(
+    &mut socket,
+    &mut channel,
+    &InnerMessage::Request {
+      method: "GET".into(),
+      path: "/api/v1/health".into(),
+      grant: grant.clone(),
+    },
+  )
+  .await;
+  assert!(
+    next_binary(&mut socket).await.is_none(),
+    "a stolen grant needs its recipient's private key"
+  );
+  assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+  let data = vec![b'x'; protocol::MAX_BODY];
+  let (mut socket, mut channel) =
+    secure_request(&endpoint, &recipient, &grant, "POST", "/api/v1/list_sessions", &data).await;
+  assert!(matches!(
+    channel.decrypt(&next_binary(&mut socket).await.unwrap()).unwrap(),
+    InnerMessage::Response { status: 200, .. }
+  ));
+  let mut response = Vec::new();
+  for _ in 0..protocol::RESPONSE_WINDOW {
+    let record = next_binary(&mut socket).await.unwrap();
+    assert!(
+      !record.windows(32).any(|chunk| chunk == &[b'x'; 32]),
+      "Hub records never contain response plaintext"
+    );
+    let InnerMessage::Chunk { data } = channel.decrypt(&record).unwrap() else {
+      panic!("expected encrypted chunk")
+    };
+    response.extend(protocol::decode(&data, protocol::CHUNK_SIZE).unwrap());
+  }
+  assert!(
+    tokio::time::timeout(Duration::from_millis(100), socket.next())
+      .await
+      .is_err(),
+    "host stops when the encrypted downstream window is exhausted"
+  );
+  send_inner(
+    &mut socket,
+    &mut channel,
+    &InnerMessage::Window {
+      credits: protocol::RESPONSE_WINDOW,
+    },
+  )
+  .await;
+  loop {
+    match channel.decrypt(&next_binary(&mut socket).await.unwrap()).unwrap() {
+      InnerMessage::Chunk { data } => {
+        response.extend(protocol::decode(&data, protocol::CHUNK_SIZE).unwrap());
+        send_inner(&mut socket, &mut channel, &InnerMessage::Window { credits: 1 }).await;
+      }
+      InnerMessage::End {} => break,
+      message => panic!("unexpected {message:?}"),
+    }
+  }
+  assert_eq!(
+    response, data,
+    "a full request and response span multiple Noise records intact"
+  );
+  drop(socket);
+
+  let mut selected = grant.grant.clone();
+  selected.grant_id = "selected_grant".into();
+  selected.scope = GrantScope::Sessions {
+    session_keys: vec!["approved_session".into()],
+  };
+  let selected = owner.sign_grant(selected).unwrap();
+  let (mut socket, mut channel) = secure_request(
+    &endpoint,
+    &recipient,
+    &selected,
+    "POST",
+    "/api/v1/list_sessions",
+    br#"{"session_keys":["private_session"],"principal":"attacker"}"#,
+  )
+  .await;
+  assert!(matches!(
+    channel.decrypt(&next_binary(&mut socket).await.unwrap()).unwrap(),
+    InnerMessage::Response { status: 200, .. }
+  ));
+  let mut body = Vec::new();
+  loop {
+    match channel.decrypt(&next_binary(&mut socket).await.unwrap()).unwrap() {
+      InnerMessage::Chunk { data } => {
+        body.extend(protocol::decode(&data, protocol::CHUNK_SIZE).unwrap());
+        send_inner(&mut socket, &mut channel, &InnerMessage::Window { credits: 1 }).await;
+      }
+      InnerMessage::End {} => break,
+      message => panic!("unexpected {message:?}"),
+    }
+  }
+  let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+  assert_eq!(envelope["session_keys"], serde_json::json!(["approved_session"]));
+  assert_eq!(envelope["principal"], recipient.public_key());
+  assert_eq!(envelope["command"], "list_sessions");
+  drop(socket);
+  let (mut socket, mut channel) = secure_request(
+    &endpoint,
+    &recipient,
+    &selected,
+    "POST",
+    "/api/v1/submit_session_input",
+    b"{}",
+  )
+  .await;
+  assert!(
+    matches!(
+      channel.decrypt(&next_binary(&mut socket).await.unwrap()).unwrap(),
+      InnerMessage::Error { .. }
+    ),
+    "selected-session sharing never authorizes input"
+  );
+  drop(socket);
+
+  let mut expiring = grant.grant.clone();
+  expiring.grant_id = "expiring_grant".into();
+  expiring.expires_at = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap()
+    .as_secs()
+    + 3;
+  let expiring = owner.sign_grant(expiring).unwrap();
+  let (mut socket, mut channel) = secure_request(&endpoint, &recipient, &expiring, "GET", "/api/v1/events", &[]).await;
+  assert!(matches!(
+    channel.decrypt(&next_binary(&mut socket).await.unwrap()).unwrap(),
+    InnerMessage::Response { .. }
+  ));
+  assert!(matches!(
+    channel.decrypt(&next_binary(&mut socket).await.unwrap()).unwrap(),
+    InnerMessage::Chunk { .. }
+  ));
+  let message = channel.decrypt(&next_binary(&mut socket).await.unwrap()).unwrap();
+  assert!(matches!(message, InnerMessage::Error { message } if message.contains("expired")));
+  wait_for(|| !streaming.load(Ordering::SeqCst)).await;
+  drop(socket);
+
+  let (mut socket, mut channel) = secure_request(&endpoint, &recipient, &grant, "GET", "/api/v1/events", &[]).await;
+  assert!(matches!(
+    channel.decrypt(&next_binary(&mut socket).await.unwrap()).unwrap(),
+    InnerMessage::Response { .. }
+  ));
+  assert!(matches!(
+    channel.decrypt(&next_binary(&mut socket).await.unwrap()).unwrap(),
+    InnerMessage::Chunk { .. }
+  ));
+  assert!(streaming.load(Ordering::SeqCst));
+  drop(socket);
+  wait_for(|| !streaming.load(Ordering::SeqCst)).await;
+
+  let (mut socket, mut channel) = secure_request(&endpoint, &recipient, &grant, "GET", "/api/v1/events", &[]).await;
+  assert!(matches!(
+    channel.decrypt(&next_binary(&mut socket).await.unwrap()).unwrap(),
+    InnerMessage::Response { .. }
+  ));
+  assert!(matches!(
+    channel.decrypt(&next_binary(&mut socket).await.unwrap()).unwrap(),
+    InnerMessage::Chunk { .. }
+  ));
+  std::fs::write(&revoked_file, serde_json::to_vec(&vec![&grant.grant.grant_id]).unwrap()).unwrap();
+  let message = channel.decrypt(&next_binary(&mut socket).await.unwrap()).unwrap();
+  assert!(matches!(message, InnerMessage::Error { message } if message.contains("revoked")));
+  wait_for(|| !streaming.load(Ordering::SeqCst)).await;
+
+  let (mut socket, mut channel) = encrypted_socket(&endpoint, &recipient, &host_identity.public_key()).await;
+  send_inner(
+    &mut socket,
+    &mut channel,
+    &InnerMessage::Request {
+      method: "GET".into(),
+      path: "/api/v1/health".into(),
+      grant,
+    },
+  )
+  .await;
+  assert!(next_binary(&mut socket).await.is_none());
+  assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+  let mut waiting = Vec::new();
+  for _ in 0..protocol::MAX_REQUESTS {
+    waiting.push(connect_async(endpoint.as_str()).await.unwrap().0);
+  }
+  let connection = tunnels.inner.lock().unwrap().online[&record.host_id].clone();
+  wait_for(|| connection.secure_channels.lock().unwrap().len() == protocol::MAX_REQUESTS).await;
+  let mut overflow = connect_async(endpoint.as_str()).await.unwrap().0;
+  assert!(
+    next_binary(&mut overflow).await.is_none(),
+    "anonymous channels cannot exceed the host capacity"
+  );
+  drop(waiting);
+  wait_for(|| connection.secure_channels.lock().unwrap().is_empty()).await;
+  stop.cancel();
+  connector.await.unwrap().unwrap();
+  tunnels.shutdown();
+  hub_task.abort();
+  local_task.abort();
+}
+
+#[tokio::test]
+async fn blind_channels_accept_opaque_bytes_and_cancel_only_the_saturated_channel() {
+  let (outgoing, mut commands) = mpsc::channel(8);
+  let connection = Arc::new(Connection {
+    capacity: Weak::new(),
+    outgoing,
+    requests: Mutex::new(HashMap::new()),
+    secure_channels: Mutex::new(HashMap::new()),
+    next_id: std::sync::atomic::AtomicU64::new(1),
+    allow_control: false,
+    secure_only: AtomicBool::new(false),
+    shutdown: CancellationToken::new(),
+  });
+  let (sender, mut received) = mpsc::channel(1);
+  connection.secure_channels.lock().unwrap().insert(7, sender);
+  let arbitrary = b"\xff\0opaque ciphertext";
+  connection
+    .receive(Frame::SecureData {
+      channel_id: 7,
+      data: protocol::encode(arbitrary),
+    })
+    .unwrap();
+  assert_eq!(&received.recv().await.unwrap()[..], arbitrary);
+  for _ in 0..2 {
+    connection
+      .receive(Frame::SecureData {
+        channel_id: 7,
+        data: protocol::encode(arbitrary),
+      })
+      .unwrap();
+  }
+  assert!(connection.secure_channels.lock().unwrap().is_empty());
+  assert!(matches!(
+    commands.recv().await,
+    Some(Frame::SecureClose { channel_id: 7 })
+  ));
+  assert!(!connection.shutdown.is_cancelled());
+  let (sender, _) = mpsc::channel(1);
+  connection.secure_channels.lock().unwrap().insert(8, sender);
+  drop(SecureGuard {
+    connection: connection.clone(),
+    channel_id: 8,
+  });
+  assert!(matches!(
+    commands.recv().await,
+    Some(Frame::SecureClose { channel_id: 8 })
+  ));
+  assert!(connection.secure_channels.lock().unwrap().is_empty());
+}
+
+#[test]
+fn anonymous_secure_channels_have_a_global_budget_separate_from_host_enrollment() {
+  let directory = tempfile::tempdir().unwrap();
+  let tunnels = HubTunnels::new(Store::open(directory.path().join("hub.sqlite")).unwrap());
+  let mut permits = Vec::new();
+  for _ in 0..128 {
+    permits.push(tunnels.reserve_secure_channel().unwrap());
+  }
+  assert!(tunnels.reserve_secure_channel().is_err());
+  assert_eq!(tunnels.handshakes.available_permits(), 32);
+  assert_eq!(tunnels.approved.available_permits(), 64);
+  permits.pop();
+  assert!(tunnels.reserve_secure_channel().is_ok());
+  drop(permits);
+  assert_eq!(tunnels.secure_capacity.available_permits(), 128);
 }

@@ -51,6 +51,7 @@ pub fn router(state: HubState) -> Router {
   Router::new()
     .merge(protected)
     .route("/hub/v1/tunnel", get(tunnel))
+    .route("/hub/v1/secure/{host_id}", get(secure_tunnel))
     .route("/hub/v1/health", get(|| async { Json(json!({ "version": 1 })) }))
     .route("/hub", any(not_found))
     .route("/hub/{*path}", any(not_found))
@@ -155,6 +156,7 @@ async fn hosts(State(state): State<HubState>) -> Result<Json<Value>, ApiError> {
   Ok(Json(json!({
     "hosts": hosts.into_iter().map(|host| json!({
       "online": state.tunnels.online(&host.host_id),
+      "secure_only": state.tunnels.secure_only(&host.host_id),
       "access": state.tunnels.access(&host.host_id).unwrap_or(host.access),
       "host_id": host.host_id,
       "name": host.name,
@@ -200,6 +202,30 @@ async fn tunnel(State(state): State<HubState>, headers: HeaderMap, websocket: We
     .on_upgrade(move |socket| async move { state.tunnels.handle_socket(socket).await })
 }
 
+async fn secure_tunnel(
+  State(state): State<HubState>,
+  Path(host_id): Path<String>,
+  headers: HeaderMap,
+  websocket: WebSocketUpgrade,
+) -> Response {
+  // The native client owns the pinned host key and owner-signed grant. Browser
+  // JavaScript served by this Hub is not a trusted endpoint for encrypted hosts.
+  if headers.contains_key(header::ORIGIN) {
+    return error(StatusCode::FORBIDDEN, "Secure channels require the native client").into_response();
+  }
+  if !state.tunnels.online(&host_id) {
+    return error(StatusCode::BAD_GATEWAY, "Host is offline").into_response();
+  }
+  let permit = match state.tunnels.reserve_secure_channel() {
+    Ok(permit) => permit,
+    Err(message) => return error(StatusCode::TOO_MANY_REQUESTS, message).into_response(),
+  };
+  websocket
+    .max_message_size(crate::protocol::MAX_SECURE_RECORD)
+    .max_frame_size(crate::protocol::MAX_SECURE_RECORD)
+    .on_upgrade(move |socket| async move { state.tunnels.handle_secure_socket(&host_id, socket, permit).await })
+}
+
 async fn proxy(
   State(state): State<HubState>,
   Path((host_id, command)): Path<(String, String)>,
@@ -207,6 +233,13 @@ async fn proxy(
   body: Bytes,
 ) -> Response {
   // The connector independently enforces its local maximum permission.
+  if state.tunnels.secure_only(&host_id) {
+    return error(
+      StatusCode::FORBIDDEN,
+      "This host requires the installed encrypted client",
+    )
+    .into_response();
+  }
   // Advertising unavailable input also keeps the viewer's composer disabled.
   if method == Method::POST
     && command == "get_session_input_status"
