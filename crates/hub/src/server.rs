@@ -82,7 +82,10 @@ pub fn with_web_ui(app: Router, web_root: PathBuf) -> Result<Router, String> {
         async move {
           // Cover malformed and trailing-slash API paths as well as normal misses.
           // A failed API lookup must never turn into a successful HTML response.
-          if matches!(request.uri().path().split('/').nth(1), Some("hub" | "hosts" | "api")) {
+          if matches!(
+            request.uri().path().split('/').nth(1),
+            Some("hub" | "hosts" | "api" | "paired")
+          ) {
             not_found().await.into_response()
           } else {
             files

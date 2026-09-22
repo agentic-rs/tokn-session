@@ -40,9 +40,10 @@ implementation status.
 
 ## Remote hosts through a Hub
 
-`tokn-session-hub` connects several hosts through one endpoint. Passkeys manage
-host enrollment; an installed client provides end-to-end encryption with
-owner-signed grants for full-host or selected-session access. Hosts enforce
-permissions and revocation. See [encrypted access and sharing](docs/hub-e2ee.md)
-and [Hub setup](docs/hub.md). The older browser-through-Hub mode requires an
-explicit `--trusted-hub` option.
+`tokn-session-hub` connects your hosts through one endpoint. Hosts automatically
+register their public identities and verify authenticator codes locally to pair
+your devices. The installed client remembers trusted keys and reconnects with
+end-to-end encryption. See [host onboarding](docs/hub-pairing.md) and
+[Hub administration](docs/hub.md). Sharing is deferred from this onboarding flow;
+the earlier grant commands remain available. The older browser-through-Hub mode
+requires an explicit `--trusted-hub` option.

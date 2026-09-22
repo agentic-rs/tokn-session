@@ -114,6 +114,7 @@ async fn enrollment_streaming_cancellation_reconnect_and_revocation() {
     allow_control: false,
     insecure_loopback: true,
     secure: None,
+    paired: None,
   };
   let stop = CancellationToken::new();
   let task = tokio::spawn(connector::run(config.clone(), stop.clone()));
@@ -301,7 +302,90 @@ async fn signatures_bind_fresh_challenge_identity_name_and_permission() {
   task.abort();
 }
 
+#[tokio::test]
+async fn encrypted_registration_proof_binds_uuid_and_reports_replacement_or_revocation() {
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path().join("hub.sqlite")).unwrap();
+  let tunnels = HubTunnels::new(store.clone());
+  let (mut endpoint, task) = hub(tunnels.clone()).await;
+  endpoint.set_scheme("ws").unwrap();
+  endpoint.set_path(protocol::TUNNEL_PATH);
+  let host_id = uuid::Uuid::new_v4().to_string();
+  let key = SigningKey::generate(&mut OsRng);
+  for attempt in 0..5 {
+    let (mut socket, _) = connect_async(endpoint.as_str()).await.unwrap();
+    let Some(Frame::Challenge { nonce, .. }) = next_frame(&mut socket).await else {
+      panic!("challenge missing")
+    };
+    let signing_key = if attempt == 3 {
+      SigningKey::generate(&mut OsRng)
+    } else {
+      key.clone()
+    };
+    let public_key = protocol::encode(signing_key.verifying_key().as_bytes());
+    let proof = if attempt == 0 {
+      protocol::proof(&nonce, &public_key, "Host", false)
+    } else {
+      protocol::registration_proof(&nonce, &host_id, &public_key, "Host", false)
+    };
+    let frame = Frame::Register {
+      version: protocol::VERSION,
+      host_id: if attempt == 1 {
+        uuid::Uuid::new_v4().to_string()
+      } else {
+        host_id.clone()
+      },
+      public_key,
+      name: "Host".into(),
+      allow_control: false,
+      signature: protocol::encode(&signing_key.sign(&proof).to_bytes()),
+    };
+    socket
+      .send(ClientMessage::Text(serde_json::to_string(&frame).unwrap().into()))
+      .await
+      .unwrap();
+    let reply = next_frame(&mut socket).await;
+    if attempt == 2 {
+      assert!(matches!(reply, Some(Frame::Ready { host_id: registered, .. }) if registered == host_id));
+      assert!(
+        tunnels.secure_only(&host_id),
+        "secure-only is effective before any host advisory"
+      );
+    } else if attempt >= 3 {
+      assert!(
+        matches!(reply, Some(Frame::RegistrationRejected { message }) if message.contains("revoked or belongs to a different identity")),
+        "proved registration receives a recovery diagnostic without authorizing the rejected identity"
+      );
+    } else {
+      assert!(
+        reply.is_none(),
+        "legacy proof and UUID substitution must fail before registration"
+      );
+    }
+    if attempt == 3 {
+      tunnels.revoke(&host_id).unwrap();
+    }
+    assert!(tunnels.pending().is_empty());
+  }
+  assert!(store.hosts().unwrap().is_empty());
+  tunnels.shutdown();
+  task.abort();
+}
+
 type TestSocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+#[test]
+fn registration_diagnostics_never_expose_database_details() {
+  let diagnostic = registration_diagnostic("Hub database: failed to open /private/example.sqlite");
+  assert_eq!(
+    diagnostic,
+    "Hub could not register this host; contact its administrator"
+  );
+  assert_eq!(
+    registration_diagnostic("New host registration rate limit reached; retry in one minute"),
+    "New host registration rate limit reached; retry in one minute"
+  );
+}
 
 async fn signed_socket(endpoint: &url::Url, key: &SigningKey) -> TestSocket {
   let (mut socket, _) = connect_async(endpoint.as_str()).await.unwrap();
@@ -430,6 +514,7 @@ async fn accepted_agent_input_is_not_replayed_after_tunnel_reconnect() {
     allow_control: true,
     insecure_loopback: true,
     secure: None,
+    paired: None,
   };
   let stop = CancellationToken::new();
   let connector_task = tokio::spawn(connector::run(config, stop.clone()));
@@ -566,6 +651,207 @@ async fn secure_request(
   (socket, channel)
 }
 
+async fn device_request(
+  endpoint: &url::Url,
+  identity: &crate::secure::NoiseIdentity,
+  host_public_key: &str,
+  method: &str,
+  path: &str,
+) -> (TestSocket, crate::secure::SecureChannel) {
+  use crate::secure::InnerMessage;
+  let (mut socket, mut channel) = encrypted_socket(endpoint, identity, host_public_key).await;
+  send_inner(
+    &mut socket,
+    &mut channel,
+    &InnerMessage::DeviceRequest {
+      method: method.into(),
+      path: path.into(),
+    },
+  )
+  .await;
+  send_inner(&mut socket, &mut channel, &InnerMessage::RequestEnd {}).await;
+  (socket, channel)
+}
+
+#[tokio::test]
+async fn authenticator_pairing_registers_only_encrypted_hosts_and_persists_trust() {
+  use crate::{
+    connector::PairedHostConfig,
+    pairing::{ClientPairing, TotpSecret},
+    secure::{InnerMessage, NoiseIdentity},
+  };
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path().join("hub.sqlite")).unwrap();
+  let tunnels = HubTunnels::new(store.clone());
+  let (hub_url, hub_task) = hub(tunnels.clone()).await;
+  let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+  let health_calls = calls.clone();
+  let streaming = Arc::new(AtomicBool::new(false));
+  let stream_state = streaming.clone();
+  let local = Router::new()
+    .route(
+      "/api/v1/health",
+      get(move || {
+        health_calls.fetch_add(1, Ordering::SeqCst);
+        async { "{}" }
+      }),
+    )
+    .route(
+      "/api/v1/events",
+      get(move || {
+        let streaming = stream_state.clone();
+        async move {
+          let stream = async_stream::stream! {
+            let _guard = StreamGuard(streaming.clone());
+            streaming.store(true, Ordering::SeqCst);
+            yield Ok::<_, io::Error>(Bytes::from_static(b"event: ready\ndata: {}\n\n"));
+            std::future::pending::<()>().await;
+          };
+          Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(stream))
+            .unwrap()
+        }
+      }),
+    );
+  let (local_url, local_task) = serve(local).await;
+  let host_id = uuid::Uuid::new_v4().to_string();
+  let noise_file = directory.path().join("host-noise.json");
+  let host_identity = NoiseIdentity::load_or_create(&noise_file).unwrap();
+  let state_file = directory.path().join("access.json");
+  let secret = TotpSecret::generate();
+  crate::onboarding::initialize_host_access(&state_file, &secret).unwrap();
+  let config = ConnectorConfig {
+    hub_url: hub_url.clone(),
+    local_url,
+    key_file: directory.path().join("enrollment.json"),
+    name: "Paired host".into(),
+    local_token: None,
+    allow_control: false,
+    insecure_loopback: true,
+    secure: None,
+    paired: Some(PairedHostConfig {
+      host_id: host_id.clone(),
+      noise_key_file: noise_file,
+      state_file: state_file.clone(),
+    }),
+  };
+  let stop = CancellationToken::new();
+  let connector_task = tokio::spawn(connector::run(config.clone(), stop.clone()));
+  wait_for(|| tunnels.online(&host_id)).await;
+  assert!(tunnels.pending().is_empty());
+  assert!(tunnels.secure_only(&host_id));
+  assert_eq!(store.hosts().unwrap().len(), 1);
+  assert_eq!(
+    tunnels
+      .proxy(&host_id, Method::GET, "/api/v1/health", Bytes::new())
+      .await
+      .err()
+      .unwrap()
+      .status,
+    StatusCode::FORBIDDEN
+  );
+  let mut endpoint = hub_url;
+  endpoint.set_scheme("ws").unwrap();
+  endpoint.set_path(&format!("/hub/v1/secure/{host_id}"));
+  let recipient = NoiseIdentity::generate().unwrap();
+  let (mut socket, mut channel) = encrypted_socket(&endpoint, &recipient, &host_identity.public_key()).await;
+  send_inner(
+    &mut socket,
+    &mut channel,
+    &InnerMessage::DeviceRequest {
+      method: "GET".into(),
+      path: "/api/v1/health".into(),
+    },
+  )
+  .await;
+  assert!(
+    next_binary(&mut socket).await.is_none(),
+    "knowing a host's public key does not authorize an unpaired device"
+  );
+  assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+  let now = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap()
+    .as_secs();
+  let code = secret.code_at(now);
+  let (pending, hello) = ClientPairing::start(&host_id, &recipient, &code, now).unwrap();
+  let (mut socket, _) = connect_async(endpoint.as_str()).await.unwrap();
+  socket.send(ClientMessage::Binary(hello.into())).await.unwrap();
+  let (waiting, confirm) = pending.confirm(&next_binary(&mut socket).await.unwrap()).unwrap();
+  socket.send(ClientMessage::Binary(confirm.into())).await.unwrap();
+  let paired = waiting.finish(&next_binary(&mut socket).await.unwrap()).unwrap();
+  assert_eq!(paired.host_public_key, host_identity.public_key());
+  assert_eq!(paired.client_public_key, recipient.public_key());
+  assert!(crate::onboarding::is_authorized(&state_file, &recipient.public_key()).unwrap());
+  drop(socket);
+
+  // A fresh exchange with the accepted time step must fail, even with a new
+  // client key and PAKE ephemeral. Authorization consumes the step locally.
+  let other = NoiseIdentity::generate().unwrap();
+  let (_, replay) = ClientPairing::start(&host_id, &other, &code, now).unwrap();
+  let (mut socket, _) = connect_async(endpoint.as_str()).await.unwrap();
+  socket.send(ClientMessage::Binary(replay.into())).await.unwrap();
+  assert!(next_binary(&mut socket).await.is_none());
+  assert!(!crate::onboarding::is_authorized(&state_file, &other.public_key()).unwrap());
+  drop(socket);
+
+  stop.cancel();
+  connector_task.await.unwrap().unwrap();
+  wait_for(|| !tunnels.online(&host_id)).await;
+  let stop = CancellationToken::new();
+  let connector_task = tokio::spawn(connector::run(config, stop.clone()));
+  wait_for(|| tunnels.online(&host_id)).await;
+  let (mut socket, mut channel) =
+    device_request(&endpoint, &recipient, &paired.host_public_key, "GET", "/api/v1/health").await;
+  assert!(matches!(
+    channel.decrypt(&next_binary(&mut socket).await.unwrap()).unwrap(),
+    InnerMessage::Response { status: 200, .. }
+  ));
+  assert_eq!(
+    calls.load(Ordering::SeqCst),
+    1,
+    "saved device authorization survives connector restart"
+  );
+  drop(socket);
+
+  let (mut socket, mut channel) = device_request(
+    &endpoint,
+    &recipient,
+    &paired.host_public_key,
+    "POST",
+    "/api/v1/submit_session_input",
+  )
+  .await;
+  assert!(matches!(
+    channel.decrypt(&next_binary(&mut socket).await.unwrap()).unwrap(),
+    InnerMessage::Error { .. }
+  ));
+  drop(socket);
+  let (mut socket, mut channel) =
+    device_request(&endpoint, &recipient, &paired.host_public_key, "GET", "/api/v1/events").await;
+  assert!(matches!(
+    channel.decrypt(&next_binary(&mut socket).await.unwrap()).unwrap(),
+    InnerMessage::Response { .. }
+  ));
+  assert!(matches!(
+    channel.decrypt(&next_binary(&mut socket).await.unwrap()).unwrap(),
+    InnerMessage::Chunk { .. }
+  ));
+  std::fs::write(&state_file, "{}").unwrap();
+  assert!(matches!(
+    channel.decrypt(&next_binary(&mut socket).await.unwrap()).unwrap(),
+    InnerMessage::Error { .. }
+  ));
+  wait_for(|| !streaming.load(Ordering::SeqCst)).await;
+  assert_eq!(calls.load(Ordering::SeqCst), 1);
+  stop.cancel();
+  connector_task.await.unwrap().unwrap();
+  hub_task.abort();
+  local_task.abort();
+}
+
 #[tokio::test]
 async fn encrypted_transport_authenticates_grants_bounds_streams_and_rejects_plaintext() {
   use crate::{
@@ -631,6 +917,7 @@ async fn encrypted_transport_authenticates_grants_bounds_streams_and_rejects_pla
       owner_public_key: owner.public_key(),
       revocations_file: Some(revoked_file.clone()),
     }),
+    paired: None,
   };
   let stop = CancellationToken::new();
   let connector = tokio::spawn(connector::run(config, stop.clone()));

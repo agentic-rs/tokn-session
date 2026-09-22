@@ -1,9 +1,10 @@
-//! Endpoint-owned identities, owner-signed grants, and authenticated Noise records.
+//! Endpoint-owned identities and authenticated Noise records.
 //!
-//! Provision the owner's verification key and the host's Noise public key over
-//! a trusted channel. The Hub must never choose either trust anchor. An
-//! authenticated Noise peer is not yet authorized: hosts must verify its grant
-//! and enforce the grant's scope before accessing the local viewer API.
+//! Host-verified authenticator pairing establishes the default device trust.
+//! Legacy signed grants require independently provisioned owner and host keys.
+//! The Hub must never choose a trust anchor. An authenticated Noise peer is not
+//! yet authorized: hosts must check their paired-device registry or verify a
+//! legacy grant and enforce its scope before accessing the local viewer API.
 mod grant;
 mod identity;
 mod noise;

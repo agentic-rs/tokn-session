@@ -1,5 +1,5 @@
 //! Host-owned trust boundary for encrypted requests. The Hub is only a carrier.
-use super::{ConnectorConfig, SecureHostConfig, enqueue};
+use super::{ConnectorConfig, PairedHostConfig, SecureHostConfig, enqueue};
 use crate::{
   protocol::{self, Frame},
   secure::{InnerMessage, NoiseIdentity, NoiseResponder, SecureChannel, SignedGrant},
@@ -17,21 +17,36 @@ use tokio::sync::{Semaphore, mpsc};
 
 pub(super) struct Host {
   identity: NoiseIdentity,
-  config: SecureHostConfig,
+  trust: HostTrust,
+}
+
+enum HostTrust {
+  SignedGrants(SecureHostConfig),
+  PairedDevices(PairedHostConfig),
 }
 
 impl Host {
-  pub(super) fn load(config: &SecureHostConfig) -> Result<Self, String> {
-    let bytes: [u8; 32] = protocol::decode(&config.owner_public_key, 32)?
-      .try_into()
-      .map_err(|_| "Invalid owner public key")?;
-    ed25519_dalek::VerifyingKey::from_bytes(&bytes).map_err(|_| "Invalid owner public key")?;
-    let host = Self {
-      identity: NoiseIdentity::load_or_create(&config.noise_key_file)?,
-      config: config.clone(),
+  pub(super) fn load(config: &ConnectorConfig) -> Result<Option<Self>, String> {
+    let host = if let Some(config) = &config.paired {
+      crate::onboarding::read_totp_secret(&config.state_file)?;
+      Self {
+        identity: NoiseIdentity::load_or_create(&config.noise_key_file)?,
+        trust: HostTrust::PairedDevices(config.clone()),
+      }
+    } else if let Some(config) = &config.secure {
+      let bytes: [u8; 32] = protocol::decode(&config.owner_public_key, 32)?
+        .try_into()
+        .map_err(|_| "Invalid owner public key")?;
+      ed25519_dalek::VerifyingKey::from_bytes(&bytes).map_err(|_| "Invalid owner public key")?;
+      Self {
+        identity: NoiseIdentity::load_or_create(&config.noise_key_file)?,
+        trust: HostTrust::SignedGrants(config.clone()),
+      }
+    } else {
+      return Ok(None);
     };
     host.revocations()?;
-    Ok(host)
+    Ok(Some(host))
   }
 
   pub(super) fn public_key(&self) -> String {
@@ -39,8 +54,10 @@ impl Host {
   }
 
   fn revocations(&self) -> Result<HashSet<String>, String> {
-    self
-      .config
+    let HostTrust::SignedGrants(config) = &self.trust else {
+      return Ok(HashSet::new());
+    };
+    config
       .revocations_file
       .as_deref()
       .map(read_revocations)
@@ -48,20 +65,75 @@ impl Host {
       .map(|value| value.unwrap_or_default())
   }
 
-  fn verify(&self, grant: &SignedGrant, host_id: &str, recipient: &str) -> Result<(), String> {
-    let now = SystemTime::now()
-      .duration_since(UNIX_EPOCH)
-      .map_err(|_| "Invalid host clock")?
-      .as_secs();
-    grant.verify(
-      &self.config.owner_public_key,
-      host_id,
-      &self.public_key(),
-      recipient,
-      now,
-      &self.revocations()?,
-    )
+  fn verify(&self, grant: Option<&SignedGrant>, host_id: &str, recipient: &str) -> Result<(), String> {
+    match (&self.trust, grant) {
+      (HostTrust::SignedGrants(config), Some(grant)) => grant.verify(
+        &config.owner_public_key,
+        host_id,
+        &self.public_key(),
+        recipient,
+        now()?,
+        &self.revocations()?,
+      ),
+      (HostTrust::PairedDevices(config), None) if config.host_id == host_id => {
+        if crate::onboarding::is_authorized(&config.state_file, recipient)? {
+          Ok(())
+        } else {
+          Err("Device is not paired with this host".into())
+        }
+      }
+      _ => Err("This host does not accept that authorization mode".into()),
+    }
   }
+
+  async fn pair(
+    &self,
+    host_id: &str,
+    first: &[u8],
+    incoming: &mut mpsc::Receiver<Vec<u8>>,
+    outgoing: &mpsc::Sender<Frame>,
+    channel_id: u64,
+  ) -> Result<(), String> {
+    let HostTrust::PairedDevices(config) = &self.trust else {
+      return Err("Authenticator pairing is unavailable".into());
+    };
+    if config.host_id != host_id {
+      return Err("Incorrect pairing target".into());
+    }
+    let step = crate::pairing::peek_step(first)?;
+    let secret = crate::onboarding::read_totp_secret(&config.state_file)?;
+    crate::onboarding::begin_pairing(&config.state_file, now()?, step)?;
+    let (pending, reply) = crate::pairing::HostPairing::respond(&secret, host_id, &self.identity, first, now()?)?;
+    send_record(outgoing, channel_id, reply).await?;
+    let (authenticated, ack) = pending.finish(&receive(incoming).await?, now()?)?;
+    // Persist consumption and authorization together before letting the client
+    // save its pin. Concurrent completions with the same TOTP step lose here.
+    crate::onboarding::authorize_device(
+      &config.state_file,
+      &authenticated.client_public_key,
+      authenticated.step,
+      now()?,
+    )?;
+    send_record(outgoing, channel_id, ack).await
+  }
+}
+
+fn now() -> Result<u64, String> {
+  SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|value| value.as_secs())
+    .map_err(|_| "Invalid host clock".into())
+}
+
+async fn send_record(outgoing: &mpsc::Sender<Frame>, channel_id: u64, record: Vec<u8>) -> Result<(), String> {
+  enqueue(
+    outgoing,
+    Frame::SecureData {
+      channel_id,
+      data: protocol::encode(&record),
+    },
+  )
+  .await
 }
 
 fn read_revocations(path: &Path) -> Result<HashSet<String>, String> {
@@ -122,6 +194,9 @@ pub(super) async fn run(
   mut incoming: mpsc::Receiver<Vec<u8>>,
 ) -> Result<(), String> {
   let first = receive(&mut incoming).await?;
+  if crate::pairing::is_pairing_record(&first) {
+    return host.pair(host_id, &first, &mut incoming, outgoing, channel_id).await;
+  }
   let (reply, mut channel) = NoiseResponder::new(&host.identity)?.accept(&first)?;
   enqueue(
     outgoing,
@@ -132,11 +207,13 @@ pub(super) async fn run(
   )
   .await?;
   let header = channel.decrypt(&receive(&mut incoming).await?)?;
-  let InnerMessage::Request { method, path, grant } = header else {
-    return Err("Expected encrypted request".into());
+  let (method, path, grant) = match header {
+    InnerMessage::Request { method, path, grant } => (method, path, Some(grant)),
+    InnerMessage::DeviceRequest { method, path } => (method, path, None),
+    _ => return Err("Expected encrypted request".into()),
   };
   let recipient = channel.remote_public_key().to_owned();
-  host.verify(&grant, host_id, &recipient)?;
+  host.verify(grant.as_ref(), host_id, &recipient)?;
   let body = tokio::time::timeout(Duration::from_secs(10), async {
     let mut body = Vec::new();
     let mut records = 0;
@@ -160,12 +237,21 @@ pub(super) async fn run(
   })
   .await
   .map_err(|_| "Encrypted request body timed out")??;
-  host.verify(&grant, host_id, &recipient)?;
+  host.verify(grant.as_ref(), host_id, &recipient)?;
   let channel = Mutex::new(channel);
   let window = Semaphore::new(protocol::RESPONSE_WINDOW);
   let result = {
     let response = forward(
-      config, client, &grant, &method, &path, body, outgoing, channel_id, &channel, &window,
+      config,
+      client,
+      grant.as_ref(),
+      &method,
+      &path,
+      body,
+      outgoing,
+      channel_id,
+      &channel,
+      &window,
     );
     let timeout = tokio::time::sleep(Duration::from_secs(120));
     tokio::pin!(response, timeout);
@@ -174,7 +260,7 @@ pub(super) async fn run(
       tokio::select! {
         biased;
         _ = policy_check.tick() => {
-          if let Err(error) = host.verify(&grant, host_id, &recipient) { break Err(error); }
+          if let Err(error) = host.verify(grant.as_ref(), host_id, &recipient) { break Err(error); }
         }
         _ = &mut timeout, if path != "/api/v1/events" => break Err("Encrypted request timed out; delivery may be uncertain and is never retried".into()),
         record = incoming.recv() => {
@@ -243,7 +329,7 @@ async fn send_inner(
 async fn forward(
   config: &ConnectorConfig,
   client: &reqwest::Client,
-  grant: &SignedGrant,
+  grant: Option<&SignedGrant>,
   method: &str,
   path: &str,
   body: Vec<u8>,
@@ -252,7 +338,11 @@ async fn forward(
   channel: &Mutex<SecureChannel>,
   window: &Semaphore,
 ) -> Result<(), String> {
-  let response = crate::secure_scope::forward(config, client, &grant.grant, method, path, body).await?;
+  let response = if let Some(grant) = grant {
+    crate::secure_scope::forward(config, client, &grant.grant, method, path, body).await?
+  } else {
+    forward_device(config, client, method, path, body).await?
+  };
   if response.status().is_redirection() {
     return Err("Local API redirects are forbidden".into());
   }
@@ -303,6 +393,45 @@ async fn forward(
   send_inner(outgoing, channel_id, channel, &InnerMessage::End {}).await
 }
 
+async fn forward_device(
+  config: &ConnectorConfig,
+  client: &reqwest::Client,
+  method: &str,
+  path: &str,
+  body: Vec<u8>,
+) -> Result<reqwest::Response, String> {
+  if !protocol::allowed_route(method, path, config.allow_control) {
+    return Err("Route unavailable or host control is disabled".into());
+  }
+  if path == "/api/v1/get_session_input_status" && !config.allow_control {
+    return Ok(reqwest::Response::from(
+      axum::http::Response::builder()
+        .header("content-type", "application/json")
+        .body(
+          serde_json::to_vec(&serde_json::json!({
+            "available": false, "message": "Agent input is disabled on this host", "max_length": 0
+          }))
+          .map_err(|_| "Could not encode input status")?,
+        )
+        .map_err(|_| "Could not encode input status")?,
+    ));
+  }
+  let mut url = config.local_url.clone();
+  url.set_path(path);
+  let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| "Invalid request method")?;
+  let mut request = client
+    .request(method, url)
+    .header(reqwest::header::CONTENT_TYPE, "application/json")
+    .body(body);
+  if let Some(token) = &config.local_token {
+    request = request.bearer_auth(token);
+  }
+  request
+    .send()
+    .await
+    .map_err(|_| "Local API request failed; delivery may be uncertain and will not be retried".into())
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -332,5 +461,37 @@ mod tests {
         "a FIFO must fail without waiting for a writer"
       );
     }
+  }
+
+  #[test]
+  fn concurrent_pairings_with_one_code_authorize_only_one_device() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("access.json");
+    let secret = crate::pairing::TotpSecret::generate();
+    crate::onboarding::initialize_host_access(&path, &secret).unwrap();
+    let now = now().unwrap();
+    let step = now / 30;
+    let first = NoiseIdentity::generate().unwrap().public_key();
+    let second = NoiseIdentity::generate().unwrap().public_key();
+    crate::onboarding::begin_pairing(&path, now, step).unwrap();
+    crate::onboarding::begin_pairing(&path, now, step).unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    let (first_result, second_result) = std::thread::scope(|scope| {
+      let a = scope.spawn(|| {
+        barrier.wait();
+        crate::onboarding::authorize_device(&path, &first, step, now)
+      });
+      let b = scope.spawn(|| {
+        barrier.wait();
+        crate::onboarding::authorize_device(&path, &second, step, now)
+      });
+      (a.join().unwrap(), b.join().unwrap())
+    });
+    assert_ne!(first_result.is_ok(), second_result.is_ok());
+    assert_ne!(
+      crate::onboarding::is_authorized(&path, &first).unwrap(),
+      crate::onboarding::is_authorized(&path, &second).unwrap()
+    );
+    assert!(crate::onboarding::begin_pairing(&path, now, step).is_err());
   }
 }

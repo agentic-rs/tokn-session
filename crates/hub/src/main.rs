@@ -8,13 +8,17 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 use tokn_session_hub::{
+  client_onboarding::{self, PairedClientConfig},
   connector::{self, ConnectorConfig, SecureHostConfig},
+  onboarding,
   secure::{Grant, GrantScope, NoiseIdentity, OwnerIdentity},
   secure_client::{self, ClientConfig},
   server::{self, HubState},
   store::Store,
 };
 use url::Url;
+
+mod cli_onboarding;
 
 #[derive(Parser)]
 #[command(about = "Passwordless access to session hosts through one Hub")]
@@ -50,18 +54,24 @@ enum Command {
   /// Enroll this host and keep an outbound tunnel to its loopback viewer-api.
   Connect {
     #[arg(long)]
-    hub: Url,
+    hub: Option<Url>,
     #[arg(long)]
-    name: String,
-    #[arg(long, default_value = "http://127.0.0.1:5558")]
-    viewer_url: Url,
+    name: Option<String>,
+    #[arg(long)]
+    viewer_url: Option<Url>,
+    /// Local configuration, keys, authenticator, and trusted-device state.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    /// Import an existing Base32 authenticator secret from a private local file on first setup.
+    #[arg(long, conflicts_with_all = ["trusted_hub", "owner_public_key"])]
+    totp_secret_file: Option<PathBuf>,
     #[arg(long, env = "TOKN_VIEWER_TOKEN", hide_env_values = true)]
     viewer_token: Option<String>,
     /// Generated enrollment identity. Reuse it when reconnecting to the same Hub.
     #[arg(long)]
     identity_file: Option<PathBuf>,
     /// Independently obtained owner signing public key. Requires E2EE for host content.
-    #[arg(long, required_unless_present = "trusted_hub", conflicts_with = "trusted_hub")]
+    #[arg(long, conflicts_with = "trusted_hub")]
     owner_public_key: Option<String>,
     /// Private host encryption identity, separate from its enrollment identity.
     #[arg(long, requires = "owner_public_key", conflicts_with = "trusted_hub")]
@@ -72,9 +82,9 @@ enum Command {
     /// Explicit legacy mode: the Hub can read content and authorize clients.
     #[arg(long)]
     trusted_hub: bool,
-    /// Allow sending input to live agents. Signed grants must also permit control.
-    #[arg(long)]
-    allow_control: bool,
+    /// Allow sending input to live agents. Use --allow-control=false to disable it again.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    allow_control: Option<bool>,
     /// Allow an unencrypted Hub URL only on loopback, for local development.
     #[arg(long)]
     insecure_loopback: bool,
@@ -82,12 +92,17 @@ enum Command {
   /// Open an E2EE host through a locally installed viewer on loopback.
   Client {
     #[arg(long)]
-    hub: Url,
+    hub: Option<Url>,
     #[arg(long)]
-    grant_file: PathBuf,
+    state_dir: Option<PathBuf>,
+    /// Select a previously paired host; otherwise reopen the last selection.
+    #[arg(long, conflicts_with = "grant_file")]
+    host: Option<String>,
+    #[arg(long)]
+    grant_file: Option<PathBuf>,
     /// Owner public key verified independently of the Hub and grant file.
-    #[arg(long)]
-    owner_public_key: String,
+    #[arg(long, requires = "grant_file")]
+    owner_public_key: Option<String>,
     #[arg(long)]
     identity_file: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1:0")]
@@ -96,6 +111,28 @@ enum Command {
     web_root: PathBuf,
     #[arg(long)]
     insecure_loopback: bool,
+  },
+  /// Show local authenticator setup, or import/export its secret for user-managed synchronization.
+  Authenticator {
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    #[arg(long, conflicts_with = "export_file")]
+    import_file: Option<PathBuf>,
+    /// Write a new mode-0600 Base32 file; never overwrite an existing file.
+    #[arg(long)]
+    export_file: Option<PathBuf>,
+  },
+  /// List this host's paired client public keys.
+  Devices {
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+  },
+  /// Revoke a paired client on this host, including its active streams.
+  ForgetDevice {
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    #[arg(long)]
+    public_key: String,
   },
   /// Generate or display a local identity. Only the public key is printed.
   Keygen {
@@ -185,7 +222,7 @@ async fn run(args: Args) -> Result<(), String> {
       if let Some(token) = state.auth.bootstrap_token()? {
         let mut setup = origin;
         setup.set_fragment(Some(&format!("bootstrap_token={token}")));
-        eprintln!("Create the owner's first passkey: {setup}");
+        eprintln!("Optional Hub administration: create the first passkey at {setup}");
       }
       let cancellation = shutdown.clone();
       axum::serve(listener, app)
@@ -202,6 +239,8 @@ async fn run(args: Args) -> Result<(), String> {
       hub,
       name,
       viewer_url,
+      state_dir,
+      totp_secret_file,
       viewer_token,
       identity_file,
       owner_public_key,
@@ -211,15 +250,35 @@ async fn run(args: Args) -> Result<(), String> {
       allow_control,
       insecure_loopback,
     } => {
+      if owner_public_key.is_none() && !trusted_hub {
+        if identity_file.is_some() {
+          return Err("Paired mode manages its own keys; use --state-dir to choose their location".into());
+        }
+        let config = cli_onboarding::prepare_host(cli_onboarding::HostOptions {
+          hub,
+          name,
+          viewer_url,
+          state_dir: state_dir.unwrap_or(default_path("")?),
+          totp_secret_file,
+          viewer_token,
+          allow_control,
+          insecure_loopback,
+        })?;
+        let signal = shutdown_signal(shutdown.clone());
+        let result = connector::run(config, shutdown).await;
+        signal.abort();
+        return result;
+      }
+      let state_dir = state_dir.unwrap_or(default_path("")?);
       let key_file = match identity_file {
         Some(path) => path,
-        None => default_path("host.key")?,
+        None => state_dir.join("host.key"),
       };
       let secure = match owner_public_key {
         Some(owner_public_key) => Some(SecureHostConfig {
           noise_key_file: match noise_key_file {
             Some(path) => path,
-            None => default_path("host-noise.key")?,
+            None => state_dir.join("host-noise.key"),
           },
           owner_public_key,
           revocations_file,
@@ -231,14 +290,15 @@ async fn run(args: Args) -> Result<(), String> {
         None => return Err("Specify --owner-public-key for E2EE or explicitly choose --trusted-hub".into()),
       };
       let config = ConnectorConfig {
-        hub_url: hub,
-        local_url: viewer_url,
+        hub_url: hub.ok_or("Legacy Hub mode requires --hub")?,
+        local_url: viewer_url.unwrap_or_else(|| Url::parse("http://127.0.0.1:5558").unwrap()),
         key_file,
-        name,
+        name: name.unwrap_or_else(|| "Session host".into()),
         local_token: viewer_token,
-        allow_control,
+        allow_control: allow_control.unwrap_or(false),
         insecure_loopback,
         secure,
+        paired: None,
       };
       let signal = shutdown_signal(shutdown.clone());
       let result = connector::run(config, shutdown).await;
@@ -247,6 +307,8 @@ async fn run(args: Args) -> Result<(), String> {
     }
     Command::Client {
       hub,
+      state_dir,
+      host,
       grant_file,
       owner_public_key,
       identity_file,
@@ -254,16 +316,38 @@ async fn run(args: Args) -> Result<(), String> {
       web_root,
       insecure_loopback,
     } => {
+      let state_dir = state_dir.unwrap_or(default_path("")?);
+      if grant_file.is_none() {
+        if identity_file.is_some() {
+          return Err("Paired mode manages its own identity; use --state-dir to choose its location".into());
+        }
+        let (hub_url, insecure_loopback) = cli_onboarding::prepare_client(&state_dir, hub, insecure_loopback)?;
+        let signal = shutdown_signal(shutdown.clone());
+        let result = client_onboarding::run_paired(
+          PairedClientConfig {
+            hub_url,
+            state_dir,
+            bind,
+            web_root,
+            insecure_loopback,
+            host_id: host,
+          },
+          shutdown,
+        )
+        .await;
+        signal.abort();
+        return result;
+      }
       let identity_file = match identity_file {
         Some(path) => path,
-        None => default_path("client-noise.key")?,
+        None => state_dir.join("client-noise.key"),
       };
       let signal = shutdown_signal(shutdown.clone());
       let result = secure_client::run(
         ClientConfig {
-          hub_url: hub,
-          grant_file,
-          owner_public_key,
+          hub_url: hub.ok_or("Legacy grant mode requires --hub")?,
+          grant_file: grant_file.unwrap(),
+          owner_public_key: owner_public_key.ok_or("Legacy grant mode requires --owner-public-key")?,
           identity_file,
           bind,
           web_root,
@@ -274,6 +358,26 @@ async fn run(args: Args) -> Result<(), String> {
       .await;
       signal.abort();
       result
+    }
+    Command::Authenticator {
+      state_dir,
+      import_file,
+      export_file,
+    } => cli_onboarding::authenticator(&state_dir.unwrap_or(default_path("")?), import_file, export_file),
+    Command::Devices { state_dir } => {
+      let state_dir = state_dir.unwrap_or(default_path("")?);
+      println!(
+        "{}",
+        serde_json::to_string_pretty(&onboarding::devices(&state_dir.join("host-access.json"))?)
+          .map_err(|e| e.to_string())?
+      );
+      Ok(())
+    }
+    Command::ForgetDevice { state_dir, public_key } => {
+      let state_dir = state_dir.unwrap_or(default_path("")?);
+      onboarding::remove_device(&state_dir.join("host-access.json"), &public_key)?;
+      println!("{}", json!({ "revoked_device": public_key }));
+      Ok(())
     }
     Command::Keygen { kind, key_file } => {
       let (kind, public_key) = match kind {
@@ -440,9 +544,11 @@ mod tests {
   use super::*;
 
   #[test]
-  fn connect_requires_explicit_trust_choice_and_control_requires_full_scope() {
+  fn connect_defaults_to_pairing_and_legacy_control_requires_full_scope() {
     let connect = ["hub", "connect", "--hub", "https://hub.example", "--name", "host"];
-    assert!(Args::try_parse_from(connect).is_err());
+    assert!(Args::try_parse_from(connect).is_ok());
+    assert!(Args::try_parse_from(["hub", "connect"]).is_ok());
+    assert!(Args::try_parse_from(["hub", "client", "--hub", "https://hub.example"]).is_ok());
     assert!(Args::try_parse_from(connect.into_iter().chain(["--trusted-hub"])).is_ok());
     assert!(Args::try_parse_from(connect.into_iter().chain(["--owner-public-key", "owner"])).is_ok());
     assert!(

@@ -23,6 +23,11 @@ pub enum InnerMessage {
     path: String,
     grant: SignedGrant,
   },
+  /// Full-host access authenticated against the host's paired-device registry.
+  DeviceRequest {
+    method: String,
+    path: String,
+  },
   RequestBody {
     data: String,
   },
@@ -46,14 +51,16 @@ pub enum InnerMessage {
 impl InnerMessage {
   pub fn validate(&self) -> Result<(), String> {
     match self {
-      Self::Request { method, path, grant } => {
+      Self::Request { method, path, .. } | Self::DeviceRequest { method, path } => {
         if !matches!(method.as_str(), "GET" | "POST") {
           return Err("Unsupported secure request method".into());
         }
         if path.len() > 512 || !path.starts_with("/api/v1/") || path.chars().any(char::is_control) {
           return Err("Invalid secure request path".into());
         }
-        grant.validate()?;
+        if let Self::Request { grant, .. } = self {
+          grant.validate()?;
+        }
       }
       Self::RequestBody { data } | Self::Chunk { data } => {
         let bytes = decode(data, MAX_CHUNK)?;
@@ -89,7 +96,8 @@ impl InnerMessage {
 }
 
 /// An IK initiator must already know the authentic host public key. Obtain it
-/// from an owner-signed invitation checked with an independent owner key.
+/// through host-verified pairing or a legacy owner-signed invitation checked
+/// with an independent owner key.
 pub struct NoiseInitiator {
   state: snow::HandshakeState,
   pinned_host: String,
@@ -132,7 +140,8 @@ impl NoiseInitiator {
 }
 
 /// Completing the responder handshake authenticates the client's static key;
-/// it does not authorize access. Verify a grant bound to that key next.
+/// it does not authorize access. Check the host's device registry or a legacy
+/// grant bound to that key next.
 pub struct NoiseResponder(snow::HandshakeState);
 
 impl NoiseResponder {

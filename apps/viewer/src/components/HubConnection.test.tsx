@@ -69,7 +69,7 @@ it("directs encrypted hosts to the installed client without opening a plaintext 
   render(<HubConnection initial_status={{ configured: true, authenticated: false }} />);
   fireEvent.click(screen.getByRole("button", { name: "Sign in with passkey" }));
   expect(await screen.findByText(/End-to-end encrypted/)).toBeInTheDocument();
-  expect(screen.getByText(/installed Tokn client/)).toBeInTheDocument();
+  expect(screen.getByText(/installed Tokn client to pair or reconnect securely/)).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Open Protected host" })).not.toBeInTheDocument();
   expect(RemoteClient.connect).not.toHaveBeenCalled();
 });

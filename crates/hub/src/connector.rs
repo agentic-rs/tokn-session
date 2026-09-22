@@ -38,6 +38,13 @@ pub struct SecureHostConfig {
 }
 
 #[derive(Clone)]
+pub struct PairedHostConfig {
+  pub host_id: String,
+  pub noise_key_file: PathBuf,
+  pub state_file: PathBuf,
+}
+
+#[derive(Clone)]
 pub struct ConnectorConfig {
   pub hub_url: Url,
   pub local_url: Url,
@@ -47,10 +54,21 @@ pub struct ConnectorConfig {
   pub allow_control: bool,
   pub insecure_loopback: bool,
   pub secure: Option<SecureHostConfig>,
+  pub paired: Option<PairedHostConfig>,
 }
 
 impl ConnectorConfig {
   pub fn validate(&self) -> Result<Url, String> {
+    if self.secure.is_some() && self.paired.is_some() {
+      return Err("Choose paired-device access or legacy signed grants, not both".into());
+    }
+    if self
+      .paired
+      .as_ref()
+      .is_some_and(|paired| !protocol::valid_host_uuid(&paired.host_id))
+    {
+      return Err("Paired host identity must be a canonical random UUID".into());
+    }
     if self.name.trim().is_empty() || self.name.len() > 128 || self.name.chars().any(char::is_control) {
       return Err("Host name must contain 1–128 bytes and no control characters".into());
     }
@@ -86,6 +104,14 @@ impl ConnectorConfig {
     endpoint.set_path(protocol::TUNNEL_PATH);
     Ok(endpoint)
   }
+}
+
+fn routing_id(config: &ConnectorConfig, key: &SigningKey) -> String {
+  config
+    .paired
+    .as_ref()
+    .map(|paired| paired.host_id.clone())
+    .unwrap_or_else(|| protocol::host_id(key.verifying_key().as_bytes()))
 }
 
 fn numeric_loopback(url: &Url) -> bool {
@@ -172,15 +198,14 @@ fn load_key(path: &Path) -> Result<SigningKey, String> {
   }
 }
 
+pub fn initialize_identity(path: &Path) -> Result<(), String> {
+  load_key(path).map(|_| ())
+}
+
 pub async fn run(config: ConnectorConfig, shutdown: CancellationToken) -> Result<(), String> {
   let endpoint = config.validate()?;
   let key = load_key(&config.key_file)?;
-  let secure = config
-    .secure
-    .as_ref()
-    .map(secure_transport::Host::load)
-    .transpose()?
-    .map(Arc::new);
+  let secure = secure_transport::Host::load(&config)?.map(Arc::new);
   let client = reqwest::Client::builder()
     .no_proxy()
     .redirect(reqwest::redirect::Policy::none())
@@ -189,7 +214,7 @@ pub async fn run(config: ConnectorConfig, shutdown: CancellationToken) -> Result
     .read_timeout(Duration::from_secs(90))
     .build()
     .map_err(|e| e.to_string())?;
-  eprintln!("Host identity: {}", protocol::host_id(key.verifying_key().as_bytes()));
+  eprintln!("Host identity: {}", routing_id(&config, &key));
   if let Some(secure) = &secure {
     eprintln!("Host encryption public key: {}", secure.public_key());
   }
@@ -252,12 +277,15 @@ async fn connect_once(
           Message::Text(text) if text.len() <= protocol::MAX_FRAME => {
             let frame: Frame = serde_json::from_str(&text).map_err(|_| "Invalid Hub tunnel message")?;
             match frame {
+              Frame::RegistrationRejected { message } if !ready && config.paired.is_some() => {
+                return Err(registration_failure(&message));
+              }
               Frame::Pending { code, expires_in } if !ready => {
                 if code.len() > 64 || code.chars().any(char::is_control) { return Err("Invalid pairing code".into()); }
                 eprintln!("Approve host '{}' in the Hub using pairing code {code} (expires in {expires_in}s).", config.name);
               }
               Frame::Ready { host_id, allow_control } if !ready => {
-                if host_id != protocol::host_id(key.verifying_key().as_bytes()) { return Err("Hub returned an incorrect host identity".into()); }
+                if host_id != routing_id(config, key) { return Err("Hub returned an incorrect host identity".into()); }
                 ready = true;
                 if secure.is_some() { enqueue(&outgoing, Frame::SecureOnly {}).await?; }
                 eprintln!("Connected to Hub as {host_id} ({})", if config.allow_control && allow_control { "control enabled" } else { "view access" });
@@ -298,7 +326,7 @@ async fn connect_once(
                 let outgoing = outgoing.clone();
                 let config = config.clone();
                 let client = client.clone();
-                let host_id = protocol::host_id(key.verifying_key().as_bytes());
+                let host_id = routing_id(&config, key);
                 let abort = tasks.spawn(async move {
                   let _ = secure_transport::run(&secure, &host_id, &config, &client, &outgoing, channel_id, received).await;
                   let _ = enqueue(&outgoing, Frame::SecureClose { channel_id }).await;
@@ -353,6 +381,13 @@ async fn connect_once(
   }
 }
 
+fn registration_failure(message: &str) -> String {
+  if message.trim().is_empty() || message.len() > 256 || message.chars().any(char::is_control) {
+    return "Invalid Hub registration diagnostic".into();
+  }
+  format!("Hub rejected registration: {message}")
+}
+
 async fn authenticate(socket: &mut Socket, config: &ConnectorConfig, key: &SigningKey) -> Result<(), String> {
   let Some(Ok(Message::Text(text))) = socket.next().await else {
     return Err("Missing Hub challenge".into());
@@ -367,6 +402,27 @@ async fn authenticate(socket: &mut Socket, config: &ConnectorConfig, key: &Signi
     return Err("Unsupported Hub protocol or invalid challenge".into());
   }
   let public_key = protocol::encode(key.verifying_key().as_bytes());
+  if let Some(paired) = &config.paired {
+    let signature = key.sign(&protocol::registration_proof(
+      &nonce,
+      &paired.host_id,
+      &public_key,
+      &config.name,
+      config.allow_control,
+    ));
+    return send(
+      socket,
+      &Frame::Register {
+        version: protocol::VERSION,
+        host_id: paired.host_id.clone(),
+        public_key,
+        name: config.name.clone(),
+        allow_control: config.allow_control,
+        signature: protocol::encode(&signature.to_bytes()),
+      },
+    )
+    .await;
+  }
   let signature = key.sign(&protocol::proof(
     &nonce,
     &public_key,
@@ -487,6 +543,17 @@ async fn send_message(socket: &mut Socket, message: Message) -> Result<(), Strin
 mod tests {
   use super::*;
 
+  #[test]
+  fn registration_diagnostics_are_bounded_and_cannot_inject_terminal_controls() {
+    assert_eq!(
+      registration_failure("Registration is temporarily unavailable"),
+      "Hub rejected registration: Registration is temporarily unavailable"
+    );
+    for message in ["\u{1b}[2Jspoofed output".into(), " ".into(), "x".repeat(257)] {
+      assert_eq!(registration_failure(&message), "Invalid Hub registration diagnostic");
+    }
+  }
+
   fn config(hub: &str, local: &str) -> ConnectorConfig {
     ConnectorConfig {
       hub_url: hub.parse().unwrap(),
@@ -497,6 +564,7 @@ mod tests {
       allow_control: false,
       insecure_loopback: false,
       secure: None,
+      paired: None,
     }
   }
 

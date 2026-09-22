@@ -259,11 +259,27 @@ impl HubTunnels {
       return;
     };
     let result = tokio::time::timeout(IO_TIMEOUT, self.authenticate(&mut socket)).await;
-    let Ok(Ok((record, allow_control))) = result else {
+    let Ok(Ok((record, allow_control, encrypted_registration))) = result else {
       return;
     };
-    let record = match self.await_approval(&mut socket, record, handshake_permit).await {
+    let registered = if encrypted_registration {
+      drop(handshake_permit);
+      self.store.register_encrypted_host(record)
+    } else {
+      self.await_approval(&mut socket, record, handshake_permit).await
+    };
+    let record = match registered {
       Ok(record) => record,
+      Err(error) if encrypted_registration => {
+        let _ = send(
+          &mut socket,
+          &Frame::RegistrationRejected {
+            message: registration_diagnostic(&error).into(),
+          },
+        )
+        .await;
+        return;
+      }
       Err(_) => return,
     };
     let (outgoing, mut outgoing_rx) = mpsc::channel(64);
@@ -292,7 +308,7 @@ impl HubTunnels {
         secure_channels: Mutex::new(HashMap::new()),
         next_id: std::sync::atomic::AtomicU64::new(1),
         allow_control: allow_control && stored.access == "control",
-        secure_only: std::sync::atomic::AtomicBool::new(false),
+        secure_only: std::sync::atomic::AtomicBool::new(encrypted_registration),
         shutdown: self.shutdown.child_token(),
       });
       if let Some(previous) = inner.online.insert(record.host_id.clone(), connection.clone()) {
@@ -354,7 +370,7 @@ impl HubTunnels {
     }
   }
 
-  async fn authenticate(&self, socket: &mut WebSocket) -> Result<(HostRecord, bool), String> {
+  async fn authenticate(&self, socket: &mut WebSocket) -> Result<(HostRecord, bool, bool), String> {
     let mut random = [0u8; 32];
     OsRng.fill_bytes(&mut random);
     let nonce = protocol::encode(&random);
@@ -372,15 +388,25 @@ impl HubTunnels {
     if text.len() > 4096 {
       return Err("Host authentication is too large".into());
     }
-    let Frame::Authenticate {
-      version,
-      public_key,
-      name,
-      allow_control,
-      signature,
-    } = serde_json::from_str(&text).map_err(|_| "Invalid host authentication")?
-    else {
-      return Err("Expected host authentication".into());
+    let (version, registered_id, public_key, name, allow_control, signature) = match serde_json::from_str(&text)
+      .map_err(|_| "Invalid host authentication")?
+    {
+      Frame::Authenticate {
+        version,
+        public_key,
+        name,
+        allow_control,
+        signature,
+      } => (version, None, public_key, name, allow_control, signature),
+      Frame::Register {
+        version,
+        host_id,
+        public_key,
+        name,
+        allow_control,
+        signature,
+      } if protocol::valid_host_uuid(&host_id) => (version, Some(host_id), public_key, name, allow_control, signature),
+      _ => return Err("Expected host authentication or encrypted registration".into()),
     };
     if version != protocol::VERSION || name.trim().is_empty() || name.len() > 128 || name.chars().any(char::is_control)
     {
@@ -391,17 +417,24 @@ impl HubTunnels {
       .map_err(|_| "Invalid host key")?;
     let key = VerifyingKey::from_bytes(&key_bytes).map_err(|_| "Invalid host key")?;
     let signature = Signature::from_slice(&protocol::decode(&signature, 64)?).map_err(|_| "Invalid host proof")?;
+    let proof = if let Some(host_id) = &registered_id {
+      protocol::registration_proof(&nonce, host_id, &public_key, &name, allow_control)
+    } else {
+      protocol::proof(&nonce, &public_key, &name, allow_control)
+    };
     key
-      .verify_strict(&protocol::proof(&nonce, &public_key, &name, allow_control), &signature)
+      .verify_strict(&proof, &signature)
       .map_err(|_| "Invalid host proof")?;
+    let encrypted_registration = registered_id.is_some();
     Ok((
       HostRecord {
-        host_id: protocol::host_id(&key_bytes),
+        host_id: registered_id.unwrap_or_else(|| protocol::host_id(&key_bytes)),
         public_key,
         name,
         access: if allow_control { "control" } else { "view" }.into(),
       },
       allow_control,
+      encrypted_registration,
     ))
   }
 
@@ -740,6 +773,27 @@ impl Connection {
         let _ = headers.send(Err(message.into()));
       }
     }
+  }
+}
+
+/// Only intentional, public registration failures may leave the Hub. Database
+/// errors can contain local details and never become remote diagnostics.
+fn registration_diagnostic(error: &str) -> &'static str {
+  match error {
+    "New host registration rate limit reached; retry in one minute" => {
+      "New host registration rate limit reached; retry in one minute"
+    }
+    "Encrypted host registration capacity reached; a Hub administrator can revoke unused hosts" => {
+      "Encrypted host registration capacity reached; a Hub administrator can revoke unused hosts"
+    }
+    "Encrypted host revocation ledger is full; Hub administrator maintenance is required before registering new hosts" => {
+      "Encrypted host revocation ledger is full; Hub administrator maintenance is required before registering new hosts"
+    }
+    "Host UUID registration is revoked or belongs to a different identity" => {
+      "Host UUID registration is revoked or belongs to a different identity"
+    }
+    "Host UUID is registered to a different identity" => "Host UUID is registered to a different identity",
+    _ => "Hub could not register this host; contact its administrator",
   }
 }
 

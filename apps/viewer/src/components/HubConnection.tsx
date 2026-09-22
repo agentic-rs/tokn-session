@@ -213,7 +213,7 @@ function HubHosts({ session, initial_notice, on_authenticated, on_disconnected }
       <ul className="hub-hosts" aria-label="Enrolled hosts">
         {hosts.map((host) => <li key={host.host_id} className="hub-host">
           <div className="hub-host-details"><h2>{host.name}</h2><p><span className={`hub-presence ${host.online ? "is-online" : ""}`}>{host.online ? "Online" : "Offline"}</span> · {host.secure_only ? "End-to-end encrypted" : host.access === "view" ? "View only" : "View and control"}</p><code>{host.host_id}</code>
-            {host.secure_only && <p>Open this host with your installed Tokn client and an owner-approved grant.</p>}
+            {host.secure_only && <p>Open this host with your installed Tokn client to pair or reconnect securely.</p>}
           </div>
           <div className="hub-actions">
             {!host.secure_only && <button disabled={!host.online || !!busy} onClick={() => { void connectHost(host); }}>{busy === host.host_id ? "Connecting…" : `Open ${host.name}`}</button>}

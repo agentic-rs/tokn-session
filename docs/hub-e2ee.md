@@ -1,5 +1,10 @@
 # Encrypted Hub access and sharing
 
+For normal setup, use [authenticator pairing](hub-pairing.md): UUID/key creation,
+host registration, local code verification, and remembered client trust are
+automatic. Sharing is deferred from that flow. This page documents the earlier
+explicit owner-key and signed-grant interface, retained for compatibility.
+
 The installed Rust client and host encrypt session traffic through the Hub.
 The host verifies an owner-signed grant bound to the recipient's device key.
 Passkeys administer the Hub and enroll host connections; they cannot authorize

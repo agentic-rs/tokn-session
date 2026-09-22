@@ -1,9 +1,11 @@
 # Session Hub
 
-For an untrusted VPS and recipient sharing, use [encrypted access](hub-e2ee.md).
-That mode uses an installed client, endpoint-held keys, and owner-signed grants.
+For the default encrypted workflow, use [authenticator pairing](hub-pairing.md).
+Hosts register automatically and verify codes locally; passkeys are optional
+Hub administration. The earlier [signed-grant workflow](hub-e2ee.md) remains
+available separately.
 The setup below describes the explicit `--trusted-hub` compatibility mode and
-the passkey administration shared by both modes.
+the passkey administration available alongside encrypted access.
 
 `tokn-session-hub` gives a browser one endpoint for multiple hosts. The Hub
 authenticates its owner with passkeys, approves host identities, and forwards

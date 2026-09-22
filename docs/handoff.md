@@ -59,20 +59,23 @@ captured compaction. Upgrade strict `AgentEvent` consumers with the producer.
 
 ## Session Hub
 
-`crates/hub` provides passkey administration and outbound host enrollment, plus
-an E2EE native `client` that serves the locally installed viewer on loopback.
-Noise IK authenticates endpoint encryption keys; owner-signed, expiring grants
-bind a recipient to one host and all or selected sessions. The host pins the
-owner independently, enforces grants, rejects plaintext fallback, and rechecks
-configured local revocations during streams. The Hub relays ciphertext.
-Selected-session grants are read-only, scope catalogs before pagination/tree
-construction, isolate leases/read markers, and use five-second generic live
-refreshes. Whole-session sharing is not redaction; keys include source paths.
-Control requires an explicit all-session grant and connector `--allow-control`.
-Key/grant/revocation management uses CLI commands; one local client opens one
-grant and the host must stay online. `connect --trusted-hub` explicitly retains
-the older browser-through-Hub mode. See [encrypted access](hub-e2ee.md) and
-[Hub administration](hub.md). Remote connections require HTTPS termination.
+`crates/hub` defaults to host-verified authenticator pairing for your own devices.
+`connect --hub …` saves UUID/keys/config, displays a local TOTP setup QR, and
+registers an encrypted-only route without Hub passkey approval. `client --hub …`
+serves a local `/connect` UI; UUID + authenticator code establishes pinned Noise
+keys and host-local device authorization. Saved selection/config reconnects
+without OTP. Switching invalidates old routes and cancels streams; host-local
+revocation is rechecked every second. Agent input requires saved host
+`--allow-control`; `--allow-control=false` disables it. Seed import/export supports
+user-managed synchronization; replay and five-attempt/five-minute limits persist
+per host. Same-seed hosts share enrollment trust, not asymmetric identities.
+SPAKE2/HKDF/HMAC pairing is experimental and unaudited; normal traffic uses Noise
+IK. Hub registrations have bounded capacity/rate and persistent UUID tombstones.
+The default flow defers sharing; earlier owner-signed grants and selected-session
+scoping remain behind explicit CLI options. `connect --trusted-hub` retains the
+older browser-through-Hub mode. See [onboarding](hub-pairing.md),
+[legacy grants](hub-e2ee.md), and [Hub administration](hub.md). Remote connections
+require HTTPS termination; the host API and installed client stay on loopback.
 
 ## Viewer core and remote API
 

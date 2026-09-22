@@ -28,6 +28,20 @@ pub enum Frame {
     allow_control: bool,
     signature: String,
   },
+  /// Public routing registration for a host that enforces device authorization
+  /// and encryption itself. Possession of this identity grants no viewer access.
+  Register {
+    version: u32,
+    host_id: String,
+    public_key: String,
+    name: String,
+    allow_control: bool,
+    signature: String,
+  },
+  /// Advisory registration failure. Never changes endpoint-owned trust.
+  RegistrationRejected {
+    message: String,
+  },
   Pending {
     code: String,
     expires_in: u64,
@@ -100,6 +114,22 @@ pub fn proof(nonce: &str, public_key: &str, name: &str, allow_control: bool) -> 
 
 pub fn host_id(public_key: &[u8; 32]) -> String {
   format!("host_{}", encode(public_key))
+}
+
+pub fn registration_proof(nonce: &str, host_id: &str, public_key: &str, name: &str, allow_control: bool) -> Vec<u8> {
+  serde_json::to_vec(&(
+    "tokn-hub-device-host-v1",
+    nonce,
+    host_id,
+    public_key,
+    name,
+    allow_control,
+  ))
+  .expect("string tuple")
+}
+
+pub fn valid_host_uuid(host_id: &str) -> bool {
+  uuid::Uuid::parse_str(host_id).is_ok_and(|uuid| uuid.get_version_num() == 4 && uuid.to_string() == host_id)
 }
 
 /// Exact paths prevent the gateway becoming a general loopback HTTP proxy.

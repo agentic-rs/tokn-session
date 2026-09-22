@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import "./App.css";
 import { ViewerPage } from "./pages/ViewerPage";
 import { isDesktop, RemoteClient, selectMachine, type ConnectionState } from "./lib/transport";
+import { PairedConnection } from "./components/PairedConnection";
 import { HubConnection } from "./components/HubConnection";
 import { detectHub, hubErrorMessage, type HubStatus } from "./lib/hub";
 
@@ -84,6 +85,7 @@ function BrowserGateway({ bootstrap_token }: { bootstrap_token?: string }) {
 
 function App({ initial_token, bootstrap_token }: { initial_token?: string; bootstrap_token?: string }) {
   if (isDesktop()) return <ViewerPage />;
+  if (window.location.pathname === "/connect") return <PairedConnection initial_token={initial_token} />;
   return initial_token ? <BrowserViewer initial_token={initial_token} /> : <BrowserGateway bootstrap_token={bootstrap_token} />;
 }
 export default App;
