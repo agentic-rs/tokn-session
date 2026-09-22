@@ -1,0 +1,21 @@
+.paired-host-form {
+  display: grid;
+  gap: 10px;
+  max-width: 440px;
+}
+
+.paired-host-form input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  color: inherit;
+  background: var(--surface-raised);
+  font: inherit;
+}
+
+.paired-host-form button {
+  margin-top: 6px;
+  justify-self: start;
+}

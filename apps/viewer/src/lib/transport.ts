@@ -17,17 +17,21 @@ export class RemoteClient {
 
   constructor(readonly endpoint: string, private token: string) {}
 
-  static async connect(endpoint: string, token: string): Promise<RemoteClient> {
+  static async connect(endpoint: string, token: string, signal?: AbortSignal): Promise<RemoteClient> {
     const url = new URL(endpoint);
     if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
       throw new Error("Enter an HTTP or HTTPS API address without credentials or query parameters.");
     }
     const client = new RemoteClient(url.toString().replace(/\/$/, ""), token);
+    const abort = () => client.close();
+    if (signal?.aborted) client.close();
+    signal?.addEventListener("abort", abort, { once: true });
     try {
       const health = await client.fetchJson("health") as { version?: number };
       if (health.version !== 1) throw new Error("This server uses an unsupported viewer API version.");
       return client;
     } catch (error) { client.close(); throw error; }
+    finally { signal?.removeEventListener("abort", abort); }
   }
 
   setStateListener(handler: (state: ConnectionState) => void) { this.onState = handler; }

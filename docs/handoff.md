@@ -57,6 +57,26 @@ request, while ZCode/DSH expose explicit start/end observations. ZCode coverage
 is based on the installed 3.7.3 bundle and representative fixtures, not a real
 captured compaction. Upgrade strict `AgentEvent` consumers with the producer.
 
+## Session Hub
+
+`crates/hub` defaults to host-verified authenticator pairing for your own devices.
+`connect --hub …` saves UUID/keys/config, displays a local TOTP setup QR, and
+registers an encrypted-only route without Hub passkey approval. `client --hub …`
+serves a local `/connect` UI; UUID + authenticator code establishes pinned Noise
+keys and host-local device authorization. Saved selection/config reconnects
+without OTP. Switching invalidates old routes and cancels streams; host-local
+revocation is rechecked every second. Agent input requires saved host
+`--allow-control`; `--allow-control=false` disables it. Seed import/export supports
+user-managed synchronization; replay and five-attempt/five-minute limits persist
+per host. Same-seed hosts share enrollment trust, not asymmetric identities.
+SPAKE2/HKDF/HMAC pairing is experimental and unaudited; normal traffic uses Noise
+IK. Hub registrations have bounded capacity/rate and persistent UUID tombstones.
+The default flow defers sharing; earlier owner-signed grants and selected-session
+scoping remain behind explicit CLI options. `connect --trusted-hub` retains the
+older browser-through-Hub mode. See [onboarding](hub-pairing.md),
+[legacy grants](hub-e2ee.md), and [Hub administration](hub.md). Remote connections
+require HTTPS termination; the host API and installed client stay on loopback.
+
 ## Viewer core and remote API
 
 Desktop calls shared Rust `crates/viewer-core` directly through Tauri. The
