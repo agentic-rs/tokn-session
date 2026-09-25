@@ -555,6 +555,7 @@ export function useViewerState() {
   const setFollowingLive = useCallback((following: boolean) => {
     followingLive.current = following;
     setIsFollowingLive(following);
+    if (following) setPendingLiveActivity(false);
   }, []);
 
   const clearInputRefreshTimers = useCallback(() => {

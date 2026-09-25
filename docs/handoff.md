@@ -766,6 +766,9 @@ subagent replies never contribute to an ancestor’s unread state or count.
 Canonical ancestors still aggregate descendant running state.
 A newest event page acknowledges only its captured revision after React commits
 it and the view is following latest; scrolling up retains unread counts.
+A downward scroll to the physical end clears the New activity action and
+acknowledges that page, even when the final wheel gesture has no scroll delta.
+Layout clamping alone does not resume following or mark the page read.
 Successful body refreshes separately name `updated_session_keys`, letting the selected timeline
 refresh tool/progress/lifecycle changes without creating unread attention.
 Unrelated indexing does not reload the conversation.

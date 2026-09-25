@@ -415,6 +415,23 @@ describe("useTimelineScroll", () => {
     expect(timeline.viewport.scrollTop).toBe(650);
   });
 
+  it("resumes following after a downward gesture at the physical end with no scroll delta", () => {
+    const timeline = mountTimeline();
+    timeline.readAt(600);
+    // A shortened card can clamp a paused reader to the physical bottom.
+    timeline.layout.height = 650;
+    fireEvent.scroll(timeline.viewport);
+    timeline.resize();
+    expect(timeline.viewport.scrollTop).toBe(450);
+    expect(timeline.on_follow_change.mock.calls).toEqual([[false]]);
+    fireEvent.wheel(timeline.viewport, { deltaY: 80 });
+    fireEvent.scroll(timeline.viewport);
+    expect(timeline.on_follow_change.mock.calls).toEqual([[false], [true]]);
+    timeline.layout.height = 1000;
+    timeline.resize();
+    expect(timeline.viewport.scrollTop).toBe(800);
+  });
+
   it("jumps immediately with unchanged data and resumes following future output", () => {
     const timeline = mountTimeline();
     timeline.readAt(300);

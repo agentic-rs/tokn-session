@@ -39,6 +39,7 @@ export function useTimelineScroll({ session_key, initial_page_loaded, last_event
     initialized: false,
     following: true,
     user_scroll: false,
+    downward_scroll: false,
     position: null as ScrollPosition | null,
   });
   const followCallback = useRef(on_follow_change);
@@ -101,8 +102,31 @@ export function useTimelineScroll({ session_key, initial_page_loaded, last_event
     const resized = timeline.scrollHeight !== previous.height || timeline.clientHeight !== previous.viewport;
     const bottom = Math.max(0, timeline.scrollHeight - timeline.clientHeight);
     const clamped = resized && previous.top > bottom && Math.abs(timeline.scrollTop - bottom) < 1;
-    if (Math.abs(movement) <= 0.5 || clamped || (resized && !state.current.user_scroll)) return false;
+    if (clamped) {
+      // Layout clamping can reuse the same scroll event as a pending gesture.
+      // Consume that hint before a later observer update reads it as a new
+      // downward action at the bottom.
+      state.current.user_scroll = false;
+      state.current.downward_scroll = false;
+      return false;
+    }
+    // Preserve a pending gesture when a React commit precedes native scrolling.
+    if (resized && Math.abs(movement) <= 0.5) return false;
+    if (Math.abs(movement) <= 0.5) {
+      // A downward wheel/End press at the physical end can produce no scroll
+      // delta. It still means the reader has reached the newest content.
+      if (!resized && state.current.user_scroll && state.current.downward_scroll
+        && bottom - timeline.scrollTop < BOTTOM_THRESHOLD) {
+        state.current.user_scroll = false;
+        state.current.downward_scroll = false;
+        setFollowing(true);
+        capture();
+        return true;
+      }
+      return false;
+    }
     state.current.user_scroll = false;
+    state.current.downward_scroll = false;
     // Even a small upward gesture pauses following. The proximity threshold
     // only resumes it when the reader actually moves down toward the end.
     setFollowing(movement > 0 && bottom - timeline.scrollTop < BOTTOM_THRESHOLD);
@@ -138,7 +162,7 @@ export function useTimelineScroll({ session_key, initial_page_loaded, last_event
   useLayoutEffect(() => {
     if (state.current.session_key !== session_key) {
       setIsFollowing(true);
-      state.current = { session_key, initialized: false, following: true, user_scroll: false, position: null };
+      state.current = { session_key, initialized: false, following: true, user_scroll: false, downward_scroll: false, position: null };
     }
     if (session_key && initial_page_loaded && !state.current.initialized) {
       const saved = last_event ? readReadingPosition(session_key) : null;
@@ -202,24 +226,28 @@ export function useTimelineScroll({ session_key, initial_page_loaded, last_event
     }
   }
 
-  function noteUserScroll(upward = false) {
+  function noteUserScroll(upward?: boolean) {
     state.current.user_scroll = true;
+    state.current.downward_scroll = upward === false;
     if (upward) setFollowing(false);
     if (inputFrame.current !== null) cancelAnimationFrame(inputFrame.current);
     inputFrame.current = requestAnimationFrame(() => {
       inputFrame.current = null;
       state.current.user_scroll = false;
+      state.current.downward_scroll = false;
     });
   }
 
   function pause() {
     state.current.user_scroll = false;
+    state.current.downward_scroll = false;
     setFollowing(false);
     capture();
   }
 
   function jumpToLatest() {
     state.current.user_scroll = false;
+    state.current.downward_scroll = false;
     setFollowing(true);
     reconcile();
   }

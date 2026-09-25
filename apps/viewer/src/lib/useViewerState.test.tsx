@@ -1477,6 +1477,34 @@ describe("useViewerState session-index signalling", () => {
     await waitFor(() => expect(result.current.eventsLoading).toBe(false));
     expect(acknowledgeSessionAttention).not.toHaveBeenCalled();
     act(() => result.current.setFollowingLive(true));
+    expect(result.current.pendingLiveActivity).toBe(false);
+    await waitFor(() => expect(acknowledgeSessionAttention).toHaveBeenCalledWith({ session_key: "live", attention_revision: "4" }));
+  });
+
+  it("hides the jump button and acknowledges replies after manually scrolling to the end", async () => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    vi.mocked(loadEventPage).mockResolvedValue({ ...toolEventPage(), attention_revision: "1" });
+    const { container } = render(<ViewerPage />);
+    fireEvent.click(await screen.findByRole("button", { name: /session live/ }));
+    await waitFor(() => expect(acknowledgeSessionAttention).toHaveBeenCalledWith({ session_key: "live", attention_revision: "1" }));
+    vi.mocked(acknowledgeSessionAttention).mockClear();
+    const timeline = container.querySelector<HTMLElement>(".conversation__timeline")!;
+    Object.defineProperties(timeline, {
+      scrollHeight: { configurable: true, value: 1000 },
+      clientHeight: { configurable: true, value: 300 },
+    });
+    timeline.scrollTop = 300;
+    fireEvent.wheel(timeline, { deltaY: -80 });
+    fireEvent.scroll(timeline);
+    vi.mocked(loadEventPage).mockResolvedValue({ ...toolEventPage(), attention_revision: "4" });
+    act(() => emit?.({ session_key: "live", reset: false }));
+    await screen.findByRole("button", { name: "New activity · Jump to latest" });
+    timeline.scrollTop = 700;
+    fireEvent.wheel(timeline, { deltaY: 80 });
+    fireEvent.scroll(timeline);
+    await waitFor(() => expect(screen.queryByRole("button", { name: /Jump to latest/ })).not.toBeInTheDocument());
     await waitFor(() => expect(acknowledgeSessionAttention).toHaveBeenCalledWith({ session_key: "live", attention_revision: "4" }));
   });
 
