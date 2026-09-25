@@ -1,4 +1,5 @@
 use super::*;
+use crate::rollout_path::rollout_thread_id;
 
 /// Exported/custom roots may have no Desktop database. Collapse duplicates
 /// only when one verified lineage contains every other file for the same ID.
@@ -66,27 +67,6 @@ pub(super) fn retain_current_rollouts(home: &Path, paths: &mut Vec<PathBuf>) {
       .and_then(|id| heads.get(id))
       .is_none_or(|head| paths_refer_to_same_file(path, head))
   });
-}
-
-fn rollout_thread_id(path: &Path) -> Option<&str> {
-  let stem = path.file_stem()?.to_str()?.strip_prefix("rollout-")?;
-  // Native names contain a 19-byte timestamp, '-', then the owning UUID.
-  // New segments add a second UUID separated by '_'.
-  let rest = stem.get(20..)?;
-  let id = rest.get(..36)?;
-  if !id.bytes().enumerate().all(|(index, byte)| {
-    if matches!(index, 8 | 13 | 18 | 23) {
-      byte == b'-'
-    } else {
-      byte.is_ascii_hexdigit()
-    }
-  }) || !rest
-    .get(36..)
-    .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('_'))
-  {
-    return None;
-  }
-  Some(id)
 }
 
 #[cfg(test)]

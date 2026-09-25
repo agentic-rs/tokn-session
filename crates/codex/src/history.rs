@@ -170,7 +170,11 @@ fn resolve_prefix(paths: &[PathBuf], current: &Path, base: &HistoryPosition) -> 
     let RolloutItem::SessionMeta(meta) = header.item() else {
       continue;
     };
-    if meta.id.as_deref() != Some(base.thread_id.as_str())
+    // Desktop can reference a continuation's physical UUID, while its
+    // session_meta.id remains the logical owner across every segment.
+    let identity_matches = meta.id.as_deref() == Some(base.thread_id.as_str())
+      || crate::rollout_path::rollout_segment_matches(path, meta.id.as_deref(), &base.thread_id);
+    if !identity_matches
       || meta.history_mode.as_deref() != Some("paginated")
       || !header
         .ordinal()
