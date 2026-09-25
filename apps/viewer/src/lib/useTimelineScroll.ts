@@ -1,4 +1,6 @@
-import { useLayoutEffect, useRef } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
+
+import { readReadingPosition, saveReadingPosition } from "./readingPosition";
 
 interface Anchor {
   key: string;
@@ -15,13 +17,15 @@ interface ScrollPosition {
 interface TimelineScrollOptions {
   session_key: string | null;
   initial_page_loaded: boolean;
+  last_event?: string;
   on_follow_change?: (following: boolean) => void;
 }
 
 const BOTTOM_THRESHOLD = 48;
 
 /** One owner for both React updates and asynchronous changes to layout. */
-export function useTimelineScroll({ session_key, initial_page_loaded, on_follow_change }: TimelineScrollOptions) {
+export function useTimelineScroll({ session_key, initial_page_loaded, last_event, on_follow_change }: TimelineScrollOptions) {
+  const [isFollowing, setIsFollowing] = useState(true);
   const timelineRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const inputFrame = useRef<number | null>(null);
@@ -43,6 +47,7 @@ export function useTimelineScroll({ session_key, initial_page_loaded, on_follow_
   function setFollowing(following: boolean) {
     if (state.current.following === following) return;
     state.current.following = following;
+    setIsFollowing(following);
     followCallback.current?.(following);
   }
 
@@ -74,6 +79,18 @@ export function useTimelineScroll({ session_key, initial_page_loaded, on_follow_
         key: element.dataset.scrollKey!, top: rect.top - viewport.top,
       })),
     };
+    if (state.current.initialized && state.current.session_key && last_event) {
+      const anchors = visible.filter(({ element }) => element.dataset.readingSlot)
+        .slice(0, 8).map(({ element, rect }) => ({
+          slot_key: element.dataset.readingSlot!,
+          type: element.dataset.readingType!,
+          timestamp: element.dataset.readingTimestamp || null,
+          top: rect.top - viewport.top,
+        }));
+      if (anchors.length) saveReadingPosition(state.current.session_key, {
+        anchors, last_event, at_end: state.current.following,
+      });
+    }
   }
 
   function acceptUserScroll(): boolean {
@@ -120,9 +137,36 @@ export function useTimelineScroll({ session_key, initial_page_loaded, on_follow_
   // Child-only changes (translation, font reflow) are covered by ResizeObserver.
   useLayoutEffect(() => {
     if (state.current.session_key !== session_key) {
+      setIsFollowing(true);
       state.current = { session_key, initialized: false, following: true, user_scroll: false, position: null };
     }
-    if (session_key && initial_page_loaded) state.current.initialized = true;
+    if (session_key && initial_page_loaded && !state.current.initialized) {
+      const saved = last_event ? readReadingPosition(session_key) : null;
+      if (saved) {
+        const following = saved.at_end && saved.last_event === last_event;
+        setFollowing(following);
+        if (!following && timelineRef.current) {
+          const timeline = timelineRef.current;
+          const elements = [...timeline.querySelectorAll<HTMLElement>("[data-reading-slot]")];
+          const anchor = saved.anchors.flatMap((anchor) => {
+            const element = elements.find((element) => element.dataset.readingSlot === anchor.slot_key
+              && element.dataset.readingType === anchor.type
+              && (element.dataset.readingTimestamp || null) === anchor.timestamp);
+            return element ? [{ anchor, element }] : [];
+          })[0];
+          // Rewritten history may remove the old anchor. Keep it unread and
+          // start at the available history instead of silently jumping to end.
+          timeline.scrollTop = anchor
+            ? timeline.scrollTop + anchor.element.getBoundingClientRect().top
+              - timeline.getBoundingClientRect().top - anchor.anchor.top
+            : 0;
+          capture();
+        }
+      } else {
+        setFollowing(true);
+      }
+      state.current.initialized = true;
+    }
     reconcile();
   });
 
@@ -179,5 +223,5 @@ export function useTimelineScroll({ session_key, initial_page_loaded, on_follow_
     reconcile();
   }
 
-  return { timelineRef, contentRef, onScroll, noteUserScroll, pause, jumpToLatest };
+  return { timelineRef, contentRef, onScroll, noteUserScroll, pause, jumpToLatest, isFollowing };
 }

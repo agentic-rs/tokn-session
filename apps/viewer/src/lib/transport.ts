@@ -174,6 +174,10 @@ export function parseEvent(frame: string): { event: string; payload: unknown } |
 }
 
 let selected: RemoteClient | undefined;
+export function viewerStorageScope(): string {
+  return isDesktop() ? "desktop" : selected?.endpoint ?? window.location.origin;
+}
+
 export function selectMachine(client?: RemoteClient) {
   selected?.close();
   selected = client;

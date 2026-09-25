@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { useLayoutEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { readingEventKey, saveReadingPosition } from "./readingPosition";
 import { eventButtonId } from "./state";
 import {
   acknowledgeSessionAttention,
@@ -51,7 +52,7 @@ vi.mock("./tauri", () => ({
 }));
 
 beforeEach(() => {
-  localStorage.removeItem("tokn.viewer.sidebar-order");
+  localStorage.clear();
   vi.mocked(updateSessionView).mockReset().mockResolvedValue(undefined);
   vi.mocked(listenForRelayChanges).mockReset().mockResolvedValue(vi.fn());
   vi.mocked(acknowledgeSessionAttention).mockReset().mockResolvedValue({ changed: false });
@@ -1477,6 +1478,23 @@ describe("useViewerState session-index signalling", () => {
     expect(acknowledgeSessionAttention).not.toHaveBeenCalled();
     act(() => result.current.setFollowingLive(true));
     await waitFor(() => expect(acknowledgeSessionAttention).toHaveBeenCalledWith({ session_key: "live", attention_revision: "4" }));
+  });
+
+  it("reopens at last read without acknowledgement, then marks the committed end read on jump", async () => {
+    const page = { ...toolEventPage(), attention_revision: "9" };
+    const event = page.events[0];
+    saveReadingPosition("saved", {
+      anchors: [{ slot_key: event.event_key, type: event.type, timestamp: event.timestamp, top: -40 }],
+      last_event: readingEventKey(event), at_end: false,
+    });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("saved")], next_cursor: null, source_errors: [], pending_providers: [] });
+    vi.mocked(loadEventPage).mockResolvedValue(page);
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "saved");
+    await waitFor(() => expect(result.current.initialPageLoaded).toBe(true));
+    expect(acknowledgeSessionAttention).not.toHaveBeenCalled();
+    act(() => result.current.showLiveActivity());
+    await waitFor(() => expect(acknowledgeSessionAttention).toHaveBeenCalledWith({ session_key: "saved", attention_revision: "9" }));
   });
 
   it("does not acknowledge a page invalidated by a selection change before commit", async () => {
