@@ -339,6 +339,7 @@ impl OpenCodeNormalizer {
     message_id: &str,
     parent_id: &Option<String>,
     provenance: &Option<MessageProvenance>,
+    message_phase: Phase,
     part: OpenCodePartRow,
   ) -> Vec<AgentEvent> {
     let OpenCodePartRow {
@@ -358,7 +359,7 @@ impl OpenCodeNormalizer {
         parent_id: parent_id.clone(),
         role: Role::Assistant,
         delivery: MessageDelivery::Final,
-        phase: Phase::Finished,
+        phase: message_phase,
         text: part.text,
         timestamp: timestamp(time_created),
       })],
@@ -485,9 +486,27 @@ impl OpenCodeNormalizer {
       }
     }
 
+    // Live V1 rows are mutable: text can exist before the assistant message
+    // finishes. Preserve its phase so it cannot count as an unread final yet.
+    // Older/exported rows without timing retain their historical behavior.
+    let message_phase = if message_native
+      .pointer("/time/created")
+      .and_then(Value::as_u64)
+      .is_some()
+      && message_native
+        .pointer("/time/completed")
+        .and_then(Value::as_u64)
+        .is_none()
+      && message_native.get("finish").and_then(Value::as_str).is_none()
+      && message_native.get("error").is_none_or(Value::is_null)
+    {
+      Phase::Delta
+    } else {
+      Phase::Finished
+    };
     let mut events = Vec::new();
     for part in parts {
-      events.extend(self.normalize_assistant_part(message_id, parent_id, &provenance, part));
+      events.extend(self.normalize_assistant_part(message_id, parent_id, &provenance, message_phase, part));
     }
     events.extend(malformed_usage);
     if let Some(usage) = latest_step_usage.or(fallback_usage) {
@@ -771,6 +790,31 @@ mod tests {
 
   use super::OpenCodeNormalizer;
   use crate::row::{OpenCodeMessageRow, OpenCodePartRow};
+
+  #[test]
+  fn assistant_text_is_not_finalized_until_the_mutable_message_completes() {
+    for provider in [
+      tokn_session_core::Provider::OpenCode,
+      tokn_session_core::Provider::ZCode,
+    ] {
+      let mut normalizer = OpenCodeNormalizer::with_provider("session".into(), provider);
+      for (time, expected) in [
+        (json!({"created": 100}), Phase::Delta),
+        (json!({"created": 100, "completed": 200}), Phase::Finished),
+      ] {
+        let events = normalizer.normalize_message(message_row(
+          "reply",
+          json!({"role":"assistant","time":time}),
+          vec![part_row("text", json!({"type":"text","text":"answer"}))],
+        ));
+        assert!(
+          events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Message(message) if message.phase == expected))
+        );
+      }
+    }
+  }
 
   #[test]
   fn normalizes_known_persisted_messages_and_parts() {

@@ -296,14 +296,16 @@ pub struct SessionSummary {
   pub message_count: Option<usize>,
   pub event_count: Option<usize>,
   pub history_status: Option<HistoryStatus>,
-  /// True when this session has a newly indexed, visible user message or
-  /// final assistant message that has not yet been acknowledged by opening
+  /// True when this session has a newly indexed, visible final assistant message that has not yet been acknowledged by opening
   /// its event page.
   pub has_unread: bool,
-  /// True when any known canonical descendant has unread visible activity.
-  /// This lets a collapsed parent communicate attention without conflating it
-  /// with an update to the parent session itself.
+  /// Compatibility field, always false. Unread attention belongs only to this session.
   pub has_unread_descendant: bool,
+  pub unread_final_count: u64,
+  /// Compatibility field, always zero. Subagent replies never contribute.
+  pub unread_descendant_count: u64,
+  pub is_running: bool,
+  pub has_running_descendant: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]

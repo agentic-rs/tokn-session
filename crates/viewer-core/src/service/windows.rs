@@ -341,7 +341,7 @@ mod tests {
     config.include_native = true;
     config.poll_interval = Duration::from_millis(10);
     let server = tokio::spawn(crate::service_server::serve_listener(listener, config));
-    let service = ViewerService::new(Arc::new(NativeRepository));
+    let service = ViewerService::new(Arc::new(NativeRepository::default()));
     let mut changes = service.relay.changes.subscribe();
     service
       .relay

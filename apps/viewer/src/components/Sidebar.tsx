@@ -91,10 +91,11 @@ function SessionBranch({
   const title = sessionDisplayTitle(session);
   const preview = session.preview?.replace(/\s+/g, " ").trim();
   const sessionDescription = depth > 0 ? `subagent ${title}` : title;
-  const hasUnread = session.has_unread || session.has_unread_descendant === true;
-  const unreadLabel = session.has_unread
-    ? "Unread updates"
-    : "Unread updates in a subagent";
+  const isRunning = session.is_running === true || session.has_running_descendant === true;
+  const unreadCount = session.unread_final_count ?? Number(session.has_unread);
+  const hasUnread = !isRunning && unreadCount > 0;
+  const unreadLabel = `${unreadCount} unread final ${unreadCount === 1 ? "reply" : "replies"}`;
+  const runningLabel = session.is_running ? "Running" : "Subagent running";
 
   useEffect(() => {
     if (hasChildren && isExpanded && !childrenState) {
@@ -120,7 +121,7 @@ function SessionBranch({
         )}
         <button
           aria-current={session.session_key === selected_session_key ? "page" : undefined}
-          aria-label={`${sessionDescription}, ${providerLabel(session.provider)} session ${session.session_id}${hasUnread ? `, ${unreadLabel.toLowerCase()}` : ""}`}
+          aria-label={`${sessionDescription}, ${providerLabel(session.provider)} session ${session.session_id}${isRunning ? `, ${runningLabel.toLowerCase()}` : hasUnread ? `, ${unreadLabel}` : ""}`}
           className="session-row"
           data-selected={session.session_key === selected_session_key}
           data-subagent={depth > 0}
@@ -133,13 +134,15 @@ function SessionBranch({
             <span className="session-row__headline">
               {depth > 0 ? <BranchIcon className="session-row__branch-icon" /> : null}
               <span className="session-row__title">{title}</span>
-              {hasUnread ? (
+              {isRunning ? (
+                <span aria-label={runningLabel} className="session-row__running inline-spinner" role="img" />
+              ) : hasUnread ? (
                 <span
                   aria-label={unreadLabel}
-                  className="session-row__unread-dot"
-                  data-unread-source={session.has_unread ? "direct" : "descendant"}
+                  className={unreadCount > 1 ? "session-row__unread-count" : "session-row__unread-dot"}
+                  data-unread-source="direct"
                   role="img"
-                />
+                >{unreadCount > 1 ? unreadCount : null}</span>
               ) : null}
             </span>
             {preview && preview !== title ? <span className="session-row__preview">{preview}</span> : null}

@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { useLayoutEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { readingEventKey, saveReadingPosition } from "./readingPosition";
 import { eventButtonId } from "./state";
 import {
   acknowledgeSessionAttention,
@@ -51,7 +52,7 @@ vi.mock("./tauri", () => ({
 }));
 
 beforeEach(() => {
-  localStorage.removeItem("tokn.viewer.sidebar-order");
+  localStorage.clear();
   vi.mocked(updateSessionView).mockReset().mockResolvedValue(undefined);
   vi.mocked(listenForRelayChanges).mockReset().mockResolvedValue(vi.fn());
   vi.mocked(acknowledgeSessionAttention).mockReset().mockResolvedValue({ changed: false });
@@ -1458,6 +1459,70 @@ describe("useViewerState session-index signalling", () => {
       sessionKey: indexedSession.session_key,
     }]);
     await waitFor(() => expect(listSessions).toHaveBeenCalledTimes(2));
+  });
+
+  it("keeps final replies unread while scrolled up and acknowledges when following resumes", async () => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    vi.mocked(loadEventPage).mockResolvedValue({ ...toolEventPage(), attention_revision: "1" });
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(acknowledgeSessionAttention).toHaveBeenCalledWith({ session_key: "live", attention_revision: "1" }));
+    vi.mocked(acknowledgeSessionAttention).mockClear();
+    act(() => result.current.setFollowingLive(false));
+    vi.mocked(loadEventPage).mockResolvedValue({ ...toolEventPage(), attention_revision: "4" });
+    act(() => emit?.({ session_key: "live", reset: false }));
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.eventsLoading).toBe(false));
+    expect(acknowledgeSessionAttention).not.toHaveBeenCalled();
+    act(() => result.current.setFollowingLive(true));
+    expect(result.current.pendingLiveActivity).toBe(false);
+    await waitFor(() => expect(acknowledgeSessionAttention).toHaveBeenCalledWith({ session_key: "live", attention_revision: "4" }));
+  });
+
+  it("hides the jump button and acknowledges replies after manually scrolling to the end", async () => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    vi.mocked(loadEventPage).mockResolvedValue({ ...toolEventPage(), attention_revision: "1" });
+    const { container } = render(<ViewerPage />);
+    fireEvent.click(await screen.findByRole("button", { name: /session live/ }));
+    await waitFor(() => expect(acknowledgeSessionAttention).toHaveBeenCalledWith({ session_key: "live", attention_revision: "1" }));
+    vi.mocked(acknowledgeSessionAttention).mockClear();
+    const timeline = container.querySelector<HTMLElement>(".conversation__timeline")!;
+    Object.defineProperties(timeline, {
+      scrollHeight: { configurable: true, value: 1000 },
+      clientHeight: { configurable: true, value: 300 },
+    });
+    timeline.scrollTop = 300;
+    fireEvent.wheel(timeline, { deltaY: -80 });
+    fireEvent.scroll(timeline);
+    vi.mocked(loadEventPage).mockResolvedValue({ ...toolEventPage(), attention_revision: "4" });
+    act(() => emit?.({ session_key: "live", reset: false }));
+    await screen.findByRole("button", { name: "New activity · Jump to latest" });
+    timeline.scrollTop = 700;
+    fireEvent.wheel(timeline, { deltaY: 80 });
+    fireEvent.scroll(timeline);
+    await waitFor(() => expect(screen.queryByRole("button", { name: /Jump to latest/ })).not.toBeInTheDocument());
+    await waitFor(() => expect(acknowledgeSessionAttention).toHaveBeenCalledWith({ session_key: "live", attention_revision: "4" }));
+  });
+
+  it("reopens at last read without acknowledgement, then marks the committed end read on jump", async () => {
+    const page = { ...toolEventPage(), attention_revision: "9" };
+    const event = page.events[0];
+    saveReadingPosition("saved", {
+      anchors: [{ slot_key: event.event_key, type: event.type, timestamp: event.timestamp, top: -40 }],
+      last_event: readingEventKey(event), at_end: false,
+    });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("saved")], next_cursor: null, source_errors: [], pending_providers: [] });
+    vi.mocked(loadEventPage).mockResolvedValue(page);
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "saved");
+    await waitFor(() => expect(result.current.initialPageLoaded).toBe(true));
+    expect(acknowledgeSessionAttention).not.toHaveBeenCalled();
+    act(() => result.current.showLiveActivity());
+    await waitFor(() => expect(acknowledgeSessionAttention).toHaveBeenCalledWith({ session_key: "saved", attention_revision: "9" }));
   });
 
   it("does not acknowledge a page invalidated by a selection change before commit", async () => {

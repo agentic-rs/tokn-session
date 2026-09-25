@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { readingEventKey } from "../lib/readingPosition";
 import { useTimelineScroll } from "../lib/useTimelineScroll";
 import { isBookkeepingEvent } from "../lib/eventFilter";
 import type {
@@ -114,6 +115,7 @@ export function Conversation({
   const scroll = useTimelineScroll({
     session_key: session?.session_key ?? null,
     initial_page_loaded,
+    last_event: events.length ? readingEventKey(events[events.length - 1]) : undefined,
     on_follow_change,
   });
 
@@ -205,11 +207,11 @@ export function Conversation({
         </button>
       </header>
 
-      {pending_live_activity ? (
+      {pending_live_activity || !scroll.isFollowing ? (
         <button className="page-button" type="button" onClick={() => {
           scroll.jumpToLatest();
           on_show_live_activity?.();
-        }}>New activity · Jump to latest</button>
+        }}>{pending_live_activity ? "New activity · Jump to latest" : "Jump to latest"}</button>
       ) : null}
       <div
         className="conversation__timeline"
@@ -300,7 +302,9 @@ export function Conversation({
             ) : null}
 
             {visibleEvents.map((event) => (
-              <div data-event-key={event.event_key} data-scroll-key={event.event_key} key={`${session.session_key}:${event.event_key}`}>
+              <div data-reading-slot={event.slot_key ?? event.event_key} data-reading-type={event.type}
+                data-reading-timestamp={event.timestamp ?? ""}
+                data-event-key={event.event_key} data-scroll-key={event.event_key} key={`${session.session_key}:${event.event_key}`}>
               <EventCard
                 session_key={session.session_key}
                 hide_lifecycle={hideLifecycle}

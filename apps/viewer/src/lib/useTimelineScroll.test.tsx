@@ -102,6 +102,7 @@ class LayoutObserver {
 interface HarnessOptions {
   session_key: string | null;
   initial_page_loaded: boolean;
+  last_event?: string;
 }
 
 function TimelineHarness({
@@ -115,6 +116,9 @@ function TimelineHarness({
       <div
         key={row.key}
         data-scroll-key={row.key}
+        data-reading-slot={row.key}
+        data-reading-type="message"
+        data-reading-timestamp=""
         ref={(element) => { if (element) layout.attachRow(element, row.key); }}
       >
         {row.children?.map(renderRow)}
@@ -168,6 +172,7 @@ function mountTimeline(layout = new TimelineLayout(), initial: Partial<HarnessOp
 }
 
 beforeEach(() => {
+  localStorage.clear();
   vi.stubGlobal("ResizeObserver", LayoutObserver);
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
     const frame_id = ++next_frame_id;
@@ -202,6 +207,52 @@ describe("useTimelineScroll", () => {
     timeline.layout.height = 1500;
     timeline.resize();
     expect(timeline.viewport.scrollTop).toBe(1300);
+  });
+
+  it("restores a saved reading line after switching sessions and after remount", () => {
+    const timeline = mountTimeline(undefined, { last_event: "last-one" });
+    timeline.readAt(350);
+    timeline.commit({ session_key: "session-two" });
+    expect(timeline.viewport.scrollTop).toBe(800);
+    timeline.commit({ session_key: "session-one" });
+    expect(timeline.viewport.scrollTop).toBe(350);
+    cleanup();
+    const reopened = mountTimeline(undefined, { last_event: "last-one" });
+    expect(reopened.viewport.scrollTop).toBe(350);
+    expect(reopened.on_follow_change).toHaveBeenCalledWith(false);
+  });
+
+  it("keeps a removed reading anchor near recent content without acknowledging unseen replies", () => {
+    const original = mountTimeline(undefined, { last_event: "old-last" });
+    original.readAt(350);
+    cleanup();
+    const layout = new TimelineLayout();
+    layout.height = 10000;
+    layout.rows = [{ key: "replacement", top: 0, height: 10000 }];
+    const reopened = mountTimeline(layout, { last_event: "new-last" });
+    expect(reopened.viewport.scrollTop).toBe(9600);
+    expect(reopened.on_follow_change).toHaveBeenLastCalledWith(false);
+    reopened.jump();
+    expect(reopened.viewport.scrollTop).toBe(9800);
+    expect(reopened.on_follow_change).toHaveBeenLastCalledWith(true);
+  });
+
+  it("restores the old end when new replies arrived while closed, then follows an explicit jump", () => {
+    mountTimeline(undefined, { last_event: "old-last" });
+    cleanup();
+    const layout = new TimelineLayout();
+    layout.height = 1400;
+    layout.rows.push({ key: "new-reply", top: 1000, height: 400 });
+    const reopened = mountTimeline(layout, { last_event: "new-last" });
+    expect(reopened.viewport.scrollTop).toBe(800);
+    expect(reopened.on_follow_change).toHaveBeenCalledWith(false);
+    reopened.jump();
+    expect(reopened.viewport.scrollTop).toBe(1200);
+    expect(reopened.on_follow_change).toHaveBeenLastCalledWith(true);
+    cleanup();
+    const again = mountTimeline(layout, { last_event: "new-last" });
+    expect(again.viewport.scrollTop).toBe(1200);
+    expect(again.on_follow_change).not.toHaveBeenCalled();
   });
 
   it("follows React and asynchronous growth without treating programmatic scroll events as user input", () => {
@@ -362,6 +413,23 @@ describe("useTimelineScroll", () => {
     expect(timeline.layout.row("row-2").top - timeline.viewport.scrollTop).toBe(-50);
     timeline.resize();
     expect(timeline.viewport.scrollTop).toBe(650);
+  });
+
+  it("resumes following after a downward gesture at the physical end with no scroll delta", () => {
+    const timeline = mountTimeline();
+    timeline.readAt(600);
+    // A shortened card can clamp a paused reader to the physical bottom.
+    timeline.layout.height = 650;
+    fireEvent.scroll(timeline.viewport);
+    timeline.resize();
+    expect(timeline.viewport.scrollTop).toBe(450);
+    expect(timeline.on_follow_change.mock.calls).toEqual([[false]]);
+    fireEvent.wheel(timeline.viewport, { deltaY: 80 });
+    fireEvent.scroll(timeline.viewport);
+    expect(timeline.on_follow_change.mock.calls).toEqual([[false], [true]]);
+    timeline.layout.height = 1000;
+    timeline.resize();
+    expect(timeline.viewport.scrollTop).toBe(800);
   });
 
   it("jumps immediately with unchanged data and resumes following future output", () => {

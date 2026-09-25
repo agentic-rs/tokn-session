@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { loadReadingWindow, readReadingPosition, readingEventKey } from "./readingPosition";
 import { refreshEventWindow, refreshTrajectoryWindow } from "./liveEvents";
 import { compareProjects, readSessionOrder, saveSessionOrder } from "./sidebarOrder";
 import { useSessionView } from "./useSessionView";
@@ -219,6 +220,7 @@ export function useViewerState() {
   const [eventsAttempt, setEventsAttempt] = useState(0);
   const eventsRequest = useRef(0);
   const followingLive = useRef(true);
+  const [isFollowingLive, setIsFollowingLive] = useState(true);
   const pendingLiveReset = useRef(false);
   const uncommittedLiveReset = useRef(false);
   const liveRefresh = useRef(false);
@@ -541,6 +543,7 @@ export function useViewerState() {
 
   const showLiveActivity = useCallback(() => {
     followingLive.current = true;
+    setIsFollowingLive(true);
     manualExpansion.current = false;
     expansionRevision.current += 1;
     if (workingTrajectory.current) applyExpandedEventKey(workingTrajectory.current);
@@ -551,6 +554,8 @@ export function useViewerState() {
 
   const setFollowingLive = useCallback((following: boolean) => {
     followingLive.current = following;
+    setIsFollowingLive(following);
+    if (following) setPendingLiveActivity(false);
   }, []);
 
   const clearInputRefreshTimers = useCallback(() => {
@@ -578,7 +583,9 @@ export function useViewerState() {
   useEffect(() => clearInputRefreshTimers, [selectedSessionKey, clearInputRefreshTimers]);
 
   useEffect(() => {
-    followingLive.current = true;
+    const following = !selectedSessionKey || !readReadingPosition(selectedSessionKey);
+    followingLive.current = following;
+    setIsFollowingLive(following);
     workingTrajectory.current = null;
     liveUpdateQueued.current = false;
     pendingLiveReset.current = false;
@@ -1117,15 +1124,20 @@ export function useViewerState() {
     const refreshExpansionRevision = expansionRevision.current;
     const page = isLiveRefresh
       ? refreshEventWindow(selectedSessionKey, loadEventPage)
-      : loadEventPage({
-        session_key: selectedSessionKey,
-        window_mode: "retained",
-        direction: "backward",
-      });
+      : loadReadingWindow(selectedSessionKey, readReadingPosition(selectedSessionKey), loadEventPage,
+        () => eventsRequest.current === requestId);
     void page
       .then(async (response) => {
         if (eventsRequest.current !== requestId) {
           return;
+        }
+        if (!isLiveRefresh) {
+          const position = readReadingPosition(selectedSessionKey);
+          const last = response.events[response.events.length - 1];
+          const following = !position || (position.at_end && !!last && position.last_event === readingEventKey(last));
+          followingLive.current = following;
+          setIsFollowingLive(following);
+          setPendingLiveActivity(!!position && !!last && position.last_event !== readingEventKey(last));
         }
         const active = [...response.events].reverse().find((event) => event.trajectory?.status === "working");
         let replacement: { trajectory_key: string; page: TrajectoryEventPageResponse } | null = null;
@@ -1267,6 +1279,8 @@ export function useViewerState() {
       return;
     }
 
+    if (!isFollowingLive || !followingLive.current) return;
+
     if (acknowledgedInitialPageRequest.current === requestId) {
       return;
     }
@@ -1280,6 +1294,7 @@ export function useViewerState() {
     acknowledgeAcceptedAttention(sessionKey, attentionRevision);
   }, [
     acceptedInitialEventPage,
+    isFollowingLive,
     acknowledgeAcceptedAttention,
     eventsOwnerKey,
     initialPageSessionKey,

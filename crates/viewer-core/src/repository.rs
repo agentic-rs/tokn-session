@@ -1,4 +1,7 @@
+pub(crate) mod activity;
+use activity::{Activity, ActivityReaders};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use tokn_session_client::{AgentClient, SessionHeader};
 use tokn_session_core::LoadedSession;
@@ -77,10 +80,17 @@ pub(crate) trait ViewerRepository: Send + Sync {
     Ok(SessionBodyIndexing::Ready)
   }
 
+  fn load_activity(&self, locator: &SessionLocator) -> Result<Activity, String> {
+    Activity::from_loaded(self.load_session(locator)?, &locator.session_id)
+  }
+
   fn load_session(&self, locator: &SessionLocator) -> Result<LoadedSession, String>;
 }
 
-pub(crate) struct NativeRepository;
+#[derive(Default)]
+pub(crate) struct NativeRepository {
+  activity: Mutex<ActivityReaders>,
+}
 
 impl ViewerRepository for NativeRepository {
   fn list_session_headers(&self, provider: ViewerProvider) -> Result<Vec<SessionHeader>, String> {
@@ -113,7 +123,17 @@ impl ViewerRepository for NativeRepository {
       .modified()
       .map_err(|error| format!("failed to inspect {}: {error}", locator.source_path.display()))?;
     let age = modified.elapsed().unwrap_or_default();
+    if age <= std::time::Duration::from_secs(30) || self.activity.lock().map_err(|e| e.to_string())?.contains(locator) {
+      return Ok(SessionBodyIndexing::Ready);
+    }
     Ok(jsonl_body_indexing(metadata.len(), age))
+  }
+
+  fn load_activity(&self, locator: &SessionLocator) -> Result<Activity, String> {
+    if matches!(locator.provider, ViewerProvider::Codex | ViewerProvider::Pi) {
+      return self.activity.lock().map_err(|e| e.to_string())?.read(locator);
+    }
+    Activity::from_loaded(self.load_session(locator)?, &locator.session_id)
   }
 
   fn load_session(&self, locator: &SessionLocator) -> Result<LoadedSession, String> {
@@ -139,7 +159,7 @@ mod tests {
   use super::*;
 
   #[test]
-  fn native_repository_defers_an_active_jsonl_body() {
+  fn native_repository_reads_active_jsonl_activity_without_the_cold_body_delay() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("active.jsonl");
     std::fs::write(&path, "active").unwrap();
@@ -150,8 +170,8 @@ mod tests {
       source_path: path,
     };
     assert_eq!(
-      NativeRepository.session_body_indexing(&locator).unwrap(),
-      SessionBodyIndexing::Deferred
+      NativeRepository::default().session_body_indexing(&locator).unwrap(),
+      SessionBodyIndexing::Ready
     );
   }
 
