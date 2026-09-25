@@ -44,6 +44,22 @@ describe("reading positions", () => {
     expect(load).toHaveBeenLastCalledWith({ session_key: "one", window_mode: "earlier", direction: "backward", cursor: "older" });
   });
 
+  it("returns the recent window when a removed bookmark exhausts older history", async () => {
+    const latest = page([event("event.v1.8")], "older");
+    const load = vi.fn().mockResolvedValueOnce(latest)
+      .mockResolvedValueOnce(page([event("event.v1.0"), event("event.v1.8")]));
+    expect(await loadReadingWindow("one", position, load, () => true)).toBe(latest);
+  });
+
+  it("uses a surviving secondary anchor when the primary was removed", async () => {
+    const saved = { ...position, anchors: [...position.anchors,
+      { slot_key: "event.v1.2", type: "message", timestamp: null, top: 100 }] };
+    const older = page([event("event.v1.2"), event("event.v1.8")]);
+    const load = vi.fn().mockResolvedValueOnce(page([event("event.v1.8")], "older"))
+      .mockResolvedValueOnce(older);
+    expect(await loadReadingWindow("one", saved, load, () => true)).toBe(older);
+  });
+
   it("stops restoring when selection changes or the server repeats a cursor", async () => {
     const load = vi.fn().mockResolvedValue(page([event("event.v1.8")], "older"));
     await loadReadingWindow("one", position, load, () => false);

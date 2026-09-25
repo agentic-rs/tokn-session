@@ -203,8 +203,9 @@ persist locally for up to 200 machine/session pairs, using source-slot, type,
 timestamp, and viewport offset without transcript text. Reopening loads earlier
 retained turns as needed and restores the last reading line; newly appended
 replies do not move it to the end. Unchanged sessions last viewed at the end
-resume following. Missing/replaced anchors fall back to available history with
-following paused. Jump to latest remains available while paused and acknowledges
+resume following. Missing/replaced anchors keep the recent window and fall back to recent context
+with following paused; exhausted bookmark searches never publish the oldest
+backfilled page as the opening position. Jump to latest remains available while paused and acknowledges
 the newest committed page; merely restoring a historical position does not.
 One scroll controller handles committed updates and asynchronous layout changes,
 preserving follow intent through browser clamping and anchoring to visible child

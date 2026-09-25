@@ -222,6 +222,21 @@ describe("useTimelineScroll", () => {
     expect(reopened.on_follow_change).toHaveBeenCalledWith(false);
   });
 
+  it("keeps a removed reading anchor near recent content without acknowledging unseen replies", () => {
+    const original = mountTimeline(undefined, { last_event: "old-last" });
+    original.readAt(350);
+    cleanup();
+    const layout = new TimelineLayout();
+    layout.height = 10000;
+    layout.rows = [{ key: "replacement", top: 0, height: 10000 }];
+    const reopened = mountTimeline(layout, { last_event: "new-last" });
+    expect(reopened.viewport.scrollTop).toBe(9600);
+    expect(reopened.on_follow_change).toHaveBeenLastCalledWith(false);
+    reopened.jump();
+    expect(reopened.viewport.scrollTop).toBe(9800);
+    expect(reopened.on_follow_change).toHaveBeenLastCalledWith(true);
+  });
+
   it("restores the old end when new replies arrived while closed, then follows an explicit jump", () => {
     mountTimeline(undefined, { last_event: "old-last" });
     cleanup();

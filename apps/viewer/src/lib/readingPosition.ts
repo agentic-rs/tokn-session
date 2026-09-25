@@ -69,6 +69,7 @@ export async function loadReadingWindow(
   is_current: () => boolean,
 ): Promise<EventPageResponse> {
   let page = await load({ session_key, window_mode: "retained", direction: "backward" });
+  let fallback = page;
   const cursors = new Set<string>();
   while (position && is_current() && page.previous_cursor
     && !page.events.some((event) => matchesReadingAnchor(event, position.anchors[0]))) {
@@ -76,6 +77,15 @@ export async function loadReadingWindow(
     if (cursors.has(cursor)) break;
     cursors.add(cursor);
     page = await load({ session_key, window_mode: "earlier", direction: "backward", cursor });
+    if (position.anchors.some((anchor) => page.events.some((event) => matchesReadingAnchor(event, anchor)))) {
+      fallback = page;
+    }
+  }
+  if (position && !page.events.some((event) => matchesReadingAnchor(event, position.anchors[0]))) {
+    // A rollback, changed projection, or removed row can invalidate a bookmark.
+    // Never publish the whole backfilled history merely because the search
+    // exhausted it: that turns a missing anchor into a jump to session start.
+    return fallback;
   }
   return page;
 }

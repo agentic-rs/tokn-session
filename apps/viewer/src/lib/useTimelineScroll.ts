@@ -154,12 +154,13 @@ export function useTimelineScroll({ session_key, initial_page_loaded, last_event
               && (element.dataset.readingTimestamp || null) === anchor.timestamp);
             return element ? [{ anchor, element }] : [];
           })[0];
-          // Rewritten history may remove the old anchor. Keep it unread and
-          // start at the available history instead of silently jumping to end.
+          // A removed anchor must not send the reader to the start of a large
+          // retained history. Show recent context, paused, until an explicit
+          // jump or downward scroll acknowledges the displayed end.
           timeline.scrollTop = anchor
             ? timeline.scrollTop + anchor.element.getBoundingClientRect().top
               - timeline.getBoundingClientRect().top - anchor.anchor.top
-            : 0;
+            : Math.max(0, timeline.scrollHeight - 2 * timeline.clientHeight);
           capture();
         }
       } else {
