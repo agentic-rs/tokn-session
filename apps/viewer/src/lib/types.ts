@@ -140,6 +140,8 @@ export interface SessionSummary {
   title: string | null;
   preview: string | null;
   project: string | null;
+  project_order_ms?: number | null;
+  project_key?: string | null;
   cwd: string | null;
   updated_at_ms: number | null;
   timestamp: string | null;
@@ -163,7 +165,10 @@ export interface SessionSummary {
   has_running_descendant?: boolean;
 }
 
+export type SessionOrder = "time" | "project";
+
 export interface SessionListQuery {
+  order?: SessionOrder;
   providers?: ViewerProvider[];
   search?: string;
 }

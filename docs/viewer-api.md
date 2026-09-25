@@ -197,3 +197,12 @@ Session summaries include `is_running`, `has_running_descendant`,
 legacy unread booleans. Running takes display precedence over unread; counts
 represent completed final assistant messages, not index refreshes. Acknowledgement
 revisions remain opaque and must come from the displayed newest event page.
+
+Session list requests accept `query.order` (`time`, the default, or `project`).
+Project ordering is applied before pagination and groups shared repository
+identities by their durable discovery anchor, newest first, then session activity.
+Root summaries include nullable `project_key` and `project_order_ms`; `cwd` remains
+the original session working directory. Clients should group by `project_key`,
+falling back to `cwd` for older servers. Clients keep Recent display positions in
+memory; this does not change API activity ordering. Start a fresh cursor when
+changing the order or filters.

@@ -3177,3 +3177,42 @@ button:disabled {
   text-align: center;
   font-variant-numeric: tabular-nums;
 }
+
+.sidebar-order {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 3px;
+  padding: 3px;
+  margin-bottom: 14px;
+  background: var(--surface-hover);
+  border-radius: 9px;
+}
+
+.sidebar-order button {
+  min-height: 32px;
+  padding: 6px 12px;
+  color: var(--text-soft);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.sidebar-order button[aria-pressed="true"] {
+  color: var(--text);
+  background: var(--surface-raised);
+  border-color: var(--border);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+}
+
+.session-row__project {
+  min-width: 0;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 860px) {
+  .sidebar-order button { min-height: 40px; }
+}

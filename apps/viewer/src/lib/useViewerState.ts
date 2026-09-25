@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { refreshEventWindow, refreshTrajectoryWindow } from "./liveEvents";
+import { compareProjects, readSessionOrder, saveSessionOrder } from "./sidebarOrder";
 import { useSessionView } from "./useSessionView";
 import {
   acknowledgeSessionAttention,
@@ -33,6 +34,7 @@ import {
   type SessionHistoryStatus,
   type SessionIndexProgress,
   type SessionSummary,
+  type SessionOrder,
   type SourceError,
   type TrajectoryEventPageResponse,
   type TrajectoryEventPageState,
@@ -142,13 +144,14 @@ interface AcceptedInitialEventPage {
 }
 
 export function useViewerState() {
+  const [sessionOrder, setSessionOrder] = useState(readSessionOrder);
   const [search, setSearchValue] = useState("");
   const debouncedSearch = useDebouncedValue(search.trim(), 180);
   const [enabledProviders, setEnabledProviders] = useState<Set<ViewerProvider>>(
     () => new Set(PROVIDERS),
   );
   const providerKey = PROVIDERS.filter((provider) => enabledProviders.has(provider)).join(",");
-  const sessionQueryKey = `${providerKey}\u0000${debouncedSearch}`;
+  const sessionQueryKey = `${sessionOrder}\u0000${providerKey}\u0000${debouncedSearch}`;
 
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [sessionChildren, setSessionChildren] = useState<Map<string, SessionChildrenState>>(
@@ -172,6 +175,7 @@ export function useViewerState() {
   const sessionsRequest = useRef(0);
   const sessionListInFlight = useRef<number | null>(null);
   const sessionListRefreshQueued = useRef(false);
+  const previousSessionFilterKey = useRef<string | null>(null);
   const previousSessionQueryKey = useRef<string | null>(null);
   const [sessionIndexListenerReady, setSessionIndexListenerReady] = useState(false);
   const [sessionIndexProgress, setSessionIndexProgress] = useState<SessionIndexProgress | null>(null);
@@ -979,6 +983,8 @@ export function useViewerState() {
       return;
     }
     const queryChanged = previousSessionQueryKey.current !== sessionQueryKey;
+    const filterKey = `${providerKey}\u0000${debouncedSearch}`;
+    const filtersChanged = previousSessionFilterKey.current !== filterKey;
     if (!queryChanged && sessionListInFlight.current === sessionsRequest.current) {
       // Index and Relay notifications can outpace a catalog read. Keep its
       // result useful and coalesce those notifications into one trailing
@@ -990,6 +996,7 @@ export function useViewerState() {
     sessionListInFlight.current = null;
     sessionListRefreshQueued.current = false;
     previousSessionQueryKey.current = sessionQueryKey;
+    previousSessionFilterKey.current = filterKey;
     setSessionsLoadingMore(false);
     if (enabledProviders.size === 0) {
       clearSessionChildren();
@@ -1008,6 +1015,7 @@ export function useViewerState() {
     sessionListInFlight.current = requestId;
     void listSessions({
       query: {
+        order: sessionOrder,
         providers: PROVIDERS.filter((provider) => enabledProviders.has(provider)),
         search: debouncedSearch || undefined,
       },
@@ -1021,7 +1029,7 @@ export function useViewerState() {
         setSessionsCursor(response.next_cursor);
         setSourceErrors(response.source_errors);
         setPendingProviders(response.pending_providers);
-        if (queryChanged) {
+        if (filtersChanged) {
           // Root responses deliberately omit lazy child rows. Replace the
           // tree only once the changed query is accepted, retaining an
           // explicit root selection only when it still belongs to the new
@@ -1038,7 +1046,7 @@ export function useViewerState() {
       })
       .catch((error: unknown) => {
         if (sessionsRequest.current === requestId) {
-          if (queryChanged) {
+          if (filtersChanged) {
             clearSessionChildren();
             setSessions([]);
             setSessionsCursor(null);
@@ -1063,6 +1071,7 @@ export function useViewerState() {
     finishSessionListRequest,
     providerKey,
     sessionQueryKey,
+    sessionOrder,
     sessionIndexListenerReady,
     sessionsAttempt,
   ]);
@@ -1554,6 +1563,18 @@ export function useViewerState() {
     });
   }, []);
 
+  const changeSessionOrder = useCallback((order: SessionOrder) => {
+    if (order === sessionOrder) return;
+    sessionsRequest.current += 1;
+    sessionListInFlight.current = null;
+    sessionListRefreshQueued.current = false;
+    setSessionsLoading(true);
+    setSessionsCursor(null);
+    setSelectedSessionMetadata(selectedSession);
+    setSessionOrder(order);
+    saveSessionOrder(order);
+  }, [sessionOrder, selectedSession]);
+
   const changeSearch = useCallback((value: string) => {
     setSearchValue(value);
   }, []);
@@ -1647,6 +1668,7 @@ export function useViewerState() {
     setSessionsError(null);
     void listSessions({
       query: {
+        order: sessionOrder,
         providers: PROVIDERS.filter((provider) => enabledProviders.has(provider)),
         search: debouncedSearch || undefined,
       },
@@ -1657,7 +1679,10 @@ export function useViewerState() {
         if (sessionsRequest.current !== requestGeneration) {
           return;
         }
-        setSessions((current) => mergeSessions(current, response.sessions));
+        setSessions((current) => {
+          const merged = mergeSessions(current, response.sessions);
+          return sessionOrder === "project" ? merged.sort(compareProjects) : merged;
+        });
         setSessionsCursor(response.next_cursor);
         setSourceErrors(response.source_errors);
         setPendingProviders(response.pending_providers);
@@ -1673,7 +1698,7 @@ export function useViewerState() {
         }
         finishSessionListRequest(requestGeneration);
       });
-  }, [debouncedSearch, enabledProviders, finishSessionListRequest, sessionsCursor, sessionsLoading, sessionsLoadingMore]);
+  }, [debouncedSearch, enabledProviders, finishSessionListRequest, sessionOrder, sessionsCursor, sessionsLoading, sessionsLoadingMore]);
 
   const loadOlderEvents = useCallback(() => {
     if (
@@ -1771,6 +1796,8 @@ export function useViewerState() {
   }, [retrySessionIndex]);
 
   return {
+    sessionOrder,
+    setSessionOrder: changeSessionOrder,
     search,
     setSearch: changeSearch,
     enabledProviders,

@@ -58,8 +58,18 @@ impl ViewerProvider {
   }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionOrder {
+  #[default]
+  Time,
+  Project,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct SessionQuery {
+  #[serde(default)]
+  pub order: SessionOrder,
   #[serde(default)]
   pub providers: Vec<ViewerProvider>,
   pub search: Option<String>,
@@ -265,6 +275,8 @@ pub struct SessionSummary {
   pub title: Option<String>,
   pub preview: Option<String>,
   pub project: Option<String>,
+  pub project_order_ms: Option<i64>,
+  pub project_key: Option<String>,
   pub cwd: Option<String>,
   pub updated_at_ms: Option<i64>,
   pub timestamp: Option<String>,

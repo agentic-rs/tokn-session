@@ -4,19 +4,22 @@ import type {
   SourceError,
   SessionSummary,
   ViewerProvider,
+  SessionOrder,
 } from "../lib/types";
 import {
   formatRelativeTime,
-  groupSessions,
   knownSessionAncestors,
   providerLabel,
   sessionDisplayTitle,
   subagentDetail,
 } from "../lib/state";
 import { BranchIcon, ChevronIcon, CloseIcon, SearchIcon, WarningIcon } from "./Icons";
+import { useSidebarGroups } from "../lib/useSidebarGroups";
 import { LoadingRows } from "./StateView";
 
 interface SidebarProps {
+  order?: SessionOrder;
+  on_order_change?: (order: SessionOrder) => void;
   on_close?: () => void;
   sessions: SessionSummary[];
   session_children: ReadonlyMap<string, SessionChildrenState>;
@@ -40,6 +43,7 @@ interface SidebarProps {
 }
 
 interface SessionBranchProps {
+  show_project?: boolean;
   session: SessionSummary;
   depth: number;
   expanded_session_keys: ReadonlySet<string>;
@@ -67,6 +71,7 @@ function pendingProviderLabel(providers: ViewerProvider[]): string {
 }
 
 function SessionBranch({
+  show_project = false,
   session,
   depth,
   expanded_session_keys,
@@ -144,6 +149,10 @@ function SessionBranch({
             {preview && preview !== title ? <span className="session-row__preview">{preview}</span> : null}
             <span className="session-row__meta">
               <span className="session-row__provider" data-provider={session.provider}>{providerLabel(session.provider)}</span>
+              {show_project && (session.project || session.cwd) ? <>
+                <span aria-hidden="true">·</span>
+                <span className="session-row__project" title={session.cwd ?? session.project ?? undefined}>{session.project || session.cwd}</span>
+              </> : null}
               <span aria-hidden="true">·</span>
               <span>{formatRelativeTime(session.timestamp, session.updated_at_ms)}</span>
               {relationship ? (
@@ -216,6 +225,8 @@ function SessionBranch({
 }
 
 export function Sidebar({
+  order = "time",
+  on_order_change,
   on_close,
   sessions,
   session_children,
@@ -237,7 +248,7 @@ export function Sidebar({
   on_retry,
   on_load_more,
 }: SidebarProps) {
-  const groups = groupSessions(sessions);
+  const groups = useSidebarGroups(sessions, order);
   const noProviders = enabled_providers.size === 0;
   const isIndexingCatalog = pending_providers.length > 0;
   const indexingLabel = pendingProviderLabel(pending_providers);
@@ -287,6 +298,10 @@ export function Sidebar({
       </header>
 
       <div className="sidebar__controls">
+        <div aria-label="Group sessions" className="sidebar-order" role="group">
+          <button aria-pressed={order === "time"} onClick={() => on_order_change?.("time")} type="button">Time</button>
+          <button aria-pressed={order === "project"} onClick={() => on_order_change?.("project")} type="button">Projects</button>
+        </div>
         <div className="sidebar__filter-heading">
           <span>Find a conversation</span>
           {search || enabled_providers.size !== PROVIDER_FILTERS.length ? (
@@ -417,6 +432,7 @@ export function Sidebar({
               {group.sessions.map((session) => (
                 <SessionBranch
                   depth={0}
+                  show_project={order === "time"}
                   expanded_session_keys={expandedSessionKeys}
                   key={session.session_key}
                   on_children_load={on_children_load}

@@ -23,7 +23,7 @@ use crate::model::{
   CatalogRefreshScope, EventDetail, EventPage, EventPageRequest, EventSummary, IndexActivity, IndexWorkerError,
   ListSessionChildrenRequest, ListSessionChildrenResponse, ListSessionsRequest, ListSessionsResponse,
   LoadEventDetailRequest, LoadTrajectoryEventPageRequest, PageDirection, ProviderBody, ReasoningCardSummary,
-  SessionIndexProgress, SessionLocator, SessionSummary, SourceError, ToolCardSummary, ToolOutputPreview,
+  SessionIndexProgress, SessionLocator, SessionOrder, SessionSummary, SourceError, ToolCardSummary, ToolOutputPreview,
   ToolOutputSection, TrajectoryCardSummary, TrajectoryEventPage, UsageCardSummary, ViewerProvider, bounded_limit,
   decode_event_cursor, decode_event_key, decode_list_cursor, decode_session_key, decode_trajectory_event_cursor,
   decode_trajectory_key, encode_event_cursor, encode_event_key, encode_list_cursor, encode_session_key,
@@ -1137,6 +1137,20 @@ impl ViewerService {
       }
     }
 
+    let project_keys = candidates
+      .iter()
+      .filter_map(|candidate| project_key(&candidate.header).map(str::to_owned))
+      .collect::<Vec<_>>();
+    let discovered_at_ms = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .unwrap_or_default()
+      .as_millis()
+      .min(i64::MAX as u128) as i64;
+    let project_order = self
+      .session_index
+      .project_groups(&project_keys, discovered_at_ms)
+      .map_err(|error| format!("failed to read project order: {error}"))?;
+
     if let Some(search) = search.as_deref() {
       let mut matches = Vec::new();
       for candidate in candidates {
@@ -1147,7 +1161,10 @@ impl ViewerService {
           candidate.is_subagent,
           candidate.attention,
         ) {
-          Ok(summary) => summary,
+          Ok(mut summary) => {
+            apply_project_group(&mut summary, &project_order);
+            summary
+          }
           Err(message) => {
             record_source_error(&mut source_errors, candidate.provider, message);
             continue;
@@ -1157,7 +1174,7 @@ impl ViewerService {
           matches.push(candidate);
         }
       }
-      sort_session_candidates(&mut matches);
+      sort_root_candidates(&mut matches, request.query.order, &project_order);
       let start = offset.min(matches.len());
       let end = start.saturating_add(limit).min(matches.len());
       let next_cursor = (end < matches.len()).then(|| encode_list_cursor(end));
@@ -1170,7 +1187,10 @@ impl ViewerService {
           candidate.is_subagent,
           candidate.attention,
         ) {
-          Ok(summary) => sessions.push(summary),
+          Ok(mut summary) => {
+            apply_project_group(&mut summary, &project_order);
+            sessions.push(summary);
+          }
           Err(message) => record_source_error(&mut source_errors, candidate.provider, message),
         }
       }
@@ -1182,7 +1202,7 @@ impl ViewerService {
       });
     }
 
-    sort_session_candidates(&mut candidates);
+    sort_root_candidates(&mut candidates, request.query.order, &project_order);
     let start = offset.min(candidates.len());
     let end = start.saturating_add(limit).min(candidates.len());
     let next_cursor = (end < candidates.len()).then(|| encode_list_cursor(end));
@@ -1195,7 +1215,10 @@ impl ViewerService {
         candidate.is_subagent,
         candidate.attention,
       ) {
-        Ok(summary) => sessions.push(summary),
+        Ok(mut summary) => {
+          apply_project_group(&mut summary, &project_order);
+          sessions.push(summary);
+        }
         Err(message) => record_source_error(&mut source_errors, candidate.provider, message),
       }
     }
@@ -3842,6 +3865,41 @@ fn relation_would_cycle(parent_indices: &[Option<usize>], child_index: usize, pa
   false
 }
 
+fn project_key(header: &SessionHeader) -> Option<&str> {
+  header.cwd.as_deref().map(str::trim).filter(|key| !key.is_empty())
+}
+
+fn apply_project_group(summary: &mut SessionSummary, projects: &HashMap<String, tokn_session_index::ProjectGroup>) {
+  if let Some(group) = summary.cwd.as_deref().and_then(|cwd| projects.get(cwd.trim())) {
+    summary.project_key = Some(group.project_key.clone());
+    summary.project = path_name(&group.project_key).map(str::to_owned);
+    summary.project_order_ms = Some(group.order_ms);
+  }
+}
+
+fn sort_root_candidates(
+  candidates: &mut [SessionListCandidate],
+  order: SessionOrder,
+  projects: &HashMap<String, tokn_session_index::ProjectGroup>,
+) {
+  if order == SessionOrder::Time {
+    sort_session_candidates(candidates);
+    return;
+  }
+  candidates.sort_by(|left, right| {
+    let left_group = project_key(&left.header).and_then(|key| projects.get(key));
+    let right_group = project_key(&right.header).and_then(|key| projects.get(key));
+    let left_key = left_group.map(|group| group.project_key.as_str());
+    let right_key = right_group.map(|group| group.project_key.as_str());
+    right_group
+      .map(|group| group.order_ms)
+      .cmp(&left_group.map(|group| group.order_ms))
+      .then_with(|| left_key.cmp(&right_key))
+      .then_with(|| compare_session_headers(&left.header, &right.header))
+      .then_with(|| left.provider.as_str().cmp(right.provider.as_str()))
+  });
+}
+
 fn sort_session_candidates(candidates: &mut [SessionListCandidate]) {
   candidates.sort_by(|left, right| {
     compare_session_headers(&left.header, &right.header)
@@ -3893,6 +3951,8 @@ fn session_summary_with_child_count(
     title,
     preview,
     project,
+    project_order_ms: None,
+    project_key: None,
     cwd: header.cwd,
     updated_at_ms: header
       .updated_at_ms
@@ -5934,6 +5994,63 @@ mod tests {
   }
 
   #[test]
+  fn project_order_precedes_pagination_and_survives_search() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("new");
+    let checkout = directory.path().join("worktree");
+    let registration = root.join(".git/worktrees/task");
+    std::fs::create_dir_all(&registration).unwrap();
+    std::fs::create_dir_all(&checkout).unwrap();
+    std::fs::write(checkout.join(".git"), format!("gitdir: {}", registration.display())).unwrap();
+    std::fs::write(registration.join("commondir"), "../..").unwrap();
+    let root = root.canonicalize().unwrap().to_string_lossy().into_owned();
+    let checkout = checkout.to_string_lossy().into_owned();
+    let mut specs = Vec::new();
+    for (id, cwd, activity) in [
+      ("a", "/old", 300),
+      ("b", root.as_str(), 100),
+      ("c", checkout.as_str(), 200),
+    ] {
+      let path = directory.path().join(format!("{id}.jsonl"));
+      std::fs::write(&path, id).unwrap();
+      let mut header = indexed_header(path, id, None);
+      header.cwd = Some(cwd.into());
+      header.updated_at_ms = Some(activity);
+      specs.push(IndexedLoadSpec {
+        header,
+        messages: vec![],
+      });
+    }
+    let index = Arc::new(SessionIndex::open_in_memory().unwrap());
+    index.project_order(&["/old".into()], 10).unwrap();
+    index.project_order(&[root.clone()], 20).unwrap();
+    let service = ViewerService::new_with_index(indexing_repository(specs), index);
+    service.refresh_session_index().unwrap();
+    let request = |cursor, search| ListSessionsRequest {
+      query: SessionQuery {
+        order: SessionOrder::Project,
+        providers: vec![ViewerProvider::Codex],
+        search,
+      },
+      cursor,
+      offset: None,
+      limit: Some(1),
+    };
+    let first = service.list_sessions(request(None, None)).unwrap();
+    assert_eq!(first.sessions[0].session_id, "c");
+    assert_eq!(first.sessions[0].project_order_ms, Some(20));
+    let second = service.list_sessions(request(first.next_cursor, None)).unwrap();
+    assert_eq!(second.sessions[0].session_id, "b");
+    assert_eq!(first.sessions[0].project_key.as_deref(), Some(root.as_str()));
+    assert_eq!(first.sessions[0].project_key, second.sessions[0].project_key);
+    assert_eq!(first.sessions[0].cwd.as_deref(), Some(checkout.as_str()));
+    let third = service.list_sessions(request(second.next_cursor, None)).unwrap();
+    assert_eq!(third.sessions[0].session_id, "a");
+    let filtered = service.list_sessions(request(None, Some("Indexed a".into()))).unwrap();
+    assert_eq!(filtered.sessions[0].project_order_ms, Some(10));
+  }
+
+  #[test]
   fn session_index_catalogs_every_header_then_backfills_newest_bodies_in_batches() {
     let directory = tempfile::tempdir().expect("temporary directory should exist");
     let mut specs = Vec::new();
@@ -5983,6 +6100,7 @@ mod tests {
     let cataloged = service
       .list_sessions(ListSessionsRequest {
         query: SessionQuery {
+          order: SessionOrder::Time,
           providers: vec![ViewerProvider::Codex],
           search: None,
         },
@@ -6535,6 +6653,7 @@ mod tests {
     let initial_sidebar = observing_service
       .list_sessions(ListSessionsRequest {
         query: SessionQuery {
+          order: SessionOrder::Time,
           providers: vec![ViewerProvider::Codex],
           search: None,
         },
@@ -6921,6 +7040,7 @@ mod tests {
     let sessions = service
       .list_sessions(ListSessionsRequest {
         query: SessionQuery {
+          order: SessionOrder::Time,
           providers: vec![ViewerProvider::Codex],
           search: None,
         },
@@ -7219,6 +7339,7 @@ mod tests {
     let sessions = service
       .list_sessions(ListSessionsRequest {
         query: SessionQuery {
+          order: SessionOrder::Time,
           providers: vec![ViewerProvider::Codex],
           search: None,
         },
@@ -7250,6 +7371,7 @@ mod tests {
     let service = ViewerService::new_with_index(repository.clone(), Arc::clone(&index));
     let request = ListSessionsRequest {
       query: SessionQuery {
+        order: SessionOrder::Time,
         providers: vec![ViewerProvider::Codex],
         search: None,
       },
@@ -7369,6 +7491,7 @@ mod tests {
     let listed = service
       .list_sessions(ListSessionsRequest {
         query: SessionQuery {
+          order: SessionOrder::Time,
           providers: vec![ViewerProvider::Codex],
           search: None,
         },
@@ -8064,6 +8187,7 @@ mod tests {
     let no_attention = service
       .list_sessions(ListSessionsRequest {
         query: SessionQuery {
+          order: SessionOrder::Time,
           providers: vec![ViewerProvider::Codex],
           search: None,
         },
@@ -8101,6 +8225,7 @@ mod tests {
     let roots = service
       .list_sessions(ListSessionsRequest {
         query: SessionQuery {
+          order: SessionOrder::Time,
           providers: vec![ViewerProvider::Codex],
           search: None,
         },
@@ -8139,6 +8264,7 @@ mod tests {
     let acknowledged = service
       .list_sessions(ListSessionsRequest {
         query: SessionQuery {
+          order: SessionOrder::Time,
           providers: vec![ViewerProvider::Codex],
           search: None,
         },
@@ -8228,6 +8354,7 @@ mod tests {
     let first = service
       .list_sessions(ListSessionsRequest {
         query: SessionQuery {
+          order: SessionOrder::Time,
           providers: Vec::new(),
           search: Some("alpha".to_string()),
         },
@@ -8249,6 +8376,7 @@ mod tests {
     let second = service
       .list_sessions(ListSessionsRequest {
         query: SessionQuery {
+          order: SessionOrder::Time,
           providers: Vec::new(),
           search: Some("alpha".to_string()),
         },
@@ -8302,6 +8430,7 @@ mod tests {
     let roots = service
       .list_sessions(ListSessionsRequest {
         query: SessionQuery {
+          order: SessionOrder::Time,
           providers: vec![ViewerProvider::Codex],
           search: None,
         },
@@ -8411,6 +8540,7 @@ mod tests {
     let search = shared
       .list_sessions(ListSessionsRequest {
         query: SessionQuery {
+          order: SessionOrder::Time,
           search: Some("hidden".into()),
           ..Default::default()
         },
@@ -8588,6 +8718,7 @@ mod tests {
     let response = service
       .list_sessions(ListSessionsRequest {
         query: SessionQuery {
+          order: SessionOrder::Time,
           providers: vec![ViewerProvider::Codex],
           search: Some("socket ownership".to_string()),
         },
@@ -8616,6 +8747,7 @@ mod tests {
     let response = service
       .list_sessions(ListSessionsRequest {
         query: SessionQuery {
+          order: SessionOrder::Time,
           providers: vec![ViewerProvider::Codex],
           search: None,
         },
@@ -8654,6 +8786,7 @@ mod tests {
     let roots = service
       .list_sessions(ListSessionsRequest {
         query: SessionQuery {
+          order: SessionOrder::Time,
           providers: vec![ViewerProvider::Codex],
           search: None,
         },
@@ -8668,6 +8801,7 @@ mod tests {
     let search = service
       .list_sessions(ListSessionsRequest {
         query: SessionQuery {
+          order: SessionOrder::Time,
           providers: vec![ViewerProvider::Codex],
           search: Some("indexed child preview".to_string()),
         },
@@ -8744,6 +8878,7 @@ mod tests {
 
     let request = ListSessionsRequest {
       query: SessionQuery {
+        order: SessionOrder::Time,
         providers: vec![ViewerProvider::Codex],
         search: None,
       },
