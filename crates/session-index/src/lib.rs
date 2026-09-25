@@ -449,8 +449,8 @@ impl SourceCursorPrecondition {
 /// enough to establish that marker; a missing marker is meaningful only when it
 /// is true. `notify_on_baseline` lets a caller defer the unread decision until
 /// that first body inspection. `has_new_attention` is the separate,
-/// caller-controlled signal that one or more new visible user messages or final
-/// assistant messages have been observed. Metadata changes, marker rewrites,
+/// caller-controlled signal that one or more eligible attention items
+/// have been observed. Counted callers also supply `new_attention_count`. Metadata changes, marker rewrites,
 /// and history reductions must leave it false.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionMetadata {
@@ -486,6 +486,8 @@ pub struct SessionMetadata {
   /// Advances the unread revision only when the caller observed new eligible
   /// visible conversation activity. The index cannot infer this from metadata.
   pub has_new_attention: bool,
+  /// Number of newly observed replies; zero keeps the legacy single-update increment.
+  pub new_attention_count: u64,
 }
 
 impl SessionMetadata {
@@ -509,6 +511,7 @@ impl SessionMetadata {
       attention_baselined: true,
       notify_on_baseline: false,
       has_new_attention: false,
+      new_attention_count: 0,
     }
   }
 }
@@ -723,6 +726,10 @@ pub struct SessionPresentation {
 /// provider needs a body read to derive them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionBaselineCompletionRequest {
+  /// Establish a quiet baseline when changing attention accounting semantics.
+  pub reset_attention: bool,
+  /// Unseen replies removed by a provider history rollback.
+  pub retired_attention_count: u64,
   pub key: SessionKey,
   /// Opaque body-derived marker, such as the newest eligible message ID.
   pub attention_marker: Option<String>,
@@ -732,15 +739,20 @@ pub struct SessionBaselineCompletionRequest {
   pub presentation: Option<SessionPresentation>,
   /// Whether the completed baseline should advance the unread revision.
   pub has_new_attention: bool,
+  /// Number of newly observed replies; zero keeps the legacy single-update increment.
+  pub new_attention_count: u64,
 }
 
 impl SessionBaselineCompletionRequest {
   pub fn new(key: SessionKey, attention_marker: Option<String>) -> Self {
     Self {
       key,
+      reset_attention: false,
+      retired_attention_count: 0,
       attention_marker,
       presentation: None,
       has_new_attention: false,
+      new_attention_count: 0,
     }
   }
 }
@@ -940,7 +952,7 @@ impl SessionIndex {
 
     let attention_changed = request.has_new_attention;
     let attention_revision = if attention_changed {
-      next_attention_revision(pending.attention_revision)?
+      advance_attention_revision(pending.attention_revision, request.new_attention_count.max(1))?
     } else {
       pending.attention_revision
     };
@@ -955,7 +967,14 @@ impl SessionIndex {
       pending.id,
       &request,
       attention_revision,
-      pending.seen_attention_revision,
+      if request.reset_attention {
+        pending.attention_revision
+      } else {
+        pending
+          .seen_attention_revision
+          .saturating_add(request.retired_attention_count.min(i64::MAX as u64) as i64)
+          .min(pending.attention_revision)
+      },
     )?;
     advance_source_state(&transaction, source_id, &committed_source)?;
     transaction.commit()?;
@@ -1522,7 +1541,7 @@ fn replace_source_in_transaction(
       Some(existing) => {
         summary.updated += 1;
         let attention_revision = if session.has_new_attention && !baseline_established {
-          let revision = next_attention_revision(existing.attention_revision)?;
+          let revision = advance_attention_revision(existing.attention_revision, session.new_attention_count.max(1))?;
           summary.attention_changed += 1;
           revision
         } else {
@@ -1545,7 +1564,7 @@ fn replace_source_in_transaction(
       None => {
         summary.inserted += 1;
         let attention_revision = if session.has_new_attention && !baseline_established {
-          1
+          advance_attention_revision(0, session.new_attention_count.max(1))?
         } else {
           0
         };
@@ -1709,9 +1728,10 @@ fn next_source_generation(generation: i64) -> Result<i64> {
     .ok_or_else(|| SessionIndexError::InvalidReplacement("source generation overflow".to_owned()))
 }
 
-fn next_attention_revision(revision: i64) -> Result<i64> {
+fn advance_attention_revision(revision: i64, count: u64) -> Result<i64> {
+  let count = i64::try_from(count).map_err(|_| SessionIndexError::AttentionRevisionOverflow)?;
   revision
-    .checked_add(1)
+    .checked_add(count)
     .ok_or(SessionIndexError::AttentionRevisionOverflow)
 }
 
@@ -1991,6 +2011,75 @@ mod tests {
       preview: preview.map(str::to_owned),
     });
     request
+  }
+
+  #[test]
+  fn counted_replies_survive_reopen_and_stale_acknowledgements() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("counts.sqlite");
+    let key = SessionKey::new(PROVIDER, SOURCE_KEY, "a");
+    let index = SessionIndex::open(&path).unwrap();
+    index
+      .replace_source(SourceReplacement::baseline(
+        source("baseline", 0),
+        vec![session("a", Some("zero"))],
+      ))
+      .unwrap();
+    let mut unread = session("a", Some("three"));
+    unread.has_new_attention = true;
+    unread.new_attention_count = 3;
+    index.replace_source(replacement("three", 1, vec![unread])).unwrap();
+    assert_eq!(index.session(&key).unwrap().unwrap().attention_revision, 3);
+    let pending = pending_session("a", false);
+    index.replace_source(replacement("pending", 2, vec![pending])).unwrap();
+    let source = index.source_state(&key.source_key()).unwrap().unwrap();
+    let mut completed = completion_request("a", Some("five"), true);
+    completed.new_attention_count = 2;
+    index
+      .complete_session_baseline(&source, &SourceState::new(source.key.clone(), "done", 3), completed)
+      .unwrap();
+    assert!(index.mark_seen_through(&key, 3, 4).unwrap());
+    drop(index);
+    let index = SessionIndex::open(&path).unwrap();
+    let current = index.session(&key).unwrap().unwrap();
+    assert_eq!(current.attention_revision, 5);
+    assert_eq!(current.attention_revision - current.seen_attention_revision, 2);
+    assert!(!index.mark_seen_through(&key, 2, 5).unwrap());
+  }
+
+  #[test]
+  fn rollback_and_accounting_upgrade_retire_unread_without_rewinding_revisions() {
+    let index = SessionIndex::open_in_memory().unwrap();
+    let key = SessionKey::new(PROVIDER, SOURCE_KEY, "a");
+    index
+      .replace_source(SourceReplacement::baseline(
+        source("baseline", 0),
+        vec![session("a", None)],
+      ))
+      .unwrap();
+    let mut unread = pending_session("a", false);
+    unread.has_new_attention = true;
+    unread.new_attention_count = 4;
+    index.replace_source(replacement("pending", 1, vec![unread])).unwrap();
+    let source = index.source_state(&key.source_key()).unwrap().unwrap();
+    let mut request = completion_request("a", Some("remaining"), false);
+    request.retired_attention_count = 2;
+    index
+      .complete_session_baseline(&source, &SourceState::new(source.key.clone(), "done", 2), request)
+      .unwrap();
+    let row = index.session(&key).unwrap().unwrap();
+    assert_eq!((row.attention_revision, row.seen_attention_revision), (4, 2));
+    index
+      .replace_source(replacement("upgrade", 3, vec![pending_session("a", false)]))
+      .unwrap();
+    let source = index.source_state(&key.source_key()).unwrap().unwrap();
+    let mut request = completion_request("a", Some("new accounting baseline"), false);
+    request.reset_attention = true;
+    index
+      .complete_session_baseline(&source, &SourceState::new(source.key.clone(), "done", 4), request)
+      .unwrap();
+    let row = index.session(&key).unwrap().unwrap();
+    assert_eq!((row.attention_revision, row.seen_attention_revision), (4, 4));
   }
 
   #[test]

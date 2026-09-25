@@ -169,11 +169,13 @@ Known-file notifications use indexed source/session lookups; duplicate revisions
 skip header reads. Provider-local scans exclude unrelated indexed sessions.
 Relay hints coalesce for 200 ms of quiet, capped at one second and scheduled
 deadlines, so streaming records do not each start a catalog pass.
-Codex/Pi body backfill scales its quiet-file delay with transcript size, up to
-five minutes, so a brief pause in an active session does not start a costly
-parse that will be discarded after the next append. JSONL bodies above 8 MiB
-keep their catalog metadata and load on demand instead of being parsed by the
-background indexer. Pending-body polling
+Active Codex/Pi body indexing uses a bounded LRU of incremental activity readers,
+retaining normalization cursors and reply counts instead of transcript bodies.
+Recent changes bypass the historical quiet-file delay so running indicators and
+final replies reach the sidebar promptly, including rollouts above 8 MiB.
+Cold backfill still scales its quiet-file delay with size, up to five minutes;
+cold JSONL bodies above 8 MiB stay catalog-only and preserve prior activity.
+The existing 128 MiB source limit still applies. Pending-body polling
 runs every five seconds and queries only unbaselined sessions and their source
 rows, so deferred work does not repeatedly decode the complete session index.
 Automatic snapshots no longer run a separate discovery or metadata-backfill
@@ -724,10 +726,10 @@ asynchronous startup; an existing SQLite sidebar remains immediately usable.
 OpenCode, ZCode, WorkBuddy, and DSH retain a ten-second *provider-local*
 catalog cadence, and a Codex/Pi root with no working native registration joins
 that subset. This preserves their update latency without repeatedly discovering
-large watched rollout trees. While eligible rows remain unbaselined, a one-second body-only pass advances
-the next batch without rediscovering the whole provider. Active Codex/Pi JSONL
-waits for a two-second quiet period so an expensive parse is not discarded on
-every append. A body failure remains visible but is not retried every second;
+large watched rollout trees. While eligible rows remain unbaselined, a one-second
+body-only pass advances the next batch without rediscovering the whole provider.
+Active Codex/Pi JSONL uses retained incremental readers; cold backfill keeps its
+quiet-period and size limits. A body failure remains visible but is not retried every second;
 a source-generation change or explicit retry makes it eligible again. When no
 body work is eligible, the one-second lease tick checks only SQLite's cheap data
 version and does not enumerate the index.
@@ -739,16 +741,22 @@ catalog races. A newly cataloged row never
 shows a dot before its body finishes, except a relocated row that retains an
 existing unread state while its new path is validated. The initial catalog
 establishes no unread attention; a session first discovered after that catalog
-can become unread only after its body confirms a new, unhidden User message or
-Final Assistant reply. Later body refreshes mark only those eligible message
-additions; commentary/non-final assistant updates, tools, reasoning, and
-metadata never produce attention. The marker is an eligible-message count
-rather than content or IDs, so history reductions and same-count rewrites
-intentionally do not dot. Direct child attention aggregates onto collapsed
-canonical ancestors without making the parent itself unread. A newest event
-page acknowledges only the opaque revision it actually captured after React
-commits it; a concurrent later revision remains unread. Successful body
-refreshes separately name `updated_session_keys`, letting the selected timeline
+can become unread only after its body confirms completed, unhidden final
+assistant replies. User messages, commentary, tools, reasoning, and metadata
+never increase the unread count. OpenCode and ZCode mutable assistant text stays
+in progress until its native message completes. Revisions advance by the number of new final
+messages, not by refresh count; multipart replies with the same message identity
+count once. History reductions retire removed unread replies without rewinding
+revisions. Older user-plus-assistant markers establish a quiet final-only baseline.
+The compact marker also stores running state, derived from turn boundaries and
+work events; final replies, turn completion/interruption, and provider errors
+stop it. Unknown activity is not inferred from file modification alone.
+The sidebar shows exactly one indicator: a running circle takes precedence;
+otherwise one unread reply is a dot, multiple replies show a count, and read
+sessions have no indicator. Canonical ancestors aggregate descendant activity.
+A newest event page acknowledges only its captured revision after React commits
+it and the view is following latest; scrolling up retains unread counts.
+Successful body refreshes separately name `updated_session_keys`, letting the selected timeline
 refresh tool/progress/lifecycle changes without creating unread attention.
 Unrelated indexing does not reload the conversation.
 

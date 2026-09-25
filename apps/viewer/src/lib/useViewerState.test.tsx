@@ -1442,6 +1442,25 @@ describe("useViewerState session-index signalling", () => {
     await waitFor(() => expect(listSessions).toHaveBeenCalledTimes(2));
   });
 
+  it("keeps final replies unread while scrolled up and acknowledges when following resumes", async () => {
+    let emit: ((change: RelayChange) => void) | undefined;
+    vi.mocked(listenForRelayChanges).mockImplementation((handler) => { emit = handler; return Promise.resolve(vi.fn()); });
+    vi.mocked(listSessions).mockResolvedValue({ sessions: [session("live")], next_cursor: null, source_errors: [], pending_providers: [] });
+    vi.mocked(loadEventPage).mockResolvedValue({ ...toolEventPage(), attention_revision: "1" });
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "live");
+    await waitFor(() => expect(acknowledgeSessionAttention).toHaveBeenCalledWith({ session_key: "live", attention_revision: "1" }));
+    vi.mocked(acknowledgeSessionAttention).mockClear();
+    act(() => result.current.setFollowingLive(false));
+    vi.mocked(loadEventPage).mockResolvedValue({ ...toolEventPage(), attention_revision: "4" });
+    act(() => emit?.({ session_key: "live", reset: false }));
+    await waitFor(() => expect(loadEventPage).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.eventsLoading).toBe(false));
+    expect(acknowledgeSessionAttention).not.toHaveBeenCalled();
+    act(() => result.current.setFollowingLive(true));
+    await waitFor(() => expect(acknowledgeSessionAttention).toHaveBeenCalledWith({ session_key: "live", attention_revision: "4" }));
+  });
+
   it("does not acknowledge a page invalidated by a selection change before commit", async () => {
     const first = session("codex:first");
     const second = session("codex:second");

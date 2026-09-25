@@ -215,6 +215,7 @@ export function useViewerState() {
   const [eventsAttempt, setEventsAttempt] = useState(0);
   const eventsRequest = useRef(0);
   const followingLive = useRef(true);
+  const [isFollowingLive, setIsFollowingLive] = useState(true);
   const pendingLiveReset = useRef(false);
   const uncommittedLiveReset = useRef(false);
   const liveRefresh = useRef(false);
@@ -537,6 +538,7 @@ export function useViewerState() {
 
   const showLiveActivity = useCallback(() => {
     followingLive.current = true;
+    setIsFollowingLive(true);
     manualExpansion.current = false;
     expansionRevision.current += 1;
     if (workingTrajectory.current) applyExpandedEventKey(workingTrajectory.current);
@@ -547,6 +549,7 @@ export function useViewerState() {
 
   const setFollowingLive = useCallback((following: boolean) => {
     followingLive.current = following;
+    setIsFollowingLive(following);
   }, []);
 
   const clearInputRefreshTimers = useCallback(() => {
@@ -575,6 +578,7 @@ export function useViewerState() {
 
   useEffect(() => {
     followingLive.current = true;
+    setIsFollowingLive(true);
     workingTrajectory.current = null;
     liveUpdateQueued.current = false;
     pendingLiveReset.current = false;
@@ -1258,6 +1262,8 @@ export function useViewerState() {
       return;
     }
 
+    if (!isFollowingLive || !followingLive.current) return;
+
     if (acknowledgedInitialPageRequest.current === requestId) {
       return;
     }
@@ -1271,6 +1277,7 @@ export function useViewerState() {
     acknowledgeAcceptedAttention(sessionKey, attentionRevision);
   }, [
     acceptedInitialEventPage,
+    isFollowingLive,
     acknowledgeAcceptedAttention,
     eventsOwnerKey,
     initialPageSessionKey,

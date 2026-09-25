@@ -13,7 +13,7 @@ use tokn_session_core::{
 };
 use tokn_session_index::{
   IndexedSession, SessionBaselineCompletionRequest, SessionIndex, SessionIndexError, SessionKey as IndexedSessionKey,
-  SessionMetadata, SessionPresentation, SourceCursorPrecondition, SourceKey, SourceReplacement, SourceState,
+  SessionMetadata, SourceCursorPrecondition, SourceKey, SourceReplacement, SourceState,
   StagedSessionBaselineSourceCount,
 };
 use tokn_session_render::render_event_summary;
@@ -29,6 +29,7 @@ use crate::model::{
   decode_trajectory_key, encode_event_cursor, encode_event_key, encode_list_cursor, encode_session_key,
   encode_trajectory_event_cursor, encode_trajectory_key, parse_updated_at_ms, requested_offset,
 };
+use crate::repository::activity::Activity;
 use crate::repository::{NativeRepository, SessionBodyIndexing, ViewerRepository};
 
 mod agent_activity;
@@ -349,12 +350,16 @@ struct SessionListCandidate {
 struct SessionAttention {
   has_unread: bool,
   has_unread_descendant: bool,
+  unread_final_count: u64,
+  unread_descendant_count: u64,
+  is_running: bool,
+  has_running_descendant: bool,
 }
 
 #[derive(Default)]
 struct SessionHeaderInventory {
   headers: Vec<SessionHeader>,
-  direct_attention: HashMap<SessionLocator, bool>,
+  direct_attention: HashMap<SessionLocator, SessionAttention>,
 }
 
 /// One SQLite-only sidebar snapshot. A provider becomes visible only after
@@ -639,7 +644,7 @@ impl ViewerService {
   pub fn native(index_path: impl AsRef<Path>) -> Result<Self, String> {
     let session_index = SessionIndex::open(index_path.as_ref())
       .map_err(|error| format!("failed to open the viewer session index: {error}"))?;
-    let mut service = Self::with_repository(Arc::new(NativeRepository), Arc::new(session_index));
+    let mut service = Self::with_repository(Arc::new(NativeRepository::default()), Arc::new(session_index));
     service.indexer_lock = Some(crate::indexer::IndexerLock::new(index_path.as_ref())?);
     Ok(service)
   }
@@ -1322,9 +1327,10 @@ impl ViewerService {
       let Ok(header) = indexed_session_header(&session) else {
         continue;
       };
-      inventory
-        .direct_attention
-        .insert(locator_for_header(provider, &header), session.has_unread());
+      inventory.direct_attention.insert(
+        locator_for_header(provider, &header),
+        SessionAttention::from_index(&session),
+      );
       inventory.headers.push(header);
     }
     Ok(Some(self.scope_inventory(provider, inventory)))
@@ -1408,9 +1414,10 @@ impl ViewerService {
           continue;
         }
       };
-      inventory
-        .direct_attention
-        .insert(locator_for_header(provider, &header), session.has_unread());
+      inventory.direct_attention.insert(
+        locator_for_header(provider, &header),
+        SessionAttention::from_index(&session),
+      );
       inventory.headers.push(header);
     }
 
@@ -1950,7 +1957,7 @@ impl ViewerService {
         );
         existing_by_session_key
           .get(&key)
-          .is_some_and(|session| !session.attention_baselined)
+          .is_some_and(|session| !session.attention_baselined || needs_activity_upgrade(session))
       });
       let source_has_new_session = source_headers.iter().any(|header| {
         let key = IndexedSessionKey::new(
@@ -2002,6 +2009,7 @@ impl ViewerService {
             if relocated.has_unread() {
               metadata.attention_marker = known_attention_marker(relocated);
               metadata.has_new_attention = true;
+              metadata.new_attention_count = (relocated.attention_revision - relocated.seen_attention_revision) as u64;
             }
           }
           Ok(metadata)
@@ -2581,12 +2589,9 @@ impl ViewerService {
     if !existing.present || existing.attention_baselined {
       return Ok(BodyJobRefresh::Stale);
     }
-    let loaded = self.repository.load_session(&job.locator)?;
-    if loaded.reference.id != job.locator.session_id {
-      return Err("session index source no longer matches its header".to_string());
-    }
-    let presentation = session_presentation_from_loaded(&loaded);
-    let attention_marker = visible_attention_marker(&loaded.events);
+    let activity = self.repository.load_activity(&job.locator)?;
+    let presentation = activity.presentation.clone();
+    let attention_marker = Some(activity.marker());
     if source_cursor(job.provider, &job.locator.source_path)? != job.raw_cursor {
       return Ok(BodyJobRefresh::Stale);
     }
@@ -2616,6 +2621,15 @@ impl ViewerService {
     let mut completion = SessionBaselineCompletionRequest::new(key, attention_marker);
     completion.presentation = Some(presentation);
     completion.has_new_attention = has_new_attention;
+    completion.new_attention_count =
+      body_new_attention_count(existing, relocated, completion.attention_marker.as_deref());
+    completion.retired_attention_count = Activity::from_marker(existing.attention_marker.as_deref())
+      .map(|before| before.final_count.saturating_sub(activity.final_count))
+      .unwrap_or_default();
+    completion.reset_attention = existing
+      .attention_marker
+      .as_deref()
+      .is_some_and(|marker| marker.starts_with("visible-message-count.v1."));
     let next_source = SourceState::new(
       job.source.key.clone(),
       advance_pending_body_cursor(&job.source.cursor)?,
@@ -2659,13 +2673,16 @@ impl ViewerService {
       advance_pending_body_cursor(&job.source.cursor)?,
       current_time_ms(),
     );
+    let existing = self.session_index.session(&key).map_err(|e| e.to_string())?;
+    let marker = existing
+      .as_ref()
+      .filter(|row| !needs_activity_upgrade(row))
+      .and_then(known_attention_marker);
+    let mut request = SessionBaselineCompletionRequest::new(key, marker);
+    request.reset_attention = existing.as_ref().is_some_and(needs_activity_upgrade);
     let completion = self
       .session_index
-      .complete_session_baseline(
-        &job.source,
-        &next_source,
-        SessionBaselineCompletionRequest::new(key, None),
-      )
+      .complete_session_baseline(&job.source, &next_source, request)
       .map_err(|error| format!("failed to update the {:?} session index: {error}", job.provider))?;
     if completion == tokn_session_index::SessionBaselineCompletion::Stale {
       return Ok(BodyJobRefresh::Stale);
@@ -3377,17 +3394,6 @@ fn session_metadata_from_header(
   Ok(metadata)
 }
 
-/// The body pass is the one bounded provider read that can enrich a catalog
-/// row whose provider headers do not expose presentation text. Keep this
-/// separate from attention derivation so the index never receives full event
-/// contents or provider-native payloads.
-fn session_presentation_from_loaded(loaded: &LoadedSession) -> SessionPresentation {
-  SessionPresentation {
-    title: normalize_session_text(loaded.reference.title.clone(), MAX_SESSION_TITLE_CHARS),
-    preview: normalize_session_text(loaded.reference.preview.clone(), MAX_SESSION_PREVIEW_CHARS),
-  }
-}
-
 /// Builds a compact catalog row while preserving the prior body-derived
 /// notification state. Presentation remains catalog-owned here; the index
 /// separately retains any completed body fallback so a blank header does not
@@ -3410,7 +3416,7 @@ fn catalog_session_metadata(
   });
   let mut metadata = session_metadata_from_header(source_key, header, attention_marker, false)?;
   match existing {
-    Some(indexed) if source_changed => {
+    Some(indexed) if source_changed || needs_activity_upgrade(indexed) => {
       metadata.attention_baselined = false;
       // A pending row that was already new must remain eligible when its body
       // eventually succeeds. A previously completed row instead compares its
@@ -3526,85 +3532,68 @@ fn same_optional_identity(left: Option<&str>, right: Option<&str>) -> bool {
   }
 }
 
-/// The marker is deliberately only a count of eligible normalized message
-/// records. It stores neither message text nor message IDs/timestamps, while
-/// still allowing a source scan to distinguish a new visible conversation row
-/// from metadata-only or work-trajectory changes. A completed zero is stored
-/// explicitly, so a staged first-run row can remain distinguishable from a
-/// previously inspected session with no eligible messages.
-fn visible_attention_marker(events: &[AgentEvent]) -> Option<String> {
-  let count = events
-    .iter()
-    .filter(|event| {
-      !event.is_hidden()
-        && matches!(
-          event,
-          AgentEvent::Message(message)
-            if message.role == Role::User
-              || (message.role == Role::Assistant && message.delivery == MessageDelivery::Final)
-        )
-    })
-    .count();
-  Some(attention_marker_for_count(count))
-}
-
-fn attention_marker_for_count(count: usize) -> String {
-  format!("visible-message-count.v1.{count}")
-}
-
-/// A historical version of the index used `NULL` for a completed zero count.
-/// Preserve that interpretation while turning a changed source back into a
-/// pending body job.
-fn known_attention_marker(indexed: &IndexedSession) -> Option<String> {
-  indexed
+fn needs_activity_upgrade(session: &IndexedSession) -> bool {
+  session
     .attention_marker
-    .clone()
-    .or_else(|| indexed.attention_baselined.then(|| attention_marker_for_count(0)))
+    .as_deref()
+    .is_some_and(|marker| marker.starts_with("visible-message-count.v1."))
 }
 
-/// Decides whether a completed staged body should advance unread attention.
-/// New rows discovered after the first complete catalog defer their decision to
-/// this point; initial rows deliberately establish a quiet baseline instead.
-fn body_has_new_attention(existing: &IndexedSession, relocated: Option<&IndexedSession>, marker: Option<&str>) -> bool {
+fn known_attention_marker(indexed: &IndexedSession) -> Option<String> {
+  indexed.attention_marker.clone()
+}
+
+fn body_new_attention_count(
+  existing: &IndexedSession,
+  relocated: Option<&IndexedSession>,
+  marker: Option<&str>,
+) -> u64 {
   if let Some(relocated) = relocated {
     if existing.attention_revision != 0 && existing.attention_marker == known_attention_marker(relocated) {
-      // Catalog transfer already retained the prior unread state before this
-      // archive body could load. Compare from that state rather than turning
-      // the same moved messages into a second unread revision.
-      return has_new_visible_attention(Some(existing), marker);
+      return new_final_count(existing, marker);
     }
-    // A move can race the first quiet body pass. Reuse the retired row's own
-    // baseline policy so an initially discovered session remains quiet, while
-    // a later newly-created-but-pending row still becomes unread as intended.
-    return relocated.has_unread() || body_has_new_attention(relocated, None, marker);
+    return (relocated.attention_revision - relocated.seen_attention_revision) as u64
+      + new_final_count(relocated, marker);
   }
-  if !existing.attention_baselined && existing.attention_marker.is_none() {
-    return existing.notify_on_baseline && attention_marker_count(marker).is_some_and(|count| count != 0);
-  }
-  has_new_visible_attention(Some(existing), marker)
+  new_final_count(existing, marker)
 }
 
+fn new_final_count(existing: &IndexedSession, marker: Option<&str>) -> u64 {
+  let Some(activity) = Activity::from_marker(marker) else {
+    return 0;
+  };
+  match Activity::from_marker(existing.attention_marker.as_deref()) {
+    Some(before) => activity.final_count.saturating_sub(before.final_count),
+    None if existing.notify_on_baseline && existing.attention_marker.is_none() => activity.final_count,
+    // First observation and older accounting formats establish a quiet baseline.
+    None => 0,
+  }
+}
+
+fn body_has_new_attention(existing: &IndexedSession, relocated: Option<&IndexedSession>, marker: Option<&str>) -> bool {
+  body_new_attention_count(existing, relocated, marker) > 0
+}
+
+#[cfg(test)]
 fn has_new_visible_attention(existing: Option<&IndexedSession>, marker: Option<&str>) -> bool {
-  let Some(new_count) = attention_marker_count(marker) else {
-    return false;
-  };
-  let Some(existing) = existing else {
-    return true;
-  };
-  // A temporarily absent source keeps its old row and marker. Reappearance
-  // alone is not a visible-message addition, so compare it just like a
-  // continuously present source rather than treating it as a new session.
-  match existing.attention_marker.as_deref() {
-    None if existing.attention_baselined => new_count != 0,
-    None => true,
-    Some(previous) => attention_marker_count(Some(previous)).is_some_and(|previous_count| new_count > previous_count),
-  }
+  existing.is_some_and(|existing| new_final_count(existing, marker) > 0)
 }
 
-fn attention_marker_count(marker: Option<&str>) -> Option<usize> {
-  marker
-    .and_then(|marker| marker.strip_prefix("visible-message-count.v1."))
-    .and_then(|count| count.parse::<usize>().ok())
+impl SessionAttention {
+  fn from_index(session: &IndexedSession) -> Self {
+    let activity = Activity::from_marker(session.attention_marker.as_deref());
+    let count = if activity.is_some() {
+      (session.attention_revision - session.seen_attention_revision) as u64
+    } else {
+      u64::from(session.has_unread())
+    };
+    Self {
+      has_unread: count > 0,
+      unread_final_count: count,
+      is_running: activity.is_some_and(|activity| activity.running),
+      ..Default::default()
+    }
+  }
 }
 
 #[cfg(test)]
@@ -3796,27 +3785,27 @@ fn session_relation_index(
 fn session_relation_attention(
   provider: ViewerProvider,
   relations: &SessionRelationIndex,
-  direct_attention: &HashMap<SessionLocator, bool>,
+  direct_attention: &HashMap<SessionLocator, SessionAttention>,
 ) -> Vec<SessionAttention> {
   let mut attention = relations
     .headers
     .iter()
-    .map(|header| SessionAttention {
-      has_unread: direct_attention
+    .map(|header| {
+      direct_attention
         .get(&locator_for_header(provider, header))
         .copied()
-        .unwrap_or(false),
-      has_unread_descendant: false,
+        .unwrap_or_default()
     })
     .collect::<Vec<_>>();
-
   for child_index in 0..attention.len() {
-    if !attention[child_index].has_unread {
-      continue;
-    }
+    let child = attention[child_index];
     let mut parent_index = relations.parent_indices[child_index];
     while let Some(index) = parent_index {
-      attention[index].has_unread_descendant = true;
+      attention[index].has_unread_descendant |= child.has_unread;
+      attention[index].unread_descendant_count = attention[index]
+        .unread_descendant_count
+        .saturating_add(child.unread_final_count);
+      attention[index].has_running_descendant |= child.is_running;
       parent_index = relations.parent_indices[index];
     }
   }
@@ -3922,6 +3911,10 @@ fn session_summary_with_child_count(
     history_status: None,
     has_unread: attention.has_unread,
     has_unread_descendant: attention.has_unread_descendant,
+    unread_final_count: attention.unread_final_count,
+    unread_descendant_count: attention.unread_descendant_count,
+    is_running: attention.is_running,
+    has_running_descendant: attention.has_running_descendant,
   })
 }
 
@@ -5897,17 +5890,47 @@ mod tests {
 
   #[test]
   fn attention_requires_new_visible_messages_even_after_a_source_reappears() {
-    let tombstoned = indexed_attention_session(Some("visible-message-count.v1.2"), false);
+    let tombstoned = indexed_attention_session(Some("final-replies.v2.2.0"), false);
 
     assert!(!has_new_visible_attention(
       Some(&tombstoned),
-      Some("visible-message-count.v1.2")
+      Some("final-replies.v2.2.0")
     ));
     assert!(has_new_visible_attention(
       Some(&tombstoned),
-      Some("visible-message-count.v1.3")
+      Some("final-replies.v2.3.0")
     ));
     assert!(!has_new_visible_attention(Some(&tombstoned), None));
+  }
+
+  #[test]
+  fn final_reply_accounting_ignores_state_changes_and_quietly_upgrades_old_markers() {
+    let indexed = indexed_attention_session(Some("final-replies.v2.2.0"), true);
+    assert_eq!(
+      body_new_attention_count(&indexed, None, Some("final-replies.v2.5.0")),
+      3
+    );
+    assert_eq!(
+      body_new_attention_count(&indexed, None, Some("final-replies.v2.2.1")),
+      0
+    );
+    assert_eq!(
+      body_new_attention_count(&indexed, None, Some("final-replies.v2.1.0")),
+      0
+    );
+    let legacy = indexed_attention_session(Some("visible-message-count.v1.50"), true);
+    assert!(needs_activity_upgrade(&legacy));
+    assert_eq!(
+      body_new_attention_count(&legacy, None, Some("final-replies.v2.25.0")),
+      0
+    );
+    let mut newly_discovered = indexed_attention_session(None, true);
+    newly_discovered.attention_baselined = false;
+    newly_discovered.notify_on_baseline = true;
+    assert_eq!(
+      body_new_attention_count(&newly_discovered, None, Some("final-replies.v2.3.0")),
+      3
+    );
   }
 
   #[test]
@@ -7318,7 +7341,7 @@ mod tests {
       .session(&index_session_key(&locator).expect("index key should encode"))
       .expect("indexed session should query")
       .expect("indexed session should exist");
-    assert_eq!(indexed.attention_marker.as_deref(), Some("visible-message-count.v1.3"));
+    assert_eq!(indexed.attention_marker.as_deref(), Some("final-replies.v2.2.0"));
   }
 
   #[test]
@@ -7864,7 +7887,7 @@ mod tests {
       .session(&index_session_key(&locator).expect("index key should encode"))
       .expect("indexed session should query")
       .expect("indexed session should remain present");
-    assert_eq!(stale.attention_marker.as_deref(), Some("visible-message-count.v1.1"));
+    assert_eq!(stale.attention_marker.as_deref(), Some("final-replies.v2.0.0"));
     assert!(!stale.attention_baselined);
     assert!(!stale.has_unread());
     assert!(service.index_error_for(ViewerProvider::Codex).is_none());
@@ -7875,10 +7898,7 @@ mod tests {
       .session(&index_session_key(&locator).expect("index key should encode"))
       .expect("indexed session should query")
       .expect("indexed session should remain present");
-    assert_eq!(
-      recovered.attention_marker.as_deref(),
-      Some("visible-message-count.v1.2")
-    );
+    assert_eq!(recovered.attention_marker.as_deref(), Some("final-replies.v2.1.0"));
     assert!(recovered.has_unread());
   }
 
@@ -8054,6 +8074,8 @@ mod tests {
       .expect("indexed listing should work");
     assert!(!no_attention.sessions[0].has_unread);
     assert!(!no_attention.sessions[0].has_unread_descendant);
+    assert!(no_attention.sessions[0].has_running_descendant);
+    assert!(!no_attention.sessions[0].is_running);
 
     std::fs::write(&child_path, "child commentary and final reply").expect("child fixture source should change");
     repository
@@ -8067,6 +8089,8 @@ mod tests {
           messages: vec![
             indexed_message(Role::User, MessageDelivery::Unspecified),
             indexed_message(Role::Assistant, MessageDelivery::Commentary),
+            indexed_message(Role::Assistant, MessageDelivery::Final),
+            indexed_message(Role::Assistant, MessageDelivery::Final),
             indexed_message(Role::Assistant, MessageDelivery::Final),
           ],
         }),
@@ -8088,6 +8112,8 @@ mod tests {
     assert_eq!(roots.sessions.len(), 1);
     assert!(!roots.sessions[0].has_unread);
     assert!(roots.sessions[0].has_unread_descendant);
+    assert_eq!(roots.sessions[0].unread_descendant_count, 3);
+    assert!(!roots.sessions[0].has_running_descendant);
 
     let children = service
       .list_session_children(ListSessionChildrenRequest {
@@ -8099,6 +8125,8 @@ mod tests {
       .expect("indexed child listing should work");
     assert_eq!(children.sessions.len(), 1);
     assert!(children.sessions[0].has_unread);
+    assert_eq!(children.sessions[0].unread_final_count, 3);
+    assert!(!children.sessions[0].is_running);
     let revision = service
       .attention_revision_for_locator(&child_locator)
       .expect("child attention should be indexed");

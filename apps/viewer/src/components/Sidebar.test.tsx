@@ -238,6 +238,26 @@ describe("Sidebar session identity", () => {
 });
 
 describe("Sidebar unread activity", () => {
+  it("shows only a running circle, then the accumulated final-reply count, then nothing", () => {
+    const running = session({ is_running: true, has_unread: true, unread_final_count: 3 });
+    renderSidebar([running]);
+    expect(screen.getByRole("img", { name: "Running" })).toHaveClass("inline-spinner");
+    expect(screen.queryByRole("img", { name: /unread/ })).not.toBeInTheDocument();
+    cleanup();
+    renderSidebar([{ ...running, is_running: false }]);
+    expect(screen.getByRole("img", { name: "3 unread final replies" })).toHaveTextContent("3");
+    expect(screen.queryByRole("img", { name: "Running" })).not.toBeInTheDocument();
+    cleanup();
+    renderSidebar([{ ...running, is_running: false, has_unread: false, unread_final_count: 0 }]);
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  });
+
+  it("prioritizes a running descendant over an unread parent", () => {
+    renderSidebar([session({ has_running_descendant: true, has_unread: true, unread_final_count: 2 })]);
+    expect(screen.getByRole("img", { name: "Subagent running" })).toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: /unread/ })).not.toBeInTheDocument();
+  });
+
   it("renders an accessible indicator for a directly unread session", () => {
     const unread = session({
       session_key: "codex:unread",
@@ -249,9 +269,9 @@ describe("Sidebar unread activity", () => {
     renderSidebar([unread]);
 
     const row = screen.getByRole("button", {
-      name: "Needs attention, Codex session unread-0000, unread updates",
+      name: "Needs attention, Codex session unread-0000, 1 unread final reply",
     });
-    const dot = within(row).getByRole("img", { name: "Unread updates" });
+    const dot = within(row).getByRole("img", { name: "1 unread final reply" });
 
     expect(row).toHaveAttribute("data-unread", "true");
     expect(dot).toHaveClass("session-row__unread-dot");
@@ -309,17 +329,17 @@ describe("Sidebar unread activity", () => {
     );
 
     const parentRow = screen.getByRole("button", {
-      name: "Root task, Codex session parent-0000, unread updates in a subagent",
+      name: "Root task, Codex session parent-0000, 1 unread final reply including subagents",
     });
-    expect(within(parentRow).getByRole("img", { name: "Unread updates in a subagent" }))
+    expect(within(parentRow).getByRole("img", { name: "1 unread final reply including subagents" }))
       .toHaveAttribute("data-unread-source", "descendant");
 
     fireEvent.click(screen.getByRole("button", { name: "Show 1 subagent for Root task" }));
 
     const childRow = screen.getByRole("button", {
-      name: "subagent Hubble, Codex session child-0000, unread updates",
+      name: "subagent Hubble, Codex session child-0000, 1 unread final reply",
     });
-    expect(within(childRow).getByRole("img", { name: "Unread updates" }))
+    expect(within(childRow).getByRole("img", { name: "1 unread final reply" }))
       .toHaveAttribute("data-unread-source", "direct");
   });
 });

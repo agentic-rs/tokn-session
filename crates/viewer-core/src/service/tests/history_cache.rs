@@ -27,7 +27,7 @@ fn local_codex_cache_tracks_inherited_history_and_rejects_missing_prefixes() {
     ),
   )
   .unwrap();
-  let service = ViewerService::new(Arc::new(NativeRepository));
+  let service = ViewerService::new(Arc::new(NativeRepository::default()));
   let locator = SessionLocator {
     version: 1,
     provider: ViewerProvider::Codex,
