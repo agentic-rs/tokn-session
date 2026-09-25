@@ -11,10 +11,9 @@ import {
   knownSessionAncestors,
   providerLabel,
   sessionDisplayTitle,
-  shortSessionId,
   subagentDetail,
 } from "../lib/state";
-import { ChevronIcon, CloseIcon, SearchIcon, WarningIcon } from "./Icons";
+import { BranchIcon, ChevronIcon, CloseIcon, SearchIcon, WarningIcon } from "./Icons";
 import { LoadingRows } from "./StateView";
 
 interface SidebarProps {
@@ -85,6 +84,7 @@ function SessionBranch({
   const children = childrenState?.sessions ?? [];
   const relationship = depth > 0 ? subagentDetail(session) : null;
   const title = sessionDisplayTitle(session);
+  const preview = session.preview?.replace(/\s+/g, " ").trim();
   const sessionDescription = depth > 0 ? `subagent ${title}` : title;
   const hasUnread = session.has_unread || session.has_unread_descendant === true;
   const unreadLabel = session.has_unread
@@ -124,21 +124,22 @@ function SessionBranch({
           title={`${title}\n${session.session_id}`}
           type="button"
         >
-          <span className="provider-avatar" data-provider={session.provider}>
-            {providerLabel(session.provider).slice(0, 1)}
-            {hasUnread ? (
-              <span
-                aria-label={unreadLabel}
-                className="session-row__unread-dot"
-                data-unread-source={session.has_unread ? "direct" : "descendant"}
-                role="img"
-              />
-            ) : null}
-          </span>
           <span className="session-row__body">
-            <span className="session-row__title">{title}</span>
+            <span className="session-row__headline">
+              {depth > 0 ? <BranchIcon className="session-row__branch-icon" /> : null}
+              <span className="session-row__title">{title}</span>
+              {hasUnread ? (
+                <span
+                  aria-label={unreadLabel}
+                  className="session-row__unread-dot"
+                  data-unread-source={session.has_unread ? "direct" : "descendant"}
+                  role="img"
+                />
+              ) : null}
+            </span>
+            {preview && preview !== title ? <span className="session-row__preview">{preview}</span> : null}
             <span className="session-row__meta">
-              <span className="session-row__id">{shortSessionId(session.session_id)}</span>
+              <span className="session-row__provider" data-provider={session.provider}>{providerLabel(session.provider)}</span>
               <span aria-hidden="true">·</span>
               <span>{formatRelativeTime(session.timestamp, session.updated_at_ms)}</span>
               {relationship ? (
@@ -151,12 +152,6 @@ function SessionBranch({
                 <>
                   <span aria-hidden="true">·</span>
                   <span>{subagentCountLabel(session.child_count)}</span>
-                </>
-              ) : null}
-              {session.message_count !== null ? (
-                <>
-                  <span aria-hidden="true">·</span>
-                  <span>{session.message_count} msg</span>
                 </>
               ) : null}
             </span>

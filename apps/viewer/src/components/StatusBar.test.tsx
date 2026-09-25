@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SessionIndexProgress, SourceError } from "../lib/types";
 import { StatusBar } from "./StatusBar";
@@ -224,6 +224,15 @@ describe("StatusBar", () => {
     fireEvent.pointerDown(screen.getByRole("button", { name: "Outside" }));
     expect(screen.queryByRole("dialog", { name: "Notifications" })).not.toBeInTheDocument();
     expect(bell).toHaveFocus();
+  });
+
+  it("lets keyboard focus leave a non-modal status panel without pulling it back", () => {
+    renderStatusBar();
+    fireEvent.click(screen.getByRole("button", { name: /open notifications/i }));
+    const outside = screen.getByRole("button", { name: "Outside" });
+    act(() => outside.focus());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(outside).toHaveFocus();
   });
 
   it("offers the real retry action without a notification history", () => {

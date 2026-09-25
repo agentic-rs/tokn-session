@@ -1,6 +1,7 @@
 import "./PairedConnection.css";
 import { useEffect, useRef, useState } from "react";
 import { RemoteClient, selectMachine, type ConnectionState } from "../lib/transport";
+import { RemoteConnection } from "./RemoteConnection";
 import { ViewerPage } from "../pages/ViewerPage";
 
 interface SavedHost {
@@ -125,13 +126,11 @@ export function PairedConnection({ initial_token }: { initial_token?: string }) 
     <p className="machine-hint">The link keeps access to this local client in your tab’s memory.</p>
   </section></main>;
 
-  if (active) return <div className="remote-viewer">
-    <div className="machine-bar">
-      <span>Encrypted host · {active.host_id} · {connection_state === "reconnecting" ? "Reconnecting · showing last received data" : connection_state}</span>
+  if (active) return <ViewerPage key={active.connection_id} remote connection={
+    <RemoteConnection name={`Encrypted host · ${active.host_id}`} state={connection_state}>
       <button disabled={busy} onClick={() => { void action(changeHost); }}>Change host</button>
-    </div>
-    <ViewerPage key={active.connection_id} remote />
-  </div>;
+    </RemoteConnection>
+  } />;
 
   return <main className="hub-home"><div className="hub-content">
     <header className="hub-header"><div>

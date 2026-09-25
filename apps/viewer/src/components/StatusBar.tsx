@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useRef, useState, type ReactNode } from "react";
 import type { SessionIndexProgress, SourceError } from "../lib/types";
 import { BellIcon } from "./Icons";
 import {
@@ -8,6 +8,7 @@ import {
 } from "./NotificationCenter";
 
 interface StatusBarProps {
+  connection?: ReactNode;
   progress: SessionIndexProgress | null;
   is_loading: boolean;
   error: string | null;
@@ -72,6 +73,7 @@ function describeStatusAnnouncement(
  * the viewer hook so a background event cannot be lost while it is closed.
  */
 export function StatusBar({
+  connection,
   progress,
   is_loading,
   error,
@@ -97,10 +99,7 @@ export function StatusBar({
   return (
     <div className="status-region">
       <footer className="status-bar" data-tone={summary.tone}>
-        <div className="status-bar__summary">
-          {isActive ? <span aria-hidden="true" className="status-bar__spinner" /> : null}
-          <span>{summary.label}</span>
-        </div>
+        {connection}
 
         <span aria-atomic="true" aria-live="polite" className="sr-only" key={announcement.key} role="status">
           {announcement.text}
@@ -111,15 +110,16 @@ export function StatusBar({
           aria-expanded={notificationsOpen}
           aria-haspopup="dialog"
           aria-label={`${summary.label}. Open notifications`}
-          className="status-bar__notifications"
+          className="status-bar__index"
           data-has-attention={hasAttention}
           onClick={toggleNotifications}
           ref={notificationTriggerRef}
+          title={summary.label}
           type="button"
         >
-          <BellIcon />
+          {isActive ? <span aria-hidden="true" className="status-bar__spinner" /> : <BellIcon />}
+          <span className="status-bar__summary">{summary.label}</span>
           {hasAttention ? <span aria-hidden="true" className="status-bar__notification-dot" /> : null}
-          <span className="sr-only">Open notifications</span>
         </button>
       </footer>
 

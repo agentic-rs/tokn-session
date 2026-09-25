@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { Conversation } from "../components/Conversation";
 import { RelayConnection } from "../components/RelayConnection";
 import { Inspector } from "../components/Inspector";
@@ -7,11 +8,16 @@ import { StatusBar } from "../components/StatusBar";
 import { TranslationProvider } from "../components/TranslationProvider";
 import { useViewerState } from "../lib/useViewerState";
 
-export function ViewerPage({ remote = false }: { remote?: boolean }) {
-  return <TranslationProvider><ViewerContent remote={remote} /></TranslationProvider>;
+interface ViewerPageProps {
+  remote?: boolean;
+  connection?: ReactNode;
 }
 
-function ViewerContent({ remote }: { remote: boolean }) {
+export function ViewerPage({ remote = false, connection }: ViewerPageProps) {
+  return <TranslationProvider><ViewerContent remote={remote} connection={connection} /></TranslationProvider>;
+}
+
+function ViewerContent({ remote, connection }: ViewerPageProps) {
   const viewer = useViewerState();
 
   function openSessions() {
@@ -24,7 +30,6 @@ function ViewerContent({ remote }: { remote: boolean }) {
 
   return (
     <div className="viewer-app" data-remote={remote}>
-      {!remote && <RelayConnection />}
       <div className="viewer-shell" data-inspector-open={viewer.inspectorOpen}>
         <SessionDrawer is_open={viewer.mobileSidebarOpen} on_close={() => viewer.setMobileSidebarOpen(false)}>
           <Sidebar
@@ -107,6 +112,7 @@ function ViewerContent({ remote }: { remote: boolean }) {
       </div>
 
       <StatusBar
+        connection={remote ? connection : <RelayConnection />}
         error={viewer.sessionIndexProgressError}
         is_loading={viewer.sessionIndexProgressLoading}
         is_retrying={viewer.sessionIndexRetrying}
