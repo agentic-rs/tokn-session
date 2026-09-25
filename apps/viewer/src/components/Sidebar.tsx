@@ -14,10 +14,11 @@ import {
   shortSessionId,
   subagentDetail,
 } from "../lib/state";
-import { ChevronIcon, SearchIcon, WarningIcon } from "./Icons";
+import { ChevronIcon, CloseIcon, SearchIcon, WarningIcon } from "./Icons";
 import { LoadingRows } from "./StateView";
 
 interface SidebarProps {
+  on_close?: () => void;
   sessions: SessionSummary[];
   session_children: ReadonlyMap<string, SessionChildrenState>;
   selected_session_key: string | null;
@@ -216,6 +217,7 @@ function SessionBranch({
 }
 
 export function Sidebar({
+  on_close,
   sessions,
   session_children,
   selected_session_key,
@@ -280,9 +282,23 @@ export function Sidebar({
           <p className="eyebrow">TOKN</p>
           <h1>Sessions</h1>
         </div>
+        <button aria-label="Close sessions" className="icon-button sidebar-close" onClick={on_close} type="button">
+          <CloseIcon />
+        </button>
       </header>
 
       <div className="sidebar__controls">
+        <div className="sidebar__filter-heading">
+          <span>Find a conversation</span>
+          {search || enabled_providers.size !== PROVIDER_FILTERS.length ? (
+            <button className="text-button" type="button" onClick={() => {
+              on_search_change("");
+              for (const provider of PROVIDER_FILTERS) {
+                if (!enabled_providers.has(provider)) on_provider_toggle(provider);
+              }
+            }}>Reset filters</button>
+          ) : null}
+        </div>
         <label className="search-field">
           <span className="sr-only">Search sessions</span>
           <SearchIcon />
@@ -392,7 +408,12 @@ export function Sidebar({
 
         {groups.map((group) => (
           <section className="session-group" key={group.key}>
-            <h2 title={group.project}>{group.project}</h2>
+            <h2 title={group.project}>
+              {group.project}
+              <span className="session-group__count" title={`${group.sessions.length} loaded sessions`}>
+                {group.sessions.length}
+              </span>
+            </h2>
             <div className="session-group__items">
               {group.sessions.map((session) => (
                 <SessionBranch

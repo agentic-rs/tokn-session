@@ -480,6 +480,13 @@ the project.
 
 ## Desktop Session Viewer
 
+The viewer switches to a native modal session drawer at 860px, preserving the
+mounted sidebar across resizing, containing keyboard focus, and focusing search
+on open. Provider filters wrap and include a reset action. Narrow conversation
+headers put the lifecycle filter on its own row; browser mode explicitly reserves
+the remaining height for the timeline. Overlay panels are anchored to the viewer
+shell below connection controls.
+
 `apps/viewer` is a Tauri 2/React desktop and browser viewer for historical Pi,
 Codex, OpenCode, ZCode, WorkBuddy, and DSH sessions. It aggregates root sessions
 into one searchable, provider-filterable sidebar, lazily expands known

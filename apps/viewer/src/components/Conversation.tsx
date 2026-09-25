@@ -230,7 +230,9 @@ export function Conversation({
       >
         {!session ? (
           <StateView
-            message="Choose a session from the sidebar to inspect its normalized conversation."
+            message="Browse your conversations, search by title, or filter by provider to pick up where you left off."
+            action_label="Browse sessions"
+            on_action={on_sidebar_open}
             title="Select a session"
           />
         ) : null}

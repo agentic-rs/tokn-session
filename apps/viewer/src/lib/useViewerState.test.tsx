@@ -952,7 +952,7 @@ describe("useViewerState Relay updates", () => {
     active.events[0].trajectory!.status = "working";
     vi.mocked(loadEventPage).mockResolvedValue(active);
     vi.mocked(loadTrajectoryEventPage).mockResolvedValue(trajectoryChildPage());
-    const { container } = render(<ViewerPage />);
+    const { container } = await act(async () => render(<ViewerPage />));
     fireEvent.click(await screen.findByRole("button", { name: /session live/ }));
     await waitFor(() => expect(screen.getByRole("button", { name: /^Working for/ })).toHaveAttribute("aria-expanded", "true"));
     expect(await screen.findByText("cargo test")).toBeInTheDocument();
