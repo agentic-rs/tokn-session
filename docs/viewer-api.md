@@ -193,8 +193,10 @@ It remains loopback-only and is used by desktop External mode. The old
 separate from the browser HTTP API and retains its version-1 framed protocol.
 
 Session list requests accept `query.order` (`time`, the default, or `project`).
-Project ordering is applied before pagination and groups full cwd paths by their
-durable discovery anchor, newest first, then session activity. Root summaries
-include nullable `project_order_ms`. Clients keep Recent display positions in
+Project ordering is applied before pagination and groups shared repository
+identities by their durable discovery anchor, newest first, then session activity.
+Root summaries include nullable `project_key` and `project_order_ms`; `cwd` remains
+the original session working directory. Clients should group by `project_key`,
+falling back to `cwd` for older servers. Clients keep Recent display positions in
 memory; this does not change API activity ordering. Start a fresh cursor when
 changing the order or filters.

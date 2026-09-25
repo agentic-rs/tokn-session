@@ -141,6 +141,7 @@ export interface SessionSummary {
   preview: string | null;
   project: string | null;
   project_order_ms?: number | null;
+  project_key?: string | null;
   cwd: string | null;
   updated_at_ms: number | null;
   timestamp: string | null;

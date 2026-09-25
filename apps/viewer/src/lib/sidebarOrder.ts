@@ -35,7 +35,7 @@ export function compareActivity(left: SessionSummary, right: SessionSummary): nu
 }
 
 export function projectKey(session: SessionSummary): string {
-  return session.cwd?.trim() || session.project?.trim() || "";
+  return session.project_key?.trim() || session.cwd?.trim() || session.project?.trim() || "";
 }
 
 export function compareProjects(left: SessionSummary, right: SessionSummary): number {

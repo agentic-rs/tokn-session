@@ -1224,7 +1224,10 @@ last hour, today, yesterday, past seven days, older, and unknown time. Recent
 rows keep their relative order for the mounted viewer; new activity arrivals
 prepend and older pagination results append. Calendar groups refresh every 30
 seconds and on focus. Switching views preserves the open conversation and tree.
-Projects sort newest-discovered first before root pagination. SQLite migration 7
-stores immutable project anchors by trimmed full cwd, shared across providers;
+Projects sort newest-discovered first before root pagination. Git worktrees and
+subdirectories group under the shared repository, using Git common-directory
+metadata rather than matching folder names. SQLite migration 8 caches these cwd
+aliases so recognized historical worktrees stay grouped after removal. Unresolved
+paths retain their own identity. Migration 7 stores immutable project anchors;
 existing projects seed from earliest known session time (index discovery as
 fallback). Later older history and removal/reappearance do not move the anchor.

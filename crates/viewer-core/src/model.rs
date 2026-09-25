@@ -276,6 +276,7 @@ pub struct SessionSummary {
   pub preview: Option<String>,
   pub project: Option<String>,
   pub project_order_ms: Option<i64>,
+  pub project_key: Option<String>,
   pub cwd: Option<String>,
   pub updated_at_ms: Option<i64>,
   pub timestamp: Option<String>,

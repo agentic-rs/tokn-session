@@ -1143,7 +1143,7 @@ impl ViewerService {
       .min(i64::MAX as u128) as i64;
     let project_order = self
       .session_index
-      .project_order(&project_keys, discovered_at_ms)
+      .project_groups(&project_keys, discovered_at_ms)
       .map_err(|error| format!("failed to read project order: {error}"))?;
 
     if let Some(search) = search.as_deref() {
@@ -1156,7 +1156,10 @@ impl ViewerService {
           candidate.is_subagent,
           candidate.attention,
         ) {
-          Ok(summary) => summary,
+          Ok(mut summary) => {
+            apply_project_group(&mut summary, &project_order);
+            summary
+          }
           Err(message) => {
             record_source_error(&mut source_errors, candidate.provider, message);
             continue;
@@ -1180,11 +1183,7 @@ impl ViewerService {
           candidate.attention,
         ) {
           Ok(mut summary) => {
-            summary.project_order_ms = summary
-              .cwd
-              .as_deref()
-              .and_then(|key| project_order.get(key.trim()))
-              .copied();
+            apply_project_group(&mut summary, &project_order);
             sessions.push(summary);
           }
           Err(message) => record_source_error(&mut source_errors, candidate.provider, message),
@@ -1212,11 +1211,7 @@ impl ViewerService {
         candidate.attention,
       ) {
         Ok(mut summary) => {
-          summary.project_order_ms = summary
-            .cwd
-            .as_deref()
-            .and_then(|key| project_order.get(key.trim()))
-            .copied();
+          apply_project_group(&mut summary, &project_order);
           sessions.push(summary);
         }
         Err(message) => record_source_error(&mut source_errors, candidate.provider, message),
@@ -3885,17 +3880,31 @@ fn project_key(header: &SessionHeader) -> Option<&str> {
   header.cwd.as_deref().map(str::trim).filter(|key| !key.is_empty())
 }
 
-fn sort_root_candidates(candidates: &mut [SessionListCandidate], order: SessionOrder, projects: &HashMap<String, i64>) {
+fn apply_project_group(summary: &mut SessionSummary, projects: &HashMap<String, tokn_session_index::ProjectGroup>) {
+  if let Some(group) = summary.cwd.as_deref().and_then(|cwd| projects.get(cwd.trim())) {
+    summary.project_key = Some(group.project_key.clone());
+    summary.project = path_name(&group.project_key).map(str::to_owned);
+    summary.project_order_ms = Some(group.order_ms);
+  }
+}
+
+fn sort_root_candidates(
+  candidates: &mut [SessionListCandidate],
+  order: SessionOrder,
+  projects: &HashMap<String, tokn_session_index::ProjectGroup>,
+) {
   if order == SessionOrder::Time {
     sort_session_candidates(candidates);
     return;
   }
   candidates.sort_by(|left, right| {
-    let left_key = project_key(&left.header);
-    let right_key = project_key(&right.header);
-    right_key
-      .and_then(|key| projects.get(key))
-      .cmp(&left_key.and_then(|key| projects.get(key)))
+    let left_group = project_key(&left.header).and_then(|key| projects.get(key));
+    let right_group = project_key(&right.header).and_then(|key| projects.get(key));
+    let left_key = left_group.map(|group| group.project_key.as_str());
+    let right_key = right_group.map(|group| group.project_key.as_str());
+    right_group
+      .map(|group| group.order_ms)
+      .cmp(&left_group.map(|group| group.order_ms))
       .then_with(|| left_key.cmp(&right_key))
       .then_with(|| compare_session_headers(&left.header, &right.header))
       .then_with(|| left.provider.as_str().cmp(right.provider.as_str()))
@@ -3954,6 +3963,7 @@ fn session_summary_with_child_count(
     preview,
     project,
     project_order_ms: None,
+    project_key: None,
     cwd: header.cwd,
     updated_at_ms: header
       .updated_at_ms
@@ -5963,8 +5973,21 @@ mod tests {
   #[test]
   fn project_order_precedes_pagination_and_survives_search() {
     let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("new");
+    let checkout = directory.path().join("worktree");
+    let registration = root.join(".git/worktrees/task");
+    std::fs::create_dir_all(&registration).unwrap();
+    std::fs::create_dir_all(&checkout).unwrap();
+    std::fs::write(checkout.join(".git"), format!("gitdir: {}", registration.display())).unwrap();
+    std::fs::write(registration.join("commondir"), "../..").unwrap();
+    let root = root.canonicalize().unwrap().to_string_lossy().into_owned();
+    let checkout = checkout.to_string_lossy().into_owned();
     let mut specs = Vec::new();
-    for (id, cwd, activity) in [("a", "/old", 300), ("b", "/new", 100), ("c", "/new", 200)] {
+    for (id, cwd, activity) in [
+      ("a", "/old", 300),
+      ("b", root.as_str(), 100),
+      ("c", checkout.as_str(), 200),
+    ] {
       let path = directory.path().join(format!("{id}.jsonl"));
       std::fs::write(&path, id).unwrap();
       let mut header = indexed_header(path, id, None);
@@ -5977,7 +6000,7 @@ mod tests {
     }
     let index = Arc::new(SessionIndex::open_in_memory().unwrap());
     index.project_order(&["/old".into()], 10).unwrap();
-    index.project_order(&["/new".into()], 20).unwrap();
+    index.project_order(&[root.clone()], 20).unwrap();
     let service = ViewerService::new_with_index(indexing_repository(specs), index);
     service.refresh_session_index().unwrap();
     let request = |cursor, search| ListSessionsRequest {
@@ -5995,6 +6018,9 @@ mod tests {
     assert_eq!(first.sessions[0].project_order_ms, Some(20));
     let second = service.list_sessions(request(first.next_cursor, None)).unwrap();
     assert_eq!(second.sessions[0].session_id, "b");
+    assert_eq!(first.sessions[0].project_key.as_deref(), Some(root.as_str()));
+    assert_eq!(first.sessions[0].project_key, second.sessions[0].project_key);
+    assert_eq!(first.sessions[0].cwd.as_deref(), Some(checkout.as_str()));
     let third = service.list_sessions(request(second.next_cursor, None)).unwrap();
     assert_eq!(third.sessions[0].session_id, "a");
     let filtered = service.list_sessions(request(None, Some("Indexed a".into()))).unwrap();
