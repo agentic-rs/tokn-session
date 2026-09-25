@@ -144,7 +144,10 @@ reset them. See [snapshot protocol](relay.md#local-snapshotfollow-service).
 Codex paginated rollouts can reference earlier physical files through
 `session_meta.history_base`, including after a native revert. CLI and viewer
 history assemble these bounded prefixes before the active segment, validating
-both byte and ordinal cutoffs so reverted turns stay excluded. Native discovery
+both byte and ordinal cutoffs so reverted turns stay excluded. Repeated
+continuations may reference the physical segment UUID in a native filename
+rather than its logical session ID; resolution verifies the filename owner
+against metadata before accepting that alias. Native discovery
 uses Desktop's current rollout path to avoid duplicate tasks; exported roots
 collapse only a uniquely verified continuation chain. Missing or ambiguous
 prefixes fail the read and preserve the last-good viewer snapshot. Linked

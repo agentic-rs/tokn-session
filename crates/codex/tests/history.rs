@@ -49,6 +49,55 @@ fn texts(loaded: &LoadedSessionRecords) -> Vec<String> {
 }
 
 #[test]
+fn repeated_continuation_resolves_physical_segment_id_and_preserves_bounds() {
+  const OWNER: &str = "01a0c8ab-3b96-7c40-adae-51c20a43c2cb";
+  const SEGMENT: &str = "01a0c923-943a-7820-b93f-15e26e7e7cd4";
+  let root = TempDir::new().unwrap();
+  let source = CodexSessionSource::new(Some(root.path().into()));
+  let original = vec![meta(OWNER, 0, None), message(OWNER, 1, "original")];
+  write(root.path(), "original.jsonl", &original);
+  let prefix = vec![
+    meta(OWNER, 2, Some(base(OWNER, &original))),
+    message(OWNER, 3, "retained"),
+  ];
+  let mut middle = prefix.clone();
+  middle.push(message(OWNER, 4, "reverted"));
+  let name = format!("rollout-2026-09-22T20-42-27-{OWNER}_{SEGMENT}.jsonl");
+  let middle_path = write(root.path(), &name, &middle);
+  let head = write(
+    root.path(),
+    "head.jsonl",
+    &[
+      meta(OWNER, 4, Some(base(SEGMENT, &prefix))),
+      message(OWNER, 5, "current"),
+    ],
+  );
+  let loaded = load(&source, &head);
+  assert_eq!(loaded.reference.id, OWNER);
+  assert_eq!(texts(&loaded), ["original", "retained", "current"]);
+  assert_eq!(source.list_session_relations().unwrap().len(), 1);
+
+  // A segment alias still requires exact bytes, ordinal, and filename owner.
+  let mut wrong_cutoff = base(SEGMENT, &prefix);
+  wrong_cutoff["end_byte_offset"] = json!(wrong_cutoff["end_byte_offset"].as_u64().unwrap() - 1);
+  write(root.path(), "head.jsonl", &[meta(OWNER, 4, Some(wrong_cutoff))]);
+  assert!(source.history_segments(&head).unwrap_err().contains("unavailable"));
+  write(
+    root.path(),
+    "head.jsonl",
+    &[meta(OWNER, 4, Some(base(SEGMENT, &prefix)))],
+  );
+  fs::rename(
+    &middle_path,
+    root
+      .path()
+      .join(format!("rollout-2026-09-22T20-42-27-{SEGMENT}_{SEGMENT}.jsonl")),
+  )
+  .unwrap();
+  assert!(source.history_segments(&head).unwrap_err().contains("unavailable"));
+}
+
+#[test]
 fn same_thread_continuation_keeps_prefix_excludes_rolled_back_suffix_and_appends_stably() {
   let root = TempDir::new().unwrap();
   let source = CodexSessionSource::new(Some(root.path().into()));
