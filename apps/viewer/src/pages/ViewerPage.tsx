@@ -33,6 +33,8 @@ function ViewerContent({ remote, connection }: ViewerPageProps) {
       <div className="viewer-shell" data-inspector-open={viewer.inspectorOpen}>
         <SessionDrawer is_open={viewer.mobileSidebarOpen} on_close={() => viewer.setMobileSidebarOpen(false)}>
           <Sidebar
+            order={viewer.sessionOrder}
+            on_order_change={viewer.setSessionOrder}
             on_close={() => viewer.setMobileSidebarOpen(false)}
             enabled_providers={viewer.enabledProviders}
             error={viewer.sessionsError}

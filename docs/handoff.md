@@ -1216,3 +1216,15 @@ cd apps/viewer && pnpm tauri dev
   instead of heuristics. Pi live boundaries require a bridge feature; do not
   infer them from historical assistant/tool records. OpenCode input-request
   events remain a follow-up.
+
+### Sidebar ordering
+
+The viewer remembers a Time/Projects toggle locally. Time groups roots into the
+last hour, today, yesterday, past seven days, older, and unknown time. Recent
+rows keep their relative order for the mounted viewer; new activity arrivals
+prepend and older pagination results append. Calendar groups refresh every 30
+seconds and on focus. Switching views preserves the open conversation and tree.
+Projects sort newest-discovered first before root pagination. SQLite migration 7
+stores immutable project anchors by trimmed full cwd, shared across providers;
+existing projects seed from earliest known session time (index discovery as
+fallback). Later older history and removal/reappearance do not move the anchor.

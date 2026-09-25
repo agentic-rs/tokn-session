@@ -14,7 +14,7 @@
 //! precondition, so a stale scan cannot overwrite a newer replacement.
 
 use std::{
-  collections::HashSet,
+  collections::{HashMap, HashSet},
   error::Error,
   fmt,
   path::Path,
@@ -196,6 +196,27 @@ CREATE INDEX sessions_by_identity
   ON sessions(session_id, present, source_id);
 "#;
 
+// Project order is a durable discovery record, independent of session activity.
+// Seed already-known projects from their earliest session time; later discovery
+// never rewrites an existing anchor, even after all its sessions disappear.
+const MIGRATION_007: &str = r#"
+CREATE TABLE projects (
+  project_key TEXT PRIMARY KEY NOT NULL,
+  discovered_at_ms INTEGER NOT NULL,
+  sort_at_ms INTEGER NOT NULL
+);
+INSERT INTO projects(project_key, discovered_at_ms, sort_at_ms)
+SELECT trim(cwd), MIN(first_indexed_at_ms), MIN(COALESCE(
+  CASE
+    WHEN length(trim(timestamp)) > 0
+      AND ltrim(trim(timestamp), '+-') NOT GLOB '*[^0-9.]*'
+      AND ltrim(trim(timestamp), '+-') GLOB '[0-9]*'
+    THEN CAST(CAST(timestamp AS REAL) * CASE WHEN abs(CAST(timestamp AS REAL)) < 100000000000 THEN 1000 ELSE 1 END AS INTEGER)
+    ELSE CAST(round((julianday(timestamp) - 2440587.5) * 86400000) AS INTEGER)
+  END, first_indexed_at_ms))
+FROM sessions WHERE cwd IS NOT NULL AND trim(cwd) != '' GROUP BY trim(cwd);
+"#;
+
 struct Migration {
   version: i64,
   sql: &'static str,
@@ -225,6 +246,10 @@ const MIGRATIONS: &[Migration] = &[
   Migration {
     version: 6,
     sql: MIGRATION_006,
+  },
+  Migration {
+    version: 7,
+    sql: MIGRATION_007,
   },
 ];
 
@@ -781,6 +806,36 @@ impl SessionIndex {
     })
   }
 
+  /// Returns immutable project ordering anchors. External catalogs can register
+  /// keys here too; ordinary indexed projects are registered during catalog writes.
+  /// Existing projects are read without a write transaction on the refresh path.
+  pub fn project_order(&self, keys: &[String], discovered_at_ms: i64) -> Result<HashMap<String, i64>> {
+    let mut connection = self.connection()?;
+    let mut order = {
+      let mut statement = connection.prepare("SELECT project_key, sort_at_ms FROM projects")?;
+      statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
+        .collect::<rusqlite::Result<HashMap<_, _>>>()?
+    };
+    let missing = keys
+      .iter()
+      .filter(|key| !key.is_empty() && !order.contains_key(*key))
+      .collect::<HashSet<_>>();
+    if !missing.is_empty() {
+      let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+      for key in missing {
+        remember_project(&transaction, key, discovered_at_ms)?;
+        // A concurrent indexer may have registered this key before our write lock.
+        let time = transaction.query_row("SELECT sort_at_ms FROM projects WHERE project_key = ?1", [key], |row| {
+          row.get(0)
+        })?;
+        order.insert(key.clone(), time);
+      }
+      transaction.commit()?;
+    }
+    Ok(order)
+  }
+
   /// Returns the last successful state for one source.
   pub fn source_state(&self, key: &SourceKey) -> Result<Option<SourceState>> {
     let connection = self.connection()?;
@@ -887,6 +942,16 @@ impl SessionIndex {
       .iter()
       .map(|replacement| replace_source_in_transaction(&transaction, replacement))
       .collect::<Result<Vec<_>>>()?;
+    let mut projects = HashSet::new();
+    for replacement in replacements {
+      for session in &replacement.sessions {
+        if let Some(key) = session.cwd.as_deref().map(str::trim).filter(|key| !key.is_empty()) {
+          if projects.insert(key) {
+            remember_project(&transaction, key, replacement.source.scanned_at_ms)?;
+          }
+        }
+      }
+    }
     transaction.commit()?;
     Ok(summaries)
   }
@@ -1715,6 +1780,15 @@ fn next_attention_revision(revision: i64) -> Result<i64> {
     .ok_or(SessionIndexError::AttentionRevisionOverflow)
 }
 
+fn remember_project(transaction: &Transaction<'_>, key: &str, discovered_at_ms: i64) -> Result<()> {
+  transaction.execute(
+    "INSERT INTO projects(project_key, discovered_at_ms, sort_at_ms) VALUES(?1, ?2, ?2)
+     ON CONFLICT(project_key) DO NOTHING",
+    params![key, discovered_at_ms],
+  )?;
+  Ok(())
+}
+
 fn insert_session(
   transaction: &Transaction<'_>,
   source_id: i64,
@@ -1994,6 +2068,34 @@ mod tests {
   }
 
   #[test]
+  fn catalog_project_anchor_survives_removal_and_older_history() {
+    let index = SessionIndex::open_in_memory().unwrap();
+    let mut row = session("a", None);
+    row.cwd = Some(" /project ".into());
+    index
+      .replace_source(baseline_replacement("one", 100, vec![row.clone()]))
+      .unwrap();
+    index.replace_source(replacement("two", 200, vec![])).unwrap();
+    row.timestamp = Some("2000-01-01T00:00:00Z".into());
+    index.replace_source(replacement("three", 300, vec![row])).unwrap();
+    assert_eq!(index.project_order(&[], 400).unwrap()["/project"], 100);
+  }
+
+  #[test]
+  fn project_discovery_order_survives_reopen_and_repeated_discovery() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("projects.sqlite3");
+    let index = SessionIndex::open(&path).unwrap();
+    assert_eq!(index.project_order(&["/a/repo".into()], 100).unwrap()["/a/repo"], 100);
+    drop(index);
+    let index = SessionIndex::open(&path).unwrap();
+    let projects = index.project_order(&["/a/repo".into(), "/b/repo".into()], 200).unwrap();
+    assert_eq!(projects["/a/repo"], 100);
+    assert_eq!(projects["/b/repo"], 200);
+    assert_eq!(index.project_order(&["/a/repo".into()], 1).unwrap()["/a/repo"], 100);
+  }
+
+  #[test]
   fn creates_and_records_migrations() {
     let directory = tempdir().expect("temporary directory should exist");
     let path = directory.path().join("session-index.sqlite3");
@@ -2017,6 +2119,7 @@ mod tests {
         (4, migration_checksum(MIGRATION_004)),
         (5, migration_checksum(MIGRATION_005)),
         (6, migration_checksum(MIGRATION_006)),
+        (7, migration_checksum(MIGRATION_007)),
       ]
     );
   }
@@ -2064,9 +2167,20 @@ mod tests {
         params!["a", "/sessions/a.jsonl", "legacy title", "legacy preview"],
       )
       .expect("old session should be inserted");
+    connection
+      .execute(
+        "UPDATE sessions SET cwd = '/legacy', timestamp = '2020-01-01T00:00:00Z'",
+        [],
+      )
+      .unwrap();
     drop(connection);
 
     let index = SessionIndex::open(&path).expect("original index should migrate");
+    assert_eq!(
+      index.project_order(&["/legacy".into()], 999).unwrap()["/legacy"],
+      1_577_836_800_000
+    );
+
     let indexed = index
       .session(&SessionKey::new(PROVIDER, SOURCE_KEY, "a"))
       .expect("session query should work")
@@ -2157,7 +2271,7 @@ mod tests {
       .expect("migration query should run")
       .collect::<rusqlite::Result<Vec<_>>>()
       .expect("migration versions should decode");
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
   }
 
   #[test]
