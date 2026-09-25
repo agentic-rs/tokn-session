@@ -1,4 +1,4 @@
-import { WarningIcon } from "./Icons";
+import { PanelIcon, WarningIcon } from "./Icons";
 
 interface StateViewProps {
   title: string;
@@ -18,7 +18,7 @@ export function StateView({
   return (
     <div className={`state-view state-view--${tone}`} role={tone === "error" ? "alert" : "status"}>
       <span className="state-view__icon">
-        <WarningIcon />
+        {tone === "error" ? <WarningIcon /> : <PanelIcon />}
       </span>
       <h2>{title}</h2>
       <p>{message}</p>

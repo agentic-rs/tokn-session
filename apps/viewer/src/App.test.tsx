@@ -2,8 +2,8 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import App from "./App";
 import { RemoteClient } from "./lib/transport";
-import { StrictMode } from "react";
-vi.mock("./pages/ViewerPage", () => ({ ViewerPage: ({ remote }: { remote?: boolean }) => <div>{remote ? "Remote sessions" : "Desktop sessions"}</div> }));
+import { StrictMode, type ReactNode } from "react";
+vi.mock("./pages/ViewerPage", () => ({ ViewerPage: ({ remote, connection }: { remote?: boolean; connection?: ReactNode }) => <><div>{remote ? "Remote sessions" : "Desktop sessions"}</div>{connection}</> }));
 beforeEach(() => { vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 404 })); });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 it("automatically connects to its own origin and closes the abandoned StrictMode connection", async () => {
@@ -15,6 +15,7 @@ it("automatically connects to its own origin and closes the abandoned StrictMode
   expect(await screen.findByText("Remote sessions")).toBeInTheDocument();
   expect(connect).toHaveBeenCalledWith(window.location.origin, "login-secret");
   expect(close).toHaveBeenCalledOnce();
+  fireEvent.click(screen.getByRole("button", { name: /connection settings/i }));
   fireEvent.click(screen.getByRole("button", { name: "Change machine" }));
   expect(screen.getByLabelText("Access token")).toHaveValue("");
   expect(connect).toHaveBeenCalledTimes(2);
@@ -38,6 +39,7 @@ it("reports connection failures, retries, and disconnects before switching machi
   expect(await screen.findByRole("alert")).toHaveTextContent("Invalid viewer API token");
   fireEvent.click(screen.getByRole("button", { name: "Connect" }));
   expect(await screen.findByText("Remote sessions")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: /connection settings/i }));
   fireEvent.click(screen.getByRole("button", { name: "Change machine" }));
   await waitFor(() => expect(close).toHaveBeenCalled());
   expect(screen.getByRole("button", { name: "Connect" })).toBeInTheDocument();

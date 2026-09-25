@@ -1,11 +1,11 @@
-import { StrictMode } from "react";
+import { StrictMode, type ReactNode } from "react";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { HubConnection } from "./HubConnection";
 import { HubClient } from "../lib/hub";
 import { RemoteClient } from "../lib/transport";
 
-vi.mock("../pages/ViewerPage", () => ({ ViewerPage: () => <div>Remote sessions</div> }));
+vi.mock("../pages/ViewerPage", () => ({ ViewerPage: ({ connection }: { connection?: ReactNode }) => <><div>Remote sessions</div>{connection}</> }));
 
 const hosts = [
   { host_id: "host/a", name: "Workstation", online: true, access: "control" },
@@ -52,6 +52,7 @@ it("routes selected hosts through Hub, closes old sessions on switching, and sig
   fireEvent.click(screen.getByRole("button", { name: "Open Workstation" }));
   expect(await screen.findByText("Remote sessions")).toBeInTheDocument();
   expect(RemoteClient.connect).toHaveBeenCalledWith(`${window.location.origin}/hosts/host%2Fa`, "owner-token", expect.any(AbortSignal));
+  fireEvent.click(screen.getByRole("button", { name: /connection settings/i }));
   fireEvent.click(screen.getByRole("button", { name: "Change host" }));
   expect(close).toHaveBeenCalledOnce();
   expect(screen.queryByText("Remote sessions")).not.toBeInTheDocument();

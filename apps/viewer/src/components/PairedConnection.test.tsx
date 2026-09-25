@@ -1,10 +1,10 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { StrictMode } from "react";
+import { StrictMode, type ReactNode } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { RemoteClient } from "../lib/transport";
 import { PairedConnection } from "./PairedConnection";
 
-vi.mock("../pages/ViewerPage", () => ({ ViewerPage: () => <div>Remote sessions</div> }));
+vi.mock("../pages/ViewerPage", () => ({ ViewerPage: ({ connection }: { connection?: ReactNode }) => <><div>Remote sessions</div>{connection}</> }));
 const host_id = "11111111-1111-4111-8111-111111111111";
 const saved_host = { host_id, host_public_key: "saved-pin" };
 const selection = { host_id, connection_id: "connection-one" };
@@ -58,6 +58,7 @@ it("disconnects the old viewer and obtains a new selection before reconnecting",
   });
   render(<PairedConnection initial_token="local-token" />);
   expect(await screen.findByText("Remote sessions")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: /connection settings/i }));
   fireEvent.click(screen.getByRole("button", { name: "Change host" }));
   await waitFor(() => expect(screen.getByRole("button", { name: `Open ${host_id}` })).toBeEnabled());
   expect(close).toHaveBeenCalled();

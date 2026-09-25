@@ -302,3 +302,33 @@ describe("SessionComposer", () => {
     expect(submitSessionInput).toHaveBeenCalledOnce();
   });
 });
+
+it("starts as one line, expands on focus, and preserves a draft when focus leaves", async () => {
+  render(<SessionComposer session={SESSION} />);
+  await ready();
+  expect(textbox()).toHaveAttribute("rows", "1");
+  fireEvent.focus(textbox());
+  expect(textbox()).toHaveAttribute("rows", "3");
+  expect(screen.getByRole("button", { name: "Send" }).parentElement).toBe(textbox().parentElement);
+  fireEvent.blur(textbox());
+  expect(textbox()).toHaveAttribute("rows", "1");
+  draft("Keep my draft\nand its newline");
+  fireEvent.blur(textbox());
+  expect(textbox()).toHaveAttribute("rows", "3");
+  expect(textbox()).toHaveValue("Keep my draft\nand its newline");
+  expect(submitSessionInput).not.toHaveBeenCalled();
+});
+
+it("opens a fresh session compactly and restores the previous session's expanded draft", async () => {
+  const view = render(<SessionComposer session={SESSION} />);
+  await ready();
+  fireEvent.focus(textbox());
+  draft("Saved draft");
+  view.rerender(<SessionComposer session={OTHER_SESSION} />);
+  await ready();
+  expect(textbox()).toHaveAttribute("rows", "1");
+  view.rerender(<SessionComposer session={SESSION} />);
+  await ready();
+  expect(textbox()).toHaveAttribute("rows", "3");
+  expect(textbox()).toHaveValue("Saved draft");
+});

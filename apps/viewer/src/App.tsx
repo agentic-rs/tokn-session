@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import "./App.css";
+import { RemoteConnection } from "./components/RemoteConnection";
 import { ViewerPage } from "./pages/ViewerPage";
 import { isDesktop, RemoteClient, selectMachine, type ConnectionState } from "./lib/transport";
 import { PairedConnection } from "./components/PairedConnection";
@@ -38,13 +39,11 @@ function BrowserViewer({ initial_token }: { initial_token?: string }) {
     } catch (error) { setError(error instanceof Error ? error.message : String(error)); }
     finally { setBusy(false); }
   }
-  if (client) return <div className="remote-viewer">
-    <div className="machine-bar">
-      <span>{client.endpoint} · {state === "reconnecting" ? "Reconnecting · showing last received data" : state}</span>
+  if (client) return <ViewerPage remote connection={
+    <RemoteConnection name={client.endpoint} state={state}>
       <button onClick={() => { selectMachine(); setClient(undefined); setState("connecting"); }}>Change machine</button>
-    </div>
-    <ViewerPage remote />
-  </div>;
+    </RemoteConnection>
+  } />;
   return <main className="machine-connect">
     <form onSubmit={(event) => { event.preventDefault(); void connect(); }}>
       <h1>Session viewer</h1>

@@ -1,0 +1,48 @@
+import { useCallback, useId, useRef, useState, type ReactNode } from "react";
+import type { ConnectionState } from "../lib/transport";
+import { useFloatingPanel } from "../lib/useFloatingPanel";
+import { CloseIcon } from "./Icons";
+
+/** The same compact connection entry point for direct, Hub, and paired viewers. */
+export function RemoteConnection({ name, state, children }: {
+  name: string;
+  state: ConnectionState;
+  children: ReactNode;
+}) {
+  const [is_open, setOpen] = useState(false);
+  const id = useId();
+  const trigger_ref = useRef<HTMLButtonElement>(null);
+  const close = useCallback(() => setOpen(false), []);
+  const panel_ref = useFloatingPanel(is_open, close, trigger_ref);
+  const label = state === "connected" ? "Connected" : state === "reconnecting" ? "Reconnecting" : "Connecting";
+  return (
+    <div className="relay-connection">
+      <button
+        aria-controls={id}
+        aria-expanded={is_open}
+        aria-haspopup="dialog"
+        aria-label={`${label}. Connection settings`}
+        className="status-bar__connection"
+        data-phase={state === "connected" ? "live" : state}
+        onClick={() => setOpen((open) => !open)}
+        ref={trigger_ref}
+        title={name}
+        type="button"
+      >
+        <span aria-hidden="true" className="connection-dot" />
+        <span>{label} · {name}</span>
+      </button>
+      {is_open && <div aria-labelledby={`${id}-title`} className="connection-panel" id={id} ref={panel_ref} role="dialog" tabIndex={-1}>
+        <header className="notification-center__header">
+          <h2 id={`${id}-title`}>Connection</h2>
+          <button aria-label="Close connection settings" className="icon-button" onClick={close} type="button"><CloseIcon /></button>
+        </header>
+        <div className="remote-connection__body">
+          <p>{name}</p>
+          <p>{state === "reconnecting" ? "Reconnecting · showing last received data" : label}</p>
+          <div className="remote-connection__actions">{children}</div>
+        </div>
+      </div>}
+    </div>
+  );
+}

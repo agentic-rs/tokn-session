@@ -115,8 +115,8 @@ describe("Sidebar session identity", () => {
       name: `Provider title, Codex session ${titledId}`,
     });
     expect(within(titled).getByText("Provider title")).toHaveClass("session-row__title");
-    expect(within(titled).queryByText("First prompt should not win")).not.toBeInTheDocument();
-    expect(within(titled).getByText("01991dce…")).toHaveClass("session-row__id");
+    expect(within(titled).getByText("First prompt should not win")).toHaveClass("session-row__preview");
+    expect(within(titled).getByText("Codex")).toHaveClass("session-row__provider");
     expect(within(titled).queryByText(titledId)).not.toBeInTheDocument();
     expect(titled).toHaveAttribute("title", `Provider title\n${titledId}`);
 
@@ -124,14 +124,14 @@ describe("Sidebar session identity", () => {
       name: `First user prompt, Codex session ${previewId}`,
     });
     expect(within(preview).getByText("First user prompt")).toHaveClass("session-row__title");
-    expect(within(preview).getByText("abcdef01…")).toHaveClass("session-row__id");
+    expect(within(preview).getByText("Codex")).toHaveClass("session-row__provider");
     expect(preview).toHaveAttribute("title", `First user prompt\n${previewId}`);
 
     const untitled = screen.getByRole("button", {
       name: `Untitled session, Codex session ${untitledId}`,
     });
     expect(within(untitled).getByText("Untitled session")).toHaveClass("session-row__title");
-    expect(within(untitled).getByText("12345678…")).toHaveClass("session-row__id");
+    expect(within(untitled).getByText("Codex")).toHaveClass("session-row__provider");
     expect(untitled).toHaveAttribute("title", `Untitled session\n${untitledId}`);
   });
 

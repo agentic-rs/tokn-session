@@ -121,3 +121,20 @@ export function MoreIcon(props: IconProps) {
     </IconBase>
   );
 }
+
+export function SendIcon(props: IconProps) {
+  return (
+    <IconBase {...props}>
+      <path d="M12 19V5m-6 6 6-6 6 6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" />
+    </IconBase>
+  );
+}
+
+export function BranchIcon(props: IconProps) {
+  return (
+    <IconBase {...props}>
+      <path d="M7 6v7a4 4 0 0 0 4 4h5m-3-3 3 3-3 3" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
+      <circle cx="7" cy="4" r="2" stroke="currentColor" strokeWidth="1.7" />
+    </IconBase>
+  );
+}

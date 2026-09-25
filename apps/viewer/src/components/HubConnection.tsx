@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { HubClient, HubError, hubErrorMessage, type HubEnrollment, type HubHost, type HubStatus } from "../lib/hub";
 import { RemoteClient, selectMachine, type ConnectionState } from "../lib/transport";
+import { RemoteConnection } from "./RemoteConnection";
 import { ViewerPage } from "../pages/ViewerPage";
 
 interface HubConnectionProps {
@@ -185,13 +186,12 @@ function HubHosts({ session, initial_notice, on_authenticated, on_disconnected }
     finally { clearTimeout(timer); logout_client.close(); }
   }
 
-  if (active) return <div className="remote-viewer">
-    <div className="machine-bar">
-      <span>Tokn Hub · {active.host.name} · {active.host.access === "view" ? "View only · " : ""}{state === "reconnecting" ? "Reconnecting · showing last received data" : state}</span>
-      <div className="hub-actions"><button onClick={disconnectHost}>Change host</button><button onClick={() => { void logout(); }}>Sign out</button></div>
-    </div>
-    <ViewerPage key={active.host.host_id} remote />
-  </div>;
+  if (active) return <ViewerPage key={active.host.host_id} remote connection={
+    <RemoteConnection name={`Tokn Hub · ${active.host.name}${active.host.access === "view" ? " · View only" : ""}`} state={state}>
+      <button onClick={disconnectHost}>Change host</button>
+      <button onClick={() => { void logout(); }}>Sign out</button>
+    </RemoteConnection>
+  } />;
 
   return <main className="hub-home">
     <div className="hub-content">

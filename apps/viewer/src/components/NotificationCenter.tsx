@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, type RefObject } from "react";
+import { useMemo, type RefObject } from "react";
 import { PROVIDERS } from "../lib/types";
 import type {
   SessionIndexBodyProviderProgress,
@@ -7,6 +7,7 @@ import type {
   SourceError,
   ViewerProvider,
 } from "../lib/types";
+import { useFloatingPanel } from "../lib/useFloatingPanel";
 import { WarningIcon } from "./Icons";
 
 const PROVIDER_LABELS: Record<ViewerProvider, string> = {
@@ -319,8 +320,7 @@ export function NotificationCenter({
   on_retry,
   trigger_ref,
 }: NotificationCenterProps) {
-  const dialogRef = useRef<HTMLDivElement | null>(null);
-  const hadFocus = useRef(false);
+  const dialogRef = useFloatingPanel(is_open, on_close, trigger_ref);
   const summary = describeSessionIndexProgress(progress, is_loading, error, source_errors);
   const failedProviders = useMemo(() => {
     const providers = new Set<ViewerProvider>();
@@ -349,53 +349,6 @@ export function NotificationCenter({
     () => providerStatuses(progress, source_errors),
     [progress, source_errors],
   );
-
-  useEffect(() => {
-    if (is_open) {
-      hadFocus.current = true;
-      dialogRef.current?.focus();
-      return;
-    }
-    if (hadFocus.current) {
-      hadFocus.current = false;
-      trigger_ref.current?.focus();
-    }
-  }, [is_open, trigger_ref]);
-
-  useEffect(() => {
-    if (!is_open) {
-      return;
-    }
-
-    function onPointerDown(event: PointerEvent) {
-      const target = event.target;
-      if (!(target instanceof Node)) {
-        return;
-      }
-      if (dialogRef.current?.contains(target) || trigger_ref.current?.contains(target)) {
-        return;
-      }
-      on_close();
-    }
-
-    function onKeyDown(event: KeyboardEvent) {
-      if (event.key !== "Escape") {
-        return;
-      }
-      // This runs in the capture phase before the viewer's global Escape
-      // handler, so closing notifications does not also close an inspector.
-      event.preventDefault();
-      event.stopPropagation();
-      on_close();
-    }
-
-    document.addEventListener("pointerdown", onPointerDown, true);
-    document.addEventListener("keydown", onKeyDown, true);
-    return () => {
-      document.removeEventListener("pointerdown", onPointerDown, true);
-      document.removeEventListener("keydown", onKeyDown, true);
-    };
-  }, [is_open, on_close, trigger_ref]);
 
   if (!is_open) {
     return null;

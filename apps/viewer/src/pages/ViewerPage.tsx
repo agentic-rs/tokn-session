@@ -1,24 +1,39 @@
+import type { ReactNode } from "react";
 import { Conversation } from "../components/Conversation";
 import { RelayConnection } from "../components/RelayConnection";
 import { Inspector } from "../components/Inspector";
+import { SessionDrawer } from "../components/SessionDrawer";
 import { Sidebar } from "../components/Sidebar";
 import { StatusBar } from "../components/StatusBar";
 import { TranslationProvider } from "../components/TranslationProvider";
 import { useViewerState } from "../lib/useViewerState";
 
-export function ViewerPage({ remote = false }: { remote?: boolean }) {
-  return <TranslationProvider><ViewerContent remote={remote} /></TranslationProvider>;
+interface ViewerPageProps {
+  remote?: boolean;
+  connection?: ReactNode;
 }
 
-function ViewerContent({ remote }: { remote: boolean }) {
+export function ViewerPage({ remote = false, connection }: ViewerPageProps) {
+  return <TranslationProvider><ViewerContent remote={remote} connection={connection} /></TranslationProvider>;
+}
+
+function ViewerContent({ remote, connection }: ViewerPageProps) {
   const viewer = useViewerState();
 
+  function openSessions() {
+    if (window.matchMedia("(max-width: 860px)").matches) {
+      viewer.setMobileSidebarOpen(true);
+    } else {
+      document.querySelector<HTMLInputElement>('.sidebar input[type="search"]')?.focus();
+    }
+  }
+
   return (
-    <div className="viewer-app">
-      {!remote && <RelayConnection />}
+    <div className="viewer-app" data-remote={remote}>
       <div className="viewer-shell" data-inspector-open={viewer.inspectorOpen}>
-        <div className="sidebar-shell" data-mobile-open={viewer.mobileSidebarOpen}>
+        <SessionDrawer is_open={viewer.mobileSidebarOpen} on_close={() => viewer.setMobileSidebarOpen(false)}>
           <Sidebar
+            on_close={() => viewer.setMobileSidebarOpen(false)}
             enabled_providers={viewer.enabledProviders}
             error={viewer.sessionsError}
             has_more={viewer.sessionsCursor !== null}
@@ -39,16 +54,7 @@ function ViewerContent({ remote }: { remote: boolean }) {
             sessions={viewer.sessions}
             source_errors={viewer.sourceErrors}
           />
-        </div>
-
-        {viewer.mobileSidebarOpen ? (
-          <button
-            aria-label="Close sessions"
-            className="sidebar-backdrop"
-            onClick={() => viewer.setMobileSidebarOpen(false)}
-            type="button"
-          />
-        ) : null}
+        </SessionDrawer>
 
         <Conversation
           pending_live_activity={viewer.pendingLiveActivity}
@@ -77,7 +83,7 @@ function ViewerContent({ remote }: { remote: boolean }) {
           on_load_older={viewer.loadOlderEvents}
           on_retry={viewer.retryEvents}
           on_retry_expanded_detail={viewer.retryExpandedDetail}
-          on_sidebar_open={() => viewer.setMobileSidebarOpen(true)}
+          on_sidebar_open={openSessions}
           on_trajectory_load_newer={viewer.loadNewerTrajectoryEvents}
           on_trajectory_load_older={viewer.loadOlderTrajectoryEvents}
           on_trajectory_retry={viewer.retryTrajectoryEvents}
@@ -106,6 +112,7 @@ function ViewerContent({ remote }: { remote: boolean }) {
       </div>
 
       <StatusBar
+        connection={remote ? connection : <RelayConnection />}
         error={viewer.sessionIndexProgressError}
         is_loading={viewer.sessionIndexProgressLoading}
         is_retrying={viewer.sessionIndexRetrying}
