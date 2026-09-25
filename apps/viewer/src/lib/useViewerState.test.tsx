@@ -51,6 +51,7 @@ vi.mock("./tauri", () => ({
 }));
 
 beforeEach(() => {
+  localStorage.removeItem("tokn.viewer.sidebar-order");
   vi.mocked(updateSessionView).mockReset().mockResolvedValue(undefined);
   vi.mocked(listenForRelayChanges).mockReset().mockResolvedValue(vi.fn());
   vi.mocked(acknowledgeSessionAttention).mockReset().mockResolvedValue({ changed: false });
@@ -349,6 +350,23 @@ function ViewerPageCommitProbe() {
     </>
   );
 }
+
+describe("sidebar view preference", () => {
+  it("requests project order and preserves a selection outside the replacement page", async () => {
+    vi.mocked(listSessions)
+      .mockResolvedValueOnce({ sessions: [session("a")], next_cursor: null, source_errors: [], pending_providers: [] })
+      .mockResolvedValueOnce({ sessions: [session("b")], next_cursor: null, source_errors: [], pending_providers: [] });
+    const { result } = renderHook(() => useViewerState());
+    await selectListedSession(result, "a");
+    act(() => result.current.setSessionOrder("project"));
+    await waitFor(() => expect(result.current.sessions[0]?.session_key).toBe("b"));
+    expect(result.current.selectedSessionKey).toBe("a");
+    expect(result.current.selectedSession?.session_key).toBe("a");
+    const calls = vi.mocked(listSessions).mock.calls;
+    expect(calls[calls.length - 1][0].query.order).toBe("project");
+    expect(localStorage.getItem("tokn.viewer.sidebar-order")).toBe("project");
+  });
+});
 
 describe("retained session turns", () => {
   it("loads earlier turns as one retained window and restores them on returning to a cached session", async () => {

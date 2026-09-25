@@ -255,7 +255,7 @@ export function groupSessions(sessions: SessionSummary[]): Array<{
   const groups = new Map<string, { project: string; sessions: SessionSummary[] }>();
   for (const session of sessions) {
     const project = session.project?.trim() || session.cwd?.trim() || "Other sessions";
-    const key = session.cwd?.trim() || project;
+    const key = session.project_key?.trim() || session.cwd?.trim() || project;
     const group = groups.get(key) ?? { project, sessions: [] };
     group.sessions.push(session);
     groups.set(key, group);
