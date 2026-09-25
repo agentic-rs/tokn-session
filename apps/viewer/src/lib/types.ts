@@ -156,10 +156,11 @@ export interface SessionSummary {
   history_status: SessionHistoryStatus | null;
   /** True when this session has a visible message the viewer has not opened. */
   has_unread: boolean;
-  /** True when a known descendant has unread visible activity. */
+  /** Legacy compatibility field; ignored. New servers always return false. */
   has_unread_descendant?: boolean;
   /** Additive fields: older remote hosts still expose the boolean indicator. */
   unread_final_count?: number;
+  /** Legacy compatibility field; ignored. New servers always return zero. */
   unread_descendant_count?: number;
   is_running?: boolean;
   has_running_descendant?: boolean;

@@ -92,10 +92,9 @@ function SessionBranch({
   const preview = session.preview?.replace(/\s+/g, " ").trim();
   const sessionDescription = depth > 0 ? `subagent ${title}` : title;
   const isRunning = session.is_running === true || session.has_running_descendant === true;
-  const unreadCount = (session.unread_final_count ?? Number(session.has_unread))
-    + (session.unread_descendant_count ?? Number(session.has_unread_descendant === true));
+  const unreadCount = session.unread_final_count ?? Number(session.has_unread);
   const hasUnread = !isRunning && unreadCount > 0;
-  const unreadLabel = `${unreadCount} unread final ${unreadCount === 1 ? "reply" : "replies"}${session.has_unread_descendant ? " including subagents" : ""}`;
+  const unreadLabel = `${unreadCount} unread final ${unreadCount === 1 ? "reply" : "replies"}`;
   const runningLabel = session.is_running ? "Running" : "Subagent running";
 
   useEffect(() => {
@@ -141,7 +140,7 @@ function SessionBranch({
                 <span
                   aria-label={unreadLabel}
                   className={unreadCount > 1 ? "session-row__unread-count" : "session-row__unread-dot"}
-                  data-unread-source={session.has_unread ? "direct" : "descendant"}
+                  data-unread-source="direct"
                   role="img"
                 >{unreadCount > 1 ? unreadCount : null}</span>
               ) : null}

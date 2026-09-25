@@ -195,7 +195,10 @@ separate from the browser HTTP API and retains its version-1 framed protocol.
 Session summaries include `is_running`, `has_running_descendant`,
 `unread_final_count`, and `unread_descendant_count`. These are additive to the
 legacy unread booleans. Running takes display precedence over unread; counts
-represent completed final assistant messages, not index refreshes. Acknowledgement
+represent only this session’s completed final assistant messages, not index
+refreshes or subagent replies. Compatibility fields `has_unread_descendant` and
+`unread_descendant_count` always return false and zero; clients ignore values
+from older servers. Acknowledgement
 revisions remain opaque and must come from the displayed newest event page.
 
 Session list requests accept `query.order` (`time`, the default, or `project`).

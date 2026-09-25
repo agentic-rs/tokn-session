@@ -278,13 +278,21 @@ describe("Sidebar unread activity", () => {
     expect(dot).toHaveAttribute("data-unread-source", "direct");
   });
 
-  it("renders unread indicators on a parent and its loaded unread subagent", () => {
+  it("counts only the parent’s own replies even when an older server reports descendant attention", () => {
+    renderSidebar([session({ title: "Parent", has_unread: true, unread_final_count: 1,
+      has_unread_descendant: true, unread_descendant_count: 2 })]);
+    expect(screen.getByRole("img", { name: "1 unread final reply" })).toHaveClass("session-row__unread-dot");
+    expect(screen.queryByRole("img", { name: /3 unread/ })).not.toBeInTheDocument();
+  });
+
+  it("ignores legacy descendant counts on a parent while showing the child’s own unread replies", () => {
     const parent = session({
       session_key: "codex:parent",
       session_id: "parent-0000",
       title: "Root task",
       child_count: 1,
       has_unread_descendant: true,
+      unread_descendant_count: 2,
     });
     const child = session({
       session_key: "codex:child",
@@ -329,10 +337,10 @@ describe("Sidebar unread activity", () => {
     );
 
     const parentRow = screen.getByRole("button", {
-      name: "Root task, Codex session parent-0000, 1 unread final reply including subagents",
+      name: "Root task, Codex session parent-0000",
     });
-    expect(within(parentRow).getByRole("img", { name: "1 unread final reply including subagents" }))
-      .toHaveAttribute("data-unread-source", "descendant");
+    expect(parentRow).not.toHaveAttribute("data-unread");
+    expect(within(parentRow).queryByRole("img", { name: /unread/ })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Show 1 subagent for Root task" }));
 

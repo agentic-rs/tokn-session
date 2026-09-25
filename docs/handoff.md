@@ -760,7 +760,9 @@ work events; final replies, turn completion/interruption, and provider errors
 stop it. Unknown activity is not inferred from file modification alone.
 The sidebar shows exactly one indicator: a running circle takes precedence;
 otherwise one unread reply is a dot, multiple replies show a count, and read
-sessions have no indicator. Canonical ancestors aggregate descendant activity.
+sessions have no indicator. Unread counts belong only to the session itself;
+subagent replies never contribute to an ancestor’s unread state or count.
+Canonical ancestors still aggregate descendant running state.
 A newest event page acknowledges only its captured revision after React commits
 it and the view is following latest; scrolling up retains unread counts.
 Successful body refreshes separately name `updated_session_keys`, letting the selected timeline

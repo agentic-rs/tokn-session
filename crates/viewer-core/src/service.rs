@@ -349,9 +349,7 @@ struct SessionListCandidate {
 #[derive(Clone, Copy, Debug, Default)]
 struct SessionAttention {
   has_unread: bool,
-  has_unread_descendant: bool,
   unread_final_count: u64,
-  unread_descendant_count: u64,
   is_running: bool,
   has_running_descendant: bool,
 }
@@ -3824,10 +3822,6 @@ fn session_relation_attention(
     let child = attention[child_index];
     let mut parent_index = relations.parent_indices[child_index];
     while let Some(index) = parent_index {
-      attention[index].has_unread_descendant |= child.has_unread;
-      attention[index].unread_descendant_count = attention[index]
-        .unread_descendant_count
-        .saturating_add(child.unread_final_count);
       attention[index].has_running_descendant |= child.is_running;
       parent_index = relations.parent_indices[index];
     }
@@ -3970,9 +3964,9 @@ fn session_summary_with_child_count(
     event_count: None,
     history_status: None,
     has_unread: attention.has_unread,
-    has_unread_descendant: attention.has_unread_descendant,
+    has_unread_descendant: false,
     unread_final_count: attention.unread_final_count,
-    unread_descendant_count: attention.unread_descendant_count,
+    unread_descendant_count: 0,
     is_running: attention.is_running,
     has_running_descendant: attention.has_running_descendant,
   })
@@ -8138,7 +8132,7 @@ mod tests {
   }
 
   #[test]
-  fn session_index_ignores_commentary_and_bubbles_child_attention_to_ancestors() {
+  fn session_index_ignores_commentary_and_keeps_child_unread_separate() {
     let directory = tempfile::tempdir().expect("temporary directory should exist");
     let parent_path = directory.path().join("parent.jsonl");
     let child_path = directory.path().join("child.jsonl");
@@ -8236,8 +8230,9 @@ mod tests {
       .expect("indexed listing should work");
     assert_eq!(roots.sessions.len(), 1);
     assert!(!roots.sessions[0].has_unread);
-    assert!(roots.sessions[0].has_unread_descendant);
-    assert_eq!(roots.sessions[0].unread_descendant_count, 3);
+    assert!(!roots.sessions[0].has_unread_descendant);
+    assert_eq!(roots.sessions[0].unread_descendant_count, 0);
+    assert_eq!(roots.sessions[0].unread_final_count, 0);
     assert!(!roots.sessions[0].has_running_descendant);
 
     let children = service
